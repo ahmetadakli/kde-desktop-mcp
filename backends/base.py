@@ -57,6 +57,51 @@ class Node(ABC):
     def is_focused(self) -> bool: ...
 
 
+class AppGroupNode(Node):
+    """Synthetic root holding every top-level window of one app name, even when
+    several processes share that name."""
+
+    def __init__(self, app: str, windows):
+        self.app = app
+        self._windows = windows  # callable returning list[Node]
+
+    def role(self) -> str:
+        return "application"
+
+    def name(self) -> str:
+        return self.app
+
+    def text(self, limit: int = 80) -> str:
+        return ""
+
+    def full_text(self, limit: int) -> str:
+        return self.app
+
+    def states(self) -> list[str]:
+        return []
+
+    def actions(self) -> list[str]:
+        return []
+
+    def do_action(self, index: int) -> bool:
+        raise ValueError("application root has no actions")
+
+    def set_text(self, text: str) -> bool:
+        raise ValueError("application root is not editable")
+
+    def children(self) -> list[Node]:
+        return self._windows()
+
+    def showing(self) -> bool:
+        return True
+
+    def app_name(self) -> str:
+        return self.app
+
+    def is_focused(self) -> bool:
+        return False
+
+
 @dataclass
 class WindowInfo:
     kind: str

@@ -78,9 +78,9 @@ def main() -> int:
         return 2
 
     tmp = Path(tempfile.mkdtemp(prefix="desktop-mcp-smoke-"))
-    path = tmp / "smoke.txt"
+    path = tmp / f"{tmp.name}.txt"  # unique, so leftover windows never match
     path.write_text("ilk satır\n", encoding="utf-8")
-    stem = path.name
+    stem = path.stem  # Notepad may hide the extension in the title
 
     server.backend.enable()
     subprocess.Popen(LAUNCH + [str(path)], stdout=subprocess.DEVNULL,

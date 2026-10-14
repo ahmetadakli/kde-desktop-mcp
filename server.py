@@ -293,7 +293,31 @@ def screenshot() -> str:
     return backend.screenshot() or "screenshot failed"
 
 
+def run_stdio() -> None:
+    """Serve MCP on the real stdout while sending stray prints to stderr.
+
+    Some platform libraries (uiautomation) print to stdout, which would corrupt
+    the JSON-RPC stream, so the protocol keeps its own handle on fd 1.
+    """
+    import sys
+    from io import TextIOWrapper
+
+    import anyio
+    from mcp.server.stdio import stdio_server
+
+    proto_out = anyio.wrap_file(TextIOWrapper(sys.stdout.buffer, encoding="utf-8"))
+    sys.stdout = sys.stderr
+
+    async def main() -> None:
+        async with stdio_server(stdout=proto_out) as (read_stream, write_stream):
+            server = mcp._mcp_server
+            await server.run(read_stream, write_stream,
+                             server.create_initialization_options())
+
+    anyio.run(main)
+
+
 if __name__ == "__main__":
     backend.enable()
     allowed()
-    mcp.run()
+    run_stdio()

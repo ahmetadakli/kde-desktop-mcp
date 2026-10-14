@@ -16,7 +16,7 @@ from gi.repository import Atspi, Gio, GLib  # noqa: E402
 
 from evdev import UInput, ecodes as e, AbsInfo  # noqa: E402
 
-from .base import AppInfo, Backend, Node, WindowInfo  # noqa: E402
+from .base import AppGroupNode, AppInfo, Backend, Node, WindowInfo  # noqa: E402
 
 DEFAULT_ALLOW = """\
 # One AT-SPI application name per line (case-insensitive). See `apps` tool output.
@@ -201,10 +201,17 @@ class KdeBackend(Backend):
         return out
 
     def app_root(self, name: str) -> Node | None:
-        for a in self._applications():
-            if (a.get_name() or "").lower() == name.lower():
-                return AtspiNode(a)
-        return None
+        # Every `kate -n` (and similar) is its own process with the same app name.
+        def windows() -> list[Node]:
+            out: list[Node] = []
+            for a in self._applications():
+                if (a.get_name() or "").lower() == name.lower():
+                    out.extend(AtspiNode(a).children())
+            return out
+
+        root = AppGroupNode(name.lower(), windows)
+        return root if any((a.get_name() or "").lower() == name.lower()
+                           for a in self._applications()) else None
 
     def active_app(self) -> str:
         for a in self._applications():
