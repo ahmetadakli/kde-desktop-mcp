@@ -1,0 +1,13 @@
+[project]
+name = "kde-desktop-mcp"
+version = "0.1.0"
+description = "Screenshot-free desktop control MCP server for KDE Plasma (Wayland) via AT-SPI, uinput and KWin scripting"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.0,<2",
+    "evdev>=1.7",
+]
+# PyGObject (gi) and AT-SPI come from the system packages; create the venv with
+# --system-site-packages so they are importable.
