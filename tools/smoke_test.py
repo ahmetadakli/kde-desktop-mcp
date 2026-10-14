@@ -1,6 +1,6 @@
 """End-to-end smoke test on the real desktop.
 
-Opens a temporary file in the platform editor (Kate on KDE, Notepad on Windows),
+Opens a temporary file in the platform editor (Kate on KDE and Hyprland, Notepad on Windows),
 then drives it only through the MCP tool functions: list, find, focus after
 focus moved away, type Unicode text, save with a shortcut, read back, and check
 that the allowlist blocks an unknown app.
