@@ -93,6 +93,12 @@ class HyprlandTest(unittest.TestCase):
         self.assertFalse(self.b._window_active(self.kate, self.kate_frames[1]))
         self.assertFalse(self.b._window_active(self.firefox, self.firefox._kids[0]))
 
+    def test_window_title_match_ignores_spacing(self):
+        # Kate's AT-SPI frame name has two spaces before the dash.
+        self.kate_frames[0]._name = "notes.txt  — Kate"
+        self.assertTrue(self.b._window_active(self.kate, self.kate_frames[0]))
+        self.assertFalse(self.b._window_active(self.kate, self.kate_frames[1]))
+
     def test_activate_window_respects_allowlist_and_query(self):
         self.b.activate_window("other.txt", {"kate"})
         self.assertEqual(self.dispatched, [("focuswindow", "address:0x55d1b0")])

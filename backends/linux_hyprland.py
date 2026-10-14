@@ -82,7 +82,9 @@ class HyprlandBackend(LinuxAtspiBackend):
             return False
         if app.get_child_count() <= 1:
             return True
-        return (frame.get_name() or "").strip() == (client.get("title") or "").strip()
+        # Toolkits and compositors space titles differently (Kate's AT-SPI frame
+        # name has two spaces before the dash, its window title one).
+        return _norm(frame.get_name()) == _norm(client.get("title"))
 
     def _window_active(self, app: Atspi.Accessible, window: Atspi.Accessible) -> bool:
         aw = self._active_window()
@@ -174,6 +176,10 @@ class HyprlandBackend(LinuxAtspiBackend):
         for cmd in _wtype_commands(text):
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            timeout=10, check=True)
+
+
+def _norm(title: str | None) -> str:
+    return " ".join((title or "").split())
 
 
 def _wtype_commands(text: str) -> list[list[str]]:
