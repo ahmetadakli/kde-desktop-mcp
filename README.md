@@ -1,33 +1,46 @@
 # kde-desktop-mcp
 
-KDE Plasma (Wayland) ve Windows için ekran görüntüsü almadan çalışan bir
+KDE Plasma (Wayland), Hyprland ve Windows için ekran görüntüsü almadan çalışan bir
 masaüstü kontrol MCP sunucusu. Claude Code gibi MCP istemcilerine
 uygulamaların içini erişilebilirlik ağacından okuma ve öğelere doğrudan işlem
 yapma yeteneği verir.
 
-*A screenshot-free desktop control MCP server for KDE Plasma on Wayland and
-Windows, built on the platform accessibility APIs, with a per-app allowlist.*
+*A screenshot-free desktop control MCP server for KDE Plasma (Wayland), Hyprland
+and Windows, built on the platform accessibility APIs, with a per-app allowlist.*
 
-> Windows desteği yenidir ve henüz gerçek bir Windows makinesinde
-> doğrulanmamıştır. Sonuçları `tools/smoke_test.py` ile paylaşın.
+> KDE Plasma gerçek masaüstünde doğrulanmıştır. Hyprland ve Windows desteği
+> yenidir ve şimdilik yalnızca birim testleriyle doğrulanmıştır. Sonuçları
+> `tools/smoke_test.py` ile paylaşın.
 
 ## Nasıl çalışır
 
 Claude ekrana bakmak yerine pencerelerdeki öğeleri `[55] button "Kaydet"` gibi
 bir liste olarak okur ve öğelere numarasıyla doğrudan işlem yapar.
 
-| Katman | KDE Plasma (Wayland) | Windows |
-|---|---|---|
-| Okuma | AT-SPI (D-Bus) | UI Automation (`uiautomation`) |
-| Öğe işlemleri | AT-SPI eylemleri, EditableText | Invoke, Toggle, ExpandCollapse, SelectionItem, Value desenleri |
-| Klavye ve fare | `/dev/uinput` sanal aygıtları (evdev) | Win32 `SendInput`, `SetCursorPos` |
-| Metin yazma | `wl-copy` + Ctrl+V (panoyu değiştirir) | `KEYEVENTF_UNICODE` (panoya dokunmaz) |
-| Pencere | KWin betikleri (`qdbus6`) | `SetForegroundWindow` |
-| Ekran görüntüsü (yedek) | `spectacle` | Pillow `ImageGrab` |
+| Katman | KDE Plasma (Wayland) | Hyprland | Windows |
+|---|---|---|---|
+| Okuma | AT-SPI (D-Bus) | AT-SPI (D-Bus) | UI Automation (`uiautomation`) |
+| Öğe işlemleri | AT-SPI eylemleri, EditableText | AT-SPI eylemleri, EditableText | Invoke, Toggle, ExpandCollapse, SelectionItem, Value desenleri |
+| Klavye | `/dev/uinput` (evdev) | `/dev/uinput` (evdev) | Win32 `SendInput` |
+| Fare | Mutlak konumlu uinput | `hyprctl dispatch movecursor` + uinput tuşları | `SetCursorPos` + `SendInput` |
+| Metin yazma | `wl-copy` + Ctrl+V (panoyu değiştirir) | `wtype` (panoya dokunmaz); yoksa `wl-copy` | `KEYEVENTF_UNICODE` (panoya dokunmaz) |
+| Pencere | KWin betikleri (`qdbus6`) | `hyprctl clients`, `focuswindow` | `SetForegroundWindow` |
+| Ekran görüntüsü (yedek) | `spectacle` | `grim` | Pillow `ImageGrab` |
 
-Kod ortak bir araç katmanı (`server.py`) ve platform modüllerinden
-(`backends/linux_kde.py`, `backends/windows.py`) oluşur. İzin listesi, öğe
-numaraları ve araçlar ortaktır; Claude iki platformda aynı araçları görür.
+Kod ortak bir araç katmanı (`server.py`) ve platform modüllerinden oluşur:
+`backends/linux_common.py` (AT-SPI ve klavye, iki Linux masaüstü için ortak),
+`backends/linux_kde.py`, `backends/linux_hyprland.py` ve `backends/windows.py`.
+İzin listesi, öğe numaraları ve araçlar ortaktır; Claude her platformda aynı
+araçları görür.
+
+Masaüstü otomatik seçilir: Windows'ta Windows modülü, Linux'ta
+`HYPRLAND_INSTANCE_SIGNATURE` tanımlıysa Hyprland, değilse KDE. Elle seçmek
+için `DESKTOP_MCP_BACKEND` ortam değişkenine `kde`, `hyprland` ya da `windows`
+verin.
+
+Hyprland'de etkin pencere, AT-SPI'deki uygulamayla süreç kimliği (pid)
+üzerinden eşleştirilir; böylece araç takımının odak bayrağına güvenmek
+gerekmez.
 
 `focus` önce erişilebilirlik altyapısından odak ister. Uygulama bunu reddederse
 (Qt'de sık görülür) öğenin ortasına gerçek bir tıklama yapar.
@@ -44,8 +57,9 @@ numaraları ve araçlar ortaktır; Claude iki platformda aynı araçları görü
 
 Her çağrıda yeniden okunur; ilk çalıştırmada varsayılan liste oluşturulur.
 
-- KDE: `~/.config/desktop-mcp/allow.txt`, satır başına AT-SPI uygulama adı
-  (`kate`, `firefox`…)
+- KDE ve Hyprland: `~/.config/desktop-mcp/allow.txt`, satır başına AT-SPI
+  uygulama adı (`kate`, `firefox`…). Hyprland'de erişilebilirliği olmayan
+  uygulamalar pencere sınıfıyla (`xterm` gibi) eşleşir.
 - Windows: `%APPDATA%\desktop-mcp\allow.txt`, satır başına `.exe` olmadan
   program adı (`notepad`, `firefox`, `chrome`…)
 
@@ -77,6 +91,20 @@ claude mcp add --scope user desktop -- "$PWD/.venv/bin/python" "$PWD/server.py"
 `--system-site-packages` gereklidir: PyGObject ve AT-SPI PyPI'dan değil,
 sistem paketlerinden gelir.
 
+## Kurulum: Hyprland
+
+Gereksinimler:
+- Hyprland oturumu (`hyprctl` ve `movecursor` dispatcher'ı)
+- Sistem paketleri (Arch): `at-spi2-core`, `python-gobject`, `wl-clipboard`;
+  önerilen: `wtype` (panoya dokunmadan yazma), `grim` (yedek ekran görüntüsü)
+- Oturumda AT-SPI veri yolunun çalışması. Qt uygulamaları için Hyprland
+  yapılandırmasına `env = QT_LINUX_ACCESSIBILITY_ALWAYS_ON,1` eklemek gerekebilir.
+- `/dev/uinput` üzerinde kullanıcı yazma izni
+- Python 3.12+ ve [uv](https://docs.astral.sh/uv/)
+
+Kurulum komutları KDE ile aynıdır. Claude Code'u Hyprland oturumunun içinden
+başlatın ki `HYPRLAND_INSTANCE_SIGNATURE` sunucuya geçsin.
+
 ## Kurulum: Windows
 
 Gereksinimler: Windows 10 veya 11, Python 3.12+ ve
@@ -95,8 +123,15 @@ sunucusunun bağlı olduğunu kontrol edin.
 
 ## Test
 
+Birim testleri gerçek masaüstü gerektirmez (Hyprland ve Windows mantığı sahte
+`hyprctl` çıktıları ve sahte UI Automation nesneleriyle denenir):
+
+```bash
+.venv/bin/python -m unittest discover -s tests
+```
+
 `tools/smoke_test.py` gerçek masaüstünde uçtan uca test yapar: düzenleyiciyi
-(KDE'de Kate, Windows'ta Not Defteri) geçici bir dosyayla açar, öğeyi bulur,
+(KDE ve Hyprland'de Kate, Windows'ta Not Defteri) geçici bir dosyayla açar, öğeyi bulur,
 odak başka yere kaydıktan sonra geri odaklar, Türkçe karakterli metin yazar,
 Ctrl+S ile kaydeder, diskten geri okur ve izin listesinin bilinmeyen bir
 uygulamayı engellediğini kontrol eder. Çalışırken klavye ve fareye dokunmayın.
@@ -117,6 +152,11 @@ KDE:
 - Chromium, Chrome ve Electron uygulamaları ağaçlarını yalnızca
   `--force-renderer-accessibility` ile başlatılırlarsa gösterir.
 - `type_text` panonun içeriğini değiştirir.
+
+Hyprland:
+- GTK uygulamalarının istemci tarafı gölgeleri, `click` ve `focus` tıklamalarını
+  birkaç piksel kaydırabilir.
+- `wtype` yoksa `type_text` panoyu değiştirir.
 
 Windows:
 - Yönetici olarak çalışan pencerelere, yönetici olmayan bir sunucudan girdi
