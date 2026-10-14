@@ -197,6 +197,9 @@ class UiaNode(Node):
     def _pattern(self, pid: int):
         return _safe(lambda: self.ctrl.GetPattern(pid))
 
+    def hwnd(self) -> int:
+        return _safe(lambda: self.ctrl.NativeWindowHandle, 0) or 0
+
     def role(self) -> str:
         name = _safe(lambda: self.ctrl.ControlTypeName, "") or ""
         return name.removesuffix("Control").lower()
@@ -253,7 +256,7 @@ class UiaNode(Node):
                 auto.ExpandCollapseState.Expanded, auto.ExpandCollapseState.PartiallyExpanded):
             out.append("expanded")
         if self.role() == "window":
-            hwnd = _safe(lambda: self.ctrl.NativeWindowHandle, 0)
+            hwnd = self.hwnd()
             if hwnd and hwnd == _foreground_hwnd():
                 out.append("active")
         if self._editable():
@@ -335,7 +338,7 @@ class WindowsBackend(Backend):
             name = node.app_name()
             if not name:
                 continue
-            hwnd = _safe(lambda: w.NativeWindowHandle, 0)
+            hwnd = node.hwnd()
             info = apps.setdefault(name, AppInfo(name))
             info.windows.append(WindowInfo(node.role(), node.name().strip(), bool(hwnd) and hwnd == fg))
         return sorted(apps.values(), key=lambda a: a.name)
@@ -422,7 +425,7 @@ class WindowsBackend(Backend):
             if app not in allowed:
                 continue
             if q in node.name().lower() or q in app:
-                hwnd = _safe(lambda: w.NativeWindowHandle, 0)
+                hwnd = node.hwnd()
                 if not hwnd:
                     continue
                 if user32.IsIconic(hwnd):
