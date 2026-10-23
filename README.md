@@ -25,9 +25,9 @@ bir liste olarak okur ve öğelere numarasıyla doğrudan işlem yapar.
 | Öğe işlemleri | AT-SPI eylemleri, EditableText | AT-SPI eylemleri, EditableText | Invoke, Toggle, ExpandCollapse, SelectionItem, Value desenleri |
 | Klavye | `/dev/uinput` | `/dev/uinput` | Win32 `SendInput` |
 | Fare | Mutlak konumlu uinput | Hyprland `movecursor` + uinput tuşları | `SetCursorPos` + `SendInput` |
-| Metin yazma | `wl-copy` + Ctrl+V (panoyu değiştirir) | `wtype` (panoya dokunmaz); yoksa `wl-copy` | `KEYEVENTF_UNICODE` (panoya dokunmaz) |
+| Metin yazma | Qt'nin çok satırlı alanlarına AT-SPI ile doğrudan ekleme (panoya dokunmaz); diğerlerinde süreç içi pano + Ctrl+V | `wtype` (panoya dokunmaz); yoksa `wl-copy` | `KEYEVENTF_UNICODE` (panoya dokunmaz) |
 | Pencere | KWin betikleri (D-Bus) | Hyprland soketi: `clients`, `focuswindow` | `SetForegroundWindow` |
-| Ekran görüntüsü (yedek) | `spectacle` | `grim` | GDI |
+| Ekran görüntüsü (yedek) | KWin `ScreenShot2` (D-Bus); yoksa `spectacle` | `grim` | GDI |
 
 Kod `rust/src/` altındadır: `main.rs` MCP protokolünü, izin listesini, öğe
 numaralarını ve araçları; `render.rs` ağaç ve arama çıktısını; `backend.rs`
@@ -56,12 +56,30 @@ Neden hızlı:
   UI Automation önbellek isteğiyle (`BuildUpdatedCache`) gelir.
 - KWin betikleri `qdbus6` süreçleri yerine D-Bus'tan, Hyprland komutları
   `hyprctl` süreçleri yerine doğrudan Hyprland'in soketinden gider.
-- Açılış 2 ms; sanal klavye ve fare açılışta hazırlanır.
+- Açılış 2 ms; sanal klavye ve fare açılışta, aynı anda hazırlanır.
+- KDE'de bekleme süreleri ölçülerek kısaltıldı (uinput olayları sırayla
+  işlenir); `focus`, bir uygulamada işe yaramayan odak yöntemlerini hatırlayıp
+  atlar; `type_text` süreç başlatmaz; ekran görüntüsü `spectacle` yerine
+  doğrudan KWin'den alınır.
+- Çıktı kısadır, Claude daha az okur: girinti seviye başına bir boşluk, aynı
+  rol ve eylemli kardeş yapraklar tek satırda
+  (`list item ×3: [8] "a" [9] "b" [10] "c"`), Qt'nin hemen her öğeye verdiği
+  "Set Focus" eylemi listelenmez. Dolphin + Kate `tree` çıktısı 15.182'den
+  7.092 karaktere indi.
+- Bir AT-SPI çağrısı en fazla 2 sn bekler; yanıt vermeyen bir uygulama
+  sunucuyu kilitlemez. Menü açan eylemler (Qt'de menü kapanana kadar yanıt
+  gelmez) 400 ms sonra gönderilmiş sayılır.
 
 ## Araçlar
 
 - `apps`, `tree`, `find`, `get_text`: okuma ve arama
-- `act`, `set_text`, `focus`, `click`: öğeye işlem
+- `act`, `set_text`, `focus`, `click`: öğeye işlem. Öğe, `tree`/`find`
+  numarasıyla (`id`) ya da tek çağrıda `app` + `query` (+ `role`) ile seçilir:
+  adı `query` ile birebir aynı olan ilk görünür öğe, yoksa adında, metninde ya
+  da rolünde geçen ilk öğe. `act`, etkin pencere değiştiyse (ör. bir iletişim
+  kutusu açıldıysa) bunu bildirir.
+- `wait_for`: bir öğe görünene ya da kaybolana kadar bekler (her 50 ms'de bir
+  bakar); tuş veya tıklamadan sonra açılan iletişim kutularını beklemek için
 - `key`, `type_text`: klavye
 - `activate_window`: pencereyi öne getirme
 - `mouse`, `screenshot`: yalnızca yedek
@@ -98,6 +116,10 @@ Gereksinimler:
 - KDE Plasma 6, Wayland oturumu
 - Sistem paketleri (Arch): `at-spi2-core`, `libkscreen`, `wl-clipboard`,
   `spectacle`
+- Hızlı ekran görüntüsü için KWin 6.8 ya da üstü. Daha eski KWin'de
+  `screenshot` `spectacle`'a döner; KWin'in `ScreenShot2` arayüzünü açmak için
+  bir kez elle bir `.desktop` dosyası kurmak gerekir (ayrıntısı
+  `rust/src/linux/kwin.rs` içinde `SHOT_NOT_AUTHORIZED` açıklamasında)
 - `/dev/uinput` üzerinde kullanıcı yazma izni (`getfacl /dev/uinput`)
 
 ```bash
@@ -163,6 +185,31 @@ medyan ms tablosu yazar (pencere açık olmalı):
 python3 tools/mcp_bench.py --app kate --window notes.txt \
     --server "Rust=rust/target/release/desktop-mcp"
 ```
+
+## Ölçümler: KDE hızlandırması
+
+`tools/mcp_bench.py`, KDE Plasma 6.8, Kate; 5 turun medyanı (ms). "Önce"
+`2f2e5df` (Python'un kaldırıldığı sürüm), "Sonra" bu sürüm:
+
+| İşlem | Önce (ms) | Sonra (ms) | Hızlanma |
+|---|---:|---:|---:|
+| `initialize` | 4.4 | 3.3 | 1.4x |
+| `apps` | 3.8 | 4.2 | 0.9x |
+| `activate_window` | 8.5 | 10.3 | 0.8x |
+| `tree` | 12.0 | 10.0 | 1.2x |
+| `find` | 10.1 | 9.9 | 1.0x |
+| `get_text` | 0.3 | 0.3 | 0.9x |
+| `key` | 19.5 | 6.4 | 3.0x |
+| `type_text` | 34.9 | 2.9 | 12x |
+| `focus` | 103.5 | 12.1 | 8.5x |
+| `click` | 78.1 | 11.1 | 7.0x |
+| `mouse` | 29.3 | 4.9 | 6.0x |
+| `screenshot` | 258.8 | 12.1 | 21x |
+
+`activate_window`'daki ~2 ms, `act`'in pencere değişikliğini bildirebilmesi
+için etkin pencere başlığının okunmasıdır. Asıl kazanç milisaniyelerin
+ötesindedir: kısa çıktı, `app` + `query` ile tek çağrıda hedefleme, `wait_for`
+ve `batch` Claude'un tur sayısını ve okuduğu metni azaltır.
 
 ## Ölçümler: eski Python sürümüyle karşılaştırma
 
@@ -241,7 +288,12 @@ KDE:
   başlamış uygulamaların bir kez yeniden başlatılması gerekir.
 - Chromium, Chrome ve Electron uygulamaları ağaçlarını yalnızca
   `--force-renderer-accessibility` ile başlatılırlarsa gösterir.
-- `type_text` panonun içeriğini değiştirir.
+- `type_text`, Qt'nin çok satırlı düzenleyicileri (Kate gibi) dışındaki
+  alanlarda panonun içeriğini değiştirir.
+- Doğrudan eklemede yazma, yapıştırmadan biraz farklıdır: seçili metni
+  değiştirmek iki geri alma adımıdır, çoklu imleçte yalnızca birincil imlece
+  yazılır, üzerine yazma kipi ve Kate'in vi kipi atlanır; yapıştırmadaki gibi
+  otomatik girinti ve parantez tamamlama çalışmaz.
 
 Hyprland:
 - GTK uygulamalarının istemci tarafı gölgeleri, `click` ve `focus` tıklamalarını
