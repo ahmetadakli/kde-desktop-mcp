@@ -318,6 +318,11 @@ def run_stdio() -> None:
 
 
 if __name__ == "__main__":
+    import threading
+
     backend.enable()
     allowed()
+    # Creating virtual input devices takes a moment; do it while the client
+    # is still connecting so the first key/click is not delayed.
+    threading.Thread(target=backend.warm_up, daemon=True).start()
     run_stdio()

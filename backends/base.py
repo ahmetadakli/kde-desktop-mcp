@@ -127,6 +127,10 @@ class Backend(ABC):
     def enable(self) -> None:
         """Make sure the accessibility layer is on. Called before reads."""
 
+    def warm_up(self) -> None:
+        """Prepare slow resources (virtual input devices) ahead of first use.
+        Runs on a background thread at startup."""
+
     @abstractmethod
     def list_apps(self) -> list[AppInfo]: ...
 
