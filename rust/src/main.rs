@@ -1,7 +1,8 @@
 //! Screenshot-free desktop control MCP server for KDE Plasma (Wayland),
 //! Hyprland and Windows.
 //!
-//! Same tools and output as the Python server (server.py), plus `batch`.
+//! Same tools and output as the former Python server (server.py, removed
+//! after 4cd2632), plus `batch`.
 //! Every app-scoped operation is restricted to the allowlist (re-read on
 //! every call). Platform code lives behind the `Backend` trait.
 

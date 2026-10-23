@@ -1,8 +1,9 @@
 //! Windows backend: UI Automation for reading and acting, SendInput for the
-//! keyboard and pointer. Same semantics as backends/windows.py.
+//! keyboard and pointer. Same semantics as the former Python backend
+//! (backends/windows.py, removed after 4cd2632).
 //!
 //! App names are executable names without ".exe" (e.g. "notepad"). The
-//! process is per-monitor DPI aware, as `uiautomation` makes the Python
+//! process is per-monitor DPI aware, as `uiautomation` made the Python
 //! server, so UIA bounds and SetCursorPos use the same physical pixels.
 
 mod input;

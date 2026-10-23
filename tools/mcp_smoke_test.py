@@ -1,10 +1,9 @@
 """End-to-end smoke test of an MCP server binary over stdio (Linux, Kate).
 
-Speaks the real MCP protocol, so it checks the Rust server and the Python
-server alike:
+Speaks the real MCP protocol, so it checks any server command; needs only
+the Python standard library:
 
-    .venv/bin/python tools/mcp_smoke_test.py rust/target/release/desktop-mcp
-    .venv/bin/python tools/mcp_smoke_test.py .venv/bin/python server.py
+    python3 tools/mcp_smoke_test.py rust/target/release/desktop-mcp
 
 Opens a temporary file in Kate and drives it only through tool calls: list,
 find, focus after focus moved away, type Unicode text, rapid typing, key
