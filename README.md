@@ -52,6 +52,8 @@ gerekmez.
 - `key`, `type_text`: klavye
 - `activate_window`: pencereyi öne getirme
 - `mouse`, `screenshot`: yalnızca yedek
+- `batch` (yalnızca Rust sunucusu): birkaç aracı tek çağrıda sırayla çalıştırır,
+  ilk hatada durur; Claude'un tur sayısını azaltır
 
 ## İzin listesi
 
@@ -90,6 +92,39 @@ claude mcp add --scope user desktop -- "$PWD/.venv/bin/python" "$PWD/server.py"
 
 `--system-site-packages` gereklidir: PyGObject ve AT-SPI PyPI'dan değil,
 sistem paketlerinden gelir.
+
+## Hızlı sunucu: Rust (KDE Plasma)
+
+`rust/` altında KDE Plasma (Wayland) için aynı araçları aynı çıktı biçimiyle
+sunan bir Rust sunucusu var. libatspi yerine AT-SPI'ye doğrudan D-Bus ile
+konuşur ve istekleri beklemeden art arda gönderir (pipelining); böylece süre
+uygulamanın yanıt hızıyla sınırlanır. KWin çağrıları da süreç başlatmadan
+D-Bus üzerinden yapılır.
+
+Ölçümler (Kate ve Dolphin, aynı makine):
+
+| İşlem | Python | Rust |
+|---|---|---|
+| Sunucu açılışı | ~390 ms | 2 ms |
+| `apps` | 40 ms | 2 ms |
+| `tree` Dolphin (300 öğe) | 178 ms | 22 ms |
+| `tree` Dolphin, gizliler dahil (2000 öğe) | 507 ms | 48 ms |
+| `find` Dolphin | 146 ms | 25 ms |
+| `key` | 69–185 ms | 19–57 ms |
+| `type_text` | 181–203 ms | 32–41 ms |
+| `focus` (tıklamayla) | 334 ms | 103 ms |
+
+Gereksinimler KDE kurulumuyla aynıdır (PyGObject ve uv gerekmez), artı
+[Rust](https://rustup.rs/):
+
+```bash
+cd kde-desktop-mcp/rust
+cargo build --release
+claude mcp add --scope user desktop -- "$PWD/target/release/desktop-mcp"
+```
+
+Rust sunucusu yalnızca KDE Plasma içindir; Hyprland ve Windows için Python
+sunucusunu kullanın.
 
 ## Kurulum: Hyprland
 
@@ -142,6 +177,16 @@ uygulamayı engellediğini kontrol eder. Çalışırken klavye ve fareye dokunma
 
 ```powershell
 .venv\Scripts\python.exe tools\smoke_test.py
+```
+
+`tools/mcp_smoke_test.py` aynı denemeyi gerçek MCP protokolü üzerinden
+herhangi bir sunucuya karşı yapar (Linux, Kate); ayrıca art arda hızlı yazmayı,
+tuş tekrarını, `batch` ve `click` araçlarını dener ve her çağrının süresini
+yazar:
+
+```bash
+(cd rust && cargo test --release)
+.venv/bin/python tools/mcp_smoke_test.py rust/target/release/desktop-mcp
 ```
 
 ## Bilinen sınırlar
