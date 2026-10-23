@@ -13,6 +13,13 @@ document is left as it was. Prints a Markdown table of medians.
 
 It sends keys and clicks to the window; do not use the keyboard or mouse
 while it runs.
+
+For partial platforms (e.g. Windows under Wine, whose UI Automation client
+lacks most of the API) pass --tolerant: failing steps are counted as failures
+instead of aborting the round, steps that need an element id are skipped when
+none was found, and `mouse` goes to --mouse-at. --pre runs a command before
+every round (e.g. to bring the window to the front when activate_window
+cannot).
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ import re
 import shlex
 import statistics
 import subprocess
+import sys
 import time
 
 STEPS = ["initialize", "apps", "activate_window", "tree", "find", "get_text", "key",
@@ -67,8 +75,11 @@ class Client:
         self.proc.wait()
 
 
-def one_round(cmd: str, app: str, window: str, query: str, roles: list[str]) -> dict[str, float]:
+def one_round(cmd: str, app: str, window: str, query: str, roles: list[str],
+              tolerant: bool = False, mouse_at: tuple[int, int] | None = None,
+              failures: dict[str, str] | None = None) -> dict[str, float]:
     times: dict[str, float] = {}
+    failures = {} if failures is None else failures
     c = Client(cmd)
     try:
         t = time.perf_counter()
@@ -81,6 +92,9 @@ def one_round(cmd: str, app: str, window: str, query: str, roles: list[str]) -> 
         def step(name: str, **args) -> str:
             ms, text, ok = c.call(name, **args)
             if not ok:
+                if tolerant:
+                    failures.setdefault(name, text)
+                    return ""
                 raise RuntimeError(f"{name}: {text}")
             times[name] = ms
             return text
@@ -98,16 +112,22 @@ def one_round(cmd: str, app: str, window: str, query: str, roles: list[str]) -> 
         editable = [line for line in found.splitlines() if "editable" in line]
         editable.sort(key=lambda line: window not in line)
         rid = int(re.match(r"\s*\[(\d+)\]", editable[0]).group(1)) if editable else None
-        if rid is None:
+        if rid is None and not tolerant:
             raise RuntimeError(f"no editable element found:\n{found}")
-        step("get_text", id=rid)
+        if rid is not None:
+            step("get_text", id=rid)
         step("key", combo="end")
-        step("type_text", text="x")
-        c.call("key", combo="backspace")
-        step("focus", id=rid)
-        step("click", id=rid)
-        center = re.search(r"at (\d+),(\d+)", c.call("click", id=rid)[1])
-        step("mouse", x=int(center.group(1)), y=int(center.group(2)), clicks=0)
+        if step("type_text", text="x"):
+            c.call("key", combo="backspace")
+        center = None
+        if rid is not None:
+            step("focus", id=rid)
+            step("click", id=rid)
+            center = re.search(r"at (\d+),(\d+)", c.call("click", id=rid)[1])
+        if center:
+            step("mouse", x=int(center.group(1)), y=int(center.group(2)), clicks=0)
+        elif mouse_at:
+            step("mouse", x=mouse_at[0], y=mouse_at[1], clicks=0)
         step("screenshot")
     finally:
         c.close()
@@ -124,14 +144,23 @@ def main() -> int:
     ap.add_argument("--role", action="append",
                     help="editor role(s) to search, first match wins (default: text)")
     ap.add_argument("--rounds", type=int, default=5)
+    ap.add_argument("--tolerant", action="store_true",
+                    help="count failing steps instead of aborting the round")
+    ap.add_argument("--mouse-at", help="X,Y for mouse when no element centre is known")
+    ap.add_argument("--pre", help="shell command run before every round")
     args = ap.parse_args()
     roles = args.role or ["text"]
+    mouse_at = tuple(int(v) for v in args.mouse_at.split(",")) if args.mouse_at else None
 
     servers = [s.split("=", 1) for s in args.server]
     results: dict[str, dict[str, list[float]]] = {label: {} for label, _ in servers}
+    failed: dict[str, dict[str, str]] = {label: {} for label, _ in servers}
     for r in range(args.rounds):
         for label, cmd in servers:  # alternate, so drift hits both alike
-            for k, v in one_round(cmd, args.app, args.window, args.query, roles).items():
+            if args.pre:
+                subprocess.run(args.pre, shell=True, check=False)
+            for k, v in one_round(cmd, args.app, args.window, args.query, roles,
+                                  args.tolerant, mouse_at, failed[label]).items():
                 results[label].setdefault(k, []).append(v)
         print(f"round {r + 1}/{args.rounds} done", flush=True)
 
@@ -142,12 +171,16 @@ def main() -> int:
     for name in STEPS:
         meds = [statistics.median(results[label][name]) if name in results[label] else None
                 for label in labels]
-        cells = [f"{m:.1f}" if m is not None else "—" for m in meds]
+        cells = [f"{m:.1f}" if m is not None else ("fail" if name in failed[label] else "—")
+                 for m, label in zip(meds, labels)]
         row = f"| `{name}` | " + " | ".join(cells) + " |"
         if len(labels) == 2 and all(meds) and meds[1] > 0:
             row += f" {meds[0] / meds[1]:.1f}x |"
         print(row)
     print(f"\nmedian of {args.rounds} rounds; raw: {json.dumps(results)}")
+    for label in labels:
+        for name, text in failed[label].items():
+            print(f"{label} {name} failed: {text}", file=sys.stderr)
     return 0
 
 
