@@ -17,7 +17,8 @@ import time
 from evdev import UInput, ecodes as e
 
 from .base import Node
-from .linux_common import LinuxAtspiBackend, frame_of, window_extents  # sets gi versions
+from .linux_common import (  # sets gi versions
+    FastUInput, LinuxAtspiBackend, frame_of, window_extents)
 
 from gi.repository import Atspi  # noqa: E402
 
@@ -54,6 +55,10 @@ class HyprlandBackend(LinuxAtspiBackend):
     def __init__(self) -> None:
         super().__init__()
         self._btn: UInput | None = None
+
+    def warm_up(self) -> None:
+        super().warm_up()
+        self._btn_dev()
 
     # ------------------------------------------------------------ compositor state
 
@@ -112,13 +117,15 @@ class HyprlandBackend(LinuxAtspiBackend):
         return int(x + ext.x + ext.width / 2), int(y + ext.y + ext.height / 2)
 
     def _btn_dev(self) -> UInput:
-        if self._btn is None:
-            cap = {
-                e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
-                e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
-            }
-            self._btn = UInput(cap, name="desktop-mcp-pointer")
-            time.sleep(0.3)  # let the compositor register the new device
+        with self._dev_lock:
+            if self._btn is None:
+                cap = {
+                    e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+                    e.EV_REL: [e.REL_X, e.REL_Y, e.REL_WHEEL],
+                }
+                btn = FastUInput(cap, name="desktop-mcp-pointer")
+                time.sleep(0.3)  # let the compositor register the new device
+                self._btn = btn
         return self._btn
 
     def pointer(self, x: int, y: int, button: str = "left", clicks: int = 1,

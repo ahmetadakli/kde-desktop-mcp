@@ -12,13 +12,16 @@ from pathlib import Path
 from evdev import UInput, ecodes as e, AbsInfo
 
 from .base import Node
-from .linux_common import LinuxAtspiBackend, frame_of, window_extents  # sets gi versions
+from .linux_common import (  # sets gi versions
+    FastUInput, LinuxAtspiBackend, frame_of, window_extents)
 
 from gi.repository import Atspi, Gio, GLib  # noqa: E402
 
 ABS_MAX = 32767
+SCREEN_BOX_TTL = 5.0  # seconds; kscreen-doctor costs ~25 ms per call
 
-KWIN_ACTIVATE = """
+# Evaluates to the caption of the window it activated, "" when none matched.
+KWIN_ACTIVATE = """(() => {
 const allow = %s;
 const q = %s.toLowerCase();
 for (const w of workspace.windowList()) {
@@ -27,10 +30,11 @@ for (const w of workspace.windowList()) {
   const okApp = allow.some(a => cls.includes(a) || name.includes(a));
   if (okApp && (w.caption.toLowerCase().includes(q) || cls.includes(q))) {
     workspace.activeWindow = w;
-    break;
+    return w.caption;
   }
 }
-"""
+return "";
+})()"""
 
 _SINK_XML = (
     "<node><interface name='org.desktopmcp.Sink'>"
@@ -45,6 +49,10 @@ class KdeBackend(LinuxAtspiBackend):
         super().__init__()
         self._ptr: UInput | None = None
 
+    def warm_up(self) -> None:
+        super().warm_up()
+        self._ptr_dev()
+
     def element_center(self, node: Node) -> tuple[int, int]:
         # On Wayland AT-SPI extents are relative to the toplevel surface, so add
         # the active window's client origin. The element's window must be active.
@@ -57,17 +65,19 @@ class KdeBackend(LinuxAtspiBackend):
         return int(geo["x"] + ext.x + ext.width / 2), int(geo["y"] + ext.y + ext.height / 2)
 
     def _ptr_dev(self) -> UInput:
-        if self._ptr is None:
-            cap = {
-                e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
-                e.EV_ABS: [
-                    (e.ABS_X, AbsInfo(0, 0, ABS_MAX, 0, 0, 0)),
-                    (e.ABS_Y, AbsInfo(0, 0, ABS_MAX, 0, 0, 0)),
-                ],
-                e.EV_REL: [e.REL_WHEEL],
-            }
-            self._ptr = UInput(cap, name="desktop-mcp-pointer")
-            time.sleep(0.3)
+        with self._dev_lock:
+            if self._ptr is None:
+                cap = {
+                    e.EV_KEY: [e.BTN_LEFT, e.BTN_RIGHT, e.BTN_MIDDLE],
+                    e.EV_ABS: [
+                        (e.ABS_X, AbsInfo(0, 0, ABS_MAX, 0, 0, 0)),
+                        (e.ABS_Y, AbsInfo(0, 0, ABS_MAX, 0, 0, 0)),
+                    ],
+                    e.EV_REL: [e.REL_WHEEL],
+                }
+                ptr = FastUInput(cap, name="desktop-mcp-pointer")
+                time.sleep(0.3)
+                self._ptr = ptr
         return self._ptr
 
     def pointer(self, x: int, y: int, button: str = "left", clicks: int = 1,
@@ -90,7 +100,27 @@ class KdeBackend(LinuxAtspiBackend):
             dev.write(e.EV_REL, e.REL_WHEEL, -scroll); dev.syn()
 
     def activate_window(self, query: str, allowed: set[str]) -> None:
-        _run_kwin_script(KWIN_ACTIVATE % (json.dumps(sorted(allowed)), json.dumps(query)))
+        caption = _kwin_query(KWIN_ACTIVATE % (json.dumps(sorted(allowed)),
+                                               json.dumps(query)))
+        if not caption:
+            return
+        # KWin switches at once; the toolkit reports ACTIVE a moment later.
+        deadline = time.monotonic() + 0.5
+        while time.monotonic() < deadline and not self._frame_active(caption):
+            time.sleep(0.02)
+
+    def _frame_active(self, caption: str) -> bool:
+        want = _norm(caption)
+        for a in self._applications():
+            try:
+                for i in range(a.get_child_count()):
+                    w = a.get_child_at_index(i)
+                    if (w is not None and _norm(w.get_name()) == want
+                            and w.get_state_set().contains(Atspi.StateType.ACTIVE)):
+                        return True
+            except Exception:
+                continue
+        return False
 
     def screenshot(self) -> str | None:
         path = Path(tempfile.gettempdir()) / f"desktop-mcp-{time.time_ns()}.png"
@@ -109,7 +139,24 @@ class KdeBackend(LinuxAtspiBackend):
         return json.loads(raw)
 
 
+def _norm(title: str | None) -> str:
+    return " ".join((title or "").split())
+
+
+_screen_cache: tuple[float, tuple[int, int, int, int]] | None = None
+
+
 def _screen_box() -> tuple[int, int, int, int]:
+    global _screen_cache
+    now = time.monotonic()
+    if _screen_cache and now - _screen_cache[0] < SCREEN_BOX_TTL:
+        return _screen_cache[1]
+    box = _read_screen_box()
+    _screen_cache = (now, box)
+    return box
+
+
+def _read_screen_box() -> tuple[int, int, int, int]:
     try:
         out = subprocess.run(["kscreen-doctor", "-j"], capture_output=True,
                              text=True, timeout=5).stdout
@@ -126,6 +173,14 @@ def _screen_box() -> tuple[int, int, int, int]:
         return 0, 0, 1920, 1080
 
 
+def _kwin_call(path: str, iface: str, method: str, args: GLib.Variant | None,
+               reply: str | None = None):
+    conn = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+    return conn.call_sync("org.kde.KWin", path, iface, method, args,
+                          GLib.VariantType.new(reply) if reply else None,
+                          Gio.DBusCallFlags.NONE, 5000, None)
+
+
 def _run_kwin_script(script: str, until=None, timeout: float = 0.2) -> None:
     """Load, run and unload a KWin script. Keeps it loaded until `until()` is
     true (pumping the GLib main context) or `timeout` seconds pass."""
@@ -134,23 +189,23 @@ def _run_kwin_script(script: str, until=None, timeout: float = 0.2) -> None:
         path = f.name
     plugin = f"desktop-mcp-{os.getpid()}-{time.time_ns()}"
     try:
-        out = subprocess.run(
-            ["qdbus6", "org.kde.KWin", "/Scripting",
-             "org.kde.kwin.Scripting.loadScript", path, plugin],
-            capture_output=True, text=True, timeout=5)
-        sid = out.stdout.strip()
-        if not sid.lstrip("-").isdigit() or int(sid) < 0:
-            raise RuntimeError(f"KWin refused script: {out.stderr.strip()}")
-        subprocess.run(["qdbus6", "org.kde.KWin", f"/Scripting/Script{sid}",
-                        "org.kde.kwin.Script.run"], capture_output=True, timeout=5)
-        ctx = GLib.MainContext.default()
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline and not (until and until()):
-            if not ctx.iteration(False):
-                time.sleep(0.01)
-        subprocess.run(["qdbus6", "org.kde.KWin", "/Scripting",
-                        "org.kde.kwin.Scripting.unloadScript", plugin],
-                       capture_output=True, timeout=5)
+        try:
+            sid = _kwin_call("/Scripting", "org.kde.kwin.Scripting", "loadScript",
+                             GLib.Variant("(ss)", (path, plugin)), "(i)").unpack()[0]
+        except GLib.Error as err:
+            raise RuntimeError(f"KWin refused script: {err.message}") from err
+        if sid < 0:
+            raise RuntimeError("KWin refused script")
+        try:
+            _kwin_call(f"/Scripting/Script{sid}", "org.kde.kwin.Script", "run", None)
+            ctx = GLib.MainContext.default()
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline and not (until and until()):
+                if not ctx.iteration(False):
+                    time.sleep(0.005)
+        finally:
+            _kwin_call("/Scripting", "org.kde.kwin.Scripting", "unloadScript",
+                       GLib.Variant("(s)", (plugin,)))
     finally:
         os.unlink(path)
 

@@ -7,13 +7,14 @@ window management, element geometry, pointer input and screenshots.
 from __future__ import annotations
 
 import subprocess
+import threading
 import time
 from pathlib import Path
 
 import gi
 
 gi.require_version("Atspi", "2.0")
-from gi.repository import Atspi  # noqa: E402
+from gi.repository import Atspi, Gio, GLib  # noqa: E402
 
 from evdev import UInput, ecodes as e  # noqa: E402
 
@@ -33,12 +34,27 @@ soffice
 """
 
 
+class FastUInput(UInput):
+    """UInput that skips evdev's lookup of the new /dev/input/event* node.
+
+    We only write to the uinput fd. Opening the event node needs the `input`
+    group; without it evdev retries for two seconds on every device creation.
+    """
+
+    def _find_device(self, fd: int) -> None:
+        return None
+
+
 class AtspiNode(Node):
     def __init__(self, acc: Atspi.Accessible):
         self.acc = acc
+        self._role: str | None = None
 
     def role(self) -> str:
-        return self.acc.get_role_name() or ""
+        # Roles never change; tree rendering asks for them twice per node.
+        if self._role is None:
+            self._role = self.acc.get_role_name() or ""
+        return self._role
 
     def name(self) -> str:
         return self.acc.get_name() or ""
@@ -160,17 +176,22 @@ class LinuxAtspiBackend(Backend):
 
     def __init__(self) -> None:
         self._kbd: UInput | None = None
+        self._dev_lock = threading.Lock()
+
+    def warm_up(self) -> None:
+        self._kbd_dev()
 
     # ------------------------------------------------------------ reading
 
     def enable(self) -> None:
-        subprocess.run(
-            ["gdbus", "call", "--session", "--dest", "org.a11y.Bus",
-             "--object-path", "/org/a11y/bus", "--method",
-             "org.freedesktop.DBus.Properties.Set", "org.a11y.Status",
-             "IsEnabled", "<true>"],
-            capture_output=True, timeout=5,
-        )
+        try:
+            Gio.bus_get_sync(Gio.BusType.SESSION, None).call_sync(
+                "org.a11y.Bus", "/org/a11y/bus", "org.freedesktop.DBus.Properties",
+                "Set", GLib.Variant("(ssv)", ("org.a11y.Status", "IsEnabled",
+                                              GLib.Variant("b", True))),
+                None, Gio.DBusCallFlags.NONE, 5000, None)
+        except GLib.Error:
+            pass
 
     def _applications(self) -> list[Atspi.Accessible]:
         desktop = Atspi.get_desktop(0)
@@ -245,10 +266,12 @@ class LinuxAtspiBackend(Backend):
     # ------------------------------------------------------------ keyboard
 
     def _kbd_dev(self) -> UInput:
-        if self._kbd is None:
-            keys = [v for k, v in e.ecodes.items() if k.startswith("KEY_") and v < 0x200]
-            self._kbd = UInput({e.EV_KEY: keys}, name="desktop-mcp-keyboard")
-            time.sleep(0.3)  # let the compositor register the new device
+        with self._dev_lock:
+            if self._kbd is None:
+                keys = [v for k, v in e.ecodes.items() if k.startswith("KEY_") and v < 0x200]
+                kbd = FastUInput({e.EV_KEY: keys}, name="desktop-mcp-keyboard")
+                time.sleep(0.3)  # let the compositor register the new device
+                self._kbd = kbd
         return self._kbd
 
     @staticmethod
