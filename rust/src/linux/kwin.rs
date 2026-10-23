@@ -11,7 +11,7 @@ use serde_json::Value as Json;
 use tokio::sync::{Mutex, mpsc};
 use zbus::Connection;
 
-use crate::atspi::R;
+use crate::backend::R;
 
 const SINK_PATH: &str = "/org/desktopmcp/sink";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);

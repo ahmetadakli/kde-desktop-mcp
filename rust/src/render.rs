@@ -2,27 +2,28 @@
 //! node they need is missing they return it, the caller fetches and retries.
 //! The format matches the Python server line for line.
 
-use std::collections::HashMap;
+use std::hash::Hash;
 
-use crate::atspi::{self, Info, Obj};
+use serde_json::Value as Json;
 
-pub const BORING_ROLES: [&str; 6] =
-    ["filler", "panel", "section", "unknown", "redundant object", "grouping"];
+use crate::backend::{Cache, Info};
+
 pub const TRUNCATED: &str = "… truncated; narrow with find or a deeper root id";
-
-pub type Cache = HashMap<Obj, Info>;
+pub const FIND_TEXT_LIMIT: usize = 200;
+pub const FIND_MAX_SEEN: usize = 20000;
 
 /// A rendered line: either a node (gets an id when printed) or plain text.
 #[derive(Debug, PartialEq)]
-pub enum Line {
-    Node { depth: usize, obj: Obj },
+pub enum Line<Id> {
+    Node { depth: usize, id: Id },
     Raw(String),
 }
 
-fn get<'a>(cache: &'a Cache, objs: &[Obj]) -> Result<Vec<&'a Info>, Vec<Obj>> {
-    let missing: Vec<Obj> = objs.iter().filter(|o| !cache.contains_key(o)).cloned().collect();
+fn get<'a, Id: Clone + Eq + Hash>(cache: &'a Cache<Id>, ids: &[Id])
+                                  -> Result<Vec<&'a Info<Id>>, Vec<Id>> {
+    let missing: Vec<Id> = ids.iter().filter(|o| !cache.contains_key(o)).cloned().collect();
     if missing.is_empty() {
-        Ok(objs.iter().map(|o| &cache[o]).collect())
+        Ok(ids.iter().map(|o| &cache[o]).collect())
     } else {
         Err(missing)
     }
@@ -32,27 +33,30 @@ fn first_chars(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
-/// Single-line text preview (Python `Node.text(limit)`).
-pub fn text_preview(info: &Info, limit: usize) -> String {
-    info.text.as_deref().map(|t| first_chars(t, limit).replace('\n', " ")).unwrap_or_default()
+/// Python-compatible `json.dumps(s, ensure_ascii=False)`.
+pub fn json_str(s: &str) -> String {
+    Json::String(s.to_string()).to_string()
 }
 
-pub fn describe(info: &Info, id: u64) -> String {
+pub fn text_preview<Id>(info: &Info<Id>, limit: usize) -> String {
+    info.text.as_deref().map(|t| first_chars(t, limit)).unwrap_or_default()
+}
+
+pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
     let name = first_chars(&info.name.replace('\n', " "), 80);
     let role = if info.role.is_empty() { "?" } else { &info.role };
     let mut out = format!("[{id}] {role}");
     if !name.is_empty() {
         out.push(' ');
-        out.push_str(&atspi::json_str(&name));
+        out.push_str(&json_str(&name));
     }
     let txt = text_preview(info, 80);
     if !txt.is_empty() && txt != name {
         out.push_str(" text=");
-        out.push_str(&atspi::json_str(&txt));
+        out.push_str(&json_str(&txt));
     }
-    let states = state_labels(info);
-    if !states.is_empty() {
-        out.push_str(&format!(" {{{}}}", states.join(",")));
+    if !info.states.is_empty() {
+        out.push_str(&format!(" {{{}}}", info.states.join(",")));
     }
     if !info.actions.is_empty() {
         let names: Vec<&str> =
@@ -62,35 +66,18 @@ pub fn describe(info: &Info, id: u64) -> String {
     out
 }
 
-pub fn state_labels(info: &Info) -> Vec<&'static str> {
-    let mut out: Vec<&'static str> = [
-        (atspi::FOCUSED, "focused"),
-        (atspi::CHECKED, "checked"),
-        (atspi::SELECTED, "selected"),
-        (atspi::EXPANDED, "expanded"),
-        (atspi::ACTIVE, "active"),
-        (atspi::EDITABLE, "editable"),
-    ]
-    .into_iter()
-    .filter(|(st, _)| info.has(*st))
-    .map(|(_, label)| label)
-    .collect();
-    if info.states_known && !info.has(atspi::ENABLED) {
-        out.push("disabled");
-    }
-    out
-}
-
 pub struct WalkOpts {
     pub max_depth: usize,
     pub budget: usize,
     pub only_showing: bool,
+    pub boring_roles: &'static [&'static str],
 }
 
 /// Python `walk`: unnamed, actionless nodes of boring roles are skipped and
 /// their children lifted to the same depth.
-pub fn walk(cache: &Cache, children: &[Obj], depth: usize, opts: &WalkOpts,
-            lines: &mut Vec<Line>) -> Result<(), Vec<Obj>> {
+pub fn walk<Id: Clone + Eq + Hash>(cache: &Cache<Id>, children: &[Id], depth: usize,
+                                   opts: &WalkOpts, lines: &mut Vec<Line<Id>>)
+                                   -> Result<(), Vec<Id>> {
     if lines.len() >= opts.budget || depth > opts.max_depth {
         return Ok(());
     }
@@ -100,14 +87,14 @@ pub fn walk(cache: &Cache, children: &[Obj], depth: usize, opts: &WalkOpts,
             lines.push(Line::Raw(TRUNCATED.into()));
             return Ok(());
         }
-        if opts.only_showing && !info.has(atspi::SHOWING) {
+        if opts.only_showing && !info.showing {
             continue;
         }
-        let interesting = !BORING_ROLES.contains(&info.role.as_str())
+        let interesting = !opts.boring_roles.contains(&info.role.as_str())
             || !info.name.is_empty()
             || !info.actions.is_empty();
         if interesting {
-            lines.push(Line::Node { depth, obj: c.clone() });
+            lines.push(Line::Node { depth, id: c.clone() });
             walk(cache, &info.children, depth + 1, opts, lines)?;
         } else {
             walk(cache, &info.children, depth, opts, lines)?;
@@ -116,30 +103,27 @@ pub fn walk(cache: &Cache, children: &[Obj], depth: usize, opts: &WalkOpts,
     Ok(())
 }
 
-pub const FIND_TEXT_LIMIT: usize = 200;
-pub const FIND_MAX_SEEN: usize = 20000;
-
 /// Python `find`: depth-first, hidden subtrees skipped, case-insensitive
 /// substring match over name, text and role.
-pub fn find(cache: &Cache, roots: &[Obj], query: &str, role: &str,
-            max_results: usize) -> Result<Vec<Obj>, Vec<Obj>> {
+pub fn find<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id], query: &str, role: &str,
+                                   max_results: usize) -> Result<Vec<Id>, Vec<Id>> {
     let q = query.to_lowercase();
     let mut hits = Vec::new();
     // None is the synthetic root whose children are `roots`.
-    let mut stack: Vec<Option<&Obj>> = vec![None];
+    let mut stack: Vec<Option<&Id>> = vec![None];
     let mut seen = 0;
     while let Some(node) = stack.pop() {
         if hits.len() >= max_results || seen >= FIND_MAX_SEEN {
             break;
         }
         seen += 1;
-        let kids: &[Obj] = match node {
+        let kids: &[Id] = match node {
             None => roots,
             Some(o) => &cache[o].children,
         };
         let infos = get(cache, kids)?;
         for (c, info) in kids.iter().zip(infos).rev() {
-            if !info.has(atspi::SHOWING) {
+            if !info.showing {
                 continue;
             }
             stack.push(Some(c));
@@ -183,47 +167,46 @@ pub fn py_repr(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zbus::zvariant::OwnedObjectPath;
 
-    fn obj(p: &str) -> Obj {
-        Obj { bus: ":1.1".into(), path: OwnedObjectPath::try_from(p).unwrap() }
-    }
+    const BORING: &[&str] = &["filler", "panel"];
 
-    fn node(role: &str, name: &str, states: &[u32], kids: &[&str]) -> Info {
+    fn node(role: &str, name: &str, showing: bool, states: &[&'static str], kids: &[&'static str])
+            -> Info<&'static str> {
         Info {
             role: role.into(),
             name: name.into(),
-            states: states.iter().fold(0, |a, s| a | (1 << s)),
-            states_known: true,
-            children: kids.iter().map(|k| obj(k)).collect(),
+            states: states.to_vec(),
+            showing,
+            children: kids.to_vec(),
             ..Default::default()
         }
     }
 
-    const SHOWN: &[u32] = &[atspi::SHOWING, atspi::ENABLED];
-
-    fn sample() -> Cache {
+    fn sample() -> Cache<&'static str> {
         let mut c = Cache::new();
-        c.insert(obj("/w"), node("frame", "Win", &[atspi::SHOWING, atspi::ENABLED, atspi::ACTIVE], &["/p"]));
-        c.insert(obj("/p"), node("panel", "", SHOWN, &["/b1", "/b2", "/h"]));
-        let mut b1 = node("push button", "Kaydet", SHOWN, &[]);
+        c.insert("/w", node("frame", "Win", true, &["active"], &["/p"]));
+        c.insert("/p", node("panel", "", true, &[], &["/b1", "/b2", "/h"]));
+        let mut b1 = node("push button", "Kaydet", true, &[], &[]);
         b1.actions = vec!["Press".into(), "".into()];
-        c.insert(obj("/b1"), b1);
-        let mut b2 = node("text", "line\nbreak", &[atspi::SHOWING, atspi::FOCUSED], &[]);
-        b2.text = Some("içerik\n\"x\"".into());
-        c.insert(obj("/b2"), b2);
-        c.insert(obj("/h"), node("push button", "hidden", &[atspi::ENABLED], &[]));
+        c.insert("/b1", b1);
+        let mut b2 = node("text", "line\nbreak", true, &["focused", "disabled"], &[]);
+        b2.text = Some("içerik \"x\"".into());
+        c.insert("/b2", b2);
+        c.insert("/h", node("push button", "hidden", false, &[], &[]));
         c
+    }
+
+    fn opts(budget: usize) -> WalkOpts {
+        WalkOpts { max_depth: 12, budget, only_showing: true, boring_roles: BORING }
     }
 
     #[test]
     fn walk_lifts_boring_nodes_and_skips_hidden() {
         let cache = sample();
         let mut lines = Vec::new();
-        let opts = WalkOpts { max_depth: 12, budget: 300, only_showing: true };
-        walk(&cache, &[obj("/w")], 1, &opts, &mut lines).unwrap();
+        walk(&cache, &["/w"], 1, &opts(300), &mut lines).unwrap();
         let got: Vec<(usize, &str)> = lines.iter().map(|l| match l {
-            Line::Node { depth, obj } => (*depth, obj.path.as_str()),
+            Line::Node { depth, id } => (*depth, *id),
             Line::Raw(_) => (0, "raw"),
         }).collect();
         assert_eq!(got, vec![(1, "/w"), (2, "/b1"), (2, "/b2")]);
@@ -232,35 +215,32 @@ mod tests {
     #[test]
     fn walk_reports_missing_nodes_and_truncates() {
         let mut cache = sample();
-        cache.remove(&obj("/b2"));
-        let opts = WalkOpts { max_depth: 12, budget: 300, only_showing: true };
-        let missing = walk(&cache, &[obj("/w")], 1, &opts, &mut Vec::new()).unwrap_err();
-        assert_eq!(missing, vec![obj("/b2")]);
+        cache.remove("/b2");
+        let missing = walk(&cache, &["/w"], 1, &opts(300), &mut Vec::new()).unwrap_err();
+        assert_eq!(missing, vec!["/b2"]);
 
         let cache = sample();
         let mut lines = Vec::new();
-        let opts = WalkOpts { max_depth: 12, budget: 2, only_showing: true };
-        walk(&cache, &[obj("/w")], 1, &opts, &mut lines).unwrap();
+        walk(&cache, &["/w"], 1, &opts(2), &mut lines).unwrap();
         assert_eq!(lines.last(), Some(&Line::Raw(TRUNCATED.into())));
     }
 
     #[test]
     fn describe_matches_python_format() {
         let cache = sample();
-        assert_eq!(describe(&cache[&obj("/b1")], 7), "[7] push button \"Kaydet\" actions=Press");
-        assert_eq!(describe(&cache[&obj("/b2")], 8),
+        assert_eq!(describe(&cache["/b1"], 7), "[7] push button \"Kaydet\" actions=Press");
+        assert_eq!(describe(&cache["/b2"], 8),
                    "[8] text \"line break\" text=\"içerik \\\"x\\\"\" {focused,disabled}");
-        assert_eq!(describe(&cache[&obj("/w")], 1), "[1] frame \"Win\" {active}");
+        assert_eq!(describe(&cache["/w"], 1), "[1] frame \"Win\" {active}");
     }
 
     #[test]
     fn find_is_depth_first_with_reversed_siblings() {
         let cache = sample();
-        let hits = find(&cache, &[obj("/w")], "", "", 10).unwrap();
-        let paths: Vec<&str> = hits.iter().map(|o| o.path.as_str()).collect();
-        assert_eq!(paths, vec!["/w", "/p", "/b2", "/b1"]);
-        let hits = find(&cache, &[obj("/w")], "KAYDET", "push button", 10).unwrap();
-        assert_eq!(hits, vec![obj("/b1")]);
+        let hits = find(&cache, &["/w"], "", "", 10).unwrap();
+        assert_eq!(hits, vec!["/w", "/p", "/b2", "/b1"]);
+        let hits = find(&cache, &["/w"], "KAYDET", "push button", 10).unwrap();
+        assert_eq!(hits, vec!["/b1"]);
     }
 
     #[test]

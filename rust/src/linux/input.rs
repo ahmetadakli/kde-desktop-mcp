@@ -8,7 +8,7 @@ use evdev::uinput::VirtualDevice;
 use evdev::{AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode,
             RelativeAxisCode, UinputAbsSetup};
 
-use crate::atspi::R;
+use crate::backend::R;
 
 pub const ABS_MAX: i32 = 32767;
 /// Time for the compositor to pick up a freshly created device.
@@ -34,6 +34,15 @@ pub fn keycode(name: &str) -> R<KeyCode> {
     KeyCode::from_str(&format!("KEY_{n}")).map_err(|_| format!("unknown key '{name}'"))
 }
 
+pub fn button_code(button: &str) -> R<KeyCode> {
+    match button {
+        "left" => Ok(KeyCode::BTN_LEFT),
+        "right" => Ok(KeyCode::BTN_RIGHT),
+        "middle" => Ok(KeyCode::BTN_MIDDLE),
+        _ => Err(format!("unknown button '{button}' (left, right, middle)")),
+    }
+}
+
 pub fn parse_combo(combo: &str) -> R<Vec<KeyCode>> {
     combo.replace(' ', "").split('+').filter(|k| !k.is_empty()).map(keycode).collect()
 }
@@ -42,10 +51,12 @@ fn ev(kind: EventType, code: u16, value: i32) -> InputEvent {
     InputEvent::new(kind.0, code, value)
 }
 
-#[derive(Default)]
 pub struct Input {
     kbd: Mutex<Option<VirtualDevice>>,
     ptr: Mutex<Option<VirtualDevice>>,
+    /// Absolute X/Y axes on the pointer device. Off where the compositor
+    /// places the cursor itself (Hyprland) and uinput only supplies buttons.
+    absolute: bool,
 }
 
 fn io(e: std::io::Error) -> String {
@@ -53,6 +64,10 @@ fn io(e: std::io::Error) -> String {
 }
 
 impl Input {
+    pub fn new(absolute: bool) -> Self {
+        Input { kbd: Mutex::new(None), ptr: Mutex::new(None), absolute }
+    }
+
     fn with_kbd<T>(&self, f: impl FnOnce(&mut VirtualDevice) -> R<T>) -> R<T> {
         let mut slot = self.kbd.lock().unwrap();
         if slot.is_none() {
@@ -80,14 +95,20 @@ impl Input {
             }
             let mut rel = AttributeSet::<RelativeAxisCode>::new();
             rel.insert(RelativeAxisCode::REL_WHEEL);
-            let axis = |code| UinputAbsSetup::new(code, AbsInfo::new(0, 0, ABS_MAX, 0, 0, 0));
-            let dev = VirtualDevice::builder().map_err(io)?
+            let mut builder = VirtualDevice::builder().map_err(io)?
                 .name("desktop-mcp-pointer")
-                .with_keys(&buttons).map_err(io)?
-                .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X)).map_err(io)?
-                .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y)).map_err(io)?
-                .with_relative_axes(&rel).map_err(io)?
-                .build().map_err(io)?;
+                .with_keys(&buttons).map_err(io)?;
+            if self.absolute {
+                let axis = |code| UinputAbsSetup::new(code, AbsInfo::new(0, 0, ABS_MAX, 0, 0, 0));
+                builder = builder
+                    .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X)).map_err(io)?
+                    .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y)).map_err(io)?;
+            } else {
+                // A pointer device needs motion axes to be classified as one.
+                rel.insert(RelativeAxisCode::REL_X);
+                rel.insert(RelativeAxisCode::REL_Y);
+            }
+            let dev = builder.with_relative_axes(&rel).map_err(io)?.build().map_err(io)?;
             std::thread::sleep(DEVICE_SETTLE);
             *slot = Some(dev);
         }
@@ -111,20 +132,25 @@ impl Input {
         Ok(())
     }
 
-    /// Move to absolute device coordinates, then click and/or scroll.
-    pub async fn pointer(&self, ax: i32, ay: i32, button: &str, clicks: i64,
-                         scroll: i64) -> R<()> {
-        let btn = match button {
-            "left" => KeyCode::BTN_LEFT,
-            "right" => KeyCode::BTN_RIGHT,
-            "middle" => KeyCode::BTN_MIDDLE,
-            _ => return Err(format!("unknown button '{button}' (left, right, middle)")),
-        };
+    /// Move to absolute device coordinates (0..=ABS_MAX) and let the
+    /// compositor catch up.
+    pub async fn move_abs(&self, ax: i32, ay: i32) -> R<()> {
         self.with_ptr(|d| d.emit(&[
             ev(EventType::ABSOLUTE, AbsoluteAxisCode::ABS_X.0, ax),
             ev(EventType::ABSOLUTE, AbsoluteAxisCode::ABS_Y.0, ay),
         ]).map_err(io))?;
         tokio::time::sleep(POINTER_SETTLE).await;
+        Ok(())
+    }
+
+    /// Wait after a cursor move done outside uinput.
+    pub async fn settle(&self) {
+        tokio::time::sleep(POINTER_SETTLE).await;
+    }
+
+    /// Click and/or scroll at the current cursor position.
+    pub async fn buttons(&self, button: &str, clicks: i64, scroll: i64) -> R<()> {
+        let btn = button_code(button)?;
         for _ in 0..clicks.clamp(0, 3) {
             self.with_ptr(|d| d.emit(&[ev(EventType::KEY, btn.0, 1)]).map_err(io))?;
             tokio::time::sleep(BUTTON_HOLD).await;

@@ -2,15 +2,17 @@
 name = "desktop-mcp"
 version = "0.4.0"
 edition = "2024"
-description = "Screenshot-free desktop control MCP server for KDE Plasma (Wayland), built on AT-SPI"
+description = "Screenshot-free desktop control MCP server for KDE Plasma (Wayland), Hyprland and Windows"
 license = "MIT"
 
 [dependencies]
-evdev = "0.13"
 futures-util = "0.3"
-serde = "1"
 serde_json = "1"
-tokio = { version = "1", features = ["rt", "macros", "time", "process", "io-std", "io-util", "sync", "fs"] }
+tokio = { version = "1", features = ["rt", "macros", "time", "process", "io-std", "io-util", "sync", "fs", "net"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+evdev = "0.13"
+serde = "1"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [profile.release]

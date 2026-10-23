@@ -9,11 +9,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use futures_util::stream::{self, StreamExt};
-use serde_json::Value as Json;
 use zbus::Connection;
 use zbus::zvariant::{OwnedObjectPath, OwnedValue};
 
-use crate::roles;
+use super::roles;
+pub use crate::backend::R;
+
+pub type Info = crate::backend::Info<Obj>;
 
 const ACC: &str = "org.a11y.atspi.Accessible";
 const PROPS: &str = "org.freedesktop.DBus.Properties";
@@ -32,9 +34,8 @@ pub const SELECTED: u32 = 23;
 pub const SHOWING: u32 = 25;
 
 // AtspiCoordType.
+pub const COORD_SCREEN: u32 = 0;
 pub const COORD_WINDOW: u32 = 1;
-
-pub type R<T> = Result<T, String>;
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -48,29 +49,34 @@ pub struct Obj {
 }
 
 impl Obj {
-    fn new(bus: &str, path: OwnedObjectPath) -> Self {
+    pub fn new(bus: &str, path: OwnedObjectPath) -> Self {
         Obj { bus: bus.into(), path }
     }
 }
 
-/// Everything tree rendering and search read about a node.
-#[derive(Clone, Debug, Default)]
-pub struct Info {
-    pub role: String,
-    pub name: String,
-    pub states: u64,
-    /// False when the state set could not be read (no "disabled" then).
-    pub states_known: bool,
-    pub actions: Vec<String>,
-    /// First characters of the Text interface, newlines kept; None without it.
-    pub text: Option<String>,
-    pub children: Vec<Obj>,
+fn has(states: u64, state: u32) -> bool {
+    states & (1u64 << state) != 0
 }
 
-impl Info {
-    pub fn has(&self, state: u32) -> bool {
-        self.states & (1u64 << state) != 0
+/// Python `AtspiNode.states()`; None when the state set could not be read.
+pub fn state_labels(states: Option<u64>) -> Vec<&'static str> {
+    let Some(st) = states else { return Vec::new() };
+    let mut out: Vec<&'static str> = [
+        (FOCUSED, "focused"),
+        (CHECKED, "checked"),
+        (SELECTED, "selected"),
+        (EXPANDED, "expanded"),
+        (ACTIVE, "active"),
+        (EDITABLE, "editable"),
+    ]
+    .into_iter()
+    .filter(|(bit, _)| has(st, *bit))
+    .map(|(_, label)| label)
+    .collect();
+    if !has(st, ENABLED) {
+        out.push("disabled");
     }
+    out
 }
 
 pub struct A11y {
@@ -186,30 +192,38 @@ impl A11y {
     }
 
     /// All attributes of one node, requested together.
-    pub async fn info(&self, o: &Obj, text_limit: i32) -> Info {
+    pub async fn info(&self, o: &Obj, text_limit: usize) -> Info {
         let (role, name, states, ifaces, children) = tokio::join!(
             self.role(o), self.name(o), self.states(o), self.interfaces(o), self.children(o));
-        let has = |i: &str| ifaces.iter().any(|x| x == i);
+        let has_iface = |i: &str| ifaces.iter().any(|x| x == i);
         let (actions, text) = tokio::join!(
             async {
-                if has("org.a11y.atspi.Action") { self.actions(o).await } else { Vec::new() }
+                if has_iface("org.a11y.atspi.Action") { self.actions(o).await } else { Vec::new() }
             },
             async {
-                if has("org.a11y.atspi.Text") {
-                    Some(self.text(o, text_limit).await.unwrap_or_default())
+                if has_iface("org.a11y.atspi.Text") {
+                    let limit = text_limit.min(i32::MAX as usize) as i32;
+                    Some(self.text(o, limit).await.unwrap_or_default().replace('\n', " "))
                 } else {
                     None
                 }
             });
-        Info { role, name, states: states.unwrap_or(0), states_known: states.is_some(),
-               actions, text, children }
+        Info {
+            role,
+            name,
+            showing: has(states.unwrap_or(0), SHOWING),
+            states: state_labels(states),
+            actions,
+            text,
+            children,
+        }
     }
 
     /// Breadth-first fetch below `roots` into `cache`, all of a level at once.
     /// Children of hidden nodes are skipped when `only_showing`. Stops after
     /// roughly `limit` new nodes.
     pub async fn prefetch(&self, cache: &mut HashMap<Obj, Info>, roots: Vec<Obj>,
-                          only_showing: bool, text_limit: i32, limit: usize) {
+                          only_showing: bool, text_limit: usize, limit: usize) {
         let mut level: Vec<Obj> = roots.into_iter().filter(|o| !cache.contains_key(o)).collect();
         let mut fetched = 0;
         while !level.is_empty() && fetched < limit {
@@ -226,7 +240,7 @@ impl A11y {
             fetched += infos.len();
             let mut next = Vec::new();
             for (o, info) in infos {
-                if !only_showing || info.has(SHOWING) {
+                if !only_showing || info.showing {
                     next.extend(info.children.iter().filter(|c| !cache.contains_key(c)).cloned());
                 }
                 cache.insert(o, info);
@@ -270,6 +284,17 @@ impl A11y {
             .unwrap_or_default()
     }
 
+    /// Process id of the connection owning `bus` on the accessibility bus.
+    pub async fn pid(&self, bus: &str) -> Option<u32> {
+        let reply = self
+            .conn
+            .call_method(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus",
+                         Some("org.freedesktop.DBus"), "GetConnectionUnixProcessID", &(bus,))
+            .await
+            .ok()?;
+        reply.body().deserialize().ok()
+    }
+
     /// Nearest frame/window/dialog ancestor (or self).
     pub async fn frame_of(&self, o: &Obj) -> Option<Obj> {
         let mut cur = Some(o.clone());
@@ -289,9 +314,4 @@ pub async fn enable(session: &Connection) {
         .call_method(Some("org.a11y.Bus"), "/org/a11y/bus", Some(PROPS), "Set",
                      &("org.a11y.Status", "IsEnabled", zbus::zvariant::Value::from(true)))
         .await;
-}
-
-/// Python-compatible `json.dumps(s, ensure_ascii=False)`.
-pub fn json_str(s: &str) -> String {
-    Json::String(s.to_string()).to_string()
 }
