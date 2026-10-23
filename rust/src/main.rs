@@ -46,6 +46,25 @@ struct Server<B: Backend> {
     b: B,
     refs: Mutex<Refs<B::Id>>,
     allow_file: PathBuf,
+    /// Title of the active window as last reported, to mention changes.
+    last_active: Mutex<Option<String>>,
+}
+
+/// An element picked by `id`, or found by `app` + `query`.
+struct Target<Id> {
+    id: Id,
+    /// `[id] role "name"` when found by query, so the reply says what was hit.
+    found: Option<String>,
+}
+
+impl<Id> Target<Id> {
+    /// Prefix a one-line reply with the element a query picked.
+    fn reply(&self, text: &str) -> String {
+        match &self.found {
+            Some(d) => format!("{d}: {text}"),
+            None => text.to_string(),
+        }
+    }
 }
 
 fn arg_s(a: &Json, k: &str, d: &str) -> String {
@@ -90,7 +109,8 @@ where
 impl<B: Backend> Server<B> {
     fn new(b: B) -> Self {
         let allow_file = b.allow_file();
-        Server { b, refs: Mutex::new(Refs { map: HashMap::new(), next: 1 }), allow_file }
+        Server { b, refs: Mutex::new(Refs { map: HashMap::new(), next: 1 }), allow_file,
+                 last_active: Mutex::new(None) }
     }
 
     // ------------------------------------------------------------ allowlist
@@ -163,6 +183,65 @@ impl<B: Backend> Server<B> {
         }
         self.b.app_windows(&name.to_lowercase()).await
             .ok_or_else(|| format!("app '{name}' not found in the accessibility tree"))
+    }
+
+    /// Fetch the visible part of `app` and pick the element `query` names.
+    async fn locate(&self, app: &str, query: &str, role: &str) -> R<Option<(B::Id, Cache<B::Id>)>> {
+        let windows = self.app_windows(app).await?;
+        let mut cache = Cache::new();
+        self.b.prefetch(&mut cache, windows.clone(), true, render::FIND_TEXT_LIMIT,
+                        render::FIND_MAX_SEEN).await;
+        loop {
+            match render::locate(&cache, &windows, query, role) {
+                Ok(found) => return Ok(found.map(|id| (id, cache))),
+                Err(missing) => {
+                    self.b.prefetch(&mut cache, missing, true, render::FIND_TEXT_LIMIT,
+                                    PREFETCH_MORE).await;
+                }
+            }
+        }
+    }
+
+    /// The element a tool call names: `id`, or `app` + `query` (+ `role`).
+    async fn target(&self, a: &Json) -> R<Target<B::Id>> {
+        if let Some(rid) = a.get("id").and_then(Json::as_i64) {
+            return Ok(Target { id: self.resolve(rid).await?, found: None });
+        }
+        let (Some(app), Some(query)) = (a.get("app").and_then(Json::as_str),
+                                        a.get("query").and_then(Json::as_str)) else {
+            return Err("pass `id` (from tree/find), or `app` and `query`".into());
+        };
+        self.b.enable().await;
+        let role = arg_s(a, "role", "");
+        let (id, cache) = self.locate(app, query, &role).await?.ok_or_else(|| {
+            let role = if role.is_empty() { String::new() } else { format!(" with role '{role}'") };
+            format!("no visible element in '{app}' matches '{query}'{role}")
+        })?;
+        let rid = self.add_ref(&id, &app.to_lowercase()).await;
+        let found = Some(render::describe(&cache[&id], rid));
+        Ok(Target { id, found })
+    }
+
+    /// Title of the active window, if any.
+    async fn active_title(&self) -> Option<String> {
+        self.b.list_apps().await.into_iter()
+            .flat_map(|a| a.windows)
+            .find(|w| w.active)
+            .map(|w| w.title)
+    }
+
+    /// Append a note when an action changed the active window (a dialog
+    /// opened, a window closed), so no tree call is needed to notice.
+    async fn note_active_change(&self, mut reply: String) -> String {
+        let now = self.active_title().await;
+        let mut last = self.last_active.lock().await;
+        if now != *last {
+            if let Some(title) = &now {
+                reply.push_str(&format!("; active window now {}", render::py_repr(title)));
+            }
+            *last = now;
+        }
+        reply
     }
 
     async fn print(&self, lines: Vec<Line<B::Id>>, cache: &Cache<B::Id>, app: &str) -> String {
@@ -268,9 +347,10 @@ impl<B: Backend> Server<B> {
     }
 
     async fn act(&self, a: &Json) -> R<String> {
-        let id = self.resolve(req_i(a, "id")?).await?;
+        let t = self.target(a).await?;
+        let id = &t.id;
         let action = arg_s(a, "action", "");
-        let names = self.b.actions(&id).await;
+        let names = self.b.actions(id).await;
         if names.is_empty() {
             return Err("element has no actions; try click, or focus + key".into());
         }
@@ -282,43 +362,81 @@ impl<B: Backend> Server<B> {
                 format!("action '{action}' not in [{}]", list.join(", "))
             })?;
         }
-        let ok = self.b.do_action(&id, idx).await?;
-        Ok(format!("{} -> {}", names[idx], if ok { "ok" } else { "failed" }))
+        let ok = self.b.do_action(id, idx).await?;
+        let reply = t.reply(&format!("{} -> {}", names[idx], if ok { "ok" } else { "failed" }));
+        Ok(self.note_active_change(reply).await)
     }
 
     async fn set_text(&self, a: &Json) -> R<String> {
-        let id = self.resolve(req_i(a, "id")?).await?;
         let text = req_s(a, "text")?;
-        Ok(if self.b.set_text(&id, &text).await? { "ok" } else { "failed" }.into())
+        let t = self.target(a).await?;
+        Ok(t.reply(if self.b.set_text(&t.id, &text).await? { "ok" } else { "failed" }))
     }
 
     async fn get_text(&self, a: &Json) -> R<String> {
-        let id = self.resolve(req_i(a, "id")?).await?;
-        self.b.full_text(&id, arg_i(a, "limit", 20000).max(0) as usize).await
+        let t = self.target(a).await?;
+        let text = self.b.full_text(&t.id, arg_i(a, "limit", 20000).max(0) as usize).await?;
+        Ok(match t.found {
+            Some(d) => format!("{d}:\n{text}"),
+            None => text,
+        })
+    }
+
+    async fn wait_for(&self, a: &Json) -> R<String> {
+        let app = req_s(a, "app")?;
+        let query = req_s(a, "query")?;
+        let role = arg_s(a, "role", "");
+        let gone = arg_b(a, "gone", false);
+        let limit = Duration::from_millis(arg_i(a, "timeout_ms", 5000).clamp(0, 60_000) as u64);
+        if !self.is_allowed(&app) {
+            return Err(self.not_allowed(&app));
+        }
+        self.b.enable().await;
+        let start = Instant::now();
+        loop {
+            // An app that is not running (yet) counts as "no match".
+            let found = self.locate(&app, &query, &role).await.ok().flatten();
+            let ms = start.elapsed().as_millis();
+            match found {
+                Some((id, cache)) if !gone => {
+                    let rid = self.add_ref(&id, &app.to_lowercase()).await;
+                    return Ok(format!("found after {ms} ms: {}", render::describe(&cache[&id], rid)));
+                }
+                None if gone => return Ok(format!("gone after {ms} ms")),
+                _ => {}
+            }
+            if start.elapsed() >= limit {
+                let what = if gone { "to disappear" } else { "to appear" };
+                return Err(format!("timed out after {ms} ms waiting for '{query}' in '{app}' {what}"));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     async fn focus(&self, a: &Json) -> R<String> {
-        let id = self.resolve(req_i(a, "id")?).await?;
-        if let Some(method) = self.b.try_focus(&id).await? {
-            return Ok(format!("ok ({method})"));
+        let t = self.target(a).await?;
+        let id = &t.id;
+        if let Some(method) = self.b.try_focus(id).await? {
+            return Ok(t.reply(&format!("ok ({method})")));
         }
         self.require_active_allowed().await?;
-        let (x, y) = self.b.element_center(&id).await?;
+        let (x, y) = self.b.element_center(id).await?;
         self.b.pointer(x as i64, y as i64, "left", 1, 0).await?;
-        if wait_for(Duration::from_millis(150), || self.b.is_focused(&id)).await {
-            return Ok(format!("ok (clicked at {x},{y})"));
+        if wait_for(Duration::from_millis(150), || self.b.is_focused(id)).await {
+            return Ok(t.reply(&format!("ok (clicked at {x},{y})")));
         }
-        Ok(format!("clicked at {x},{y} but element did not report focus"))
+        Ok(t.reply(&format!("clicked at {x},{y} but element did not report focus")))
     }
 
     async fn click(&self, a: &Json) -> R<String> {
-        let id = self.resolve(req_i(a, "id")?).await?;
         let button = arg_s(a, "button", "left");
         let clicks = arg_i(a, "clicks", 1);
+        let t = self.target(a).await?;
         self.require_active_allowed().await?;
-        let (x, y) = self.b.element_center(&id).await?;
+        let (x, y) = self.b.element_center(&t.id).await?;
         self.b.pointer(x as i64, y as i64, &button, clicks, 0).await?;
-        Ok(format!("clicked {button} x{clicks} at {x},{y}"))
+        let reply = t.reply(&format!("clicked {button} x{clicks} at {x},{y}"));
+        Ok(self.note_active_change(reply).await)
     }
 
     async fn key(&self, a: &Json) -> R<String> {
@@ -329,7 +447,7 @@ impl<B: Backend> Server<B> {
         for _ in 0..repeat.clamp(1, 100) {
             self.b.press_combo(&combo).await?;
         }
-        Ok(format!("sent {combo} x{repeat} to {app}"))
+        Ok(self.note_active_change(format!("sent {combo} x{repeat} to {app}")).await)
     }
 
     async fn type_text(&self, a: &Json) -> R<String> {
@@ -350,6 +468,7 @@ impl<B: Backend> Server<B> {
     async fn activate_window(&self, a: &Json) -> R<String> {
         let query = req_s(a, "query")?;
         self.b.activate_window(&query, &self.allowed()).await?;
+        *self.last_active.lock().await = self.active_title().await;
         let app = self.b.active_app().await;
         Ok(format!("active app now: {}", if app.is_empty() { "unknown" } else { &app }))
     }
@@ -393,6 +512,7 @@ impl<B: Backend> Server<B> {
                 "act" => self.act(a).await,
                 "set_text" => self.set_text(a).await,
                 "get_text" => self.get_text(a).await,
+                "wait_for" => self.wait_for(a).await,
                 "focus" => self.focus(a).await,
                 "click" => self.click(a).await,
                 "key" => self.key(a).await,

@@ -226,6 +226,42 @@ pub fn find<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id], query: &str,
     Ok(hits)
 }
 
+/// The element a query names: depth-first in document order over visible
+/// elements, the first whose name equals `query` (case-insensitive) wins,
+/// else the first whose name, text or role contains it. Ok(None) when
+/// nothing matches.
+pub fn locate<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id], query: &str,
+                                     role: &str) -> Result<Option<Id>, Vec<Id>> {
+    let q = query.trim().to_lowercase();
+    let mut first_partial = None;
+    let mut stack: Vec<&Id> = Vec::new();
+    let infos = get(cache, roots)?;
+    stack.extend(roots.iter().zip(infos).filter(|(_, i)| i.showing).map(|(r, _)| r).rev());
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        let info = &cache[id];
+        if role.is_empty() || info.role == role {
+            if info.name.trim().to_lowercase() == q {
+                return Ok(Some(id.clone()));
+            }
+            if first_partial.is_none() {
+                let hay = format!("{} {} {}", info.name, text_preview(info, FIND_TEXT_LIMIT),
+                                  info.role).to_lowercase();
+                if hay.contains(&q) {
+                    first_partial = Some(id.clone());
+                }
+            }
+        }
+        let kids = get(cache, &info.children)?;
+        stack.extend(info.children.iter().zip(kids).filter(|(_, k)| k.showing).map(|(c, _)| c).rev());
+    }
+    Ok(first_partial)
+}
+
 /// Python `repr()` of a str, for window titles in `apps`.
 pub fn py_repr(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
@@ -377,6 +413,19 @@ mod tests {
         assert_eq!(hits, vec!["/w", "/p", "/b2", "/b1"]);
         let hits = find(&cache, &["/w"], "KAYDET", "push button", 10).unwrap();
         assert_eq!(hits, vec!["/b1"]);
+    }
+
+    #[test]
+    fn locate_prefers_exact_names_in_document_order() {
+        let mut cache = sample();
+        cache.insert("/b3", node("push button", "Farklı Kaydet", true, &[], &[]));
+        cache.get_mut("/p").unwrap().children = vec!["/b3", "/b1", "/b2", "/h"];
+        assert_eq!(locate(&cache, &["/w"], "kaydet", "").unwrap(), Some("/b1"));
+        assert_eq!(locate(&cache, &["/w"], "farklı", "").unwrap(), Some("/b3"));
+        assert_eq!(locate(&cache, &["/w"], "kaydet", "text").unwrap(), None);
+        assert_eq!(locate(&cache, &["/w"], "hidden", "").unwrap(), None);
+        cache.remove("/b2");
+        assert_eq!(locate(&cache, &["/w"], "x", "").unwrap_err(), vec!["/b2"]);
     }
 
     #[test]
