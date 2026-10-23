@@ -30,7 +30,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use backend::{Backend, Cache, R};
-use render::{Line, WalkOpts};
+use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
 const TREE_TEXT_LIMIT: usize = 80;
@@ -169,14 +169,14 @@ impl<B: Backend> Server<B> {
         let mut out = Vec::with_capacity(lines.len());
         for line in lines {
             out.push(match line {
-                Line::Raw(s) => s,
+                Line::Raw(s) => Printed::Raw(s),
                 Line::Node { depth, id } => {
                     let rid = self.add_ref(&id, app).await;
-                    format!("{}{}", "  ".repeat(depth), render::describe(&cache[&id], rid))
+                    Printed::Node { depth, rid, info: &cache[&id] }
                 }
             });
         }
-        out.join("\n")
+        render::format(&out)
     }
 
     // ------------------------------------------------------------ tools
