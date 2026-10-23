@@ -1,6 +1,7 @@
 //! Tree and search output over already-fetched nodes. Pure functions: when a
 //! node they need is missing they return it, the caller fetches and retries.
-//! The format matches the Python server line for line.
+//! The format matches the former Python server line for line, so the
+//! "Python ..." notes below name the function each one reproduces.
 
 use std::hash::Hash;
 

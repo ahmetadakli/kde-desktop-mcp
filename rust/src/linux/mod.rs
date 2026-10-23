@@ -498,3 +498,22 @@ impl Backend for LinuxBackend {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn client_app_name_prefers_atspi_name_by_pid() {
+        let names = HashMap::from([(4242, "kate".to_string()), (6161, "Firefox".to_string())]);
+        let kate = json!({"pid": 4242, "class": "org.kde.kate"});
+        let firefox = json!({"pid": 6161, "class": "firefox"});
+        // No accessibility: fall back to the window class.
+        let xterm = json!({"pid": 5151, "class": "XTerm"});
+        assert_eq!(LinuxBackend::client_app_name(&names, &kate), "kate");
+        assert_eq!(LinuxBackend::client_app_name(&names, &firefox), "firefox");
+        assert_eq!(LinuxBackend::client_app_name(&names, &xterm), "xterm");
+        assert_eq!(LinuxBackend::client_app_name(&names, &json!({})), "");
+    }
+}

@@ -1,8 +1,8 @@
 """Latency benchmark of MCP servers over stdio: same calls, median ms per tool.
 
-    .venv/bin/python tools/mcp_bench.py --app kate --window notes.txt \\
-        --server "Python=.venv/bin/python server.py" \\
-        --server "Rust=rust/target/release/desktop-mcp"
+    python3 tools/mcp_bench.py --app kate --window notes.txt \\
+        --server "Old=/path/to/old/desktop-mcp" \\
+        --server "New=rust/target/release/desktop-mcp"
 
 The window must already be open. Each server is started fresh per round and
 runs the same sequence: initialize, apps, activate_window, tree, find,
