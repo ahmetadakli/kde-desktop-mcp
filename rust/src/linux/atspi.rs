@@ -6,7 +6,8 @@
 //! application answers rather than by round-trip latency.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use futures_util::stream::{self, StreamExt};
 use zbus::Connection;
@@ -20,6 +21,13 @@ pub type Info = crate::backend::Info<Obj>;
 const ACC: &str = "org.a11y.atspi.Accessible";
 const PROPS: &str = "org.freedesktop.DBus.Properties";
 const NULL_PATH: &str = "/org/a11y/atspi/null";
+/// Upper bound for one AT-SPI request. Replies normally take well under
+/// 100 ms even for big trees; an app that is blocked (a modal loop inside a
+/// handler, a hung process) must not freeze the whole server, since every
+/// later request queues behind the stuck one.
+const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+/// How long `do_action` waits for an action's reply; see there.
+const ACTION_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
 /// Requests kept in flight at once; well under the bus' pending-reply limit.
 const IN_FLIGHT: usize = 512;
 
@@ -30,6 +38,7 @@ pub const EDITABLE: u32 = 7;
 pub const ENABLED: u32 = 8;
 pub const EXPANDED: u32 = 10;
 pub const FOCUSED: u32 = 12;
+pub const MULTI_LINE: u32 = 17;
 pub const SELECTED: u32 = 23;
 pub const SHOWING: u32 = 25;
 
@@ -81,6 +90,11 @@ pub fn state_labels(states: Option<u64>) -> Vec<&'static str> {
 
 pub struct A11y {
     pub conn: Connection,
+    /// Last element seen gaining or holding focus: from focus events, and
+    /// from any read that found it focused. Only a hint; check before use.
+    focus_hint: Mutex<Option<Obj>>,
+    /// Bus name of the app `active_app` last found in front, and when.
+    active_bus: Mutex<Option<(Arc<str>, Instant)>>,
 }
 
 impl A11y {
@@ -97,7 +111,7 @@ impl A11y {
             .build()
             .await
             .map_err(|e| format!("cannot connect to the accessibility bus: {e}"))?;
-        Ok(A11y { conn })
+        Ok(A11y { conn, focus_hint: Mutex::new(None), active_bus: Mutex::new(None) })
     }
 
     async fn call<T>(&self, o: &Obj, iface: &str, method: &str,
@@ -105,10 +119,9 @@ impl A11y {
     where
         T: for<'d> serde::Deserialize<'d> + zbus::zvariant::Type,
     {
-        let reply = self
-            .conn
-            .call_method(Some(o.bus.as_ref()), &o.path, Some(iface), method, args)
-            .await
+        let reply = self.conn.call_method(Some(o.bus.as_ref()), &o.path, Some(iface), method, args);
+        let reply = tokio::time::timeout(CALL_TIMEOUT, reply).await
+            .map_err(|_| format!("{method}: no reply from the application within {CALL_TIMEOUT:?}"))?
             .map_err(err)?;
         reply.body().deserialize().map_err(err)
     }
@@ -140,7 +153,76 @@ impl A11y {
     }
 
     pub async fn has_state(&self, o: &Obj, state: u32) -> bool {
-        self.states(o).await.unwrap_or(0) & (1u64 << state) != 0
+        let st = self.states(o).await.unwrap_or(0);
+        self.note_states(o, st);
+        has(st, state)
+    }
+
+    fn note_states(&self, o: &Obj, states: u64) {
+        if has(states, FOCUSED) {
+            self.note_focus(o.clone());
+        }
+    }
+
+    pub fn note_focus(&self, o: Obj) {
+        *self.focus_hint.lock().unwrap() = Some(o);
+    }
+
+    pub fn focus_hint(&self) -> Option<Obj> {
+        self.focus_hint.lock().unwrap().clone()
+    }
+
+    /// Bus of the app `active_app` found in front, if it looked within `max_age`.
+    pub fn recent_active_bus(&self, max_age: std::time::Duration) -> Option<Arc<str>> {
+        let seen = self.active_bus.lock().unwrap().clone();
+        seen.filter(|(_, at)| at.elapsed() <= max_age).map(|(bus, _)| bus)
+    }
+
+    /// Ask toolkits to emit focus changes (Qt only sends events someone
+    /// registered for), and keep `focus_hint` current from them. The
+    /// registration ends with this connection.
+    pub async fn track_focus(self: &Arc<Self>) -> R<()> {
+        use futures_util::StreamExt;
+        let rule = zbus::MatchRule::builder()
+            .msg_type(zbus::message::Type::Signal)
+            .interface("org.a11y.atspi.Event.Object").map_err(err)?
+            .member("StateChanged").map_err(err)?
+            .add_arg("focused").map_err(err)?
+            .build();
+        let mut stream = zbus::MessageStream::for_match_rule(rule, &self.conn, Some(256))
+            .await.map_err(err)?;
+        let args = ("object:state-changed:focused", Vec::<String>::new(), "");
+        let register = self.conn
+            .call_method(Some("org.a11y.atspi.Registry"), "/org/a11y/atspi/registry",
+                         Some("org.a11y.atspi.Registry"), "RegisterEvent", &args);
+        tokio::time::timeout(CALL_TIMEOUT, register).await
+            .map_err(|_| "RegisterEvent: no reply".to_string())?.map_err(err)?;
+        let me = Arc::downgrade(self);
+        tokio::spawn(async move {
+            while let Some(Ok(msg)) = stream.next().await {
+                let Some(a11y) = me.upgrade() else { break };
+                let header = msg.header();
+                let (Some(sender), Some(path)) = (header.sender(), header.path()) else { continue };
+                let gained = msg.body().deserialize::<(String, i32, i32, OwnedValue)>()
+                    .map(|(_, d1, _, _)| d1)
+                    .or_else(|_| msg.body()
+                        .deserialize::<(String, i32, i32, OwnedValue, HashMap<String, OwnedValue>)>()
+                        .map(|(_, d1, _, _, _)| d1));
+                if gained == Ok(1) {
+                    a11y.note_focus(Obj::new(sender.as_str(), path.clone().into()));
+                }
+            }
+        });
+        Ok(())
+    }
+
+    /// Toolkit of the application owning `bus` ("Qt", "GTK", "Gecko", ...).
+    pub async fn toolkit(&self, bus: &str) -> String {
+        let root = Obj::new(bus, OwnedObjectPath::try_from("/org/a11y/atspi/accessible/root").unwrap());
+        match self.prop(&root, "org.a11y.atspi.Application", "ToolkitName").await {
+            Ok(v) => String::try_from(v).unwrap_or_default(),
+            Err(_) => String::new(),
+        }
     }
 
     pub async fn interfaces(&self, o: &Obj) -> Vec<String> {
@@ -168,8 +250,17 @@ impl A11y {
         list.map(|l| l.into_iter().map(|(name, _, _)| name).collect()).unwrap_or_default()
     }
 
+    /// Run action `index`. Some toolkits answer only once the action is
+    /// over: Qt runs a menu button's QMenu::exec() inside the DoAction
+    /// handler, so the reply comes when the menu closes. Without a reply
+    /// within ACTION_WAIT the action counts as sent (the menu or dialog it
+    /// opened is the expected result) and the late reply is dropped.
     pub async fn do_action(&self, o: &Obj, index: i32) -> R<bool> {
-        self.call(o, "org.a11y.atspi.Action", "DoAction", &(index,)).await
+        match tokio::time::timeout(ACTION_WAIT,
+                                   self.call(o, "org.a11y.atspi.Action", "DoAction", &(index,))).await {
+            Ok(done) => done,
+            Err(_) => Ok(true),
+        }
     }
 
     /// Up to `limit` characters of the Text interface, or None without it.
@@ -181,6 +272,36 @@ impl A11y {
 
     pub async fn set_text(&self, o: &Obj, text: &str) -> R<bool> {
         self.call(o, "org.a11y.atspi.EditableText", "SetTextContents", &(text,)).await
+    }
+
+    pub async fn caret(&self, o: &Obj) -> R<i32> {
+        i32::try_from(self.prop(o, "org.a11y.atspi.Text", "CaretOffset").await?).map_err(err)
+    }
+
+    pub async fn char_count(&self, o: &Obj) -> R<i32> {
+        i32::try_from(self.prop(o, "org.a11y.atspi.Text", "CharacterCount").await?).map_err(err)
+    }
+
+    /// (start, end) of the first selection, None without one.
+    pub async fn selection(&self, o: &Obj) -> R<Option<(i32, i32)>> {
+        let n: i32 = self.call(o, "org.a11y.atspi.Text", "GetNSelections", &()).await?;
+        if n <= 0 {
+            return Ok(None);
+        }
+        let (start, end): (i32, i32) = self.call(o, "org.a11y.atspi.Text", "GetSelection", &(0i32,)).await?;
+        Ok((start != end).then_some((start.min(end), start.max(end))))
+    }
+
+    pub async fn set_caret(&self, o: &Obj, offset: i32) -> R<bool> {
+        self.call(o, "org.a11y.atspi.Text", "SetCaretOffset", &(offset,)).await
+    }
+
+    pub async fn insert_text(&self, o: &Obj, offset: i32, text: &str, length: i32) -> R<bool> {
+        self.call(o, "org.a11y.atspi.EditableText", "InsertText", &(offset, text, length)).await
+    }
+
+    pub async fn delete_text(&self, o: &Obj, start: i32, end: i32) -> R<bool> {
+        self.call(o, "org.a11y.atspi.EditableText", "DeleteText", &(start, end)).await
     }
 
     pub async fn grab_focus(&self, o: &Obj) -> bool {
@@ -195,6 +316,9 @@ impl A11y {
     pub async fn info(&self, o: &Obj, text_limit: usize) -> Info {
         let (role, name, states, ifaces, children) = tokio::join!(
             self.role(o), self.name(o), self.states(o), self.interfaces(o), self.children(o));
+        if let Some(st) = states {
+            self.note_states(o, st);
+        }
         let has_iface = |i: &str| ifaces.iter().any(|x| x == i);
         let (actions, text) = tokio::join!(
             async {
@@ -278,10 +402,9 @@ impl A11y {
             .buffered(IN_FLIGHT)
             .collect()
             .await;
-        apps.iter().zip(flags)
-            .find(|(_, f)| f.iter().any(|x| *x))
-            .map(|((_, name, _), _)| name.clone())
-            .unwrap_or_default()
+        let found = apps.iter().zip(flags).find(|(_, f)| f.iter().any(|x| *x)).map(|(a, _)| a);
+        *self.active_bus.lock().unwrap() = found.map(|(app, _, _)| (app.bus.clone(), Instant::now()));
+        found.map(|(_, name, _)| name.clone()).unwrap_or_default()
     }
 
     /// Process id of the connection owning `bus` on the accessibility bus.

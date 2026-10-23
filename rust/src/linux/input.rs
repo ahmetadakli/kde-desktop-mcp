@@ -13,10 +13,19 @@ use crate::backend::R;
 pub const ABS_MAX: i32 = 32767;
 /// Time for the compositor to pick up a freshly created device.
 const DEVICE_SETTLE: Duration = Duration::from_millis(300);
-const KEY_HOLD: Duration = Duration::from_millis(8);
-const KEY_GAP: Duration = Duration::from_millis(8);
-const POINTER_SETTLE: Duration = Duration::from_millis(25);
-const BUTTON_HOLD: Duration = Duration::from_millis(15);
+// Events from one uinput device reach the compositor in order, so these
+// are margins rather than waits for something to happen. Measured on KDE
+// Plasma 6.8 with Kate: 0 ms for each still delivered 90 rapid keys and 120
+// clicks (placed by line) correctly; the values below keep a small margin.
+const KEY_HOLD: Duration = Duration::from_millis(2);
+const KEY_GAP: Duration = Duration::from_millis(1);
+/// After an absolute move on the pointer device, before its button events.
+const POINTER_SETTLE: Duration = Duration::from_millis(2);
+/// After the cursor was moved outside uinput (Hyprland IPC), which is not
+/// ordered with the button events.
+const EXTERNAL_MOVE_SETTLE: Duration = Duration::from_millis(25);
+const BUTTON_HOLD: Duration = Duration::from_millis(3);
+/// Between the clicks of a double or triple click.
 const BUTTON_GAP: Duration = Duration::from_millis(30);
 
 const ALIASES: &[(&str, &str)] = &[
@@ -115,9 +124,13 @@ impl Input {
         f(slot.as_mut().unwrap())
     }
 
-    /// Create both devices ahead of first use (blocking).
-    pub fn warm_up(&self) {
+    /// Create the keyboard ahead of first use (blocking for DEVICE_SETTLE).
+    pub fn warm_up_keyboard(&self) {
         let _ = self.with_kbd(|_| Ok(()));
+    }
+
+    /// Create the pointer ahead of first use (blocking for DEVICE_SETTLE).
+    pub fn warm_up_pointer(&self) {
         let _ = self.with_ptr(|_| Ok(()));
     }
 
@@ -145,17 +158,21 @@ impl Input {
 
     /// Wait after a cursor move done outside uinput.
     pub async fn settle(&self) {
-        tokio::time::sleep(POINTER_SETTLE).await;
+        tokio::time::sleep(EXTERNAL_MOVE_SETTLE).await;
     }
 
     /// Click and/or scroll at the current cursor position.
     pub async fn buttons(&self, button: &str, clicks: i64, scroll: i64) -> R<()> {
         let btn = button_code(button)?;
-        for _ in 0..clicks.clamp(0, 3) {
+        let clicks = clicks.clamp(0, 3);
+        for i in 0..clicks {
+            if i > 0 {
+                // Only between the clicks of a double/triple click.
+                tokio::time::sleep(BUTTON_GAP).await;
+            }
             self.with_ptr(|d| d.emit(&[ev(EventType::KEY, btn.0, 1)]).map_err(io))?;
             tokio::time::sleep(BUTTON_HOLD).await;
             self.with_ptr(|d| d.emit(&[ev(EventType::KEY, btn.0, 0)]).map_err(io))?;
-            tokio::time::sleep(BUTTON_GAP).await;
         }
         if scroll != 0 {
             let v = (-scroll).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
