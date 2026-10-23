@@ -404,8 +404,11 @@ impl Backend for LinuxBackend {
     }
 
     fn warm_up(&self) {
+        // In parallel: each device waits DEVICE_SETTLE after creation.
         let input = self.input.clone();
-        std::thread::spawn(move || input.warm_up());
+        std::thread::spawn(move || input.warm_up_keyboard());
+        let input = self.input.clone();
+        std::thread::spawn(move || input.warm_up_pointer());
     }
 
     async fn list_apps(&self) -> Vec<AppEntry> {

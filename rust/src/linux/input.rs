@@ -124,9 +124,13 @@ impl Input {
         f(slot.as_mut().unwrap())
     }
 
-    /// Create both devices ahead of first use (blocking).
-    pub fn warm_up(&self) {
+    /// Create the keyboard ahead of first use (blocking for DEVICE_SETTLE).
+    pub fn warm_up_keyboard(&self) {
         let _ = self.with_kbd(|_| Ok(()));
+    }
+
+    /// Create the pointer ahead of first use (blocking for DEVICE_SETTLE).
+    pub fn warm_up_pointer(&self) {
         let _ = self.with_ptr(|_| Ok(()));
     }
 
