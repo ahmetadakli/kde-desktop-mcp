@@ -1,6 +1,6 @@
-//! KWin over the session bus: scripting for the active window geometry and
-//! raising windows, ScreenShot2 for window captures, plus the screen layout
-//! from kscreen-doctor.
+//! KWin over the session bus: scripting for the active window geometry,
+//! the screen layout and raising windows, and ScreenShot2 for window
+//! captures.
 //!
 //! KWin scripts cannot return values over D-Bus, so a script calls back into
 //! an object this process exports on its own unique bus name.
@@ -93,6 +93,9 @@ return "";
 const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
      const g = w.clientGeometry; return {x: g.x, y: g.y, width: g.width, \
      height: g.height, caption: w.caption, cls: w.resourceClass}; })())";
+
+const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtualScreenGeometry; \
+     return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
 
 impl KWin {
     pub async fn new(session: Connection) -> R<Self> {
@@ -233,12 +236,28 @@ impl KWin {
             && at.elapsed() < SCREEN_BOX_TTL {
                 return b;
             }
-        let b = read_screen_box().await.unwrap_or((0, 0, 1920, 1080));
+        let b = match self.virtual_screen().await {
+            Some(b) => b,
+            None => read_screen_box().await.unwrap_or((0, 0, 1920, 1080)),
+        };
         *cached = Some((Instant::now(), b));
         b
     }
 }
 
+impl KWin {
+    /// Bounding box of all outputs from KWin itself, in logical px: one
+    /// script run instead of starting kscreen-doctor.
+    async fn virtual_screen(&self) -> Option<ScreenBox> {
+        let raw = self.query(VIRTUAL_SCREEN).await.ok()??;
+        let g: Json = serde_json::from_str(&raw).ok()?;
+        let (x, y) = (g["x"].as_f64()?, g["y"].as_f64()?);
+        let (w, h) = (g["width"].as_f64()?, g["height"].as_f64()?);
+        (w > 0.0 && h > 0.0).then_some((x as i32, y as i32, (x + w) as i32, (y + h) as i32))
+    }
+}
+
+/// Fallback when the KWin query fails.
 async fn read_screen_box() -> Option<(i32, i32, i32, i32)> {
     let out = tokio::process::Command::new("kscreen-doctor").arg("-j").output().await.ok()?;
     let doc: Json = serde_json::from_slice(&out.stdout).ok()?;
