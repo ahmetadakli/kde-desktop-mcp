@@ -84,7 +84,10 @@ pub fn walk<Id: Clone + Eq + Hash>(cache: &Cache<Id>, children: &[Id], depth: us
     let infos = get(cache, children)?;
     for (c, info) in children.iter().zip(infos) {
         if lines.len() >= opts.budget {
-            lines.push(Line::Raw(TRUNCATED.into()));
+            // Once, not once per open level.
+            if !matches!(lines.last(), Some(Line::Raw(s)) if s == TRUNCATED) {
+                lines.push(Line::Raw(TRUNCATED.into()));
+            }
             return Ok(());
         }
         if opts.only_showing && !info.showing {
@@ -223,6 +226,7 @@ mod tests {
         let mut lines = Vec::new();
         walk(&cache, &["/w"], 1, &opts(2), &mut lines).unwrap();
         assert_eq!(lines.last(), Some(&Line::Raw(TRUNCATED.into())));
+        assert_eq!(lines.iter().filter(|l| matches!(l, Line::Raw(_))).count(), 1);
     }
 
     #[test]
