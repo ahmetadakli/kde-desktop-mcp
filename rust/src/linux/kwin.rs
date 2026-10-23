@@ -1,21 +1,56 @@
-//! KWin scripting over the session bus: active window geometry and raising
-//! windows, plus the screen layout from kscreen-doctor.
+//! KWin over the session bus: scripting for the active window geometry and
+//! raising windows, ScreenShot2 for window captures, plus the screen layout
+//! from kscreen-doctor.
 //!
 //! KWin scripts cannot return values over D-Bus, so a script calls back into
 //! an object this process exports on its own unique bus name.
 
+use std::collections::HashMap;
+use std::io::Read;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value as Json;
 use tokio::sync::{Mutex, mpsc};
 use zbus::Connection;
+use zbus::zvariant::{Fd, OwnedValue, Value};
 
 use crate::backend::R;
 
 const SINK_PATH: &str = "/org/desktopmcp/sink";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
 const SCREEN_BOX_TTL: Duration = Duration::from_secs(5);
+const SHOT_PATH: &str = "/org/kde/KWin/ScreenShot2";
+const SHOT_IFACE: &str = "org.kde.KWin.ScreenShot2";
+/// KWin 6.8 serves ScreenShot2 to any client on the session bus. Before
+/// that (dropped in KWin commit 0ea31ae7), each call looked up the caller's
+/// pid, resolved /proc/<pid>/exe and searched the installed applications
+/// (ksycoca) for a .desktop file whose Exec= program has that canonical
+/// path; the call was refused with this error unless the file's
+/// X-KDE-DBUS-Restricted-Interfaces listed org.kde.KWin.ScreenShot2
+/// (KWIN_SCREENSHOT_NO_PERMISSION_CHECKS=1 in KWin's environment disabled
+/// the check). On such a KWin `screenshot` falls back to spectacle; to grant
+/// the faster path once, install by hand, then run `kbuildsycoca6`:
+///
+/// ```text
+/// ~/.local/share/applications/desktop-mcp.desktop
+/// [Desktop Entry]
+/// Type=Application
+/// Name=desktop-mcp
+/// Exec=/absolute/path/to/rust/target/release/desktop-mcp
+/// NoDisplay=true
+/// X-KDE-DBUS-Restricted-Interfaces=org.kde.KWin.ScreenShot2
+/// ```
+pub const SHOT_NOT_AUTHORIZED: &str = "org.kde.KWin.ScreenShot2.Error.NoAuthorized";
+
+/// A capture as KWin sent it: `format` is a QImage::Format value.
+pub struct RawImage {
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: u32,
+    pub data: Vec<u8>,
+}
 
 /// (x0, y0, x1, y1) in logical px.
 type ScreenBox = (i32, i32, i32, i32);
@@ -144,6 +179,51 @@ impl KWin {
             (Some(x), Some(y)) => Ok((x, y)),
             _ => Err("could not read the active window geometry from KWin".into()),
         }
+    }
+
+    /// Capture the active window (with its title bar, without the shadow)
+    /// through ScreenShot2: KWin writes the raw pixels into a pipe after
+    /// replying with their layout.
+    pub async fn capture_active_window(&self) -> R<RawImage> {
+        let (mut reader, writer) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
+        // Read concurrently: KWin blocks on a full pipe until it is drained.
+        let pixels = tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            reader.read_to_end(&mut buf).map(|_| buf)
+        });
+        let options = HashMap::from([
+            ("include-decoration", Value::from(true)),
+            ("include-shadow", Value::from(false)),
+            ("include-cursor", Value::from(false)),
+            ("native-resolution", Value::from(true)),
+        ]);
+        let reply = self.session
+            .call_method(Some("org.kde.KWin"), SHOT_PATH, Some(SHOT_IFACE), "CaptureActiveWindow",
+                         &(options, Fd::from(&writer)))
+            .await;
+        // KWin holds its own duplicate; ours must go for the read to end.
+        drop(writer);
+        let reply = match reply {
+            Ok(r) => r,
+            Err(zbus::Error::MethodError(name, msg, _)) => {
+                return Err(format!("{}: {}", name.as_str(), msg.unwrap_or_default()));
+            }
+            Err(e) => return Err(format!("KWin CaptureActiveWindow: {e}")),
+        };
+        let meta: HashMap<String, OwnedValue> = reply.body().deserialize().map_err(|e| e.to_string())?;
+        let num = |k: &str| meta.get(k).and_then(|v| u32::try_from(v).ok())
+            .ok_or_else(|| format!("ScreenShot2 reply lacks '{k}'"));
+        let kind = meta.get("type").and_then(|v| String::try_from(v.try_clone().ok()?).ok());
+        if kind.as_deref().unwrap_or("raw") != "raw" {
+            return Err(format!("ScreenShot2 sent unsupported type {kind:?}"));
+        }
+        let (width, height, stride, format) = (num("width")?, num("height")?, num("stride")?, num("format")?);
+        let data = pixels.await.map_err(|e| e.to_string())?.map_err(|e| format!("pipe: {e}"))?;
+        if (data.len() as u64) < u64::from(stride) * u64::from(height) {
+            return Err(format!("ScreenShot2 sent {} of {} bytes", data.len(),
+                               u64::from(stride) * u64::from(height)));
+        }
+        Ok(RawImage { width, height, stride, format, data })
     }
 
     /// Bounding box (x0, y0, x1, y1) of all enabled outputs in logical px.
