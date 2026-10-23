@@ -85,6 +85,8 @@ def find_app(name: str) -> Node:
 
 # ---------------------------------------------------------------- rendering
 
+TRUNCATED = "… truncated; narrow with find or a deeper root id"
+
 
 def describe(node: Node) -> str:
     rid = ref(node)
@@ -110,7 +112,8 @@ def walk(node: Node, depth: int, max_depth: int, lines: list[str], budget: int,
         return
     for c in node.children():
         if len(lines) >= budget:
-            lines.append("… truncated; narrow with find or a deeper root id")
+            if lines[-1] != TRUNCATED:  # once, not once per open level
+                lines.append(TRUNCATED)
             return
         if only_showing and not c.showing():
             continue
