@@ -231,7 +231,9 @@ impl<B: Backend> Server<B> {
     }
 
     /// Append a note when an action changed the active window (a dialog
-    /// opened, a window closed), so no tree call is needed to notice.
+    /// opened, a window closed), so no tree call is needed to notice. Only
+    /// for `act`: apps run actions before replying, while keys and clicks
+    /// take effect after the call returns (use wait_for for those).
     async fn note_active_change(&self, mut reply: String) -> String {
         let now = self.active_title().await;
         let mut last = self.last_active.lock().await;
@@ -435,8 +437,7 @@ impl<B: Backend> Server<B> {
         self.require_active_allowed().await?;
         let (x, y) = self.b.element_center(&t.id).await?;
         self.b.pointer(x as i64, y as i64, &button, clicks, 0).await?;
-        let reply = t.reply(&format!("clicked {button} x{clicks} at {x},{y}"));
-        Ok(self.note_active_change(reply).await)
+        Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}")))
     }
 
     async fn key(&self, a: &Json) -> R<String> {
@@ -447,7 +448,7 @@ impl<B: Backend> Server<B> {
         for _ in 0..repeat.clamp(1, 100) {
             self.b.press_combo(&combo).await?;
         }
-        Ok(self.note_active_change(format!("sent {combo} x{repeat} to {app}")).await)
+        Ok(format!("sent {combo} x{repeat} to {app}"))
     }
 
     async fn type_text(&self, a: &Json) -> R<String> {
