@@ -93,29 +93,94 @@ claude mcp add --scope user desktop -- "$PWD/.venv/bin/python" "$PWD/server.py"
 `--system-site-packages` gereklidir: PyGObject ve AT-SPI PyPI'dan değil,
 sistem paketlerinden gelir.
 
-## Hızlı sunucu: Rust (KDE Plasma)
+## Hızlı sunucu: Rust
 
-`rust/` altında KDE Plasma (Wayland) için aynı araçları aynı çıktı biçimiyle
-sunan bir Rust sunucusu var. libatspi yerine AT-SPI'ye doğrudan D-Bus ile
-konuşur ve istekleri beklemeden art arda gönderir (pipelining); böylece süre
-uygulamanın yanıt hızıyla sınırlanır. KWin çağrıları da süreç başlatmadan
-D-Bus üzerinden yapılır.
+`rust/` altında aynı araçları aynı çıktı biçimiyle sunan bir Rust sunucusu
+var (KDE Plasma ve Hyprland'de Python sunucusuyla satır satır karşılaştırıldı:
+fark yok). Ayrıca birkaç aracı tek çağrıda çalıştıran `batch` aracı vardır.
 
-Ölçümler (Kate ve Dolphin, aynı makine):
+Neden hızlı:
+- AT-SPI'ye libatspi yerine doğrudan D-Bus ile konuşur ve istekleri
+  beklemeden art arda gönderir (pipelining): bir öğenin bütün öznitelikleri ve
+  ağacın her seviyesi aynı anda istenir; süre gidiş-dönüş gecikmesiyle değil
+  uygulamanın yanıt hızıyla sınırlanır.
+- KWin betikleri `qdbus6` süreçleri yerine D-Bus'tan, Hyprland komutları
+  `hyprctl` süreçleri yerine doğrudan Hyprland'in soketinden gider.
+- Açılış 2 ms (Python ~390 ms); sanal klavye ve fare açılışta hazırlanır.
 
-| İşlem | Python | Rust |
-|---|---|---|
-| Sunucu açılışı | ~390 ms | 2 ms |
-| `apps` | 40 ms | 2 ms |
-| `tree` Dolphin (300 öğe) | 178 ms | 22 ms |
-| `tree` Dolphin, gizliler dahil (2000 öğe) | 507 ms | 48 ms |
-| `find` Dolphin | 146 ms | 25 ms |
-| `key` | 69–185 ms | 19–57 ms |
-| `type_text` | 181–203 ms | 32–41 ms |
-| `focus` (tıklamayla) | 334 ms | 103 ms |
+### Ölçümler
 
-Gereksinimler KDE kurulumuyla aynıdır (PyGObject ve uv gerekmez), artı
-[Rust](https://rustup.rs/):
+`tools/mcp_bench.py` ile, iki sunucuya aynı çağrı dizisi sırayla uygulandı;
+değerler 5 turun medyanıdır (ms, Kate penceresinde, aynı makine).
+
+KDE Plasma 6 (Wayland):
+
+| İşlem | Python (ms) | Rust (ms) | Hızlanma |
+|---|---:|---:|---:|
+| `initialize` | 400.5 | 2.2 | 181x |
+| `apps` | 48.8 | 4.2 | 11.6x |
+| `activate_window` | 22.7 | 7.4 | 3.1x |
+| `tree` | 66.6 | 11.5 | 5.8x |
+| `find` | 40.8 | 9.4 | 4.3x |
+| `get_text` | 5.0 | 0.3 | 15x |
+| `key` | 61.3 | 19.4 | 3.2x |
+| `type_text` | 197.0 | 35.6 | 5.5x |
+| `focus` | 339.2 | 102.8 | 3.3x |
+| `click` | 165.5 | 78.4 | 2.1x |
+| `mouse` | 66.4 | 28.8 | 2.3x |
+| `screenshot` | 269.0 | 254.3 | 1.1x |
+
+Hyprland 0.56 (KDE içinde iç içe çalışan oturum):
+
+| İşlem | Python (ms) | Rust (ms) | Hızlanma |
+|---|---:|---:|---:|
+| `initialize` | 394.5 | 2.2 | 178x |
+| `apps` | 145.6 | 4.3 | 34x |
+| `activate_window` | 225.0 | 3.1 | 73x |
+| `tree` | 120.9 | 18.5 | 6.5x |
+| `find` | 75.9 | 16.1 | 4.7x |
+| `get_text` | 4.5 | 0.3 | 13x |
+| `key` | 60.5 | 19.2 | 3.1x |
+| `type_text` | 28.6 | 11.1 | 2.6x |
+| `focus` | 319.5 | 77.7 | 4.1x |
+| `click` | 168.7 | 78.0 | 2.2x |
+| `mouse` | 69.1 | 28.3 | 2.4x |
+| `screenshot` | 38.1 | 24.2 | 1.6x |
+
+Windows (Wine 11.20 içinde Not Defteri; gerçek Windows ölçümü değildir):
+
+| İşlem | Python (ms) | Rust (ms) | Hızlanma |
+|---|---:|---:|---:|
+| `initialize` | 1998.6 | 62.8 | 32x |
+| `apps` | 43.0 | 1.4 | 32x |
+| `activate_window` | 5.9 | 0.9 | 6.4x |
+| `key` | 54.8 | 19.3 | 2.8x |
+| `type_text` | 7.1 | 1.1 | 6.5x |
+| `mouse` | 55.6 | 30.5 | 1.8x |
+| `screenshot` | 82.3 | 8.3 | 9.9x |
+
+Wine'ın UI Automation istemcisi önbellek isteklerini, ağaç gezmeyi ve çoğu
+özelliği desteklemediği için (`E_NOTIMPL`) `tree`, `find`, `get_text`,
+`focus` ve `click` Wine'da iki sunucuda da çalışmaz; tablodaki `apps`
+ve `activate_window` pencere bulamadan dönen sürelerdir. Rust'ın Windows
+okuma kodu (bütün alt ağacı tek `BuildUpdatedCache` çağrısıyla alan UIA
+önbellek istekleri) derlenir ve birim testleri geçer ama henüz gerçek
+Windows'ta denenmemiştir. Girdi adımlarındaki farkın çoğu Rust'taki daha
+kısa beklemelerden gelir.
+
+Daha büyük ağaçlarda fark büyür: Dolphin'de gizliler dahil 2000 öğelik `tree`
+Python'da 507 ms, Rust'ta 48 ms. `screenshot` süresi çoğunlukla `spectacle`
+ve `grim` programlarının kendisidir.
+
+İç içe Hyprland'de uinput'tan gelen Ctrl/Alt'lı kısayollar dış KWin
+üzerinden geçerken kaybolur (iki sunucuda da); bu yüzden orada kısayol
+denemeleri yapılmadı. Gerçek bir Hyprland oturumunda uinput doğrudan
+Hyprland'e gider.
+
+### Kurulum
+
+Gereksinimler platformun kendi kurulumuyla aynıdır (PyGObject ve uv
+gerekmez), artı [Rust](https://rustup.rs/):
 
 ```bash
 cd kde-desktop-mcp/rust
@@ -123,8 +188,20 @@ cargo build --release
 claude mcp add --scope user desktop -- "$PWD/target/release/desktop-mcp"
 ```
 
-Rust sunucusu yalnızca KDE Plasma içindir; Hyprland ve Windows için Python
-sunucusunu kullanın.
+Windows'ta (PowerShell):
+
+```powershell
+cd kde-desktop-mcp\rust
+cargo build --release
+claude mcp add --scope user desktop -- "$PWD\target\release\desktop-mcp.exe"
+```
+
+Linux'ta Windows için derlemek de mümkündür (`mingw-w64-gcc` ve
+`rustup target add x86_64-pc-windows-gnu`, sonra
+`cargo build --release --target x86_64-pc-windows-gnu`).
+
+Masaüstü Python sunucusundaki gibi seçilir (`HYPRLAND_INSTANCE_SIGNATURE`
+varsa Hyprland, yoksa KDE; `DESKTOP_MCP_BACKEND` ile elle).
 
 ## Kurulum: Hyprland
 
@@ -187,6 +264,15 @@ yazar:
 ```bash
 (cd rust && cargo test --release)
 .venv/bin/python tools/mcp_smoke_test.py rust/target/release/desktop-mcp
+```
+
+`tools/mcp_bench.py` iki sunucuyu aynı çağrılarla ölçer ve medyan ms
+tablosu yazar (pencere açık olmalı):
+
+```bash
+.venv/bin/python tools/mcp_bench.py --app kate --window notes.txt \
+    --server "Python=.venv/bin/python server.py" \
+    --server "Rust=rust/target/release/desktop-mcp"
 ```
 
 ## Bilinen sınırlar
