@@ -302,6 +302,20 @@ impl Uia {
         unsafe { el.SetFocus() }.is_ok()
     }
 
+    /// Native handle of the element or its nearest ancestor that has one.
+    pub fn window_handle(&self, el: &IUIAutomationElement) -> Option<i32> {
+        let walker = unsafe { self.auto.RawViewWalker() }.ok()?;
+        let mut cur = el.clone();
+        for _ in 0..64 {
+            let h = unsafe { cur.CurrentNativeWindowHandle() }.map(|h| h.0 as usize as u32 as i32).unwrap_or(0);
+            if h != 0 {
+                return Some(h);
+            }
+            cur = unsafe { walker.GetParentElement(&cur) }.ok()?;
+        }
+        None
+    }
+
     pub fn bounds(&self, el: &IUIAutomationElement) -> Option<(i32, i32, i32, i32)> {
         let r = unsafe { el.CurrentBoundingRectangle() }.ok()?;
         Some((r.left, r.top, r.right, r.bottom))

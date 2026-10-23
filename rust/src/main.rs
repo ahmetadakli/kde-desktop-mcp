@@ -143,13 +143,17 @@ impl<B: Backend> Server<B> {
         rid
     }
 
-    async fn resolve(&self, rid: i64) -> R<B::Id> {
+    async fn resolve_with_app(&self, rid: i64) -> R<(B::Id, String)> {
         let found = self.refs.lock().await.map.get(&(rid as u64)).cloned();
         let (id, app) = found.ok_or_else(|| format!("unknown id {rid}; call tree/find again"))?;
         if !self.is_allowed(&app) {
             return Err(self.not_allowed(&app));
         }
-        Ok(id)
+        Ok((id, app))
+    }
+
+    async fn resolve(&self, rid: i64) -> R<B::Id> {
+        Ok(self.resolve_with_app(rid).await?.0)
     }
 
     async fn app_windows(&self, name: &str) -> R<Vec<B::Id>> {
@@ -209,8 +213,7 @@ impl<B: Backend> Server<B> {
         };
         let mut cache = Cache::new();
         let (header, roots, app) = if root_id != 0 {
-            let id = self.resolve(root_id).await?;
-            let app = self.refs.lock().await.map[&(root_id as u64)].1.clone();
+            let (id, app) = self.resolve_with_app(root_id).await?;
             let info = self.b.info(&id, TREE_TEXT_LIMIT).await;
             let rid = self.add_ref(&id, &app).await;
             let header = render::describe(&info, rid);
@@ -468,6 +471,9 @@ async fn serve<B: Backend>(backend: B) -> R<()> {
     }
     Ok(())
 }
+
+#[cfg(not(any(target_os = "linux", windows)))]
+compile_error!("desktop-mcp supports Linux (KDE Plasma, Hyprland) and Windows only");
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {

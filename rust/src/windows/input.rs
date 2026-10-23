@@ -1,9 +1,7 @@
 //! Win32 side of input and windows: SendInput, the cursor, the foreground
 //! window, process names and window screenshots.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Mutex;
 
 use windows::Win32::Foundation::{CloseHandle, GetLastError, HWND, RECT};
 use windows::Win32::Graphics::Gdi::{
@@ -21,8 +19,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
+    GA_ROOT, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
+    IsIconic, SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
 };
 use windows::core::PWSTR;
 
@@ -115,53 +113,45 @@ pub fn hwnd_from_i32(h: i32) -> HWND {
     HWND(h as isize as *mut core::ffi::c_void)
 }
 
-/// Restore if minimised, then take the foreground. Windows only lets a
-/// process take the foreground right after input; a bare Alt tap satisfies
-/// that rule.
-pub fn raise(h: HWND) -> R<()> {
+/// Top-level window that owns `h`.
+pub fn root(h: HWND) -> HWND {
+    unsafe { GetAncestor(h, GA_ROOT) }
+}
+
+/// Restore if minimised and ask for the foreground.
+pub fn set_foreground(h: HWND) {
     unsafe {
         if IsIconic(h).as_bool() {
             let _ = ShowWindow(h, SW_RESTORE);
         }
-    }
-    let alt = logic::VK_MENU;
-    send_keys(&[KeyEv { vk: alt, scan: 0, flags: 0 },
-                KeyEv { vk: alt, scan: 0, flags: logic::KEYEVENTF_KEYUP }])?;
-    unsafe {
         let _ = SetForegroundWindow(h);
     }
-    Ok(())
 }
 
-/// Executable stem per process id; process ids are reused rarely enough.
-#[derive(Default)]
-pub struct ProcNames(Mutex<HashMap<u32, String>>);
+/// A bare Alt tap: Windows only lets a process take the foreground right
+/// after input.
+pub fn alt_tap() -> R<()> {
+    let alt = logic::VK_MENU;
+    send_keys(&[KeyEv { vk: alt, scan: 0, flags: 0 },
+                KeyEv { vk: alt, scan: 0, flags: logic::KEYEVENTF_KEYUP }])
+}
 
-impl ProcNames {
-    pub fn name(&self, pid: u32) -> String {
-        if pid == 0 {
-            return String::new();
-        }
-        if let Some(n) = self.0.lock().unwrap().get(&pid) {
-            return n.clone();
-        }
-        let name = image_stem(pid);
-        let mut map = self.0.lock().unwrap();
-        if map.len() > 4096 {
-            map.clear();
-        }
-        map.insert(pid, name.clone());
-        name
+/// Executable stem of a process. Not cached: process ids are reused, and a
+/// stale name would let input through the allowlist.
+pub fn proc_name(pid: u32) -> String {
+    if pid == 0 {
+        return String::new();
     }
+    image_stem(pid)
+}
 
-    pub fn of_hwnd(&self, h: HWND) -> String {
-        if h.is_invalid() {
-            return String::new();
-        }
-        let mut pid = 0u32;
-        unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
-        self.name(pid)
+pub fn hwnd_proc_name(h: HWND) -> String {
+    if h.is_invalid() {
+        return String::new();
     }
+    let mut pid = 0u32;
+    unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
+    proc_name(pid)
 }
 
 fn image_stem(pid: u32) -> String {

@@ -19,7 +19,6 @@ use windows::Win32::UI::HiDpi::{
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 
 use crate::backend::{AppEntry, Backend, Cache, Info, R, WindowEntry};
-use input::ProcNames;
 use logic::Props;
 use uia::{Elem, Uia};
 
@@ -48,7 +47,6 @@ const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
 
 pub struct WindowsBackend {
     uia: Uia,
-    procs: ProcNames,
 }
 
 async fn poll(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
@@ -76,7 +74,7 @@ impl WindowsBackend {
             // Fails when already set (e.g. by a manifest); either way is fine.
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
         }
-        Ok(WindowsBackend { uia: Uia::new()?, procs: ProcNames::default() })
+        Ok(WindowsBackend { uia: Uia::new()? })
     }
 
     /// Info of an element whose properties (and, from a subtree request,
@@ -135,7 +133,7 @@ impl Backend for WindowsBackend {
         let fg = Self::foreground_i32();
         let mut apps: BTreeMap<String, Vec<WindowEntry>> = BTreeMap::new();
         for (_, p) in self.uia.top_level() {
-            let name = self.procs.name(p.pid);
+            let name = input::proc_name(p.pid);
             if name.is_empty() {
                 continue;
             }
@@ -151,14 +149,14 @@ impl Backend for WindowsBackend {
     async fn app_windows(&self, app: &str) -> Option<Vec<Elem>> {
         // UIA has no application object: group top-level windows by executable.
         let windows: Vec<Elem> = self.uia.top_level().into_iter()
-            .filter(|(_, p)| self.procs.name(p.pid) == app)
+            .filter(|(_, p)| input::proc_name(p.pid) == app)
             .map(|(e, _)| e)
             .collect();
         (!windows.is_empty()).then_some(windows)
     }
 
     async fn active_app(&self) -> String {
-        self.procs.of_hwnd(input::foreground())
+        input::hwnd_proc_name(input::foreground())
     }
 
     async fn info(&self, id: &Elem, text_limit: usize) -> Info<Elem> {
@@ -255,6 +253,13 @@ impl Backend for WindowsBackend {
     }
 
     async fn element_center(&self, id: &Elem) -> R<(i32, i32)> {
+        // Like the Linux backends: a click at a background element's
+        // coordinates would land on whatever window covers them.
+        if let Some(h) = self.uia.window_handle(&id.el)
+            && input::root(input::hwnd_from_i32(h)) != input::root(input::foreground())
+        {
+            return Err("element's window is not active; call activate_window first".into());
+        }
         self.uia.bounds(&id.el)
             .and_then(|(l, t, r, b)| logic::center(l, t, r, b))
             .ok_or_else(|| "element has no on-screen area".into())
@@ -301,14 +306,22 @@ impl Backend for WindowsBackend {
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()> {
         let q = query.to_lowercase();
         for (_, p) in self.uia.top_level() {
-            let app = self.procs.name(p.pid);
+            let app = input::proc_name(p.pid);
             if !allowed.contains(&app) {
                 continue;
             }
             if (p.name.to_lowercase().contains(&q) || app.contains(&q)) && p.hwnd != 0 {
                 let h = input::hwnd_from_i32(p.hwnd);
-                input::raise(h)?;
-                poll(ACTIVATE_WAIT, || input::foreground() == h).await;
+                input::set_foreground(h);
+                if !poll(FOCUS_WAIT, || input::foreground() == h).await {
+                    // Refused: retry after an Alt tap, but only send that
+                    // key to a foreground app on the allowlist.
+                    if allowed.contains(&input::hwnd_proc_name(input::foreground())) {
+                        input::alt_tap()?;
+                        input::set_foreground(h);
+                    }
+                    poll(ACTIVATE_WAIT, || input::foreground() == h).await;
+                }
                 return Ok(());
             }
         }

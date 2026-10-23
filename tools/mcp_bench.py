@@ -122,8 +122,7 @@ def one_round(cmd: str, app: str, window: str, query: str, roles: list[str],
         center = None
         if rid is not None:
             step("focus", id=rid)
-            step("click", id=rid)
-            center = re.search(r"at (\d+),(\d+)", c.call("click", id=rid)[1])
+            center = re.search(r"at (\d+),(\d+)", step("click", id=rid))
         if center:
             step("mouse", x=int(center.group(1)), y=int(center.group(2)), clicks=0)
         elif mouse_at:

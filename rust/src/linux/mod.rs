@@ -100,10 +100,16 @@ async fn wl_copy(text: &str) -> R<()> {
     Ok(())
 }
 
-fn temp_png() -> PathBuf {
+/// A new, empty file only this user can read, for a screenshot. Creating it
+/// exclusively means a planted file or symlink in /tmp makes this fail
+/// instead of being written through.
+fn temp_png() -> Option<PathBuf> {
+    use std::os::unix::fs::OpenOptionsExt;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
-    std::env::temp_dir().join(format!("desktop-mcp-{nanos}.png"))
+    let path = std::env::temp_dir().join(format!("desktop-mcp-{}-{nanos}.png", std::process::id()));
+    std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).ok()?;
+    Some(path)
 }
 
 impl LinuxBackend {
@@ -143,21 +149,23 @@ impl LinuxBackend {
 
     // ------------------------------------------------------------ Hyprland
 
-    async fn app_name_for_pid(&self, pid: i64) -> String {
+    /// AT-SPI app name per process id, from one registry scan; the first
+    /// app wins when a process registered several.
+    async fn app_names_by_pid(&self) -> HashMap<i64, String> {
+        let mut out = HashMap::new();
         for (app, name, _) in self.a11y.apps_with_windows().await {
-            if self.pid(&app.bus).await.map(i64::from) == Some(pid) {
-                return name;
+            if let Some(pid) = self.pid(&app.bus).await {
+                out.entry(i64::from(pid)).or_insert(name);
             }
         }
-        String::new()
+        out
     }
 
     /// Prefer the AT-SPI name so one allowlist works for every Linux
     /// backend; fall back to the window class for apps without accessibility.
-    async fn client_app_name(&self, client: &Json) -> String {
-        let by_pid = self.app_name_for_pid(client["pid"].as_i64().unwrap_or(-1)).await;
-        let name = if by_pid.is_empty() { client["class"].as_str().unwrap_or("").to_string() } else { by_pid };
-        name.to_lowercase()
+    fn client_app_name(names: &HashMap<i64, String>, client: &Json) -> String {
+        let by_pid = client["pid"].as_i64().and_then(|p| names.get(&p)).filter(|n| !n.is_empty());
+        by_pid.map(String::as_str).unwrap_or(client["class"].as_str().unwrap_or("")).to_lowercase()
     }
 
     async fn same_window(&self, frame: &Obj, client: &Json) -> bool {
@@ -263,7 +271,7 @@ impl Backend for LinuxBackend {
         match &self.comp {
             Compositor::Kde(_) => self.a11y.active_app().await,
             Compositor::Hyprland(h) => match h.active_window().await.ok().flatten() {
-                Some(c) => self.client_app_name(&c).await,
+                Some(c) => Self::client_app_name(&self.app_names_by_pid().await, &c),
                 None => String::new(),
             },
         }
@@ -434,12 +442,13 @@ impl Backend for LinuxBackend {
             }
             Compositor::Hyprland(h) => {
                 let q = query.to_lowercase();
-                let clients = h.json("clients").await?;
+                let (clients, names) = tokio::join!(h.json("clients"), self.app_names_by_pid());
+                let clients = clients?;
                 for c in clients.as_array().into_iter().flatten() {
                     if !c["mapped"].as_bool().unwrap_or(true) || c["hidden"].as_bool().unwrap_or(false) {
                         continue;
                     }
-                    let app = self.client_app_name(c).await;
+                    let app = Self::client_app_name(&names, c);
                     if !allowed.contains(&app) {
                         continue;
                     }
@@ -461,11 +470,11 @@ impl Backend for LinuxBackend {
     }
 
     async fn screenshot(&self) -> Option<String> {
-        let path = temp_png();
-        match &self.comp {
+        let mut cmd = match &self.comp {
             Compositor::Kde(_) => {
-                let _ = tokio::process::Command::new("spectacle")
-                    .args(["-b", "-n", "-a", "-o"]).arg(&path).output().await;
+                let mut c = tokio::process::Command::new("spectacle");
+                c.args(["-b", "-n", "-a", "-o"]);
+                c
             }
             Compositor::Hyprland(h) => {
                 let aw = h.active_window().await.ok().flatten()?;
@@ -473,13 +482,19 @@ impl Backend for LinuxBackend {
                     return None;
                 }
                 let geo = format!("{},{} {}x{}", aw["at"][0], aw["at"][1], aw["size"][0], aw["size"][1]);
-                let out = tokio::process::Command::new("grim").args(["-g", &geo]).arg(&path)
-                    .output().await.ok()?;
-                if !out.status.success() {
-                    return None;
-                }
+                let mut c = tokio::process::Command::new("grim");
+                c.args(["-g", &geo]);
+                c
             }
+        };
+        let path = temp_png()?;
+        let _ = cmd.arg(&path).output().await;
+        // The file exists from the start; it only counts once written.
+        if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
+            Some(path.display().to_string())
+        } else {
+            let _ = std::fs::remove_file(&path);
+            None
         }
-        path.exists().then(|| path.display().to_string())
     }
 }
