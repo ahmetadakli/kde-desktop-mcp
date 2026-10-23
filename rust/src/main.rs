@@ -12,6 +12,11 @@ mod render;
 mod tools;
 #[cfg(windows)]
 mod windows;
+// The Windows backend's pure helpers, so their tests also run on Linux.
+#[cfg(all(test, not(windows)))]
+#[path = "windows/logic.rs"]
+#[allow(dead_code)]
+mod windows_logic;
 
 use std::collections::HashMap;
 use std::future::Future;
