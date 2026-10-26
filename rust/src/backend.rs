@@ -29,6 +29,18 @@ pub struct Info<Id> {
 
 pub type Cache<Id> = HashMap<Id, Info<Id>>;
 
+/// The element holding keyboard focus, as `focus_note` reports it.
+#[derive(Clone, Debug)]
+pub struct Focused<Id> {
+    pub id: Id,
+    /// Role, name, states and actions only: no children or text.
+    pub info: Info<Id>,
+    /// Name of the app the element belongs to, read from that app itself
+    /// (not from the caller's earlier active-window check), so the caller
+    /// can check it against the allowlist and tag the id with it.
+    pub app: String,
+}
+
 /// Window management the desktop does not offer (only KDE does so far).
 pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma";
 
@@ -206,7 +218,8 @@ pub trait Backend {
     async fn set_text(&self, id: &Self::Id, text: &str) -> R<bool>;
     async fn is_focused(&self, id: &Self::Id) -> bool;
     /// The element holding keyboard focus now, when the backend tracks it.
-    async fn focused(&self) -> Option<Self::Id> {
+    /// Only an element whose app has the active window; None otherwise.
+    async fn focused(&self) -> Option<Focused<Self::Id>> {
         None
     }
     /// Focus without synthesising pointer input. Ok(Some(method)) when it
@@ -214,6 +227,11 @@ pub trait Backend {
     async fn try_focus(&self, id: &Self::Id) -> R<Option<String>>;
     /// Centre of the element in the coordinate space `pointer` accepts.
     async fn element_center(&self, id: &Self::Id) -> R<(i32, i32)>;
+    /// `element_center` of several elements at once (a drag's two ends), so
+    /// what they share (the active window's origin) is looked up once.
+    async fn element_centers(&self, ids: &[Self::Id]) -> Vec<R<(i32, i32)>> {
+        futures_util::future::join_all(ids.iter().map(|id| self.element_center(id))).await
+    }
 
     /// Check a chord such as "ctrl+s" without pressing it.
     fn check_combo(&self, combo: &str) -> R<()>;

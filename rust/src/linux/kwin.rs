@@ -19,7 +19,11 @@ use crate::backend::{R, Screen, WindowChange, WindowGeo};
 
 const SINK_PATH: &str = "/org/desktopmcp/sink";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
-const SCREEN_BOX_TTL: Duration = Duration::from_secs(5);
+/// How long the outputs' bounding box is reused for mapping pointer moves.
+/// Outputs rarely change, and every element-based pointer tool refreshes it
+/// for free (the active-window script reports it), so only `mouse` and
+/// `drag` by coordinates rely on it for this long after a monitor change.
+const SCREEN_BOX_TTL: Duration = Duration::from_secs(60);
 const SHOT_PATH: &str = "/org/kde/KWin/ScreenShot2";
 const SHOT_IFACE: &str = "org.kde.KWin.ScreenShot2";
 /// KWin 6.8 serves ScreenShot2 to any client on the session bus. Before
@@ -200,8 +204,9 @@ const SCREENS: &str = "JSON.stringify(workspace.screens.map(o => ({name: o.name,
      height: o.geometry.height, scale: o.devicePixelRatio})))";
 
 const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
-     const g = w.clientGeometry; return {x: g.x, y: g.y, width: g.width, \
-     height: g.height, caption: w.caption, cls: w.resourceClass}; })())";
+     const g = w.clientGeometry; const s = workspace.virtualScreenGeometry; \
+     return {x: g.x, y: g.y, width: g.width, height: g.height, caption: w.caption, \
+     cls: w.resourceClass, screen: {x: s.x, y: s.y, width: s.width, height: s.height}}; })())";
 
 const FRAME: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
      const g = w.frameGeometry; return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
@@ -346,6 +351,9 @@ impl KWin {
     pub async fn active_window_origin(&self) -> R<(f64, f64)> {
         let raw = self.query(GEOMETRY).await?.unwrap_or_default();
         let geo: Json = serde_json::from_str(&raw).unwrap_or(Json::Null);
+        if let Some(b) = screen_box_of(&geo["screen"]) {
+            *self.screen.lock().await = Some((Instant::now(), b));
+        }
         match (geo["x"].as_f64(), geo["y"].as_f64()) {
             (Some(x), Some(y)) => Ok((x, y)),
             _ => Err("could not read the active window geometry from KWin".into()),
@@ -518,11 +526,15 @@ impl KWin {
     /// script run instead of starting kscreen-doctor.
     async fn virtual_screen(&self) -> Option<ScreenBox> {
         let raw = self.query(VIRTUAL_SCREEN).await.ok()??;
-        let g: Json = serde_json::from_str(&raw).ok()?;
-        let (x, y) = (g["x"].as_f64()?, g["y"].as_f64()?);
-        let (w, h) = (g["width"].as_f64()?, g["height"].as_f64()?);
-        (w > 0.0 && h > 0.0).then_some((x as i32, y as i32, (x + w) as i32, (y + h) as i32))
+        screen_box_of(&serde_json::from_str(&raw).ok()?)
     }
+}
+
+/// (x0, y0, x1, y1) of a `{x, y, width, height}` rectangle with an area.
+fn screen_box_of(g: &Json) -> Option<ScreenBox> {
+    let (x, y) = (g["x"].as_f64()?, g["y"].as_f64()?);
+    let (w, h) = (g["width"].as_f64()?, g["height"].as_f64()?);
+    (w > 0.0 && h > 0.0).then_some((x as i32, y as i32, (x + w) as i32, (y + h) as i32))
 }
 
 fn window_js(query: &str, allow: &Allow) -> String {
