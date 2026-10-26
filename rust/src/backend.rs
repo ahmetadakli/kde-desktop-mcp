@@ -249,6 +249,12 @@ pub trait Backend {
     async fn full_text(&self, id: &Self::Id, limit: usize) -> R<String>;
     /// Replace the contents; Err when the element is not editable.
     async fn set_text(&self, id: &Self::Id, text: &str) -> R<bool>;
+    /// Names the application `id` belongs to for as long as it runs (Linux:
+    /// its AT-SPI bus name), so what was learnt about it (set_text writes
+    /// that do nothing) is reused; None when the backend has no such key.
+    fn app_key(&self, _id: &Self::Id) -> Option<String> {
+        None
+    }
     async fn is_focused(&self, id: &Self::Id) -> bool;
     /// The element holding keyboard focus now, when the backend tracks it.
     /// Only an element whose app has the active window; None otherwise.

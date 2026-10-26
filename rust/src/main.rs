@@ -20,7 +20,7 @@ mod windows;
 #[allow(dead_code)]
 mod windows_logic;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -129,6 +129,9 @@ struct Server<B: Backend> {
     /// Held by tools that send keyboard or pointer input, so two concurrent
     /// calls never interleave their events.
     input: Mutex<()>,
+    /// `app_key`s of apps whose accessibility text writes report success
+    /// and change nothing (Firefox); set_text types there right away.
+    inert_writes: Mutex<HashSet<String>>,
 }
 
 /// Tools that send keyboard or pointer input, run an app's actions (`act`
@@ -466,6 +469,7 @@ impl<B: Backend> Server<B> {
             last_active: Mutex::new(None),
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
+            inert_writes: Mutex::new(HashSet::new()),
         }
     }
 
@@ -1082,14 +1086,33 @@ impl<B: Backend> Server<B> {
         if self.b.info(&t.id, 0).await.role.contains("password") {
             return Ok(t.reply("ok (password field: contents cannot be read back)"));
         }
-        let mut how = "";
-        let mut seen = self.read_back(&t.id, &text).await;
         // Firefox reports success for accessibility writes and changes
         // nothing. Retype through the keyboard when the element takes focus;
         // never with a newline, which Enter would turn into a submit.
-        if matches!(&seen, Ok(Some(_))) && !text.contains('\n') && self.retype(&t.id, &text).await {
+        let retypable = !text.contains('\n');
+        let key = self.b.app_key(&t.id);
+        let inert = match &key {
+            Some(k) if retypable => self.inert_writes.lock().await.contains(k),
+            _ => false,
+        };
+        // Where writes are known to do nothing, one look instead of waiting
+        // SET_TEXT_VERIFY for the write to show.
+        let patience = if inert {
+            Duration::ZERO
+        } else {
+            SET_TEXT_VERIFY
+        };
+        let mut how = "";
+        let mut seen = self.read_back(&t.id, &text, patience).await;
+        if matches!(&seen, Ok(Some(_))) && retypable && self.retype(&t.id, &text).await {
             how = "; typed, the accessibility write had no effect";
-            seen = self.read_back(&t.id, &text).await;
+            seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+            if let (Ok(None), Some(k)) = (&seen, key) {
+                self.inert_writes.lock().await.insert(k);
+            }
+        } else if inert && matches!(&seen, Ok(Some(_))) {
+            // Could not retype: give the write its usual time after all.
+            seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
         }
         match seen {
             Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
@@ -1107,9 +1130,10 @@ impl<B: Backend> Server<B> {
         }
     }
 
-    /// Ok(None) once the element holds `text` (polled briefly, as some
-    /// toolkits apply a change a moment later), else Ok(Some(what it holds)).
-    async fn read_back(&self, id: &B::Id, text: &str) -> R<Option<String>> {
+    /// Ok(None) once the element holds `text` (polled for up to `patience`,
+    /// as some toolkits apply a change a moment later), else Ok(Some(what
+    /// it holds)).
+    async fn read_back(&self, id: &B::Id, text: &str, patience: Duration) -> R<Option<String>> {
         let limit = text.chars().count() + 64;
         let start = Instant::now();
         loop {
@@ -1117,7 +1141,7 @@ impl<B: Backend> Server<B> {
             if written_matches(text, &now) {
                 return Ok(None);
             }
-            if start.elapsed() >= SET_TEXT_VERIFY {
+            if start.elapsed() >= patience {
                 return Ok(Some(now));
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1482,7 +1506,7 @@ impl<B: Backend> Server<B> {
         if !self.b.set_text(&d.field, &text).await? {
             return Err("the file name field refused the path".into());
         }
-        if let Some(now) = self.read_back(&d.field, &text).await? {
+        if let Some(now) = self.read_back(&d.field, &text, SET_TEXT_VERIFY).await? {
             return Err(format!(
                 "the file name field holds {now:?} instead of the path; nothing was chosen"
             ));
@@ -1914,6 +1938,9 @@ mod tests {
         /// App the focused element belongs to.
         focus_app: Rc<RefCell<String>>,
         clipboard: RefCell<String>,
+        /// A text field like Firefox's when Some: accessibility writes do
+        /// nothing, typing replaces it, and it always has focus.
+        field: Rc<RefCell<Option<String>>>,
     }
 
     impl Backend for FakeBackend {
@@ -1964,13 +1991,20 @@ mod tests {
             Ok(true)
         }
         async fn full_text(&self, _: &u32, _: usize) -> R<String> {
-            Ok(String::new())
+            let field = self.field.borrow().clone();
+            if field.is_some() {
+                self.keys.borrow_mut().push("read".into());
+            }
+            Ok(field.unwrap_or_default())
         }
         async fn set_text(&self, _: &u32, _: &str) -> R<bool> {
             Ok(true)
         }
+        fn app_key(&self, _: &u32) -> Option<String> {
+            Some("fake".into())
+        }
         async fn is_focused(&self, _: &u32) -> bool {
-            false
+            self.field.borrow().is_some()
         }
         async fn try_focus(&self, _: &u32) -> R<Option<String>> {
             Ok(None)
@@ -1987,7 +2021,10 @@ mod tests {
             self.keys.borrow_mut().push(format!("up {combo}"));
             Ok(())
         }
-        async fn type_text(&self, _: &str) -> R<String> {
+        async fn type_text(&self, text: &str) -> R<String> {
+            if let Some(f) = self.field.borrow_mut().as_mut() {
+                *f = text.to_string();
+            }
             Ok(String::new())
         }
         async fn clipboard_get(&self, limit: usize) -> R<Clip> {
@@ -2047,6 +2084,7 @@ mod tests {
         keys: Rc<RefCell<Vec<String>>>,
         focus: Rc<RefCell<Info<u32>>>,
         focus_app: Rc<RefCell<String>>,
+        field: Rc<RefCell<Option<String>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -2065,12 +2103,14 @@ mod tests {
             ..Info::default()
         }));
         let focus_app = Rc::new(RefCell::new("fake".to_string()));
+        let field = Rc::new(RefCell::new(None));
         let server = Rc::new(Server::new(FakeBackend {
             allow_file,
             keys: keys.clone(),
             focus: focus.clone(),
             focus_app: focus_app.clone(),
             clipboard: RefCell::new(String::new()),
+            field: field.clone(),
         }));
         let (stdin, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, client_out) = tokio::io::duplex(64 * 1024);
@@ -2081,6 +2121,7 @@ mod tests {
             keys,
             focus,
             focus_app,
+            field,
         }
     }
 
@@ -2712,6 +2753,36 @@ mod tests {
             let id = focus_id(&mut s, 3).await;
             let r = call_tool(&mut s, 4, "act", json!({"id": id})).await;
             assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+        });
+    }
+
+    #[test]
+    fn set_text_types_right_away_where_writes_did_nothing_before() {
+        local(async {
+            let mut s = session("inert");
+            *s.field.borrow_mut() = Some("old".into());
+            let id = focus_id(&mut s, 2).await;
+            let reads = |s: &Session| s.keys.borrow().iter().filter(|k| *k == "read").count();
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "set_text", json!({"id": id, "text": "one"})).await;
+            let first = start.elapsed();
+            assert!(reply_text(&r).contains("ok (verified; typed"), "{r}");
+            assert!(first >= SET_TEXT_VERIFY, "{first:?}");
+            assert_eq!(s.field.borrow().as_deref(), Some("one"));
+            // Known now: one look at the field, then typing, then verified.
+            s.keys.borrow_mut().clear();
+            let start = Instant::now();
+            let r = call_tool(&mut s, 4, "set_text", json!({"id": id, "text": "two"})).await;
+            assert!(reply_text(&r).contains("ok (verified; typed"), "{r}");
+            assert!(start.elapsed() < SET_TEXT_VERIFY, "{:?}", start.elapsed());
+            assert_eq!(s.field.borrow().as_deref(), Some("two"));
+            assert_eq!(reads(&s), 2, "{:?}", s.keys.borrow());
+            // Text with a newline is never retyped: the usual wait, unchanged.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 5, "set_text", json!({"id": id, "text": "a\nb"})).await;
+            assert!(r.to_string().contains("the field now holds"), "{r}");
+            assert!(start.elapsed() >= SET_TEXT_VERIFY);
+            assert_eq!(s.field.borrow().as_deref(), Some("two"));
         });
     }
 

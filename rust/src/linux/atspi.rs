@@ -27,8 +27,36 @@ const NULL_PATH: &str = "/org/a11y/atspi/null";
 /// handler, a hung process) must not freeze the whole server, since every
 /// later request queues behind the stuck one.
 const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-/// How long `do_action` waits for an action's reply; see there.
+/// How long `do_action` waits for an action's reply at most; see there.
 const ACTION_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
+/// How long `do_action` still waits for the reply once the app signalled
+/// that the action took effect: a handler that returns replies within a
+/// few ms of its last event; one that went into a modal loop never does.
+const EFFECT_GRACE: std::time::Duration = std::time::Duration::from_millis(25);
+/// Events that show an action did something without its reply: a menu or
+/// popup shown, a window (dialog) created or activated. Focus changes,
+/// which `track_focus` listens to, count too. (event, interface, member,
+/// first argument)
+const EFFECT_EVENTS: [(&str, &str, &str, Option<&str>); 3] = [
+    (
+        "object:state-changed:showing",
+        "org.a11y.atspi.Event.Object",
+        "StateChanged",
+        Some("showing"),
+    ),
+    (
+        "window:activate",
+        "org.a11y.atspi.Event.Window",
+        "Activate",
+        None,
+    ),
+    (
+        "window:create",
+        "org.a11y.atspi.Event.Window",
+        "Create",
+        None,
+    ),
+];
 /// Requests kept in flight at once; well under the bus' pending-reply limit.
 const IN_FLIGHT: usize = 512;
 /// How long an app's overlay viewport (its largest window) is reused: one
@@ -117,6 +145,9 @@ pub struct A11y {
     active_bus: Mutex<Option<(Arc<str>, Instant)>>,
     /// Overlay viewport per application bus, and when it was measured.
     views: tokio::sync::Mutex<HashMap<Arc<str>, (Instant, Viewport)>>,
+    /// Bus names of apps that just sent one of EFFECT_EVENTS or a focus
+    /// change; only fed while a `do_action` listens.
+    effects: tokio::sync::broadcast::Sender<Arc<str>>,
 }
 
 impl A11y {
@@ -143,6 +174,7 @@ impl A11y {
             focus_hint: Mutex::new(None),
             active_bus: Mutex::new(None),
             views: tokio::sync::Mutex::new(HashMap::new()),
+            effects: tokio::sync::broadcast::channel(64).0,
         })
     }
 
@@ -242,20 +274,77 @@ impl A11y {
     /// registered for), and keep `focus_hint` current from them. The
     /// registration ends with this connection.
     pub async fn track_focus(self: &Arc<Self>) -> R<()> {
+        self.listen(
+            "object:state-changed:focused",
+            "org.a11y.atspi.Event.Object",
+            "StateChanged",
+            Some("focused"),
+            |a11y, sender, path, msg| {
+                a11y.note_effect(sender);
+                let gained = msg
+                    .body()
+                    .deserialize::<(String, i32, i32, OwnedValue)>()
+                    .map(|(_, d1, _, _)| d1)
+                    .or_else(|_| {
+                        msg.body()
+                            .deserialize::<(
+                                String,
+                                i32,
+                                i32,
+                                OwnedValue,
+                                HashMap<String, OwnedValue>,
+                            )>()
+                            .map(|(_, d1, _, _, _)| d1)
+                    });
+                if gained == Ok(1) {
+                    a11y.note_focus(Obj::new(sender, path.clone().into()));
+                }
+            },
+        )
+        .await
+    }
+
+    /// Listen for EFFECT_EVENTS, so `do_action` can tell an action that
+    /// opened a menu or dialog (and has not replied) from one still
+    /// running. One registration per event for the connection's lifetime:
+    /// registering per action would race the app learning of it.
+    pub async fn track_actions(self: &Arc<Self>) -> R<()> {
+        let all = EFFECT_EVENTS.map(|(event, iface, member, arg0)| {
+            self.listen(event, iface, member, arg0, |a11y, sender, _, _| {
+                a11y.note_effect(sender)
+            })
+        });
+        futures_util::future::join_all(all)
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// Register `event` with the AT-SPI registry and run `on` (with the
+    /// sender's bus name and the object path) for each matching signal,
+    /// until this A11y is dropped. The registration ends with the connection.
+    async fn listen(
+        self: &Arc<Self>,
+        event: &str,
+        iface: &str,
+        member: &str,
+        arg0: Option<&str>,
+        on: impl Fn(&A11y, &str, &zbus::zvariant::ObjectPath<'_>, &zbus::Message) + Send + 'static,
+    ) -> R<()> {
         use futures_util::StreamExt;
-        let rule = zbus::MatchRule::builder()
+        let mut rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
-            .interface("org.a11y.atspi.Event.Object")
+            .interface(iface)
             .map_err(err)?
-            .member("StateChanged")
-            .map_err(err)?
-            .add_arg("focused")
-            .map_err(err)?
-            .build();
-        let mut stream = zbus::MessageStream::for_match_rule(rule, &self.conn, Some(256))
+            .member(member)
+            .map_err(err)?;
+        if let Some(arg) = arg0 {
+            rule = rule.add_arg(arg).map_err(err)?;
+        }
+        let mut stream = zbus::MessageStream::for_match_rule(rule.build(), &self.conn, Some(256))
             .await
             .map_err(err)?;
-        let args = ("object:state-changed:focused", Vec::<String>::new(), "");
+        let args = (event, Vec::<String>::new(), "");
         let register = self.conn.call_method(
             Some("org.a11y.atspi.Registry"),
             "/org/a11y/atspi/registry",
@@ -272,20 +361,18 @@ impl A11y {
             while let Some(Ok(msg)) = stream.next().await {
                 let Some(a11y) = me.upgrade() else { break };
                 let header = msg.header();
-                let (Some(sender), Some(path)) = (header.sender(), header.path()) else {
-                    continue;
-                };
-                let gained = msg.body().deserialize::<(String, i32, i32, OwnedValue)>()
-                    .map(|(_, d1, _, _)| d1)
-                    .or_else(|_| msg.body()
-                        .deserialize::<(String, i32, i32, OwnedValue, HashMap<String, OwnedValue>)>()
-                        .map(|(_, d1, _, _, _)| d1));
-                if gained == Ok(1) {
-                    a11y.note_focus(Obj::new(sender.as_str(), path.clone().into()));
+                if let (Some(sender), Some(path)) = (header.sender(), header.path()) {
+                    on(&a11y, sender.as_str(), path, &msg);
                 }
             }
         });
         Ok(())
+    }
+
+    fn note_effect(&self, bus: &str) {
+        if self.effects.receiver_count() > 0 {
+            let _ = self.effects.send(bus.into());
+        }
     }
 
     /// Toolkit of the application owning `bus` ("Qt", "GTK", "Gecko", ...).
@@ -350,19 +437,17 @@ impl A11y {
 
     /// Run action `index`. Some toolkits answer only once the action is
     /// over: Qt runs a menu button's QMenu::exec() inside the DoAction
-    /// handler, so the reply comes when the menu closes. Without a reply
-    /// within ACTION_WAIT the action counts as sent (the menu or dialog it
-    /// opened is the expected result) and the late reply is dropped.
+    /// handler, so the reply comes when the menu closes. Such an action
+    /// counts as sent (the menu or dialog it opened is the expected result)
+    /// once the app signals an effect (EFFECT_EVENTS, focus) and EFFECT_GRACE
+    /// passes without a reply, or after ACTION_WAIT without either. The
+    /// late reply is dropped.
     pub async fn do_action(&self, o: &Obj, index: i32) -> R<bool> {
-        match tokio::time::timeout(
-            ACTION_WAIT,
-            self.call(o, "org.a11y.atspi.Action", "DoAction", &(index,)),
-        )
-        .await
-        {
-            Ok(done) => done,
-            Err(_) => Ok(true),
-        }
+        // Subscribed before the call is sent, so no effect is missed.
+        let effects = self.effects.subscribe();
+        let args = (index,);
+        let reply = self.call(o, "org.a11y.atspi.Action", "DoAction", &args);
+        await_action(reply, effects, &o.bus, ACTION_WAIT, EFFECT_GRACE).await
     }
 
     /// Up to `limit` characters of the Text interface, or None without it.
@@ -739,6 +824,36 @@ pub async fn enable(session: &Connection) {
         .await;
 }
 
+/// The reply of an action, or Ok(true) once it is overdue: `grace` after
+/// `effects` named `bus`, or after `wait` in any case.
+async fn await_action(
+    reply: impl std::future::Future<Output = R<bool>>,
+    mut effects: tokio::sync::broadcast::Receiver<Arc<str>>,
+    bus: &str,
+    wait: std::time::Duration,
+    grace: std::time::Duration,
+) -> R<bool> {
+    use tokio::sync::broadcast::error::RecvError;
+    let deadline = tokio::time::Instant::now() + wait;
+    let mut reply = std::pin::pin!(reply);
+    let mut listening = true;
+    loop {
+        tokio::select! {
+            done = &mut reply => return done,
+            ev = effects.recv(), if listening => match ev {
+                Ok(from) if *from == *bus => break,
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => listening = false,
+            },
+            _ = tokio::time::sleep_until(deadline) => return Ok(true),
+        }
+    }
+    let until = (tokio::time::Instant::now() + grace).min(deadline);
+    tokio::time::timeout_at(until, reply)
+        .await
+        .unwrap_or(Ok(true))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -753,6 +868,68 @@ mod tests {
         assert!(!overlaps((0, -200, 300, 40), window));
         assert!(!overlaps((10, 10, 0, 40), window));
         assert!(!overlaps((-1, -1, -1, -1), window));
+    }
+
+    /// `await_action` on a reply that comes after `reply_ms` with `value`,
+    /// while `effect` (bus, after ms) is sent: (result, elapsed ms).
+    fn run_action(reply_ms: u64, value: bool, effect: Option<(&str, u64)>) -> (R<bool>, u128) {
+        use std::time::Duration;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let (tx, rx) = tokio::sync::broadcast::channel::<Arc<str>>(8);
+            if let Some((bus, ms)) = effect {
+                let bus: Arc<str> = bus.into();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    let _ = tx.send(bus);
+                    // Keep the sender alive past the wait.
+                    tokio::time::sleep(Duration::from_secs(2)).await;
+                });
+            }
+            let reply = async move {
+                tokio::time::sleep(Duration::from_millis(reply_ms)).await;
+                Ok(value)
+            };
+            let start = std::time::Instant::now();
+            let out = await_action(
+                reply,
+                rx,
+                ":1.42",
+                Duration::from_millis(400),
+                Duration::from_millis(25),
+            )
+            .await;
+            (out, start.elapsed().as_millis())
+        })
+    }
+
+    #[test]
+    fn a_quick_reply_is_returned_as_is() {
+        let (out, ms) = run_action(5, false, None);
+        assert_eq!(out, Ok(false));
+        assert!(ms < 100, "{ms} ms");
+        // An effect does not cut a reply that follows within the grace.
+        let (out, _) = run_action(15, false, Some((":1.42", 5)));
+        assert_eq!(out, Ok(false));
+    }
+
+    #[test]
+    fn an_effect_of_the_target_app_ends_the_wait_after_a_grace() {
+        // A menu opened (reply only when it closes): sent after the grace.
+        let (out, ms) = run_action(5000, false, Some((":1.42", 10)));
+        assert_eq!(out, Ok(true));
+        assert!((30..200).contains(&ms), "{ms} ms");
+        // Events of other apps do not count: the full wait.
+        let (out, ms) = run_action(5000, false, Some((":1.7", 10)));
+        assert_eq!(out, Ok(true));
+        assert!(ms >= 390, "{ms} ms");
+        // Nobody listening at all: the full wait, too.
+        let (out, ms) = run_action(5000, false, None);
+        assert_eq!(out, Ok(true));
+        assert!(ms >= 390, "{ms} ms");
     }
 
     #[test]

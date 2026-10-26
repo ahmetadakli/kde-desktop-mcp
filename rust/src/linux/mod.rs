@@ -102,17 +102,51 @@ enum FocusMethod {
     SetFocusAction,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Tried {
-    failed: bool,
-    worked: bool,
+/// Failures in a row of a focus method, on elements of one role in one app,
+/// after which `try_focus` skips it there (Qt widgets mostly ignore both
+/// methods, and each try costs a poll).
+const FOCUS_FAILS_TO_SKIP: u32 = 2;
+/// Skips after which a skipped method is tried once more, so an app or
+/// role where it works again gets it back.
+const FOCUS_RETRY_AFTER: u32 = 8;
+
+/// What each `try_focus` method did so far, per (app bus, role). Keyed by
+/// role, so one element that cannot take focus (a label, a disabled row)
+/// does not turn a method off for the whole app.
+#[derive(Default)]
+struct FocusRecord {
+    map: HashMap<(String, String, FocusMethod), Tried>,
 }
 
-impl Tried {
-    /// Skip a method that failed in this app and never worked there (Qt
-    /// widgets mostly ignore both, and each try costs a poll).
-    fn skip(self) -> bool {
-        self.failed && !self.worked
+#[derive(Clone, Copy, Debug, Default)]
+struct Tried {
+    /// Failures since the last success.
+    fails: u32,
+    /// Tries skipped since the last one made.
+    skipped: u32,
+}
+
+impl FocusRecord {
+    /// Whether to try `m` on an element of `role` in the app on `bus`;
+    /// counts a skip when not.
+    fn should_try(&mut self, bus: &str, role: &str, m: FocusMethod) -> bool {
+        let Some(t) = self.map.get_mut(&(bus.to_string(), role.to_string(), m)) else {
+            return true;
+        };
+        if t.fails < FOCUS_FAILS_TO_SKIP || t.skipped >= FOCUS_RETRY_AFTER {
+            t.skipped = 0;
+            return true;
+        }
+        t.skipped += 1;
+        false
+    }
+
+    fn note(&mut self, bus: &str, role: &str, m: FocusMethod, worked: bool) {
+        let t = self
+            .map
+            .entry((bus.to_string(), role.to_string(), m))
+            .or_default();
+        t.fails = if worked { 0 } else { t.fails.saturating_add(1) };
     }
 }
 
@@ -130,8 +164,8 @@ pub struct LinuxBackend {
     pids: Mutex<HashMap<String, Option<u32>>>,
     /// Toolkit name per AT-SPI bus name.
     toolkits: Mutex<HashMap<String, String>>,
-    /// What each `try_focus` method did so far, per AT-SPI bus name.
-    focus_record: Mutex<HashMap<(String, FocusMethod), Tried>>,
+    /// What each `try_focus` method did so far, per AT-SPI bus and role.
+    focus_record: Mutex<FocusRecord>,
     /// KWin refused ScreenShot2; use spectacle from now on.
     shot_unauthorized: AtomicBool,
     indicator: tokio::sync::Mutex<IndicatorProc>,
@@ -438,10 +472,14 @@ impl LinuxBackend {
             None => Compositor::Kde(KWin::new(session.clone()).await?),
         };
         let absolute = matches!(comp, Compositor::Kde(_));
-        if absolute {
-            // Without it `type_text` falls back to pasting more often.
-            let _ = a11y.track_focus().await;
-        }
+        let focus = async {
+            if absolute {
+                // Without it `type_text` falls back to pasting more often.
+                let _ = a11y.track_focus().await;
+            }
+        };
+        // Lets `act` return as soon as a menu or dialog opened.
+        let _ = tokio::join!(focus, a11y.track_actions());
         Ok(LinuxBackend {
             session,
             a11y,
@@ -449,7 +487,7 @@ impl LinuxBackend {
             input: Arc::new(Input::new(absolute)),
             pids: Mutex::new(HashMap::new()),
             toolkits: Mutex::new(HashMap::new()),
-            focus_record: Mutex::new(HashMap::new()),
+            focus_record: Mutex::new(FocusRecord::default()),
             shot_unauthorized: AtomicBool::new(false),
             indicator: tokio::sync::Mutex::new(IndicatorProc::default()),
         })
@@ -521,23 +559,18 @@ impl LinuxBackend {
 
     // ------------------------------------------------------------ focus
 
-    fn focus_tried(&self, id: &Obj, m: FocusMethod) -> Tried {
+    fn focus_should_try(&self, id: &Obj, role: &str, m: FocusMethod) -> bool {
         self.focus_record
             .lock()
             .unwrap()
-            .get(&(id.bus.to_string(), m))
-            .copied()
-            .unwrap_or_default()
+            .should_try(&id.bus, role, m)
     }
 
-    fn focus_note(&self, id: &Obj, m: FocusMethod, worked: bool) {
-        let mut rec = self.focus_record.lock().unwrap();
-        let t = rec.entry((id.bus.to_string(), m)).or_default();
-        if worked {
-            t.worked = true;
-        } else {
-            t.failed = true;
-        }
+    fn focus_note(&self, id: &Obj, role: &str, m: FocusMethod, worked: bool) {
+        self.focus_record
+            .lock()
+            .unwrap()
+            .note(&id.bus, role, m, worked);
     }
 
     // ------------------------------------------------------------ KDE
@@ -898,6 +931,11 @@ impl Backend for LinuxBackend {
         self.a11y.set_text(id, text).await
     }
 
+    fn app_key(&self, id: &Obj) -> Option<String> {
+        // A unique connection name, never reused for another process.
+        Some(id.bus.to_string())
+    }
+
     async fn focused(&self) -> Option<Focused<Obj>> {
         // Focus events keep the hint current; check it still holds focus,
         // and that its own app has the active window. The app's name comes
@@ -950,14 +988,18 @@ impl Backend for LinuxBackend {
     async fn try_focus(&self, id: &Obj) -> R<Option<String>> {
         // Qt only honours GrabFocus when the element exposes a "Set Focus"
         // action, so try both before the caller falls back to a click.
-        let (ifaces, actions) = tokio::join!(self.a11y.interfaces(id), self.a11y.actions(id));
+        let (ifaces, actions, role) = tokio::join!(
+            self.a11y.interfaces(id),
+            self.a11y.actions(id),
+            self.a11y.role(id)
+        );
         if !ifaces.iter().any(|i| i == "org.a11y.atspi.Component") {
             return Err("element cannot take focus".into());
         }
         let wait = FOCUS_POLL;
-        if !self.focus_tried(id, FocusMethod::GrabFocus).skip() {
+        if self.focus_should_try(id, &role, FocusMethod::GrabFocus) {
             let ok = self.a11y.grab_focus(id).await && poll(wait, || self.is_focused(id)).await;
-            self.focus_note(id, FocusMethod::GrabFocus, ok);
+            self.focus_note(id, &role, FocusMethod::GrabFocus, ok);
             if ok {
                 return Ok(Some("grab_focus".into()));
             }
@@ -967,11 +1009,11 @@ impl Backend for LinuxBackend {
             .map(|n| n.to_lowercase().replace(' ', ""))
             .collect();
         if let Some(i) = names.iter().position(|n| n == "setfocus")
-            && !self.focus_tried(id, FocusMethod::SetFocusAction).skip()
+            && self.focus_should_try(id, &role, FocusMethod::SetFocusAction)
         {
             let _ = self.a11y.do_action(id, i as i32).await;
             let ok = poll(wait, || self.is_focused(id)).await;
-            self.focus_note(id, FocusMethod::SetFocusAction, ok);
+            self.focus_note(id, &role, FocusMethod::SetFocusAction, ok);
             if ok {
                 return Ok(Some("set focus action".into()));
             }
@@ -1554,6 +1596,47 @@ impl Backend for LinuxBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn one_unfocusable_element_does_not_turn_focus_off_for_the_app() {
+        let g = FocusMethod::GrabFocus;
+        let mut rec = FocusRecord::default();
+        assert!(rec.should_try(":1.5", "label", g));
+        rec.note(":1.5", "label", g, false);
+        // Other roles in the app, and a second try on the role, still go.
+        assert!(rec.should_try(":1.5", "push button", g));
+        assert!(rec.should_try(":1.5", "label", g));
+        rec.note(":1.5", "label", g, false);
+        // Failed twice in a row on labels there: skipped, for labels only,
+        // in that app only, for that method only.
+        assert!(!rec.should_try(":1.5", "label", g));
+        assert!(rec.should_try(":1.5", "text", g));
+        assert!(rec.should_try(":1.9", "label", g));
+        assert!(rec.should_try(":1.5", "label", FocusMethod::SetFocusAction));
+    }
+
+    #[test]
+    fn a_skipped_focus_method_is_retried_and_a_success_restores_it() {
+        let g = FocusMethod::GrabFocus;
+        let mut rec = FocusRecord::default();
+        rec.note(":1.5", "text", g, false);
+        rec.note(":1.5", "text", g, false);
+        for _ in 0..FOCUS_RETRY_AFTER {
+            assert!(!rec.should_try(":1.5", "text", g));
+        }
+        // The probe after the skips; it works, so the method is back.
+        assert!(rec.should_try(":1.5", "text", g));
+        rec.note(":1.5", "text", g, true);
+        assert!(rec.should_try(":1.5", "text", g));
+        rec.note(":1.5", "text", g, false);
+        assert!(
+            rec.should_try(":1.5", "text", g),
+            "one failure after a success"
+        );
+        // A failed probe keeps it skipped.
+        rec.note(":1.5", "text", g, false);
+        assert!(!rec.should_try(":1.5", "text", g));
+    }
 
     #[test]
     fn file_dialog_parts_are_matched_by_qt_ids() {
