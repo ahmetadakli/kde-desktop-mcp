@@ -58,7 +58,8 @@ Window and tab titles (frame, window, page tab) count only when nothing else mat
 - batch runs steps in one round trip: use it whenever later steps don't depend on reading a \
 result. Start it with activate_window when key/type_text/click/mouse input must reach an app. \
 Mark waits \"optional\": true and end with an observation step (find, get_text, screenshot) so \
-one failure doesn't cost a turn. Ids printed inside a batch can't be used in it; use app + query.
+one failure doesn't cost a turn. A later step's `id` (or root_id/from_id/to_id) may be \"$N\": \
+the element step N found or acted on (find: its first hit).
 - pause for a fixed wait; wait_for only for something that visibly appears or goes away \
 (gone=true), never a query that can't match as a sleep.
 - screenshot is a last resort; the image comes back inline (don't Read the file). To click \
@@ -299,7 +300,7 @@ pub fn tools() -> Json {
         ),
         t(
             "batch",
-            "Run tool calls in order in one round trip; prefer it whenever later steps\ndon't depend on reading a result. `steps` is a list of\n{\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.\n[{\"tool\": \"activate_window\", \"args\": {\"query\": \"Kate\"}},\n {\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+o\"}},\n {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},\n {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].\nStops at the first failing step unless it is `optional`: then it is reported\nas failed (optional) and the rest still runs. Mark waits optional and end\nwith an observation step (find, get_text, screenshot). Start with\nactivate_window when input goes to an app. Ids from earlier tree/find work;\nids printed inside the same batch don't, but `app` + `query` targets do.",
+            "Run tool calls in order in one round trip; prefer it whenever later steps\ndon't depend on reading a result. `steps` is a list of\n{\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.\n[{\"tool\": \"activate_window\", \"args\": {\"query\": \"Kate\"}},\n {\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+o\"}},\n {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},\n {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].\nStops at the first failing step unless it is `optional`: then it is reported\nas failed (optional) and the rest still runs. Mark waits optional and end\nwith an observation step (find, get_text, screenshot). Start with\nactivate_window when input goes to an app. Ids from earlier tree/find work.\nAn `id`/`*_id` arg of \"$N\" is the element step N produced: find's first\nhit, wait_for's match, the target of act/click/focus/get_text/set_text/\nscroll, else the focus key/type_text report; e.g. {\"tool\": \"act\",\n\"args\": {\"id\": \"$4\"}}. Input steps of one batch never interleave with\nanother call's.",
             batch_schema
         ),
     ]);
