@@ -142,6 +142,23 @@ fn written_matches(written: &str, now: &str) -> bool {
     norm(written) == norm(now)
 }
 
+/// What the on-screen indicator says while a tool runs; None for tools that
+/// only read.
+fn indicator_label(tool: &str, a: &Json) -> Option<String> {
+    Some(match tool {
+        "click" | "act" => "clicking".into(),
+        "focus" => "focusing".into(),
+        "key" => format!("pressing {}", arg_s(a, "combo", "a key")),
+        "type_text" | "set_text" => "typing".into(),
+        "mouse" => "using the mouse".into(),
+        "drag" => "dragging".into(),
+        "scroll" => "scrolling".into(),
+        "activate_window" => "switching windows".into(),
+        "move_window" => "arranging windows".into(),
+        _ => return None,
+    })
+}
+
 /// How long move_window waits for a window to take its new geometry.
 const WINDOW_SETTLE: Duration = Duration::from_millis(1000);
 
@@ -1186,6 +1203,9 @@ impl<B: Backend> Server<B> {
             } else {
                 None
             };
+            if let Some(label) = indicator_label(name, a) {
+                self.b.indicate(&label).await;
+            }
             match name {
                 "apps" => self.apps().await.map(Out::from),
                 "tree" => self.tree(a).await.map(Out::from),
@@ -1413,6 +1433,14 @@ compile_error!("desktop-mcp supports Linux (KDE Plasma, Hyprland) and Windows on
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("--indicator") {
+        if let Err(e) = linux::indicator::run() {
+            eprintln!("desktop-mcp indicator: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Tool calls run as local tasks: the backends are not `Send`.
     let local = tokio::task::LocalSet::new();
     #[cfg(target_os = "linux")]

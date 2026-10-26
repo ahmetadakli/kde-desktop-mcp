@@ -186,6 +186,9 @@ pub trait Backend {
     async fn screens(&self) -> Vec<Screen> {
         Vec::new()
     }
+    /// Show what the agent is doing on screen, when the desktop has an
+    /// indicator.
+    async fn indicate(&self, _label: &str) {}
     /// Platform checks for `doctor`.
     async fn doctor(&self) -> Vec<Check> {
         Vec::new()
