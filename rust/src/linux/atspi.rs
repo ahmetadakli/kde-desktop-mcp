@@ -59,7 +59,10 @@ pub struct Obj {
 
 impl Obj {
     pub fn new(bus: &str, path: OwnedObjectPath) -> Self {
-        Obj { bus: bus.into(), path }
+        Obj {
+            bus: bus.into(),
+            path,
+        }
     }
 }
 
@@ -101,8 +104,13 @@ impl A11y {
     pub async fn connect(session: &Connection) -> R<Self> {
         enable(session).await;
         let reply = session
-            .call_method(Some("org.a11y.Bus"), "/org/a11y/bus", Some("org.a11y.Bus"),
-                         "GetAddress", &())
+            .call_method(
+                Some("org.a11y.Bus"),
+                "/org/a11y/bus",
+                Some("org.a11y.Bus"),
+                "GetAddress",
+                &(),
+            )
             .await
             .map_err(|e| format!("accessibility bus unavailable: {e}"))?;
         let addr: String = reply.body().deserialize().map_err(err)?;
@@ -111,17 +119,31 @@ impl A11y {
             .build()
             .await
             .map_err(|e| format!("cannot connect to the accessibility bus: {e}"))?;
-        Ok(A11y { conn, focus_hint: Mutex::new(None), active_bus: Mutex::new(None) })
+        Ok(A11y {
+            conn,
+            focus_hint: Mutex::new(None),
+            active_bus: Mutex::new(None),
+        })
     }
 
-    async fn call<T>(&self, o: &Obj, iface: &str, method: &str,
-                     args: &(impl serde::Serialize + zbus::zvariant::DynamicType)) -> R<T>
+    async fn call<T>(
+        &self,
+        o: &Obj,
+        iface: &str,
+        method: &str,
+        args: &(impl serde::Serialize + zbus::zvariant::DynamicType),
+    ) -> R<T>
     where
         T: for<'d> serde::Deserialize<'d> + zbus::zvariant::Type,
     {
-        let reply = self.conn.call_method(Some(o.bus.as_ref()), &o.path, Some(iface), method, args);
-        let reply = tokio::time::timeout(CALL_TIMEOUT, reply).await
-            .map_err(|_| format!("{method}: no reply from the application within {CALL_TIMEOUT:?}"))?
+        let reply = self
+            .conn
+            .call_method(Some(o.bus.as_ref()), &o.path, Some(iface), method, args);
+        let reply = tokio::time::timeout(CALL_TIMEOUT, reply)
+            .await
+            .map_err(|_| {
+                format!("{method}: no reply from the application within {CALL_TIMEOUT:?}")
+            })?
             .map_err(err)?;
         reply.body().deserialize().map_err(err)
     }
@@ -142,14 +164,22 @@ impl A11y {
             Ok(r) if r != roles::EXTENDED && (r as usize) < roles::NAMES.len() => {
                 roles::NAMES[r as usize].to_string()
             }
-            _ => self.call(o, ACC, "GetRoleName", &()).await.unwrap_or_default(),
+            _ => self
+                .call(o, ACC, "GetRoleName", &())
+                .await
+                .unwrap_or_default(),
         }
     }
 
     pub async fn states(&self, o: &Obj) -> Option<u64> {
         let words = self.call::<Vec<u32>>(o, ACC, "GetState", &()).await.ok()?;
-        Some(words.iter().take(2).enumerate()
-            .fold(0, |acc, (i, w)| acc | (u64::from(*w) << (32 * i))))
+        Some(
+            words
+                .iter()
+                .take(2)
+                .enumerate()
+                .fold(0, |acc, (i, w)| acc | (u64::from(*w) << (32 * i))),
+        )
     }
 
     pub async fn has_state(&self, o: &Obj, state: u32) -> bool {
@@ -175,7 +205,8 @@ impl A11y {
     /// Bus of the app `active_app` found in front, if it looked within `max_age`.
     pub fn recent_active_bus(&self, max_age: std::time::Duration) -> Option<Arc<str>> {
         let seen = self.active_bus.lock().unwrap().clone();
-        seen.filter(|(_, at)| at.elapsed() <= max_age).map(|(bus, _)| bus)
+        seen.filter(|(_, at)| at.elapsed() <= max_age)
+            .map(|(bus, _)| bus)
     }
 
     /// Ask toolkits to emit focus changes (Qt only sends events someone
@@ -185,24 +216,36 @@ impl A11y {
         use futures_util::StreamExt;
         let rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
-            .interface("org.a11y.atspi.Event.Object").map_err(err)?
-            .member("StateChanged").map_err(err)?
-            .add_arg("focused").map_err(err)?
+            .interface("org.a11y.atspi.Event.Object")
+            .map_err(err)?
+            .member("StateChanged")
+            .map_err(err)?
+            .add_arg("focused")
+            .map_err(err)?
             .build();
         let mut stream = zbus::MessageStream::for_match_rule(rule, &self.conn, Some(256))
-            .await.map_err(err)?;
+            .await
+            .map_err(err)?;
         let args = ("object:state-changed:focused", Vec::<String>::new(), "");
-        let register = self.conn
-            .call_method(Some("org.a11y.atspi.Registry"), "/org/a11y/atspi/registry",
-                         Some("org.a11y.atspi.Registry"), "RegisterEvent", &args);
-        tokio::time::timeout(CALL_TIMEOUT, register).await
-            .map_err(|_| "RegisterEvent: no reply".to_string())?.map_err(err)?;
+        let register = self.conn.call_method(
+            Some("org.a11y.atspi.Registry"),
+            "/org/a11y/atspi/registry",
+            Some("org.a11y.atspi.Registry"),
+            "RegisterEvent",
+            &args,
+        );
+        tokio::time::timeout(CALL_TIMEOUT, register)
+            .await
+            .map_err(|_| "RegisterEvent: no reply".to_string())?
+            .map_err(err)?;
         let me = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(Ok(msg)) = stream.next().await {
                 let Some(a11y) = me.upgrade() else { break };
                 let header = msg.header();
-                let (Some(sender), Some(path)) = (header.sender(), header.path()) else { continue };
+                let (Some(sender), Some(path)) = (header.sender(), header.path()) else {
+                    continue;
+                };
                 let gained = msg.body().deserialize::<(String, i32, i32, OwnedValue)>()
                     .map(|(_, d1, _, _)| d1)
                     .or_else(|_| msg.body()
@@ -218,20 +261,30 @@ impl A11y {
 
     /// Toolkit of the application owning `bus` ("Qt", "GTK", "Gecko", ...).
     pub async fn toolkit(&self, bus: &str) -> String {
-        let root = Obj::new(bus, OwnedObjectPath::try_from("/org/a11y/atspi/accessible/root").unwrap());
-        match self.prop(&root, "org.a11y.atspi.Application", "ToolkitName").await {
+        let root = Obj::new(
+            bus,
+            OwnedObjectPath::try_from("/org/a11y/atspi/accessible/root").unwrap(),
+        );
+        match self
+            .prop(&root, "org.a11y.atspi.Application", "ToolkitName")
+            .await
+        {
             Ok(v) => String::try_from(v).unwrap_or_default(),
             Err(_) => String::new(),
         }
     }
 
     pub async fn interfaces(&self, o: &Obj) -> Vec<String> {
-        self.call(o, ACC, "GetInterfaces", &()).await.unwrap_or_default()
+        self.call(o, ACC, "GetInterfaces", &())
+            .await
+            .unwrap_or_default()
     }
 
     pub async fn children(&self, o: &Obj) -> Vec<Obj> {
-        let kids: Vec<(String, OwnedObjectPath)> =
-            self.call(o, ACC, "GetChildren", &()).await.unwrap_or_default();
+        let kids: Vec<(String, OwnedObjectPath)> = self
+            .call(o, ACC, "GetChildren", &())
+            .await
+            .unwrap_or_default();
         kids.into_iter()
             .filter(|(_, p)| p.as_str() != NULL_PATH)
             .map(|(b, p)| Obj::new(&b, p))
@@ -245,9 +298,11 @@ impl A11y {
     }
 
     pub async fn actions(&self, o: &Obj) -> Vec<String> {
-        let list: R<Vec<(String, String, String)>> =
-            self.call(o, "org.a11y.atspi.Action", "GetActions", &()).await;
-        list.map(|l| l.into_iter().map(|(name, _, _)| name).collect()).unwrap_or_default()
+        let list: R<Vec<(String, String, String)>> = self
+            .call(o, "org.a11y.atspi.Action", "GetActions", &())
+            .await;
+        list.map(|l| l.into_iter().map(|(name, _, _)| name).collect())
+            .unwrap_or_default()
     }
 
     /// Run action `index`. Some toolkits answer only once the action is
@@ -256,8 +311,12 @@ impl A11y {
     /// within ACTION_WAIT the action counts as sent (the menu or dialog it
     /// opened is the expected result) and the late reply is dropped.
     pub async fn do_action(&self, o: &Obj, index: i32) -> R<bool> {
-        match tokio::time::timeout(ACTION_WAIT,
-                                   self.call(o, "org.a11y.atspi.Action", "DoAction", &(index,))).await {
+        match tokio::time::timeout(
+            ACTION_WAIT,
+            self.call(o, "org.a11y.atspi.Action", "DoAction", &(index,)),
+        )
+        .await
+        {
             Ok(done) => done,
             Err(_) => Ok(true),
         }
@@ -265,13 +324,27 @@ impl A11y {
 
     /// Up to `limit` characters of the Text interface, or None without it.
     pub async fn text(&self, o: &Obj, limit: i32) -> R<String> {
-        let count = self.prop(o, "org.a11y.atspi.Text", "CharacterCount").await?;
+        let count = self
+            .prop(o, "org.a11y.atspi.Text", "CharacterCount")
+            .await?;
         let count = i32::try_from(count).map_err(err)?;
-        self.call(o, "org.a11y.atspi.Text", "GetText", &(0i32, count.min(limit))).await
+        self.call(
+            o,
+            "org.a11y.atspi.Text",
+            "GetText",
+            &(0i32, count.min(limit)),
+        )
+        .await
     }
 
     pub async fn set_text(&self, o: &Obj, text: &str) -> R<bool> {
-        self.call(o, "org.a11y.atspi.EditableText", "SetTextContents", &(text,)).await
+        self.call(
+            o,
+            "org.a11y.atspi.EditableText",
+            "SetTextContents",
+            &(text,),
+        )
+        .await
     }
 
     pub async fn caret(&self, o: &Obj) -> R<i32> {
@@ -279,59 +352,98 @@ impl A11y {
     }
 
     pub async fn char_count(&self, o: &Obj) -> R<i32> {
-        i32::try_from(self.prop(o, "org.a11y.atspi.Text", "CharacterCount").await?).map_err(err)
+        i32::try_from(
+            self.prop(o, "org.a11y.atspi.Text", "CharacterCount")
+                .await?,
+        )
+        .map_err(err)
     }
 
     /// (start, end) of the first selection, None without one.
     pub async fn selection(&self, o: &Obj) -> R<Option<(i32, i32)>> {
-        let n: i32 = self.call(o, "org.a11y.atspi.Text", "GetNSelections", &()).await?;
+        let n: i32 = self
+            .call(o, "org.a11y.atspi.Text", "GetNSelections", &())
+            .await?;
         if n <= 0 {
             return Ok(None);
         }
-        let (start, end): (i32, i32) = self.call(o, "org.a11y.atspi.Text", "GetSelection", &(0i32,)).await?;
+        let (start, end): (i32, i32) = self
+            .call(o, "org.a11y.atspi.Text", "GetSelection", &(0i32,))
+            .await?;
         Ok((start != end).then_some((start.min(end), start.max(end))))
     }
 
     pub async fn set_caret(&self, o: &Obj, offset: i32) -> R<bool> {
-        self.call(o, "org.a11y.atspi.Text", "SetCaretOffset", &(offset,)).await
+        self.call(o, "org.a11y.atspi.Text", "SetCaretOffset", &(offset,))
+            .await
     }
 
     pub async fn insert_text(&self, o: &Obj, offset: i32, text: &str, length: i32) -> R<bool> {
-        self.call(o, "org.a11y.atspi.EditableText", "InsertText", &(offset, text, length)).await
+        self.call(
+            o,
+            "org.a11y.atspi.EditableText",
+            "InsertText",
+            &(offset, text, length),
+        )
+        .await
     }
 
     pub async fn delete_text(&self, o: &Obj, start: i32, end: i32) -> R<bool> {
-        self.call(o, "org.a11y.atspi.EditableText", "DeleteText", &(start, end)).await
+        self.call(
+            o,
+            "org.a11y.atspi.EditableText",
+            "DeleteText",
+            &(start, end),
+        )
+        .await
     }
 
     pub async fn grab_focus(&self, o: &Obj) -> bool {
-        self.call(o, "org.a11y.atspi.Component", "GrabFocus", &()).await.unwrap_or(false)
+        self.call(o, "org.a11y.atspi.Component", "GrabFocus", &())
+            .await
+            .unwrap_or(false)
     }
 
     pub async fn extents(&self, o: &Obj, coord: u32) -> R<(i32, i32, i32, i32)> {
-        self.call(o, "org.a11y.atspi.Component", "GetExtents", &(coord,)).await
+        self.call(o, "org.a11y.atspi.Component", "GetExtents", &(coord,))
+            .await
     }
 
     /// All attributes of one node, requested together.
     pub async fn info(&self, o: &Obj, text_limit: usize) -> Info {
         let (role, name, states, ifaces, children) = tokio::join!(
-            self.role(o), self.name(o), self.states(o), self.interfaces(o), self.children(o));
+            self.role(o),
+            self.name(o),
+            self.states(o),
+            self.interfaces(o),
+            self.children(o)
+        );
         if let Some(st) = states {
             self.note_states(o, st);
         }
         let has_iface = |i: &str| ifaces.iter().any(|x| x == i);
         let (actions, text) = tokio::join!(
             async {
-                if has_iface("org.a11y.atspi.Action") { self.actions(o).await } else { Vec::new() }
+                if has_iface("org.a11y.atspi.Action") {
+                    self.actions(o).await
+                } else {
+                    Vec::new()
+                }
             },
             async {
                 if has_iface("org.a11y.atspi.Text") {
                     let limit = text_limit.min(i32::MAX as usize) as i32;
-                    Some(self.text(o, limit).await.unwrap_or_default().replace('\n', " "))
+                    Some(
+                        self.text(o, limit)
+                            .await
+                            .unwrap_or_default()
+                            .replace('\n', " "),
+                    )
                 } else {
                     None
                 }
-            });
+            }
+        );
         Info {
             role,
             name,
@@ -346,9 +458,18 @@ impl A11y {
     /// Breadth-first fetch below `roots` into `cache`, all of a level at once.
     /// Children of hidden nodes are skipped when `only_showing`. Stops after
     /// roughly `limit` new nodes.
-    pub async fn prefetch(&self, cache: &mut HashMap<Obj, Info>, roots: Vec<Obj>,
-                          only_showing: bool, text_limit: usize, limit: usize) {
-        let mut level: Vec<Obj> = roots.into_iter().filter(|o| !cache.contains_key(o)).collect();
+    pub async fn prefetch(
+        &self,
+        cache: &mut HashMap<Obj, Info>,
+        roots: Vec<Obj>,
+        only_showing: bool,
+        text_limit: usize,
+        limit: usize,
+    ) {
+        let mut level: Vec<Obj> = roots
+            .into_iter()
+            .filter(|o| !cache.contains_key(o))
+            .collect();
         let mut fetched = 0;
         while !level.is_empty() && fetched < limit {
             level.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
@@ -365,7 +486,12 @@ impl A11y {
             let mut next = Vec::new();
             for (o, info) in infos {
                 if !only_showing || info.showing {
-                    next.extend(info.children.iter().filter(|c| !cache.contains_key(c)).cloned());
+                    next.extend(
+                        info.children
+                            .iter()
+                            .filter(|c| !cache.contains_key(c))
+                            .cloned(),
+                    );
                 }
                 cache.insert(o, info);
             }
@@ -374,8 +500,10 @@ impl A11y {
     }
 
     pub async fn applications(&self) -> Vec<Obj> {
-        let root = Obj::new("org.a11y.atspi.Registry",
-                            OwnedObjectPath::try_from("/org/a11y/atspi/accessible/root").unwrap());
+        let root = Obj::new(
+            "org.a11y.atspi.Registry",
+            OwnedObjectPath::try_from("/org/a11y/atspi/accessible/root").unwrap(),
+        );
         self.children(&root).await
     }
 
@@ -402,8 +530,13 @@ impl A11y {
             .buffered(IN_FLIGHT)
             .collect()
             .await;
-        let found = apps.iter().zip(flags).find(|(_, f)| f.iter().any(|x| *x)).map(|(a, _)| a);
-        *self.active_bus.lock().unwrap() = found.map(|(app, _, _)| (app.bus.clone(), Instant::now()));
+        let found = apps
+            .iter()
+            .zip(flags)
+            .find(|(_, f)| f.iter().any(|x| *x))
+            .map(|(a, _)| a);
+        *self.active_bus.lock().unwrap() =
+            found.map(|(app, _, _)| (app.bus.clone(), Instant::now()));
         found.map(|(_, name, _)| name.clone()).unwrap_or_default()
     }
 
@@ -411,8 +544,13 @@ impl A11y {
     pub async fn pid(&self, bus: &str) -> Option<u32> {
         let reply = self
             .conn
-            .call_method(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus",
-                         Some("org.freedesktop.DBus"), "GetConnectionUnixProcessID", &(bus,))
+            .call_method(
+                Some("org.freedesktop.DBus"),
+                "/org/freedesktop/DBus",
+                Some("org.freedesktop.DBus"),
+                "GetConnectionUnixProcessID",
+                &(bus,),
+            )
             .await
             .ok()?;
         reply.body().deserialize().ok()
@@ -434,7 +572,16 @@ impl A11y {
 /// Ask the session to turn the accessibility layer on (idempotent).
 pub async fn enable(session: &Connection) {
     let _ = session
-        .call_method(Some("org.a11y.Bus"), "/org/a11y/bus", Some(PROPS), "Set",
-                     &("org.a11y.Status", "IsEnabled", zbus::zvariant::Value::from(true)))
+        .call_method(
+            Some("org.a11y.Bus"),
+            "/org/a11y/bus",
+            Some(PROPS),
+            "Set",
+            &(
+                "org.a11y.Status",
+                "IsEnabled",
+                zbus::zvariant::Value::from(true),
+            ),
+        )
         .await;
 }

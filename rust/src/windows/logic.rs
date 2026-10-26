@@ -23,19 +23,45 @@ pub struct KeyEv {
 }
 
 const VK: &[(&str, u16)] = &[
-    ("ctrl", 0x11), ("control", 0x11), ("shift", 0x10), ("alt", 0x12), ("altgr", 0xA5),
-    ("win", 0x5B), ("super", 0x5B), ("meta", 0x5B), ("enter", 0x0D), ("return", 0x0D),
-    ("esc", 0x1B), ("escape", 0x1B), ("tab", 0x09), ("space", 0x20), ("backspace", 0x08),
-    ("delete", 0x2E), ("del", 0x2E), ("insert", 0x2D), ("home", 0x24), ("end", 0x23),
-    ("pageup", 0x21), ("pgup", 0x21), ("pagedown", 0x22), ("pgdn", 0x22),
-    ("left", 0x25), ("up", 0x26), ("right", 0x27), ("down", 0x28),
-    ("capslock", 0x14), ("printscreen", 0x2C), ("sysrq", 0x2C), ("menu", 0x5D),
+    ("ctrl", 0x11),
+    ("control", 0x11),
+    ("shift", 0x10),
+    ("alt", 0x12),
+    ("altgr", 0xA5),
+    ("win", 0x5B),
+    ("super", 0x5B),
+    ("meta", 0x5B),
+    ("enter", 0x0D),
+    ("return", 0x0D),
+    ("esc", 0x1B),
+    ("escape", 0x1B),
+    ("tab", 0x09),
+    ("space", 0x20),
+    ("backspace", 0x08),
+    ("delete", 0x2E),
+    ("del", 0x2E),
+    ("insert", 0x2D),
+    ("home", 0x24),
+    ("end", 0x23),
+    ("pageup", 0x21),
+    ("pgup", 0x21),
+    ("pagedown", 0x22),
+    ("pgdn", 0x22),
+    ("left", 0x25),
+    ("up", 0x26),
+    ("right", 0x27),
+    ("down", 0x28),
+    ("capslock", 0x14),
+    ("printscreen", 0x2C),
+    ("sysrq", 0x2C),
+    ("menu", 0x5D),
     ("compose", 0x5D),
 ];
 /// Keys that need KEYEVENTF_EXTENDEDKEY (navigation block, Win, Menu,
 /// AltGr, PrintScreen).
-const EXTENDED: &[u16] = &[0x2E, 0x2D, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28,
-                           0x5B, 0x5D, 0xA5, 0x2C];
+const EXTENDED: &[u16] = &[
+    0x2E, 0x2D, 0x24, 0x23, 0x21, 0x22, 0x25, 0x26, 0x27, 0x28, 0x5B, 0x5D, 0xA5, 0x2C,
+];
 
 /// Python `_vk`: alias table, single ASCII letter or digit, or F1-F24.
 pub fn vk(name: &str) -> R<u16> {
@@ -45,31 +71,57 @@ pub fn vk(name: &str) -> R<u16> {
     }
     let mut chars = n.chars();
     if let (Some(c), None) = (chars.next(), chars.next())
-        && c.is_ascii_alphanumeric() {
+        && c.is_ascii_alphanumeric()
+    {
         return Ok(c.to_ascii_uppercase() as u16);
     }
     if let Some(num) = n.strip_prefix('f')
-        && !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit())
+        && !num.is_empty()
+        && num.bytes().all(|b| b.is_ascii_digit())
         && let Ok(i) = num.parse::<u16>()
-        && (1..=24).contains(&i) {
+        && (1..=24).contains(&i)
+    {
         return Ok(0x70 + i - 1);
     }
     Err(format!("unknown key '{name}'"))
 }
 
 pub fn parse_combo(combo: &str) -> R<Vec<u16>> {
-    combo.replace(' ', "").split('+').filter(|k| !k.is_empty()).map(vk).collect()
+    combo
+        .replace(' ', "")
+        .split('+')
+        .filter(|k| !k.is_empty())
+        .map(vk)
+        .collect()
 }
 
 fn key_flags(vk: u16, up: bool) -> u32 {
-    (if EXTENDED.contains(&vk) { KEYEVENTF_EXTENDEDKEY } else { 0 })
-        | (if up { KEYEVENTF_KEYUP } else { 0 })
+    (if EXTENDED.contains(&vk) {
+        KEYEVENTF_EXTENDEDKEY
+    } else {
+        0
+    }) | (if up { KEYEVENTF_KEYUP } else { 0 })
 }
 
 /// Key-down events in order, then key-up events in reverse order.
 pub fn combo_events(vks: &[u16]) -> (Vec<KeyEv>, Vec<KeyEv>) {
-    let downs = vks.iter().map(|&vk| KeyEv { vk, scan: 0, flags: key_flags(vk, false) }).collect();
-    let ups = vks.iter().rev().map(|&vk| KeyEv { vk, scan: 0, flags: key_flags(vk, true) }).collect();
+    let downs = vks
+        .iter()
+        .map(|&vk| KeyEv {
+            vk,
+            scan: 0,
+            flags: key_flags(vk, false),
+        })
+        .collect();
+    let ups = vks
+        .iter()
+        .rev()
+        .map(|&vk| KeyEv {
+            vk,
+            scan: 0,
+            flags: key_flags(vk, true),
+        })
+        .collect();
     (downs, ups)
 }
 
@@ -83,14 +135,30 @@ pub fn unicode_batches(text: &str) -> Vec<Vec<KeyEv>> {
     for ch in text.chars() {
         if ch == '\n' || ch == '\t' {
             let vk = if ch == '\n' { VK_RETURN } else { VK_TAB };
-            batch.push(KeyEv { vk, scan: 0, flags: 0 });
-            batch.push(KeyEv { vk, scan: 0, flags: KEYEVENTF_KEYUP });
+            batch.push(KeyEv {
+                vk,
+                scan: 0,
+                flags: 0,
+            });
+            batch.push(KeyEv {
+                vk,
+                scan: 0,
+                flags: KEYEVENTF_KEYUP,
+            });
             continue;
         }
         let mut units = [0u16; 2];
         for &unit in ch.encode_utf16(&mut units).iter() {
-            batch.push(KeyEv { vk: 0, scan: unit, flags: KEYEVENTF_UNICODE });
-            batch.push(KeyEv { vk: 0, scan: unit, flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP });
+            batch.push(KeyEv {
+                vk: 0,
+                scan: unit,
+                flags: KEYEVENTF_UNICODE,
+            });
+            batch.push(KeyEv {
+                vk: 0,
+                scan: unit,
+                flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+            });
         }
         if batch.len() >= TYPE_BATCH {
             out.push(std::mem::take(&mut batch));
@@ -105,17 +173,54 @@ pub fn unicode_batches(text: &str) -> Vec<Vec<KeyEv>> {
 /// uiautomation's ControlTypeName without "Control", lower-cased, indexed
 /// by UIA_*ControlTypeId - 50000.
 const CONTROL_TYPES: [&str; 41] = [
-    "button", "calendar", "checkbox", "combobox", "edit", "hyperlink", "image",
-    "listitem", "list", "menu", "menubar", "menuitem", "progressbar", "radiobutton",
-    "scrollbar", "slider", "spinner", "statusbar", "tab", "tabitem", "text", "toolbar",
-    "tooltip", "tree", "treeitem", "custom", "group", "thumb", "datagrid", "dataitem",
-    "document", "splitbutton", "window", "pane", "header", "headeritem", "table",
-    "titlebar", "separator", "semanticzoom", "appbar",
+    "button",
+    "calendar",
+    "checkbox",
+    "combobox",
+    "edit",
+    "hyperlink",
+    "image",
+    "listitem",
+    "list",
+    "menu",
+    "menubar",
+    "menuitem",
+    "progressbar",
+    "radiobutton",
+    "scrollbar",
+    "slider",
+    "spinner",
+    "statusbar",
+    "tab",
+    "tabitem",
+    "text",
+    "toolbar",
+    "tooltip",
+    "tree",
+    "treeitem",
+    "custom",
+    "group",
+    "thumb",
+    "datagrid",
+    "dataitem",
+    "document",
+    "splitbutton",
+    "window",
+    "pane",
+    "header",
+    "headeritem",
+    "table",
+    "titlebar",
+    "separator",
+    "semanticzoom",
+    "appbar",
 ];
 
 /// Role for a UIA control type id; None for ids uiautomation does not know.
 pub fn role_name(control_type: i32) -> Option<&'static str> {
-    usize::try_from(control_type - 50000).ok().and_then(|i| CONTROL_TYPES.get(i).copied())
+    usize::try_from(control_type - 50000)
+        .ok()
+        .and_then(|i| CONTROL_TYPES.get(i).copied())
 }
 
 /// `Path(image).stem.lower()`: file name without its last extension.
@@ -130,7 +235,10 @@ pub fn exe_stem(path: &str) -> String {
 
 /// Single-line preview: first `limit` characters, CR and LF as spaces.
 pub fn one_line(text: &str, limit: usize) -> String {
-    text.chars().take(limit).map(|c| if c == '\r' || c == '\n' { ' ' } else { c }).collect()
+    text.chars()
+        .take(limit)
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .collect()
 }
 
 /// TextPattern text with Windows line ends turned into "\n".
@@ -173,10 +281,26 @@ impl Default for Props {
     /// What Python's `_safe` defaults amount to for an unreadable element.
     fn default() -> Self {
         Props {
-            name: String::new(), control_type: 0, offscreen: true, focused: false, enabled: true,
-            focusable: false, hwnd: 0, pid: 0, invoke: false, toggle: false, expand: false,
-            select: false, value: false, text: false, legacy: false, toggle_state: 0,
-            selected: false, expand_state: 0, value_text: String::new(), read_only: true,
+            name: String::new(),
+            control_type: 0,
+            offscreen: true,
+            focused: false,
+            enabled: true,
+            focusable: false,
+            hwnd: 0,
+            pid: 0,
+            invoke: false,
+            toggle: false,
+            expand: false,
+            select: false,
+            value: false,
+            text: false,
+            legacy: false,
+            toggle_state: 0,
+            selected: false,
+            expand_state: 0,
+            value_text: String::new(),
+            read_only: true,
             default_action: String::new(),
         }
     }
@@ -261,7 +385,11 @@ impl Props {
 
 /// Top-down 32-bit BGRA rows (GetDIBits) to packed RGB.
 pub fn bgra_to_rgb(bgra: &[u8]) -> Vec<u8> {
-    bgra.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0]]).collect()
+    bgra.as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|p| [p[2], p[1], p[0]])
+        .collect()
 }
 
 /// Python's `rect.xcenter()`/`ycenter()`: left + width // 2.
@@ -277,7 +405,10 @@ mod tests {
     #[test]
     fn parses_keys_like_python() {
         assert_eq!(parse_combo("ctrl+s").unwrap(), vec![0x11, b'S' as u16]);
-        assert_eq!(parse_combo("Ctrl + Shift + F5").unwrap(), vec![0x11, 0x10, 0x74]);
+        assert_eq!(
+            parse_combo("Ctrl + Shift + F5").unwrap(),
+            vec![0x11, 0x10, 0x74]
+        );
         assert_eq!(parse_combo("f24").unwrap(), vec![0x87]);
         assert_eq!(parse_combo("alt+4").unwrap(), vec![0x12, b'4' as u16]);
         assert_eq!(parse_combo("pgdn").unwrap(), vec![0x22]);
@@ -291,10 +422,36 @@ mod tests {
     #[test]
     fn combo_releases_in_reverse_with_extended_flags() {
         let (downs, ups) = combo_events(&parse_combo("ctrl+home").unwrap());
-        assert_eq!(downs, vec![KeyEv { vk: 0x11, scan: 0, flags: 0 },
-                               KeyEv { vk: 0x24, scan: 0, flags: KEYEVENTF_EXTENDEDKEY }]);
-        assert_eq!(ups, vec![KeyEv { vk: 0x24, scan: 0, flags: KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP },
-                             KeyEv { vk: 0x11, scan: 0, flags: KEYEVENTF_KEYUP }]);
+        assert_eq!(
+            downs,
+            vec![
+                KeyEv {
+                    vk: 0x11,
+                    scan: 0,
+                    flags: 0
+                },
+                KeyEv {
+                    vk: 0x24,
+                    scan: 0,
+                    flags: KEYEVENTF_EXTENDEDKEY
+                }
+            ]
+        );
+        assert_eq!(
+            ups,
+            vec![
+                KeyEv {
+                    vk: 0x24,
+                    scan: 0,
+                    flags: KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP
+                },
+                KeyEv {
+                    vk: 0x11,
+                    scan: 0,
+                    flags: KEYEVENTF_KEYUP
+                }
+            ]
+        );
     }
 
     #[test]
@@ -303,21 +460,48 @@ mod tests {
         assert_eq!(b.len(), 1);
         let evs = &b[0];
         assert_eq!(evs.len(), 2 + 4 + 2 + 2);
-        assert_eq!(evs[0], KeyEv { vk: 0, scan: 0x011F, flags: KEYEVENTF_UNICODE });
+        assert_eq!(
+            evs[0],
+            KeyEv {
+                vk: 0,
+                scan: 0x011F,
+                flags: KEYEVENTF_UNICODE
+            }
+        );
         assert_eq!(evs[1].flags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
         assert_eq!((evs[2].scan, evs[4].scan), (0xD83D, 0xDE00));
-        assert_eq!(evs[6], KeyEv { vk: VK_RETURN, scan: 0, flags: 0 });
-        assert_eq!(evs[7], KeyEv { vk: VK_RETURN, scan: 0, flags: KEYEVENTF_KEYUP });
+        assert_eq!(
+            evs[6],
+            KeyEv {
+                vk: VK_RETURN,
+                scan: 0,
+                flags: 0
+            }
+        );
+        assert_eq!(
+            evs[7],
+            KeyEv {
+                vk: VK_RETURN,
+                scan: 0,
+                flags: KEYEVENTF_KEYUP
+            }
+        );
         assert_eq!(evs[8].vk, VK_TAB);
         assert!(unicode_batches("").is_empty());
     }
 
     #[test]
     fn unicode_typing_batches_like_python() {
-        let sizes: Vec<usize> = unicode_batches(&"a".repeat(250)).iter().map(Vec::len).collect();
+        let sizes: Vec<usize> = unicode_batches(&"a".repeat(250))
+            .iter()
+            .map(Vec::len)
+            .collect();
         assert_eq!(sizes, vec![200, 200, 100]);
         // Newlines never trigger a flush on their own.
-        let sizes: Vec<usize> = unicode_batches(&"\n".repeat(150)).iter().map(Vec::len).collect();
+        let sizes: Vec<usize> = unicode_batches(&"\n".repeat(150))
+            .iter()
+            .map(Vec::len)
+            .collect();
         assert_eq!(sizes, vec![300]);
     }
 
@@ -337,7 +521,10 @@ mod tests {
     #[test]
     fn exe_stem_matches_pathlib() {
         assert_eq!(exe_stem(r"C:\Windows\System32\Notepad.EXE"), "notepad");
-        assert_eq!(exe_stem(r"C:\Program Files\Mozilla Firefox\firefox.exe"), "firefox");
+        assert_eq!(
+            exe_stem(r"C:\Program Files\Mozilla Firefox\firefox.exe"),
+            "firefox"
+        );
         assert_eq!(exe_stem(r"C:\x\archive.tar.exe"), "archive.tar");
         assert_eq!(exe_stem(r"C:\x\noext"), "noext");
         assert_eq!(exe_stem(""), "");
@@ -351,7 +538,13 @@ mod tests {
     }
 
     fn edit() -> Props {
-        Props { control_type: 50004, offscreen: false, focusable: true, text: true, ..Default::default() }
+        Props {
+            control_type: 50004,
+            offscreen: false,
+            focusable: true,
+            text: true,
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -362,17 +555,32 @@ mod tests {
         p.enabled = false;
         assert_eq!(p.states(0), vec!["focused", "disabled"]);
 
-        let mut w = Props { control_type: 50032, hwnd: 42, ..Default::default() };
+        let mut w = Props {
+            control_type: 50032,
+            hwnd: 42,
+            ..Default::default()
+        };
         assert_eq!(w.states(42), vec!["active"]);
         assert!(w.states(7).is_empty());
         w.hwnd = 0;
         assert!(w.states(0).is_empty());
 
-        let mut c = Props { control_type: 50002, toggle: true, toggle_state: TOGGLE_ON,
-                            select: true, selected: true, expand: true,
-                            expand_state: PARTIALLY_EXPANDED, value: true, read_only: false,
-                            ..Default::default() };
-        assert_eq!(c.states(0), vec!["checked", "selected", "expanded", "editable"]);
+        let mut c = Props {
+            control_type: 50002,
+            toggle: true,
+            toggle_state: TOGGLE_ON,
+            select: true,
+            selected: true,
+            expand: true,
+            expand_state: PARTIALLY_EXPANDED,
+            value: true,
+            read_only: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            c.states(0),
+            vec!["checked", "selected", "expanded", "editable"]
+        );
         c.toggle = false;
         c.read_only = true;
         assert_eq!(c.states(0), vec!["selected", "expanded"]);
@@ -387,18 +595,39 @@ mod tests {
         p.value_text = "x\ny".into();
         assert!(!p.wants_document_text());
         assert_eq!(p.value_preview(80).as_deref(), Some("x y"));
-        let label = Props { control_type: 50020, text: true, ..Default::default() };
+        let label = Props {
+            control_type: 50020,
+            text: true,
+            ..Default::default()
+        };
         assert!(!label.wants_document_text());
     }
 
     #[test]
     fn actions_follow_python_table() {
-        let p = Props { invoke: true, toggle: true, expand: true, select: true, legacy: true,
-                        default_action: "Press".into(), ..Default::default() };
-        assert_eq!(p.actions(), vec!["invoke", "toggle", "expand", "collapse", "select"]);
-        let p = Props { legacy: true, default_action: "Press".into(), ..Default::default() };
+        let p = Props {
+            invoke: true,
+            toggle: true,
+            expand: true,
+            select: true,
+            legacy: true,
+            default_action: "Press".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            p.actions(),
+            vec!["invoke", "toggle", "expand", "collapse", "select"]
+        );
+        let p = Props {
+            legacy: true,
+            default_action: "Press".into(),
+            ..Default::default()
+        };
         assert_eq!(p.actions(), vec!["default"]);
-        let p = Props { legacy: true, ..Default::default() };
+        let p = Props {
+            legacy: true,
+            ..Default::default()
+        };
         assert!(p.actions().is_empty());
     }
 
@@ -411,6 +640,9 @@ mod tests {
 
     #[test]
     fn bgra_to_rgb_drops_alpha() {
-        assert_eq!(bgra_to_rgb(&[1, 2, 3, 255, 4, 5, 6, 0]), vec![3, 2, 1, 6, 5, 4]);
+        assert_eq!(
+            bgra_to_rgb(&[1, 2, 3, 255, 4, 5, 6, 0]),
+            vec![3, 2, 1, 6, 5, 4]
+        );
     }
 }

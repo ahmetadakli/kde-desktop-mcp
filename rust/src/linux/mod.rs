@@ -24,7 +24,6 @@ use hyprland::Hypr;
 use input::Input;
 use kwin::KWin;
 
-
 const DEFAULT_ALLOW: &str = "\
 # One AT-SPI application name per line (case-insensitive). See `apps` tool output.
 # Keyboard/mouse input is only sent when the active window belongs to one of these.
@@ -42,7 +41,14 @@ const APPS_NOTE: &str = "Apps started before accessibility was enabled may need 
 const APPS_NOTE_HYPRLAND: &str = "Apps started before accessibility was enabled may need a \
 restart (Chromium/Electron: --force-renderer-accessibility). On Hyprland, Qt apps may need \
 QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1 and the at-spi bus must be running in the session.";
-const BORING: &[&str] = &["filler", "panel", "section", "unknown", "redundant object", "grouping"];
+const BORING: &[&str] = &[
+    "filler",
+    "panel",
+    "section",
+    "unknown",
+    "redundant object",
+    "grouping",
+];
 const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
 /// How old the active-app check before `type_text` may be for the
 /// accessibility insert to trust it.
@@ -95,9 +101,8 @@ pub struct LinuxBackend {
 }
 
 fn which(cmd: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|d| d.join(cmd).is_file())
-    })
+    std::env::var_os("PATH")
+        .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
 }
 
 async fn poll<F, Fut>(limit: Duration, mut check: F) -> bool
@@ -125,18 +130,26 @@ fn own_clipboard(text: &str) -> R<()> {
     use std::io::Read;
     use wl_clipboard_rs::{copy, paste};
     copy::Options::new()
-        .copy(copy::Source::Bytes(text.as_bytes().into()), copy::MimeType::Text)
+        .copy(
+            copy::Source::Bytes(text.as_bytes().into()),
+            copy::MimeType::Text,
+        )
         .map_err(|e| format!("clipboard: {e}"))?;
     // The selection request is flushed by the serving thread; read the
     // clipboard back until it is ours (if it held the same text already,
     // a paste gives the right text either way).
     let start = std::time::Instant::now();
     loop {
-        let got = paste::get_contents(paste::ClipboardType::Regular, paste::Seat::Unspecified,
-                                      paste::MimeType::Text);
+        let got = paste::get_contents(
+            paste::ClipboardType::Regular,
+            paste::Seat::Unspecified,
+            paste::MimeType::Text,
+        );
         let mut buf = Vec::new();
         if let Ok((mut pipe, _)) = got
-            && pipe.read_to_end(&mut buf).is_ok() && buf == text.as_bytes() {
+            && pipe.read_to_end(&mut buf).is_ok()
+            && buf == text.as_bytes()
+        {
             return Ok(());
         }
         if start.elapsed() >= CLIPBOARD_WAIT {
@@ -165,7 +178,10 @@ async fn wl_copy(text: &str) -> R<()> {
         .spawn()
         .map_err(|e| format!("wl-copy: {e}"))?;
     let mut stdin = child.stdin.take().ok_or("wl-copy: no stdin")?;
-    stdin.write_all(text.as_bytes()).await.map_err(|e| format!("wl-copy: {e}"))?;
+    stdin
+        .write_all(text.as_bytes())
+        .await
+        .map_err(|e| format!("wl-copy: {e}"))?;
     drop(stdin);
     // wl-copy's parent exits only once the compositor has the selection.
     let status = child.wait().await.map_err(|e| format!("wl-copy: {e}"))?;
@@ -181,9 +197,16 @@ async fn wl_copy(text: &str) -> R<()> {
 fn temp_png() -> Option<(PathBuf, std::fs::File)> {
     use std::os::unix::fs::OpenOptionsExt;
     let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let path = std::env::temp_dir().join(format!("desktop-mcp-{}-{nanos}.png", std::process::id()));
-    let file = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&path).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .ok()?;
     Some((path, file))
 }
 
@@ -201,14 +224,22 @@ impl LinuxBackend {
     /// Hyprland when HYPRLAND_INSTANCE_SIGNATURE is set, otherwise KDE;
     /// DESKTOP_MCP_BACKEND=kde|hyprland overrides.
     pub async fn new() -> R<Self> {
-        let session = zbus::Connection::session().await.map_err(|e| format!("session bus: {e}"))?;
+        let session = zbus::Connection::session()
+            .await
+            .map_err(|e| format!("session bus: {e}"))?;
         let a11y = Arc::new(A11y::connect(&session).await?);
-        let forced = std::env::var("DESKTOP_MCP_BACKEND").unwrap_or_default().to_lowercase();
+        let forced = std::env::var("DESKTOP_MCP_BACKEND")
+            .unwrap_or_default()
+            .to_lowercase();
         let hypr = match forced.as_str() {
             "hyprland" => Some(Hypr::from_env().ok_or("HYPRLAND_INSTANCE_SIGNATURE is not set")?),
             "kde" => None,
             "" => Hypr::from_env(),
-            other => return Err(format!("unknown DESKTOP_MCP_BACKEND '{other}' (kde, hyprland)")),
+            other => {
+                return Err(format!(
+                    "unknown DESKTOP_MCP_BACKEND '{other}' (kde, hyprland)"
+                ));
+            }
         };
         let comp = match hypr {
             Some(h) => Compositor::Hyprland(h),
@@ -219,11 +250,16 @@ impl LinuxBackend {
             // Without it `type_text` falls back to pasting more often.
             let _ = a11y.track_focus().await;
         }
-        Ok(LinuxBackend { session, a11y, comp, input: Arc::new(Input::new(absolute)),
-                          pids: Mutex::new(HashMap::new()),
-                          toolkits: Mutex::new(HashMap::new()),
-                          focus_record: Mutex::new(HashMap::new()),
-                          shot_unauthorized: AtomicBool::new(false) })
+        Ok(LinuxBackend {
+            session,
+            a11y,
+            comp,
+            input: Arc::new(Input::new(absolute)),
+            pids: Mutex::new(HashMap::new()),
+            toolkits: Mutex::new(HashMap::new()),
+            focus_record: Mutex::new(HashMap::new()),
+            shot_unauthorized: AtomicBool::new(false),
+        })
     }
 
     fn app_of(o: &Obj) -> Obj {
@@ -256,8 +292,14 @@ impl LinuxBackend {
     /// Prefer the AT-SPI name so one allowlist works for every Linux
     /// backend; fall back to the window class for apps without accessibility.
     fn client_app_name(names: &HashMap<i64, String>, client: &Json) -> String {
-        let by_pid = client["pid"].as_i64().and_then(|p| names.get(&p)).filter(|n| !n.is_empty());
-        by_pid.map(String::as_str).unwrap_or(client["class"].as_str().unwrap_or("")).to_lowercase()
+        let by_pid = client["pid"]
+            .as_i64()
+            .and_then(|p| names.get(&p))
+            .filter(|n| !n.is_empty());
+        by_pid
+            .map(String::as_str)
+            .unwrap_or(client["class"].as_str().unwrap_or(""))
+            .to_lowercase()
     }
 
     async fn same_window(&self, frame: &Obj, client: &Json) -> bool {
@@ -275,7 +317,12 @@ impl LinuxBackend {
     // ------------------------------------------------------------ focus
 
     fn focus_tried(&self, id: &Obj, m: FocusMethod) -> Tried {
-        self.focus_record.lock().unwrap().get(&(id.bus.to_string(), m)).copied().unwrap_or_default()
+        self.focus_record
+            .lock()
+            .unwrap()
+            .get(&(id.bus.to_string(), m))
+            .copied()
+            .unwrap_or_default()
     }
 
     fn focus_note(&self, id: &Obj, m: FocusMethod, worked: bool) {
@@ -295,7 +342,10 @@ impl LinuxBackend {
             return t.clone();
         }
         let t = self.a11y.toolkit(bus).await;
-        self.toolkits.lock().unwrap().insert(bus.to_string(), t.clone());
+        self.toolkits
+            .lock()
+            .unwrap()
+            .insert(bus.to_string(), t.clone());
         t
     }
 
@@ -316,24 +366,39 @@ impl LinuxBackend {
     /// Ok(false) when it does not apply and nothing was changed.
     async fn insert_at_caret(&self, text: &str) -> R<bool> {
         let a11y = &self.a11y;
-        let Some(target) = a11y.focus_hint() else { return Ok(false) };
+        let Some(target) = a11y.focus_hint() else {
+            return Ok(false);
+        };
         // `type_text` runs right after the caller checked the active app.
         if a11y.recent_active_bus(INSERT_ACTIVE_AGE).as_deref() != Some(&*target.bus) {
             return Ok(false);
         }
         // Qt's offsets and lengths count UTF-16 units.
         let len = text.encode_utf16().count();
-        let Ok(len) = i32::try_from(len) else { return Ok(false) };
+        let Ok(len) = i32::try_from(len) else {
+            return Ok(false);
+        };
         let (toolkit, states, ifaces, count, selection, caret) = tokio::join!(
-            self.toolkit(&target.bus), a11y.states(&target), a11y.interfaces(&target),
-            a11y.char_count(&target), a11y.selection(&target), a11y.caret(&target));
+            self.toolkit(&target.bus),
+            a11y.states(&target),
+            a11y.interfaces(&target),
+            a11y.char_count(&target),
+            a11y.selection(&target),
+            a11y.caret(&target)
+        );
         let st = states.unwrap_or(0);
         let bit = |b: u32| st & (1u64 << b) != 0;
-        if toolkit != "Qt" || !bit(atspi::FOCUSED) || !bit(atspi::EDITABLE) || !bit(atspi::MULTI_LINE)
-            || !ifaces.iter().any(|i| i == "org.a11y.atspi.EditableText") {
+        if toolkit != "Qt"
+            || !bit(atspi::FOCUSED)
+            || !bit(atspi::EDITABLE)
+            || !bit(atspi::MULTI_LINE)
+            || !ifaces.iter().any(|i| i == "org.a11y.atspi.EditableText")
+        {
             return Ok(false);
         }
-        let (Ok(count), Ok(selection), Ok(caret)) = (count, selection, caret) else { return Ok(false) };
+        let (Ok(count), Ok(selection), Ok(caret)) = (count, selection, caret) else {
+            return Ok(false);
+        };
         // Typing replaces the selection.
         let (at, removed) = match selection {
             Some((start, end)) => {
@@ -344,7 +409,10 @@ impl LinuxBackend {
             }
             None => (caret, 0),
         };
-        let inserted = a11y.insert_text(&target, at, text, len).await.unwrap_or(false);
+        let inserted = a11y
+            .insert_text(&target, at, text, len)
+            .await
+            .unwrap_or(false);
         // Normally `len`; an editor may normalise text (line endings).
         let grown = a11y.char_count(&target).await? - (count - removed);
         if grown <= 0 {
@@ -380,7 +448,9 @@ impl Backend for LinuxBackend {
     type Id = Obj;
 
     fn allow_file(&self) -> PathBuf {
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_default();
         home.join(".config/desktop-mcp/allow.txt")
     }
 
@@ -420,19 +490,23 @@ impl Backend for LinuxBackend {
         let a11y = &self.a11y;
         let details = futures_util::future::join_all(apps.iter().map(|(_, _, ws)| {
             futures_util::future::join_all(ws.iter().map(|w| async {
-                let (kind, title, active) = tokio::join!(
-                    a11y.role(w), a11y.name(w), async {
-                        match (&self.comp, &active_client) {
-                            (Compositor::Kde(_), _) => a11y.has_state(w, atspi::ACTIVE).await,
-                            (Compositor::Hyprland(_), Some(c)) => self.same_window(w, c).await,
-                            (Compositor::Hyprland(_), None) => false,
-                        }
-                    });
-                WindowEntry { kind, title: title.trim().to_string(), active }
+                let (kind, title, active) = tokio::join!(a11y.role(w), a11y.name(w), async {
+                    match (&self.comp, &active_client) {
+                        (Compositor::Kde(_), _) => a11y.has_state(w, atspi::ACTIVE).await,
+                        (Compositor::Hyprland(_), Some(c)) => self.same_window(w, c).await,
+                        (Compositor::Hyprland(_), None) => false,
+                    }
+                });
+                WindowEntry {
+                    kind,
+                    title: title.trim().to_string(),
+                    active,
+                }
             }))
         }))
         .await;
-        apps.into_iter().zip(details)
+        apps.into_iter()
+            .zip(details)
             .map(|((_, name, _), windows)| AppEntry { name, windows })
             .collect()
     }
@@ -463,9 +537,17 @@ impl Backend for LinuxBackend {
         self.a11y.info(id, text_limit).await
     }
 
-    async fn prefetch(&self, cache: &mut Cache<Obj>, roots: Vec<Obj>, only_showing: bool,
-                      text_limit: usize, limit: usize) {
-        self.a11y.prefetch(cache, roots, only_showing, text_limit, limit).await
+    async fn prefetch(
+        &self,
+        cache: &mut Cache<Obj>,
+        roots: Vec<Obj>,
+        only_showing: bool,
+        text_limit: usize,
+        limit: usize,
+    ) {
+        self.a11y
+            .prefetch(cache, roots, only_showing, text_limit, limit)
+            .await
     }
 
     async fn actions(&self, id: &Obj) -> Vec<String> {
@@ -477,15 +559,29 @@ impl Backend for LinuxBackend {
     }
 
     async fn full_text(&self, id: &Obj, limit: usize) -> R<String> {
-        if self.a11y.interfaces(id).await.iter().any(|i| i == "org.a11y.atspi.Text") {
-            self.a11y.text(id, limit.min(i32::MAX as usize) as i32).await
+        if self
+            .a11y
+            .interfaces(id)
+            .await
+            .iter()
+            .any(|i| i == "org.a11y.atspi.Text")
+        {
+            self.a11y
+                .text(id, limit.min(i32::MAX as usize) as i32)
+                .await
         } else {
             Ok(self.a11y.name(id).await)
         }
     }
 
     async fn set_text(&self, id: &Obj, text: &str) -> R<bool> {
-        if !self.a11y.interfaces(id).await.iter().any(|i| i == "org.a11y.atspi.EditableText") {
+        if !self
+            .a11y
+            .interfaces(id)
+            .await
+            .iter()
+            .any(|i| i == "org.a11y.atspi.EditableText")
+        {
             return Err("element is not editable text; use focus + type".into());
         }
         self.a11y.set_text(id, text).await
@@ -510,9 +606,13 @@ impl Backend for LinuxBackend {
                 return Ok(Some("grab_focus".into()));
             }
         }
-        let names: Vec<String> = actions.iter().map(|n| n.to_lowercase().replace(' ', "")).collect();
+        let names: Vec<String> = actions
+            .iter()
+            .map(|n| n.to_lowercase().replace(' ', ""))
+            .collect();
         if let Some(i) = names.iter().position(|n| n == "setfocus")
-            && !self.focus_tried(id, FocusMethod::SetFocusAction).skip() {
+            && !self.focus_tried(id, FocusMethod::SetFocusAction).skip()
+        {
             let _ = self.a11y.do_action(id, i as i32).await;
             let ok = poll(wait, || self.is_focused(id)).await;
             self.focus_note(id, FocusMethod::SetFocusAction, ok);
@@ -539,7 +639,8 @@ impl Backend for LinuxBackend {
                         }
                     },
                     a11y.extents(id, atspi::COORD_WINDOW),
-                    kwin.active_window_origin());
+                    kwin.active_window_origin()
+                );
                 if !frame_active {
                     return Err(NOT_ACTIVE.into());
                 }
@@ -548,11 +649,16 @@ impl Backend for LinuxBackend {
                     return Err(no_area());
                 }
                 let (gx, gy) = origin?;
-                Ok(((gx + x as f64 + w as f64 / 2.0) as i32, (gy + y as f64 + h as f64 / 2.0) as i32))
+                Ok((
+                    (gx + x as f64 + w as f64 / 2.0) as i32,
+                    (gy + y as f64 + h as f64 / 2.0) as i32,
+                ))
             }
             Compositor::Hyprland(h) => {
                 let (aw, frame) = tokio::join!(h.active_window(), a11y.frame_of(id));
-                let (Some(aw), Some(frame)) = (aw?, frame) else { return Err(NOT_ACTIVE.into()) };
+                let (Some(aw), Some(frame)) = (aw?, frame) else {
+                    return Err(NOT_ACTIVE.into());
+                };
                 if !self.same_window(&frame, &aw).await {
                     return Err(NOT_ACTIVE.into());
                 }
@@ -562,7 +668,10 @@ impl Backend for LinuxBackend {
                     if w <= 0 || hh <= 0 {
                         return Err(no_area());
                     }
-                    return Ok(((x as f64 + w as f64 / 2.0) as i32, (y as f64 + hh as f64 / 2.0) as i32));
+                    return Ok((
+                        (x as f64 + w as f64 / 2.0) as i32,
+                        (y as f64 + hh as f64 / 2.0) as i32,
+                    ));
                 }
                 // Wayland clients report surface-relative extents; add the window origin.
                 let (x, y, w, hh) = a11y.extents(id, atspi::COORD_WINDOW).await?;
@@ -571,7 +680,10 @@ impl Backend for LinuxBackend {
                 }
                 let ox = aw["at"][0].as_f64().unwrap_or(0.0);
                 let oy = aw["at"][1].as_f64().unwrap_or(0.0);
-                Ok(((ox + x as f64 + w as f64 / 2.0) as i32, (oy + y as f64 + hh as f64 / 2.0) as i32))
+                Ok((
+                    (ox + x as f64 + w as f64 / 2.0) as i32,
+                    (oy + y as f64 + hh as f64 / 2.0) as i32,
+                ))
             }
         }
     }
@@ -592,9 +704,13 @@ impl Backend for LinuxBackend {
             // wtype uses the virtual-keyboard protocol: Unicode-safe and
             // leaves the clipboard alone.
             for args in hyprland::wtype_commands(text) {
-                let status = tokio::process::Command::new("wtype").args(&args)
-                    .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
-                    .status().await.map_err(|e| format!("wtype: {e}"))?;
+                let status = tokio::process::Command::new("wtype")
+                    .args(&args)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .await
+                    .map_err(|e| format!("wtype: {e}"))?;
                 if !status.success() {
                     return Err(format!("wtype failed: {status}"));
                 }
@@ -640,7 +756,9 @@ impl Backend for LinuxBackend {
                 let (clients, names) = tokio::join!(h.json("clients"), self.app_names_by_pid());
                 let clients = clients?;
                 for c in clients.as_array().into_iter().flatten() {
-                    if !c["mapped"].as_bool().unwrap_or(true) || c["hidden"].as_bool().unwrap_or(false) {
+                    if !c["mapped"].as_bool().unwrap_or(true)
+                        || c["hidden"].as_bool().unwrap_or(false)
+                    {
                         continue;
                     }
                     let app = Self::client_app_name(&names, c);
@@ -653,9 +771,13 @@ impl Backend for LinuxBackend {
                         let addr = c["address"].as_str().unwrap_or("").to_string();
                         h.dispatch(&format!("focuswindow address:{addr}")).await?;
                         poll(ACTIVATE_WAIT, || async {
-                            h.active_window().await.ok().flatten()
+                            h.active_window()
+                                .await
+                                .ok()
+                                .flatten()
                                 .is_some_and(|aw| aw["address"].as_str() == Some(addr.as_str()))
-                        }).await;
+                        })
+                        .await;
                         return Ok(());
                     }
                 }
@@ -672,8 +794,9 @@ impl Backend for LinuxBackend {
                         Ok(raw) => {
                             let (path, file) = temp_png()?;
                             let mut out = std::io::BufWriter::new(file);
-                            let written = image::write_png(&raw, &mut out)
-                                .and_then(|()| std::io::Write::flush(&mut out).map_err(|e| e.to_string()));
+                            let written = image::write_png(&raw, &mut out).and_then(|()| {
+                                std::io::Write::flush(&mut out).map_err(|e| e.to_string())
+                            });
                             if written.is_ok() {
                                 return keep_if_written(path);
                             }
@@ -696,7 +819,10 @@ impl Backend for LinuxBackend {
                 if !which("grim") {
                     return None;
                 }
-                let geo = format!("{},{} {}x{}", aw["at"][0], aw["at"][1], aw["size"][0], aw["size"][1]);
+                let geo = format!(
+                    "{},{} {}x{}",
+                    aw["at"][0], aw["at"][1], aw["size"][0], aw["size"][1]
+                );
                 let mut c = tokio::process::Command::new("grim");
                 c.args(["-g", &geo]);
                 c

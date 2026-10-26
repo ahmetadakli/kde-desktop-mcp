@@ -100,12 +100,26 @@ const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtua
 impl KWin {
     pub async fn new(session: Connection) -> R<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
-        session.object_server().at(SINK_PATH, Sink { tx }).await.map_err(|e| e.to_string())?;
-        Ok(KWin { session, rx: Mutex::new(rx), seq: AtomicU64::new(0), screen: Mutex::new(None) })
+        session
+            .object_server()
+            .at(SINK_PATH, Sink { tx })
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(KWin {
+            session,
+            rx: Mutex::new(rx),
+            seq: AtomicU64::new(0),
+            screen: Mutex::new(None),
+        })
     }
 
-    async fn call<T>(&self, path: &str, iface: &str, method: &str,
-                     args: &(impl serde::Serialize + zbus::zvariant::DynamicType)) -> R<T>
+    async fn call<T>(
+        &self,
+        path: &str,
+        iface: &str,
+        method: &str,
+        args: &(impl serde::Serialize + zbus::zvariant::DynamicType),
+    ) -> R<T>
     where
         T: for<'d> serde::Deserialize<'d> + zbus::zvariant::Type,
     {
@@ -119,31 +133,58 @@ impl KWin {
 
     /// Evaluate a JS expression inside KWin and return its string value.
     pub async fn query(&self, js_expr: &str) -> R<Option<String>> {
-        let me = self.session.unique_name().ok_or("no unique bus name")?.to_string();
-        let id = format!("{}-{}", std::process::id(), self.seq.fetch_add(1, Ordering::Relaxed));
+        let me = self
+            .session
+            .unique_name()
+            .ok_or("no unique bus name")?
+            .to_string();
+        let id = format!(
+            "{}-{}",
+            std::process::id(),
+            self.seq.fetch_add(1, Ordering::Relaxed)
+        );
         let script = format!(
             "const result = String({js_expr});\ncallDBus({}, {}, 'org.desktopmcp.Sink', 'Report', {}, result);\n",
-            Json::from(me), Json::from(SINK_PATH), Json::from(id.as_str()));
+            Json::from(me),
+            Json::from(SINK_PATH),
+            Json::from(id.as_str())
+        );
         let file = std::env::temp_dir().join(format!("desktop-mcp-{id}.js"));
-        tokio::fs::write(&file, script).await.map_err(|e| e.to_string())?;
+        tokio::fs::write(&file, script)
+            .await
+            .map_err(|e| e.to_string())?;
         let plugin = format!("desktop-mcp-{id}");
         let result = self.run_script(&file, &plugin, &id).await;
         let _ = tokio::fs::remove_file(&file).await;
         result
     }
 
-    async fn run_script(&self, file: &std::path::Path, plugin: &str, id: &str) -> R<Option<String>> {
+    async fn run_script(
+        &self,
+        file: &std::path::Path,
+        plugin: &str,
+        id: &str,
+    ) -> R<Option<String>> {
         let mut rx = self.rx.lock().await;
         while rx.try_recv().is_ok() {} // reports from earlier, timed-out scripts
         let sid: i32 = self
-            .call("/Scripting", "org.kde.kwin.Scripting", "loadScript",
-                  &(file.to_string_lossy().as_ref(), plugin))
+            .call(
+                "/Scripting",
+                "org.kde.kwin.Scripting",
+                "loadScript",
+                &(file.to_string_lossy().as_ref(), plugin),
+            )
             .await?;
         if sid < 0 {
             return Err("KWin refused script".into());
         }
         let ran: R<()> = self
-            .call(&format!("/Scripting/Script{sid}"), "org.kde.kwin.Script", "run", &())
+            .call(
+                &format!("/Scripting/Script{sid}"),
+                "org.kde.kwin.Script",
+                "run",
+                &(),
+            )
             .await;
         let data = match ran {
             Ok(()) => {
@@ -155,12 +196,20 @@ impl KWin {
                     }
                     None
                 };
-                tokio::time::timeout(QUERY_TIMEOUT, wait).await.ok().flatten()
+                tokio::time::timeout(QUERY_TIMEOUT, wait)
+                    .await
+                    .ok()
+                    .flatten()
             }
             Err(_) => None,
         };
         let _: R<bool> = self
-            .call("/Scripting", "org.kde.kwin.Scripting", "unloadScript", &(plugin,))
+            .call(
+                "/Scripting",
+                "org.kde.kwin.Scripting",
+                "unloadScript",
+                &(plugin,),
+            )
             .await;
         ran?;
         Ok(data)
@@ -200,9 +249,15 @@ impl KWin {
             ("include-cursor", Value::from(false)),
             ("native-resolution", Value::from(true)),
         ]);
-        let reply = self.session
-            .call_method(Some("org.kde.KWin"), SHOT_PATH, Some(SHOT_IFACE), "CaptureActiveWindow",
-                         &(options, Fd::from(&writer)))
+        let reply = self
+            .session
+            .call_method(
+                Some("org.kde.KWin"),
+                SHOT_PATH,
+                Some(SHOT_IFACE),
+                "CaptureActiveWindow",
+                &(options, Fd::from(&writer)),
+            )
             .await;
         // KWin holds its own duplicate; ours must go for the read to end.
         drop(writer);
@@ -213,29 +268,53 @@ impl KWin {
             }
             Err(e) => return Err(format!("KWin CaptureActiveWindow: {e}")),
         };
-        let meta: HashMap<String, OwnedValue> = reply.body().deserialize().map_err(|e| e.to_string())?;
-        let num = |k: &str| meta.get(k).and_then(|v| u32::try_from(v).ok())
-            .ok_or_else(|| format!("ScreenShot2 reply lacks '{k}'"));
-        let kind = meta.get("type").and_then(|v| String::try_from(v.try_clone().ok()?).ok());
+        let meta: HashMap<String, OwnedValue> =
+            reply.body().deserialize().map_err(|e| e.to_string())?;
+        let num = |k: &str| {
+            meta.get(k)
+                .and_then(|v| u32::try_from(v).ok())
+                .ok_or_else(|| format!("ScreenShot2 reply lacks '{k}'"))
+        };
+        let kind = meta
+            .get("type")
+            .and_then(|v| String::try_from(v.try_clone().ok()?).ok());
         if kind.as_deref().unwrap_or("raw") != "raw" {
             return Err(format!("ScreenShot2 sent unsupported type {kind:?}"));
         }
-        let (width, height, stride, format) = (num("width")?, num("height")?, num("stride")?, num("format")?);
-        let data = pixels.await.map_err(|e| e.to_string())?.map_err(|e| format!("pipe: {e}"))?;
+        let (width, height, stride, format) = (
+            num("width")?,
+            num("height")?,
+            num("stride")?,
+            num("format")?,
+        );
+        let data = pixels
+            .await
+            .map_err(|e| e.to_string())?
+            .map_err(|e| format!("pipe: {e}"))?;
         if (data.len() as u64) < u64::from(stride) * u64::from(height) {
-            return Err(format!("ScreenShot2 sent {} of {} bytes", data.len(),
-                               u64::from(stride) * u64::from(height)));
+            return Err(format!(
+                "ScreenShot2 sent {} of {} bytes",
+                data.len(),
+                u64::from(stride) * u64::from(height)
+            ));
         }
-        Ok(RawImage { width, height, stride, format, data })
+        Ok(RawImage {
+            width,
+            height,
+            stride,
+            format,
+            data,
+        })
     }
 
     /// Bounding box (x0, y0, x1, y1) of all enabled outputs in logical px.
     pub async fn screen_box(&self) -> (i32, i32, i32, i32) {
         let mut cached = self.screen.lock().await;
         if let Some((at, b)) = *cached
-            && at.elapsed() < SCREEN_BOX_TTL {
-                return b;
-            }
+            && at.elapsed() < SCREEN_BOX_TTL
+        {
+            return b;
+        }
         let b = match self.virtual_screen().await {
             Some(b) => b,
             None => read_screen_box().await.unwrap_or((0, 0, 1920, 1080)),
@@ -259,7 +338,11 @@ impl KWin {
 
 /// Fallback when the KWin query fails.
 async fn read_screen_box() -> Option<(i32, i32, i32, i32)> {
-    let out = tokio::process::Command::new("kscreen-doctor").arg("-j").output().await.ok()?;
+    let out = tokio::process::Command::new("kscreen-doctor")
+        .arg("-j")
+        .output()
+        .await
+        .ok()?;
     let doc: Json = serde_json::from_slice(&out.stdout).ok()?;
     let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
     for o in doc["outputs"].as_array()? {
@@ -267,7 +350,10 @@ async fn read_screen_box() -> Option<(i32, i32, i32, i32)> {
             continue;
         }
         let sc = o["scale"].as_f64().filter(|s| *s > 0.0).unwrap_or(1.0);
-        let (w, h) = (o["size"]["width"].as_f64()? / sc, o["size"]["height"].as_f64()? / sc);
+        let (w, h) = (
+            o["size"]["width"].as_f64()? / sc,
+            o["size"]["height"].as_f64()? / sc,
+        );
         let (px, py) = (o["pos"]["x"].as_f64()?, o["pos"]["y"].as_f64()?);
         x0 = x0.min(px);
         y0 = y0.min(py);

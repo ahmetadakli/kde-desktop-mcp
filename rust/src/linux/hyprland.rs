@@ -19,19 +19,31 @@ impl Hypr {
         let runtime = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
         // Hyprland 0.40 moved the sockets from /tmp into XDG_RUNTIME_DIR.
         let candidates = [
-            PathBuf::from(runtime).join("hypr").join(&sig).join(".socket.sock"),
+            PathBuf::from(runtime)
+                .join("hypr")
+                .join(&sig)
+                .join(".socket.sock"),
             PathBuf::from("/tmp/hypr").join(&sig).join(".socket.sock"),
         ];
-        let socket = candidates.iter().find(|p| p.exists()).unwrap_or(&candidates[0]).clone();
+        let socket = candidates
+            .iter()
+            .find(|p| p.exists())
+            .unwrap_or(&candidates[0])
+            .clone();
         Some(Hypr { socket })
     }
 
     async fn request(&self, cmd: &str) -> R<String> {
-        let mut s = UnixStream::connect(&self.socket).await
+        let mut s = UnixStream::connect(&self.socket)
+            .await
             .map_err(|e| format!("hyprland socket {}: {e}", self.socket.display()))?;
-        s.write_all(cmd.as_bytes()).await.map_err(|e| e.to_string())?;
+        s.write_all(cmd.as_bytes())
+            .await
+            .map_err(|e| e.to_string())?;
         let mut out = String::new();
-        s.read_to_string(&mut out).await.map_err(|e| e.to_string())?;
+        s.read_to_string(&mut out)
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(out)
     }
 
@@ -56,7 +68,11 @@ impl Hypr {
     /// The focused client, or None.
     pub async fn active_window(&self) -> R<Option<Json>> {
         let aw = self.json("activewindow").await?;
-        Ok(aw.get("address").and_then(Json::as_str).filter(|a| !a.is_empty()).map(|_| aw.clone()))
+        Ok(aw
+            .get("address")
+            .and_then(Json::as_str)
+            .filter(|a| !a.is_empty())
+            .map(|_| aw.clone()))
     }
 }
 
@@ -76,7 +92,10 @@ pub fn wtype_commands(text: &str) -> Vec<Vec<String>> {
             if !chunk.is_empty() {
                 cmds.push(vec!["--".into(), std::mem::take(&mut chunk)]);
             }
-            cmds.push(vec!["-k".into(), if ch == '\n' { "Return" } else { "Tab" }.into()]);
+            cmds.push(vec![
+                "-k".into(),
+                if ch == '\n' { "Return" } else { "Tab" }.into(),
+            ]);
         } else {
             chunk.push(ch);
         }
@@ -95,11 +114,19 @@ mod tests {
     fn wtype_splits_newlines_and_tabs() {
         let got = wtype_commands("a b\nc\td\r\n");
         let want: Vec<Vec<&str>> = vec![
-            vec!["--", "a b"], vec!["-k", "Return"], vec!["--", "c"], vec!["-k", "Tab"],
-            vec!["--", "d"], vec!["-k", "Return"],
+            vec!["--", "a b"],
+            vec!["-k", "Return"],
+            vec!["--", "c"],
+            vec!["-k", "Tab"],
+            vec!["--", "d"],
+            vec!["-k", "Return"],
         ];
-        assert_eq!(got, want.iter().map(|v| v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
-                   .collect::<Vec<_>>());
+        assert_eq!(
+            got,
+            want.iter()
+                .map(|v| v.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
@@ -135,7 +162,13 @@ mod tests {
         assert_eq!(h.active_window().await.unwrap().unwrap()["pid"], 42);
         h.dispatch("movecursor 10 20").await.unwrap();
         assert!(h.dispatch("nope").await.is_err());
-        assert_eq!(server.await.unwrap(),
-                   vec!["j/activewindow", "dispatch movecursor 10 20", "dispatch nope"]);
+        assert_eq!(
+            server.await.unwrap(),
+            vec![
+                "j/activewindow",
+                "dispatch movecursor 10 20",
+                "dispatch nope"
+            ]
+        );
     }
 }

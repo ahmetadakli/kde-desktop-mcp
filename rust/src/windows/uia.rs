@@ -12,9 +12,7 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, SAFEARRAY,
 };
-use windows::Win32::System::Variant::{
-    VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4, VariantClear,
-};
+use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4, VariantClear};
 use windows::Win32::UI::Accessibility::*;
 use windows::core::{BSTR, Interface};
 
@@ -111,7 +109,8 @@ impl Var {
     }
 
     fn bool(&self) -> Option<bool> {
-        (self.vt() == VT_BOOL.0).then(|| unsafe { self.0.Anonymous.Anonymous.Anonymous.boolVal.0 != 0 })
+        (self.vt() == VT_BOOL.0)
+            .then(|| unsafe { self.0.Anonymous.Anonymous.Anonymous.boolVal.0 != 0 })
     }
 
     fn i32(&self) -> Option<i32> {
@@ -204,16 +203,18 @@ impl Requests {
         unsafe {
             // The Python backend walks the raw view; so do the cache requests.
             let all = auto.CreateTrueCondition().map_err(err)?;
-            let request = |props: &[UIA_PROPERTY_ID], scope: TreeScope| -> R<IUIAutomationCacheRequest> {
-                let req = auto.CreateCacheRequest().map_err(err)?;
-                for p in props {
-                    req.AddProperty(*p).map_err(err)?;
-                }
-                req.SetTreeScope(scope).map_err(err)?;
-                req.SetTreeFilter(&all).map_err(err)?;
-                req.SetAutomationElementMode(AutomationElementMode_Full).map_err(err)?;
-                Ok(req)
-            };
+            let request =
+                |props: &[UIA_PROPERTY_ID], scope: TreeScope| -> R<IUIAutomationCacheRequest> {
+                    let req = auto.CreateCacheRequest().map_err(err)?;
+                    for p in props {
+                        req.AddProperty(*p).map_err(err)?;
+                    }
+                    req.SetTreeScope(scope).map_err(err)?;
+                    req.SetTreeFilter(&all).map_err(err)?;
+                    req.SetAutomationElementMode(AutomationElementMode_Full)
+                        .map_err(err)?;
+                    Ok(req)
+                };
             Ok(Requests {
                 subtree: request(PROPS, TreeScope_Subtree)?,
                 element: request(PROPS, TreeScope_Element)?,
@@ -236,18 +237,26 @@ impl Uia {
     pub fn new() -> R<Self> {
         unsafe {
             // MTA: UIA clients must not depend on a message pump.
-            CoInitializeEx(None, COINIT_MULTITHREADED).ok().map_err(|e| format!("COM: {}", err(e)))?;
+            CoInitializeEx(None, COINIT_MULTITHREADED)
+                .ok()
+                .map_err(|e| format!("COM: {}", err(e)))?;
             let auto: IUIAutomation = CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER)
                 .map_err(|e| format!("UI Automation: {}", err(e)))?;
             let req = Requests::new(&auto)
-                .inspect_err(|e| eprintln!("desktop-mcp: UI Automation cache requests unavailable: {e}"))
+                .inspect_err(|e| {
+                    eprintln!("desktop-mcp: UI Automation cache requests unavailable: {e}")
+                })
                 .ok();
             Ok(Uia { auto, req })
         }
     }
 
     fn wrap(el: IUIAutomationElement, subtree: bool) -> Elem {
-        Elem { rid: runtime_id(&el), el, subtree }
+        Elem {
+            rid: runtime_id(&el),
+            el,
+            subtree,
+        }
     }
 
     /// Children of an array, cut at the first element of a control type
@@ -257,7 +266,9 @@ impl Uia {
         let n = unsafe { arr.Length() }.unwrap_or(0);
         let mut out = Vec::with_capacity(n.max(0) as usize);
         for i in 0..n {
-            let Ok(el) = (unsafe { arr.GetElement(i) }) else { break };
+            let Ok(el) = (unsafe { arr.GetElement(i) }) else {
+                break;
+            };
             if super::logic::role_name(props_control_type(&el)).is_none() {
                 break;
             }
@@ -268,15 +279,21 @@ impl Uia {
 
     /// Top-level windows with their name, role, handle and process id cached.
     pub fn top_level(&self) -> Vec<(Elem, Props)> {
-        let Some(req) = &self.req else { return Vec::new() };
+        let Some(req) = &self.req else {
+            return Vec::new();
+        };
         let arr = unsafe {
-            self.auto.GetRootElement()
+            self.auto
+                .GetRootElement()
                 .and_then(|root| root.FindAllBuildCache(TreeScope_Children, &req.all, &req.windows))
         };
-        Self::elems(arr.ok(), false).into_iter().map(|e| {
-            let p = props(&e.el);
-            (e, p)
-        }).collect()
+        Self::elems(arr.ok(), false)
+            .into_iter()
+            .map(|e| {
+                let p = props(&e.el);
+                (e, p)
+            })
+            .collect()
     }
 
     /// Fetch `el` and everything below it in one cross-process call.
@@ -286,7 +303,11 @@ impl Uia {
 
     /// Fetch every property of one element (no children).
     pub fn fetch(&self, el: &IUIAutomationElement) -> Option<Props> {
-        unsafe { el.BuildUpdatedCache(&self.req.as_ref()?.element).ok().map(|e| props(&e)) }
+        unsafe {
+            el.BuildUpdatedCache(&self.req.as_ref()?.element)
+                .ok()
+                .map(|e| props(&e))
+        }
     }
 
     /// Cached children of an element from `fetch_subtree`.
@@ -295,7 +316,9 @@ impl Uia {
     }
 
     pub fn has_focus(&self, el: &IUIAutomationElement) -> bool {
-        unsafe { el.CurrentHasKeyboardFocus() }.map(|b| b.as_bool()).unwrap_or(false)
+        unsafe { el.CurrentHasKeyboardFocus() }
+            .map(|b| b.as_bool())
+            .unwrap_or(false)
     }
 
     pub fn set_focus(&self, el: &IUIAutomationElement) -> bool {
@@ -307,7 +330,9 @@ impl Uia {
         let walker = unsafe { self.auto.RawViewWalker() }.ok()?;
         let mut cur = el.clone();
         for _ in 0..64 {
-            let h = unsafe { cur.CurrentNativeWindowHandle() }.map(|h| h.0 as usize as u32 as i32).unwrap_or(0);
+            let h = unsafe { cur.CurrentNativeWindowHandle() }
+                .map(|h| h.0 as usize as u32 as i32)
+                .unwrap_or(0);
             if h != 0 {
                 return Some(h);
             }
@@ -330,7 +355,9 @@ impl Uia {
     pub fn document_text(&self, el: &IUIAutomationElement, limit: usize) -> Option<String> {
         let tp: IUIAutomationTextPattern = Self::pattern(el, UIA_TextPatternId)?;
         let max = i32::try_from(limit).unwrap_or(i32::MAX);
-        unsafe { tp.DocumentRange().and_then(|r| r.GetText(max)) }.ok().map(|s| s.to_string())
+        unsafe { tp.DocumentRange().and_then(|r| r.GetText(max)) }
+            .ok()
+            .map(|s| s.to_string())
     }
 
     /// Live ValuePattern value.
@@ -342,7 +369,9 @@ impl Uia {
     /// Live ValuePattern, None when absent or read-only.
     pub fn writable_value(&self, el: &IUIAutomationElement) -> Option<IUIAutomationValuePattern> {
         let vp: IUIAutomationValuePattern = Self::pattern(el, UIA_ValuePatternId)?;
-        let read_only = unsafe { vp.CurrentIsReadOnly() }.map(|b| b.as_bool()).unwrap_or(true);
+        let read_only = unsafe { vp.CurrentIsReadOnly() }
+            .map(|b| b.as_bool())
+            .unwrap_or(true);
         (!read_only).then_some(vp)
     }
 
@@ -359,13 +388,25 @@ impl Uia {
                 "toggle" => Self::pattern::<IUIAutomationTogglePattern>(el, UIA_TogglePatternId)
                     .is_some_and(|p| p.Toggle().is_ok()),
                 "expand" => Self::pattern::<IUIAutomationExpandCollapsePattern>(
-                    el, UIA_ExpandCollapsePatternId).is_some_and(|p| p.Expand().is_ok()),
+                    el,
+                    UIA_ExpandCollapsePatternId,
+                )
+                .is_some_and(|p| p.Expand().is_ok()),
                 "collapse" => Self::pattern::<IUIAutomationExpandCollapsePattern>(
-                    el, UIA_ExpandCollapsePatternId).is_some_and(|p| p.Collapse().is_ok()),
+                    el,
+                    UIA_ExpandCollapsePatternId,
+                )
+                .is_some_and(|p| p.Collapse().is_ok()),
                 "select" => Self::pattern::<IUIAutomationSelectionItemPattern>(
-                    el, UIA_SelectionItemPatternId).is_some_and(|p| p.Select().is_ok()),
+                    el,
+                    UIA_SelectionItemPatternId,
+                )
+                .is_some_and(|p| p.Select().is_ok()),
                 "default" => Self::pattern::<IUIAutomationLegacyIAccessiblePattern>(
-                    el, UIA_LegacyIAccessiblePatternId).is_some_and(|p| p.DoDefaultAction().is_ok()),
+                    el,
+                    UIA_LegacyIAccessiblePatternId,
+                )
+                .is_some_and(|p| p.DoDefaultAction().is_ok()),
                 _ => false,
             }
         }

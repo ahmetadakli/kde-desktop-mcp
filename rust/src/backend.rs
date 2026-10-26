@@ -66,8 +66,14 @@ pub trait Backend {
     /// Fetch `roots` and their descendants into `cache`, as fast as the
     /// platform allows. Children of hidden nodes may be skipped when
     /// `only_showing`; stop after roughly `limit` new nodes.
-    async fn prefetch(&self, cache: &mut Cache<Self::Id>, roots: Vec<Self::Id>,
-                      only_showing: bool, text_limit: usize, limit: usize);
+    async fn prefetch(
+        &self,
+        cache: &mut Cache<Self::Id>,
+        roots: Vec<Self::Id>,
+        only_showing: bool,
+        text_limit: usize,
+        limit: usize,
+    );
 
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
