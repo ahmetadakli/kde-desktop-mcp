@@ -19,7 +19,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, SetProcessDpiAwarenessContext,
 };
 
-use crate::backend::{AppEntry, Backend, Cache, Info, R, Shot, WindowEntry};
+use crate::backend::{Activated, AppEntry, Backend, Cache, Info, R, Shot, WindowEntry};
 use logic::Props;
 use uia::{Elem, Uia};
 
@@ -362,7 +362,7 @@ impl Backend for WindowsBackend {
         Ok(())
     }
 
-    async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()> {
+    async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {
         let q = query.to_lowercase();
         for (_, p) in self.uia.top_level() {
             let app = input::proc_name(p.pid);
@@ -381,10 +381,10 @@ impl Backend for WindowsBackend {
                     }
                     poll(ACTIVATE_WAIT, || input::foreground() == h).await;
                 }
-                return Ok(());
+                return Ok(None);
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn screenshot(&self) -> Option<Shot> {

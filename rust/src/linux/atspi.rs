@@ -238,6 +238,12 @@ impl A11y {
             .map(|(bus, _)| bus)
     }
 
+    /// Record that the app on `bus` is in front, as `active_app` does when
+    /// it finds it there.
+    pub fn note_active_bus(&self, bus: Arc<str>) {
+        *self.active_bus.lock().unwrap() = Some((bus, Instant::now()));
+    }
+
     /// Ask toolkits to emit focus changes (Qt only sends events someone
     /// registered for), and keep `focus_hint` current from them. The
     /// registration ends with this connection.
