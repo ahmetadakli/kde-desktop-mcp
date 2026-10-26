@@ -25,7 +25,7 @@ bir liste olarak okur ve öğelere numarasıyla doğrudan işlem yapar.
 | Öğe işlemleri | AT-SPI eylemleri, EditableText | AT-SPI eylemleri, EditableText | Invoke, Toggle, ExpandCollapse, SelectionItem, Value desenleri |
 | Klavye | `/dev/uinput` | `/dev/uinput` | Win32 `SendInput` |
 | Fare | Mutlak konumlu uinput | Hyprland `movecursor` + uinput tuşları | `SetCursorPos` + `SendInput` |
-| Metin yazma | Qt'nin çok satırlı alanlarına AT-SPI ile doğrudan ekleme (panoya dokunmaz); diğerlerinde süreç içi pano + Ctrl+V | `wtype` (panoya dokunmaz); yoksa `wl-copy` | `KEYEVENTF_UNICODE` (panoya dokunmaz) |
+| Metin yazma | Qt'nin çok satırlı alanlarına AT-SPI ile doğrudan ekleme (panoya dokunmaz); diğerlerinde süreç içi pano + Ctrl+V, ardından panodaki metin geri konur | `wtype` (panoya dokunmaz); yoksa KDE'deki gibi pano + Ctrl+V | `KEYEVENTF_UNICODE` (panoya dokunmaz) |
 | Pencere | KWin betikleri (D-Bus) | Hyprland soketi: `clients`, `focuswindow` | `SetForegroundWindow` |
 | Ekran görüntüsü (yedek) | KWin `ScreenShot2` (D-Bus); yoksa `spectacle` | `grim` | GDI |
 
@@ -84,7 +84,7 @@ Neden hızlı:
   inilir, kaydırılarak ekran dışında kalan içerik yine atlanır. Örnek: Gemini'nin
   "Dosya yükleyin" menüsü artık ekran görüntüsü olmadan bulunur.
 - Okuma araçları (`apps`, `tree`, `find`, `get_text`, `wait_for`,
-  `screenshot`, `pause`) MCP'de `readOnlyHint` ile işaretlidir; Claude Code
+  `screenshot`, `pause`, `clipboard_get`) MCP'de `readOnlyHint` ile işaretlidir; Claude Code
   bunları tek mesajda birden fazla istendiğinde paralel çalıştırır.
 
 ## Ekran göstergesi
@@ -147,6 +147,14 @@ değişkenini verin.
 - `key`, `type_text`: klavye. Yanıt, ardından odakta olan öğeyi adlandırır;
   `type_text` odak düzenlenebilir bir alanda değilse uyarır (KDE)
 - `activate_window`: pencereyi öne getirme
+- `clipboard_get`, `clipboard_set`: panoyu metin olarak okur ya da yazar
+  (yalnızca Linux). Pano, kullanıcının herhangi bir yerden kopyaladığı her şeyi
+  (parolalar dahil) tutabildiği için ikisi de yalnızca izin verilen bir
+  uygulamanın penceresi etkinken çalışır. `clipboard_get` en fazla `limit`
+  karakter döndürür (varsayılan 20.000; kesildiyse yanıtta yazar); pano metin
+  değil de resim ya da dosya tutuyorsa yalnızca türlerini söyler, bir parola
+  yöneticisinin parola olarak işaretlediği içeriği (`x-kde-passwordManagerHint`)
+  okumaz.
 - `mouse`, `screenshot`: yalnızca yedek. `screenshot` görüntüyü yanıtın
   içinde döndürür (dosyayı ayrıca okumak gerekmez), uzun kenarı varsayılan
   1280 px olacak şekilde küçültür (`max_size`; `inline: false` yalnızca dosya
@@ -373,7 +381,13 @@ KDE:
 - Chromium, Chrome ve Electron uygulamaları ağaçlarını yalnızca
   `--force-renderer-accessibility` ile başlatılırlarsa gösterir.
 - `type_text`, Qt'nin çok satırlı düzenleyicileri (Kate gibi) dışındaki
-  alanlarda panonun içeriğini değiştirir.
+  alanlara pano üzerinden yapıştırır. Önce panodaki metni saklar; hedef
+  uygulama yapıştırılanı okuyunca (Wayland data-control ile görülür) onu geri
+  koyar. Yazılan metin Klipper geçmişine girmez (parola işaretiyle sunulur).
+  Pano resim, dosya ya da 4 MiB'tan büyük metin tutuyorsa geri konmaz;
+  uygulama 1 sn içinde okumazsa da geri konmaz (geç okuyan uygulama
+  kullanıcının panosunu yapıştırmasın diye). İki durumda da yanıt bunu söyler.
+  Zengin metin (HTML) yalnızca düz metin olarak geri gelir.
 - Doğrudan eklemede yazma, yapıştırmadan biraz farklıdır: seçili metni
   değiştirmek iki geri alma adımıdır, çoklu imleçte yalnızca birincil imlece
   yazılır, üzerine yazma kipi ve Kate'in vi kipi atlanır; yapıştırmadaki gibi
@@ -383,7 +397,8 @@ Hyprland:
 - GTK uygulamalarının istemci tarafı gölgeleri, `click` ve `focus` tıklamalarını
   birkaç piksel kaydırabilir.
 - Aynı süreçte aynı başlığı taşıyan iki pencere ayırt edilemez.
-- `wtype` yoksa `type_text` panoyu değiştirir.
+- `wtype` yoksa `type_text` KDE'deki gibi pano üzerinden yapıştırır ve
+  panodaki metni sonra geri koyar.
 
 Windows:
 - Yönetici olarak çalışan pencerelere, yönetici olmayan bir sunucudan girdi

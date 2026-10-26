@@ -32,6 +32,26 @@ pub type Cache<Id> = HashMap<Id, Info<Id>>;
 /// Window management the desktop does not offer (only KDE does so far).
 pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma";
 
+/// Clipboard access the desktop does not offer (only Linux so far).
+pub const NO_CLIPBOARD: &str = "the clipboard tools are only available on Linux (Wayland)";
+
+/// What `clipboard_get` found on the clipboard.
+// Only the Linux backend builds one so far.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Clip {
+    Empty,
+    /// The text, cut to the limit asked for; `truncated` when it was.
+    Text {
+        text: String,
+        truncated: bool,
+    },
+    /// Marked as a password by the app that copied it; not read.
+    Secret,
+    /// Not text: the types offered (an image, copied files...).
+    Other(Vec<String>),
+}
+
 /// A top-level window and where it is, in logical screen px.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WindowGeo {
@@ -166,7 +186,9 @@ pub trait Backend {
     /// Check a chord such as "ctrl+s" without pressing it.
     fn check_combo(&self, combo: &str) -> R<()>;
     async fn press_combo(&self, combo: &str) -> R<()>;
-    async fn type_text(&self, text: &str) -> R<()>;
+    /// Type `text`; Ok holds a note for the reply ("" when none), e.g. that
+    /// the clipboard could not be put back after a paste.
+    async fn type_text(&self, text: &str) -> R<String>;
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()>;
     /// Move the cursor to screen coordinates without clicking.
     async fn move_pointer(&self, x: i64, y: i64) -> R<()>;
@@ -188,6 +210,13 @@ pub trait Backend {
         _change: &WindowChange,
     ) -> R<WindowGeo> {
         Err(NO_WINDOW_CONTROL.into())
+    }
+    /// Read the clipboard as text, at most `limit` characters.
+    async fn clipboard_get(&self, _limit: usize) -> R<Clip> {
+        Err(NO_CLIPBOARD.into())
+    }
+    async fn clipboard_set(&self, _text: &str) -> R<()> {
+        Err(NO_CLIPBOARD.into())
     }
     async fn screens(&self) -> Vec<Screen> {
         Vec::new()
