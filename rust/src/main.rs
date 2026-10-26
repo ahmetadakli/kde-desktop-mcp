@@ -118,6 +118,64 @@ fn name_is_stable<Id>(info: &Info<Id>) -> bool {
         && !VOLATILE_NAME_ROLES.contains(&info.role.as_str())
 }
 
+/// `apps` output. Allowed apps list their windows (untitled ones only when
+/// active: plasmashell alone has a dozen); blocked apps share one line,
+/// since nothing can be done with their windows. The allowlist path and the
+/// accessibility note (both in `doctor`) only come when no app is allowed.
+fn apps_text(
+    list: Vec<backend::AppEntry>,
+    allow: &[String],
+    allow_file: &std::path::Path,
+    note: &str,
+) -> String {
+    let mut lines = Vec::new();
+    // Name, and whether one of its windows is the active one.
+    let mut blocked: Vec<(String, bool)> = Vec::new();
+    for app in list {
+        if app.windows.is_empty() {
+            continue;
+        }
+        if !allow.contains(&app.name.to_lowercase()) {
+            let active = app.windows.iter().any(|w| w.active);
+            match blocked.iter_mut().find(|(n, _)| *n == app.name) {
+                Some((_, a)) => *a |= active,
+                None => blocked.push((app.name, active)),
+            }
+            continue;
+        }
+        lines.push(format!("{} (allowed)", app.name));
+        for w in app.windows {
+            if w.title.is_empty() && !w.active {
+                continue;
+            }
+            let act = if w.active { " [active]" } else { "" };
+            lines.push(format!(
+                "  - {}: {}{act}",
+                w.kind,
+                render::py_repr(&w.title)
+            ));
+        }
+    }
+    let none_allowed = lines.is_empty();
+    if !blocked.is_empty() {
+        let names: Vec<String> = blocked
+            .into_iter()
+            .map(|(n, active)| if active { format!("{n} [active]") } else { n })
+            .collect();
+        lines.push(format!("blocked: {}", names.join(", ")));
+    }
+    if none_allowed {
+        lines.push(format!(
+            "no allowed app has a window; allowlist file: {}",
+            allow_file.display()
+        ));
+        if !note.is_empty() {
+            lines.push(note.into());
+        }
+    }
+    lines.join("\n")
+}
+
 struct Server<B: Backend> {
     b: B,
     refs: Mutex<Refs<B::Id>>,
@@ -214,7 +272,9 @@ impl From<String> for Out {
 }
 
 /// Longest side of a screenshot sent back, unless `max_size` says otherwise.
-const SHOT_MAX_SIZE: i64 = 1280;
+/// Image tokens grow with the area: 1024 costs about 0.64 of 1280 and
+/// still shows a 1536 px wide window's text legibly.
+const SHOT_MAX_SIZE: i64 = 1024;
 
 /// How long set_text waits for the field to show what was written.
 const SET_TEXT_VERIFY: Duration = Duration::from_millis(300);
@@ -691,32 +751,13 @@ impl<B: Backend> Server<B> {
 
     async fn apps(&self) -> R<String> {
         self.b.enable().await;
-        let allow = self.allowed();
-        let mut lines = Vec::new();
-        for app in self.b.list_apps().await {
-            if app.windows.is_empty() {
-                continue;
-            }
-            let flag = if allow.contains(&app.name.to_lowercase()) {
-                "allowed"
-            } else {
-                "blocked"
-            };
-            lines.push(format!("{} ({flag})", app.name));
-            for w in app.windows {
-                let act = if w.active { " [active]" } else { "" };
-                lines.push(format!(
-                    "  - {}: {}{act}",
-                    w.kind,
-                    render::py_repr(&w.title)
-                ));
-            }
-        }
-        lines.push(format!("allowlist file: {}", self.allow_file.display()));
-        if !self.b.apps_note().is_empty() {
-            lines.push(self.b.apps_note().into());
-        }
-        Ok(lines.join("\n"))
+        let list = self.b.list_apps().await;
+        Ok(apps_text(
+            list,
+            &self.allowed(),
+            &self.allow_file,
+            self.b.apps_note(),
+        ))
     }
 
     async fn windows(&self, a: &Json) -> R<String> {
@@ -972,15 +1013,32 @@ impl<B: Backend> Server<B> {
             stop_roles: &render::DOCUMENT_ROLES,
             ..search_fetch(TREE_TEXT_LIMIT, limit)
         };
-        self.b
-            .prefetch_with(cache, windows.clone(), &fetch(render::FIND_MAX_SEEN))
-            .await;
-        let window = windows
+        // The windows themselves (limit 1 stops after their level), and the
+        // document each says it shows, at once.
+        let level = fetch(1);
+        let (_, embedded) = tokio::join!(
+            self.b.prefetch_with(cache, windows.clone(), &level),
+            futures_util::future::join_all(windows.iter().map(|w| self.b.embedded_document(w)))
+        );
+        let (window, embedded) = windows
             .iter()
-            .filter(|w| cache.get(*w).is_some_and(|i| i.showing))
-            .max_by_key(|w| cache[*w].states.contains(&"active"))
-            .cloned()
+            .zip(embedded)
+            .filter(|(w, _)| cache.get(*w).is_some_and(|i| i.showing))
+            .max_by_key(|(w, _)| cache[*w].states.contains(&"active"))
+            .map(|(w, d)| (w.clone(), d))
             .ok_or_else(|| format!("'{app}' has no visible window"))?;
+        if let Some(doc) = embedded {
+            let info = self.b.info(&doc, TREE_TEXT_LIMIT).await;
+            if info.showing && render::DOCUMENT_ROLES.contains(&info.role.as_str()) {
+                cache.insert(doc.clone(), info);
+                return Ok(doc);
+            }
+        }
+        // Otherwise search the window for it.
+        let below = cache[&window].children.clone();
+        self.b
+            .prefetch_with(cache, below, &fetch(render::FIND_MAX_SEEN))
+            .await;
         loop {
             match render::first_with_role(
                 cache,
@@ -1139,14 +1197,55 @@ impl<B: Backend> Server<B> {
 
     async fn get_text(&self, a: &Json) -> R<String> {
         let t = self.target(a).await?;
-        let text = self
-            .b
-            .full_text(&t.id, arg_i(a, "limit", 20000).max(0) as usize)
-            .await?;
+        let limit = arg_i(a, "limit", 20000).max(0) as usize;
+        let mut text = self.b.full_text(&t.id, limit).await?;
+        if render::has_embedded_objects(&text) {
+            text = self.container_text(&t.id, limit).await;
+        }
         Ok(match t.found {
             Some(d) => format!("{d}:\n{text}"),
             None => text,
         })
+    }
+
+    /// A web container's text with its descendants' text in place of the
+    /// U+FFFC placeholders (see `render::container_text`). Hidden nodes are
+    /// read too: text scrolled out of view is part of the page.
+    async fn container_text(&self, id: &B::Id, limit: usize) -> String {
+        let fetch = |nodes| Fetch {
+            only_showing: false,
+            ..search_fetch(limit, nodes)
+        };
+        let mut cache = Cache::new();
+        self.b
+            .prefetch_with(&mut cache, vec![id.clone()], &fetch(render::FIND_MAX_SEEN))
+            .await;
+        loop {
+            match render::container_text(&cache, id, limit) {
+                Ok(text) => return text,
+                Err(missing) => {
+                    let before = cache.len();
+                    self.b
+                        .prefetch_with(&mut cache, missing.clone(), &fetch(PREFETCH_MORE))
+                        .await;
+                    if cache.len() == before {
+                        // Nodes that cannot be read (gone meanwhile) read
+                        // as nothing.
+                        for m in missing {
+                            cache.entry(m).or_insert_with(|| Info {
+                                role: String::new(),
+                                name: String::new(),
+                                states: Vec::new(),
+                                showing: false,
+                                actions: Vec::new(),
+                                text: None,
+                                children: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn wait_for(&self, a: &Json) -> R<String> {
@@ -1560,10 +1659,8 @@ impl<B: Backend> Server<B> {
         let (iw, ih) = size;
         let mut text = format!("{path}\n{iw}x{ih} px");
         if let (Some((x, y, w, h)), Some(_)) = (area, map) {
-            text.push_str(&format!(
-                " image of screen area at ({x},{y}), {w}x{h}. To click a point seen in it, \
-                 pass its pixel position as image_x/image_y to mouse."
-            ));
+            // How to click a point in it is in the server instructions.
+            text.push_str(&format!(" of screen area at ({x},{y}), {w}x{h}"));
         }
         Ok(Out {
             text,
@@ -2353,7 +2450,7 @@ mod tests {
             let content = &r["result"]["content"];
             let text = content[0]["text"].as_str().unwrap();
             assert!(
-                text.contains("100x50 px image of screen area at (10,20), 400x200"),
+                text.contains("100x50 px of screen area at (10,20), 400x200"),
                 "{text}"
             );
             assert_eq!(content[1]["type"], "image", "{r}");
@@ -2562,6 +2659,57 @@ mod tests {
             let text = r["result"]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains(backend::NO_FILE_DIALOG), "{text}");
         });
+    }
+
+    #[test]
+    fn apps_lists_allowed_windows_and_blocked_names_on_one_line() {
+        let w = |title: &str, active: bool| backend::WindowEntry {
+            kind: "frame".into(),
+            title: title.into(),
+            active,
+        };
+        let app = |name: &str, windows| AppEntry {
+            name: name.into(),
+            windows,
+        };
+        let list = || {
+            vec![
+                app("kwin", vec![w("", false)]),
+                app("konsole", vec![w("~ : claude", false)]),
+                app(
+                    "Firefox",
+                    vec![w("Page — Mozilla Firefox", true), w("", false)],
+                ),
+                app("konsole", vec![w("other", false)]),
+                app("plasmashell", vec![w("Desktop", false), w("", false)]),
+                app("idle", vec![]),
+            ]
+        };
+        let file = PathBuf::from("/home/u/.config/desktop-mcp/allow.txt");
+        let allow = vec!["firefox".to_string()];
+        assert_eq!(
+            apps_text(list(), &allow, &file, "restart note"),
+            "Firefox (allowed)\n  - frame: 'Page — Mozilla Firefox' [active]\n\
+             blocked: kwin, konsole, plasmashell"
+        );
+        // An untitled window is listed when it is the active one; so is
+        // a blocked app's.
+        let mut l = list();
+        l[1].windows[0].active = true;
+        l[2].windows[0].active = false;
+        l[2].windows[1].active = true;
+        assert_eq!(
+            apps_text(l, &allow, &file, "restart note"),
+            "Firefox (allowed)\n  - frame: 'Page — Mozilla Firefox'\n  - frame: '' [active]\n\
+             blocked: kwin, konsole [active], plasmashell"
+        );
+        // Nothing allowed: where the allowlist is, and the note.
+        assert_eq!(
+            apps_text(list(), &[], &file, "restart note"),
+            "blocked: kwin, konsole, Firefox [active], plasmashell\n\
+             no allowed app has a window; allowlist file: \
+             /home/u/.config/desktop-mcp/allow.txt\nrestart note"
+        );
     }
 
     #[test]

@@ -861,6 +861,10 @@ impl Backend for LinuxBackend {
         self.a11y.fill_actions(cache, ids).await
     }
 
+    async fn embedded_document(&self, window: &Obj) -> Option<Obj> {
+        self.a11y.relation(window, atspi::RELATION_EMBEDS).await
+    }
+
     async fn actions(&self, id: &Obj) -> Vec<String> {
         self.a11y.actions(id).await
     }

@@ -50,6 +50,9 @@ pub const SHOWING: u32 = 25;
 pub const VISIBLE: u32 = 30;
 pub const IS_DEFAULT: u32 = 39;
 
+// AtspiRelationType: a browser window EMBEDS its current tab's document.
+pub const RELATION_EMBEDS: u32 = 13;
+
 // AtspiCoordType.
 pub const COORD_SCREEN: u32 = 0;
 pub const COORD_WINDOW: u32 = 1;
@@ -318,6 +321,18 @@ impl A11y {
             .filter(|(_, p)| p.as_str() != NULL_PATH)
             .map(|(b, p)| Obj::new(&b, p))
             .collect()
+    }
+
+    /// The first target of `o`'s relation of `kind` (AtspiRelationType),
+    /// None without one.
+    pub async fn relation(&self, o: &Obj, kind: u32) -> Option<Obj> {
+        let set: Vec<(u32, Vec<(String, OwnedObjectPath)>)> =
+            self.call(o, ACC, "GetRelationSet", &()).await.ok()?;
+        set.into_iter()
+            .filter(|(k, _)| *k == kind)
+            .flat_map(|(_, targets)| targets)
+            .find(|(_, p)| p.as_str() != NULL_PATH)
+            .map(|(b, p)| Obj::new(&b, p))
     }
 
     pub async fn parent(&self, o: &Obj) -> Option<Obj> {

@@ -243,6 +243,13 @@ pub trait Backend {
     /// actions keeps this default, which does nothing.
     async fn fill_actions(&self, _cache: &mut Cache<Self::Id>, _ids: &[Self::Id]) {}
 
+    /// The document a top-level window shows, when the platform says so in
+    /// one call (Firefox: the window's EMBEDS relation names the current
+    /// tab's page). None to search the window for it instead.
+    async fn embedded_document(&self, _window: &Self::Id) -> Option<Self::Id> {
+        None
+    }
+
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
     /// Complete text content (falls back to the name).
