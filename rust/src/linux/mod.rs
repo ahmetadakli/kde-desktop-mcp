@@ -4,9 +4,12 @@
 mod atspi;
 mod hyprland;
 mod image;
+pub mod indicator;
+mod indicator_draw;
 mod input;
 mod kwin;
 mod roles;
+mod terminals;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -101,6 +104,114 @@ pub struct LinuxBackend {
     focus_record: Mutex<HashMap<(String, FocusMethod), Tried>>,
     /// KWin refused ScreenShot2; use spectacle from now on.
     shot_unauthorized: AtomicBool,
+    indicator: tokio::sync::Mutex<IndicatorProc>,
+}
+
+/// The `--indicator` child process, started on the first action.
+#[derive(Default)]
+struct IndicatorProc {
+    child: Option<(
+        tokio::process::Child,
+        tokio::process::ChildStdin,
+        tokio::io::Lines<tokio::io::BufReader<tokio::process::ChildStdout>>,
+    )>,
+    /// Turned off by DESKTOP_MCP_INDICATOR=0, or after the child failed.
+    off: bool,
+}
+
+/// How long a screenshot waits for the indicator to clear the screen.
+const INDICATOR_HIDE_WAIT: Duration = Duration::from_millis(300);
+
+impl IndicatorProc {
+    fn spawn(&mut self) -> bool {
+        if self.off {
+            return false;
+        }
+        if self.child.is_some() {
+            return true;
+        }
+        let env_off = std::env::var("DESKTOP_MCP_INDICATOR").is_ok_and(|v| v == "0");
+        let child = std::env::current_exe()
+            .ok()
+            .filter(|_| !env_off)
+            .and_then(|exe| {
+                tokio::process::Command::new(exe)
+                    .arg("--indicator")
+                    .stdin(std::process::Stdio::piped())
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true)
+                    .spawn()
+                    .ok()
+            });
+        let Some(mut child) = child else {
+            self.off = true;
+            return false;
+        };
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+            self.off = true;
+            return false;
+        };
+        use tokio::io::AsyncBufReadExt;
+        let lines = tokio::io::BufReader::new(stdout).lines();
+        self.child = Some((child, stdin, lines));
+        true
+    }
+
+    /// Send one command line; a child that cannot take it is dropped and
+    /// the indicator stays off.
+    async fn send(&mut self, line: &str) -> bool {
+        let Some((_, stdin, _)) = self.child.as_mut() else {
+            return false;
+        };
+        let sent = stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .is_ok()
+            && stdin.flush().await.is_ok();
+        if !sent {
+            self.child = None;
+            self.off = true;
+        }
+        sent
+    }
+}
+
+impl LinuxBackend {
+    /// Clear the indicator off the screen before a capture, waiting for it
+    /// to confirm (briefly; a stuck indicator is dropped).
+    async fn hide_indicator(&self) {
+        let mut ind = self.indicator.lock().await;
+        if ind.child.is_none() || !ind.send("hide").await {
+            return;
+        }
+        let answered = match ind.child.as_mut() {
+            Some((_, _, lines)) => {
+                tokio::time::timeout(INDICATOR_HIDE_WAIT, lines.next_line()).await
+            }
+            None => return,
+        };
+        if !matches!(answered, Ok(Ok(Some(ref l))) if l == "hidden") {
+            ind.child = None;
+            ind.off = true;
+        }
+    }
+}
+
+/// Fill in the terminals of each window from /proc (off the event loop).
+async fn with_terminals(list: &mut [WindowGeo]) {
+    let pids: Vec<u32> = list.iter().map(|w| w.pid).collect();
+    let found = tokio::task::spawn_blocking(move || {
+        let stats = terminals::read_stats();
+        pids.into_iter()
+            .map(|pid| terminals::terminals_of(pid, &stats, terminals::describe))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    for (w, t) in list.iter_mut().zip(found) {
+        w.terminals = t;
+    }
 }
 
 fn which(cmd: &str) -> bool {
@@ -262,6 +373,7 @@ impl LinuxBackend {
             toolkits: Mutex::new(HashMap::new()),
             focus_record: Mutex::new(HashMap::new()),
             shot_unauthorized: AtomicBool::new(false),
+            indicator: tokio::sync::Mutex::new(IndicatorProc::default()),
         })
     }
 
@@ -746,7 +858,21 @@ impl Backend for LinuxBackend {
         self.input.buttons(button, clicks, scroll).await
     }
 
+    async fn indicate(&self, label: &str) {
+        let mut ind = self.indicator.lock().await;
+        if ind.spawn() {
+            ind.send(&format!("show {}", label.replace('\n', " ")))
+                .await;
+        }
+    }
+
     async fn move_pointer(&self, x: i64, y: i64) -> R<()> {
+        {
+            let mut ind = self.indicator.lock().await;
+            if ind.child.is_some() {
+                ind.send(&format!("point {x} {y}")).await;
+            }
+        }
         match &self.comp {
             Compositor::Kde(kwin) => {
                 let (x0, y0, x1, y1) = kwin.screen_box().await;
@@ -813,7 +939,11 @@ impl Backend for LinuxBackend {
 
     async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
         match &self.comp {
-            Compositor::Kde(kwin) => kwin.windows(query, allowed).await,
+            Compositor::Kde(kwin) => {
+                let mut list = kwin.windows(query, allowed).await?;
+                with_terminals(&mut list).await;
+                Ok(list)
+            }
             Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
         }
     }
@@ -941,6 +1071,7 @@ impl Backend for LinuxBackend {
     }
 
     async fn screenshot(&self) -> Option<Shot> {
+        self.hide_indicator().await;
         let area;
         let mut cmd = match &self.comp {
             Compositor::Kde(kwin) => {

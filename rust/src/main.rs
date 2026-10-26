@@ -142,6 +142,23 @@ fn written_matches(written: &str, now: &str) -> bool {
     norm(written) == norm(now)
 }
 
+/// What the on-screen indicator says while a tool runs; None for tools that
+/// only read.
+fn indicator_label(tool: &str, a: &Json) -> Option<String> {
+    Some(match tool {
+        "click" | "act" => "clicking".into(),
+        "focus" => "focusing".into(),
+        "key" => format!("pressing {}", arg_s(a, "combo", "a key")),
+        "type_text" | "set_text" => "typing".into(),
+        "mouse" => "using the mouse".into(),
+        "drag" => "dragging".into(),
+        "scroll" => "scrolling".into(),
+        "activate_window" => "switching windows".into(),
+        "move_window" => "arranging windows".into(),
+        _ => return None,
+    })
+}
+
 /// How long move_window waits for a window to take its new geometry.
 const WINDOW_SETTLE: Duration = Duration::from_millis(1000);
 
@@ -183,6 +200,14 @@ fn describe_window(w: &WindowGeo) -> String {
     }
     if !w.output.is_empty() {
         line.push_str(&format!(" on {}", w.output));
+    }
+    for t in &w.terminals {
+        line.push_str(&format!(
+            "\n  {}: {} (in {})",
+            t.tty,
+            render::py_repr(&t.command),
+            t.cwd
+        ));
     }
     line
 }
@@ -1064,7 +1089,10 @@ impl<B: Backend> Server<B> {
     }
 
     async fn activate_window(&self, a: &Json) -> R<String> {
-        let query = req_s(a, "query")?;
+        let query = match a.get("terminal").and_then(Json::as_str) {
+            Some(t) => self.terminal_window(t).await?,
+            None => req_s(a, "query")?,
+        };
         self.b.activate_window(&query, &self.allowed()).await?;
         *self.last_active.lock().await = self.active_title().await;
         let app = self.b.active_app().await;
@@ -1072,6 +1100,23 @@ impl<B: Backend> Server<B> {
             "active app now: {}",
             if app.is_empty() { "unknown" } else { &app }
         ))
+    }
+
+    /// Title of the allowed window whose terminal runs a command, or is in a
+    /// directory, containing `what` (case-insensitive).
+    async fn terminal_window(&self, what: &str) -> R<String> {
+        let q = what.to_lowercase();
+        let list = self.b.windows("", &self.allowed()).await?;
+        list.into_iter()
+            .find(|w| {
+                w.terminals.iter().any(|t| {
+                    t.command.to_lowercase().contains(&q) || t.cwd.to_lowercase().contains(&q)
+                })
+            })
+            .map(|w| w.title)
+            .ok_or_else(|| {
+                format!("no terminal of an allowed app runs or is in '{what}' (see windows)")
+            })
     }
 
     async fn screenshot(&self, a: &Json) -> R<Out> {
@@ -1158,6 +1203,9 @@ impl<B: Backend> Server<B> {
             } else {
                 None
             };
+            if let Some(label) = indicator_label(name, a) {
+                self.b.indicate(&label).await;
+            }
             match name {
                 "apps" => self.apps().await.map(Out::from),
                 "tree" => self.tree(a).await.map(Out::from),
@@ -1385,6 +1433,14 @@ compile_error!("desktop-mcp supports Linux (KDE Plasma, Hyprland) and Windows on
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    #[cfg(target_os = "linux")]
+    if std::env::args().nth(1).as_deref() == Some("--indicator") {
+        if let Err(e) = linux::indicator::run() {
+            eprintln!("desktop-mcp indicator: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     // Tool calls run as local tasks: the backends are not `Send`.
     let local = tokio::task::LocalSet::new();
     #[cfg(target_os = "linux")]

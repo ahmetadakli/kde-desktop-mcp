@@ -87,6 +87,17 @@ Neden hızlı:
   `screenshot`, `pause`) MCP'de `readOnlyHint` ile işaretlidir; Claude Code
   bunları tek mesajda birden fazla istendiğinde paralel çalıştırır.
 
+## Ekran göstergesi
+
+Ajan klavye ya da fare kullanırken ekran kenarları turuncu parlar, üstte
+"Claude · typing" gibi ne yaptığını söyleyen bir etiket çıkar ve her işaretçi
+hedefinde bir halka belirir. Hepsi tıklamaları alttaki pencereye geçiren
+katmanlardır (wlr-layer-shell; KDE Plasma ve Hyprland), son işlemden 2,5 sn
+sonra kaybolur ve ekran görüntüsü alınmadan önce gizlenir. Sunucu göstergeyi
+ilk işlemde `desktop-mcp --indicator` olarak başlatır; kendisi kapanınca o da
+kapanır. Kapatmak için MCP ayarında `DESKTOP_MCP_INDICATOR=0` ortam
+değişkenini verin.
+
 ## Araçlar
 
 - `apps`, `tree`, `find`, `get_text`: okuma ve arama. `tree`'ye
@@ -118,6 +129,11 @@ Neden hızlı:
 - `move_window`: pencereyi taşır, boyutlandırır ya da büyütür, simge durumuna
   küçültür, eski haline getirir; pencere yeni boyutu alana kadar (en fazla
   1 sn) bekleyip gerçek sonucu bildirir (yalnızca KDE)
+- Terminal pencereleri: `windows`, her terminal sekmesinin pts aygıtını, ön
+  planda çalışan komutu ve klasörünü de listeler; `activate_window`
+  `terminal: "pytest"` ile o komutu çalıştıran (ya da o klasördeki)
+  terminali öne getirir. Birden çok sekmeli terminal, o an gösterdiği sekmeyle
+  öne gelir. Terminalin izin listesinde olması gerekir (ör. `konsole`)
 - `doctor`: kurulumu tek raporda denetler: sürüm, izin listesi, çalışan
   uygulamalardan hangilerinin izinli olduğu, oturum, AT-SPI, sanal klavye ve
   fare, KWin betikleri, ekranlar ve ekran görüntüsü yolu
