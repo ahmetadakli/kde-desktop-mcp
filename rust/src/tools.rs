@@ -58,13 +58,14 @@ pub fn tools() -> Json {
         ),
         t(
             "tree",
-            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.",
+            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nWith `document`=true only the page of `app`'s active window is listed: in a\nbrowser, the current tab's web page without the tabs and toolbars.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.",
             schema(&[
                 ("app", "string", Some(json!(""))),
                 ("root_id", "integer", Some(json!(0))),
                 ("max_depth", "integer", Some(json!(12))),
                 ("max_nodes", "integer", Some(json!(300))),
-                ("include_hidden", "boolean", Some(json!(false)))
+                ("include_hidden", "boolean", Some(json!(false))),
+                ("document", "boolean", Some(json!(false))),
             ])
         ),
         t(

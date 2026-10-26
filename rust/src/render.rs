@@ -47,20 +47,30 @@ pub fn json_str(s: &str) -> String {
     Json::String(s.to_string()).to_string()
 }
 
+/// Web pages put U+FFFC (OBJECT REPLACEMENT CHARACTER) in a container's
+/// text for each child element; it says nothing the tree does not.
+const EMBEDDED_OBJECT: char = '\u{FFFC}';
+
 pub fn text_preview<Id>(info: &Info<Id>, limit: usize) -> String {
     info.text
         .as_deref()
-        .map(|t| first_chars(t, limit))
+        .map(|t| first_chars(&t.replace(EMBEDDED_OBJECT, ""), limit))
         .unwrap_or_default()
 }
 
-/// Actions worth listing. Qt gives nearly every widget "Set Focus"; the
-/// `focus` tool uses it on its own, so listing it only costs tokens.
+/// Actions that say nothing about the element itself, so listing them only
+/// costs tokens (and would keep unnamed containers from being lifted). Qt
+/// gives nearly every widget "Set Focus", which the `focus` tool uses on its
+/// own; Firefox gives every element inside a clickable one "clickAncestor".
+/// `act` still runs them by name.
+const UNLISTED_ACTIONS: [&str; 2] = ["set focus", "clickancestor"];
+
+/// Actions worth listing.
 pub fn shown_actions<Id>(info: &Info<Id>) -> Vec<&str> {
     info.actions
         .iter()
         .map(String::as_str)
-        .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("set focus"))
+        .filter(|a| !a.is_empty() && !UNLISTED_ACTIONS.iter().any(|u| a.eq_ignore_ascii_case(u)))
         .collect()
 }
 
@@ -344,6 +354,50 @@ pub fn locate<Id: Clone + Eq + Hash>(
     Ok(first_partial)
 }
 
+/// Roles of the page or document inside an app window: a browser tab's web
+/// page, an office document.
+pub const DOCUMENT_ROLES: [&str; 3] = ["document web", "document frame", "document"];
+
+/// The first visible element whose role is one of `roles`, depth-first in
+/// document order. Ok(None) when there is none.
+pub fn first_with_role<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+    roles: &[&str],
+) -> Result<Option<Id>, Vec<Id>> {
+    let mut stack: Vec<&Id> = Vec::new();
+    let infos = get(cache, roots)?;
+    stack.extend(
+        roots
+            .iter()
+            .zip(infos)
+            .filter(|(_, i)| i.showing)
+            .map(|(r, _)| r)
+            .rev(),
+    );
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        let info = &cache[id];
+        if roles.contains(&info.role.as_str()) {
+            return Ok(Some(id.clone()));
+        }
+        let kids = get(cache, &info.children)?;
+        stack.extend(
+            info.children
+                .iter()
+                .zip(kids)
+                .filter(|(_, k)| k.showing)
+                .map(|(c, _)| c)
+                .rev(),
+        );
+    }
+    Ok(None)
+}
+
 /// Python `repr()` of a str, for window titles in `apps`.
 pub fn py_repr(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') {
@@ -419,6 +473,16 @@ mod tests {
     }
 
     #[test]
+    fn embedded_object_placeholders_are_not_text() {
+        let mut n = node("section", "", true, &[], &[]);
+        n.text = Some("\u{FFFC}\u{FFFC}".into());
+        assert_eq!(text_preview(&n, 80), "");
+        assert_eq!(describe(&n, 4), "[4] section");
+        n.text = Some("Prime\u{FFFC} Video".into());
+        assert_eq!(text_preview(&n, 80), "Prime Video");
+    }
+
+    #[test]
     fn walk_lifts_boring_nodes_and_skips_hidden() {
         let cache = sample();
         let mut lines = Vec::new();
@@ -465,6 +529,10 @@ mod tests {
         let mut f = node("filler", "", true, &[], &[]);
         f.actions = vec!["Set Focus".into()];
         assert_eq!(describe(&f, 2), "[2] filler");
+        f.actions = vec!["clickAncestor".into()];
+        assert_eq!(describe(&f, 2), "[2] filler");
+        f.actions = vec!["clickAncestor".into(), "click".into()];
+        assert_eq!(describe(&f, 2), "[2] filler actions=click");
     }
 
     #[test]
@@ -593,6 +661,19 @@ mod tests {
         assert_eq!(locate(&cache, &["/w"], "hidden", "").unwrap(), None);
         cache.remove("/b2");
         assert_eq!(locate(&cache, &["/w"], "x", "").unwrap_err(), vec!["/b2"]);
+    }
+
+    #[test]
+    fn first_with_role_finds_the_document_in_document_order() {
+        let mut cache = sample();
+        cache.insert("/d1", node("document web", "page", true, &[], &[]));
+        cache.insert("/d2", node("document web", "hidden page", false, &[], &[]));
+        cache.get_mut("/p").unwrap().children = vec!["/b1", "/d2", "/d1"];
+        assert_eq!(
+            first_with_role(&cache, &["/w"], &DOCUMENT_ROLES).unwrap(),
+            Some("/d1")
+        );
+        assert_eq!(first_with_role(&cache, &["/w"], &["table"]).unwrap(), None);
     }
 
     #[test]

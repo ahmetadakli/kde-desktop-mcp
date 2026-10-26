@@ -70,6 +70,12 @@ fn has(states: u64, state: u32) -> bool {
     states & (1u64 << state) != 0
 }
 
+/// `true` when GetActions returned actions but no usable names: all empty,
+/// or only the `;` separators of an empty key binding (Firefox).
+pub fn action_names_missing(names: &[String]) -> bool {
+    !names.is_empty() && names.iter().all(|n| n.chars().all(|c| c == ';'))
+}
+
 /// Python `AtspiNode.states()`; None when the state set could not be read.
 pub fn state_labels(states: Option<u64>) -> Vec<&'static str> {
     let Some(st) = states else { return Vec::new() };
@@ -301,8 +307,22 @@ impl A11y {
         let list: R<Vec<(String, String, String)>> = self
             .call(o, "org.a11y.atspi.Action", "GetActions", &())
             .await;
-        list.map(|l| l.into_iter().map(|(name, _, _)| name).collect())
-            .unwrap_or_default()
+        let names: Vec<String> = list
+            .map(|l| l.into_iter().map(|(name, _, _)| name).collect())
+            .unwrap_or_default();
+        if !action_names_missing(&names) {
+            return names;
+        }
+        // Firefox answers GetActions with ";;" (an empty key binding) in every
+        // field; GetName(i), which libatspi uses, has the real names.
+        futures_util::future::join_all((0..names.len() as i32).map(|i| async move {
+            self.call::<String>(o, "org.a11y.atspi.Action", "GetName", &(i,))
+                .await
+        }))
+        .await
+        .into_iter()
+        .map(|name| name.unwrap_or_default())
+        .collect()
     }
 
     /// Run action `index`. Some toolkits answer only once the action is
@@ -584,4 +604,19 @@ pub async fn enable(session: &Connection) {
             ),
         )
         .await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn firefox_key_bindings_are_not_action_names() {
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(action_names_missing(&names(&[";;"])));
+        assert!(action_names_missing(&names(&[";;", ""])));
+        assert!(!action_names_missing(&names(&["Press", ";;"])));
+        assert!(!action_names_missing(&names(&["Set Focus"])));
+        assert!(!action_names_missing(&[]));
+    }
 }
