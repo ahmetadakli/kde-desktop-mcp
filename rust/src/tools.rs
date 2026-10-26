@@ -40,7 +40,7 @@ const READ_ONLY: [&str; 10] = [
 ];
 
 /// How act/click/focus/get_text/set_text pick their element.
-const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`) to find and act in\none call: the first visible element whose name equals `query`\n(case-insensitive) wins, else the first whose name, text or role contains it.\nThe reply then starts with the element that was picked.";
+const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`) to find and act in\none call: the first visible element whose name equals `query`\n(case-insensitive) wins, else the first whose name or text contains it. Window\nand tab titles (frame, window, page tab) count only when nothing else\nmatches, or when `role` names that role. The reply then starts with the\nelement that was picked.";
 
 pub fn tools() -> Json {
     let target = |extra: &[(&'static str, &'static str, Option<Json>)]| {
@@ -84,7 +84,7 @@ pub fn tools() -> Json {
         ),
         t(
             "find",
-            "Search an allowed app for elements whose name, text or role contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree.\nUsually cheaper than tree.",
+            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree; with\n`role`, the role name is searched too. Window and tab titles (frame, window,\npage tab) are listed after all other matches. Usually cheaper than tree.",
             schema(&[
                 ("query", "string", None),
                 ("app", "string", None),
@@ -151,7 +151,7 @@ pub fn tools() -> Json {
         ),
         t(
             "wait_for",
-            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). To just wait a fixed time, use pause, not a query\nthat never matches.",
+            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). Matches like act's `query`, except that window and\ntab titles (frame, window, page tab), which name a page before it has loaded,\nmatch only when `role` names that role. To just wait a fixed time, use pause,\nnot a query that never matches.",
             schema(&[
                 ("app", "string", None),
                 ("query", "string", None),

@@ -111,8 +111,10 @@ it exits with the server. To turn it off, set the environment variable
 - `act`, `set_text`, `focus`, `click`: act on an element. The element is picked
   by its `tree`/`find` number (`id`) or in one call by `app` + `query`
   (+ `role`): the first visible element whose name equals `query`, else the
-  first whose name, text or role contains it. `act` reports when the active
-  window changed (e.g. a dialog opened).
+  first whose name or text contains it. Window and tab titles (frame, window,
+  page tab) count only when nothing else matches or `role` names that role;
+  `wait_for` skips them unless `role` names them. `act` reports when the
+  active window changed (e.g. a dialog opened).
 - Stale ids: every use of an `id` reads the element's role and name again (one
   round trip). If the element is gone, or its role or name changed (the page
   was redrawn, the object path now belongs to another element), nothing is
