@@ -57,9 +57,11 @@ struct Server<B: Backend> {
 }
 
 /// Tools that send keyboard or pointer input.
-const INPUT_TOOLS: [&str; 6] = [
+const INPUT_TOOLS: [&str; 8] = [
     "focus",
     "click",
+    "drag",
+    "scroll",
     "key",
     "type_text",
     "mouse",
@@ -126,6 +128,19 @@ impl From<String> for Out {
 
 /// Longest side of a screenshot sent back, unless `max_size` says otherwise.
 const SHOT_MAX_SIZE: i64 = 1280;
+
+/// How long set_text waits for the field to show what was written.
+const SET_TEXT_VERIFY: Duration = Duration::from_millis(300);
+/// Intermediate pointer moves in a drag, so apps see motion, not a jump.
+const DRAG_STEPS: i64 = 12;
+const DRAG_STEP_GAP: Duration = Duration::from_millis(12);
+
+/// Whether a field's contents equal what was written, ignoring CRLF vs LF
+/// and a trailing newline the widget may add.
+fn written_matches(written: &str, now: &str) -> bool {
+    let norm = |t: &str| t.replace("\r\n", "\n").trim_end_matches('\n').to_string();
+    norm(written) == norm(now)
+}
 
 /// Roles that take typed text without the editable state.
 const TEXT_SINKS: [&str; 2] = ["terminal", "console"];
@@ -607,11 +622,65 @@ impl<B: Backend> Server<B> {
     async fn set_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
         let t = self.target(a).await?;
-        Ok(t.reply(if self.b.set_text(&t.id, &text).await? {
-            "ok"
-        } else {
-            "failed"
-        }))
+        if !self.b.set_text(&t.id, &text).await? {
+            return Ok(t.reply("failed"));
+        }
+        if self.b.info(&t.id, 0).await.role.contains("password") {
+            return Ok(t.reply("ok (password field: contents cannot be read back)"));
+        }
+        let mut how = "";
+        let mut seen = self.read_back(&t.id, &text).await;
+        // Firefox reports success for accessibility writes and changes
+        // nothing. Retype through the keyboard when the element takes focus;
+        // never with a newline, which Enter would turn into a submit.
+        if matches!(&seen, Ok(Some(_))) && !text.contains('\n') && self.retype(&t.id, &text).await {
+            how = "; typed, the accessibility write had no effect";
+            seen = self.read_back(&t.id, &text).await;
+        }
+        match seen {
+            Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
+            Ok(Some(now)) => {
+                let shown: String = now.chars().take(120).collect();
+                let more = if now.chars().count() > 120 { "…" } else { "" };
+                Err(t.reply(&format!(
+                    "written, but the field now holds {shown:?}{more} ({} chars, {} asked{how}); \
+                     it may limit or reformat input. Check with get_text before retrying.",
+                    now.chars().count(),
+                    text.chars().count()
+                )))
+            }
+            Err(e) => Ok(t.reply(&format!("ok (not verified: {e})"))),
+        }
+    }
+
+    /// Ok(None) once the element holds `text` (polled briefly, as some
+    /// toolkits apply a change a moment later), else Ok(Some(what it holds)).
+    async fn read_back(&self, id: &B::Id, text: &str) -> R<Option<String>> {
+        let limit = text.chars().count() + 64;
+        let start = Instant::now();
+        loop {
+            let now = self.b.full_text(id, limit).await?;
+            if written_matches(text, &now) {
+                return Ok(None);
+            }
+            if start.elapsed() >= SET_TEXT_VERIFY {
+                return Ok(Some(now));
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    }
+
+    /// Focus the element, select all and type `text`; false when the element
+    /// would not take focus in an allowed active window (nothing typed).
+    async fn retype(&self, id: &B::Id, text: &str) -> bool {
+        let _input = self.input.lock().await;
+        if self.require_active_allowed().await.is_err() {
+            return false;
+        }
+        if !matches!(self.b.try_focus(id).await, Ok(Some(_))) && !self.b.is_focused(id).await {
+            return false;
+        }
+        self.b.press_combo("ctrl+a").await.is_ok() && self.b.type_text(text).await.is_ok()
     }
 
     async fn get_text(&self, a: &Json) -> R<String> {
@@ -696,6 +765,63 @@ impl<B: Backend> Server<B> {
             .pointer(x as i64, y as i64, &button, clicks, 0)
             .await?;
         Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}")))
+    }
+
+    /// One end of a drag: `<end>_id` (an element's centre), else
+    /// `<end>_x`/`<end>_y`, as screenshot pixels when `image` is true.
+    async fn drag_point(&self, a: &Json, end: &str) -> R<(i64, i64)> {
+        if let Some(rid) = a.get(format!("{end}_id")).and_then(Json::as_i64) {
+            let (id, _) = self.resolve_with_app(rid).await?;
+            let (x, y) = self.b.element_center(&id).await?;
+            return Ok((x as i64, y as i64));
+        }
+        let (x, y) = (
+            req_i(a, &format!("{end}_x"))?,
+            req_i(a, &format!("{end}_y"))?,
+        );
+        if arg_b(a, "image", false) {
+            let map = (*self.last_shot.lock().await)
+                .ok_or("image=true needs a screenshot taken first")?;
+            return Ok(map.to_screen(x, y));
+        }
+        Ok((x, y))
+    }
+
+    async fn drag(&self, a: &Json) -> R<String> {
+        let button = arg_s(a, "button", "left");
+        let app = self.require_active_allowed().await?;
+        let (x0, y0) = self.drag_point(a, "from").await?;
+        let (x1, y1) = self.drag_point(a, "to").await?;
+        self.b.move_pointer(x0, y0).await?;
+        self.b.button(&button, true).await?;
+        let mut moved = Ok(());
+        for i in 1..=DRAG_STEPS {
+            let x = x0 + (x1 - x0) * i / DRAG_STEPS;
+            let y = y0 + (y1 - y0) * i / DRAG_STEPS;
+            moved = self.b.move_pointer(x, y).await;
+            if moved.is_err() {
+                break;
+            }
+            tokio::time::sleep(DRAG_STEP_GAP).await;
+        }
+        // Never leave the button held, whatever happened on the way.
+        let released = self.b.button(&button, false).await;
+        moved?;
+        released?;
+        Ok(format!(
+            "dragged {button} from ({x0},{y0}) to ({x1},{y1}) in {app}"
+        ))
+    }
+
+    async fn scroll(&self, a: &Json) -> R<String> {
+        let amount = arg_i(a, "amount", 3).clamp(-50, 50);
+        let t = self.target(a).await?;
+        self.require_active_allowed().await?;
+        let (x, y) = self.b.element_center(&t.id).await?;
+        self.b
+            .pointer(x as i64, y as i64, "left", 0, amount)
+            .await?;
+        Ok(t.reply(&format!("scrolled {amount} at {x},{y}")))
     }
 
     async fn key(&self, a: &Json) -> R<String> {
@@ -866,6 +992,8 @@ impl<B: Backend> Server<B> {
                 "pause" => self.pause(a).await.map(Out::from),
                 "focus" => self.focus(a).await.map(Out::from),
                 "click" => self.click(a).await.map(Out::from),
+                "drag" => self.drag(a).await.map(Out::from),
+                "scroll" => self.scroll(a).await.map(Out::from),
                 "key" => self.key(a).await.map(Out::from),
                 "type_text" => self.type_text(a).await.map(Out::from),
                 "mouse" => self.mouse(a).await.map(Out::from),
@@ -1194,6 +1322,15 @@ mod tests {
         async fn pointer(&self, _: i64, _: i64, _: &str, _: i64, _: i64) -> R<()> {
             Ok(())
         }
+        async fn move_pointer(&self, x: i64, y: i64) -> R<()> {
+            self.keys.borrow_mut().push(format!("move {x},{y}"));
+            Ok(())
+        }
+        async fn button(&self, button: &str, down: bool) -> R<()> {
+            let what = if down { "press" } else { "release" };
+            self.keys.borrow_mut().push(format!("{what} {button}"));
+            Ok(())
+        }
         async fn activate_window(&self, _: &str, _: &[String]) -> R<()> {
             Ok(())
         }
@@ -1465,6 +1602,49 @@ mod tests {
             let text = r["result"]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains("; focus: [2] push button \"OK\""), "{text}");
             assert!(!text.contains("not an editable"), "{text}");
+        });
+    }
+
+    #[test]
+    fn set_text_readback_tolerates_line_endings_only() {
+        assert!(written_matches("a\nb", "a\r\nb\n"));
+        assert!(written_matches("", ""));
+        assert!(!written_matches("hello world", "hello"));
+        assert!(!written_matches("Ahmet", "ahmet"));
+    }
+
+    #[test]
+    fn drag_moves_in_steps_and_releases() {
+        local(async {
+            let mut s = session("drag");
+            let r = call_tool(
+                &mut s,
+                2,
+                "drag",
+                json!({"from_x": 0, "from_y": 0, "to_x": 120, "to_y": 60}),
+            )
+            .await;
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(text, "dragged left from (0,0) to (120,60) in fake");
+            let log = s.keys.borrow().clone();
+            assert_eq!(log[..2], ["move 0,0", "press left"]);
+            assert_eq!(log[log.len() - 2..], ["move 120,60", "release left"]);
+            assert_eq!(log.len(), 2 + DRAG_STEPS as usize + 1);
+            // Screenshot pixels: (50, 25) of the fake's 2x image at (10, 20).
+            call_tool(&mut s, 3, "screenshot", json!({"inline": false})).await;
+            let r = call_tool(
+                &mut s,
+                4,
+                "drag",
+                json!({"from_x": 0, "from_y": 0, "to_x": 50, "to_y": 25, "image": true}),
+            )
+            .await;
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(text, "dragged left from (11,21) to (111,71) in fake");
+            let _ = std::fs::remove_file(
+                std::env::temp_dir()
+                    .join(format!("desktop-mcp-test-{}-drag.png", std::process::id())),
+            );
         });
     }
 }

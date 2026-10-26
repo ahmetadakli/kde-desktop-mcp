@@ -206,6 +206,17 @@ impl Input {
         tokio::time::sleep(EXTERNAL_MOVE_SETTLE).await;
     }
 
+    /// Press or release one button at the current cursor position.
+    pub async fn button(&self, button: &str, down: bool) -> R<()> {
+        let btn = button_code(button)?;
+        self.with_ptr(|d| {
+            d.emit(&[ev(EventType::KEY, btn.0, i32::from(down))])
+                .map_err(io)
+        })?;
+        tokio::time::sleep(BUTTON_HOLD).await;
+        Ok(())
+    }
+
     /// Click and/or scroll at the current cursor position.
     pub async fn buttons(&self, button: &str, clicks: i64, scroll: i64) -> R<()> {
         let btn = button_code(button)?;
