@@ -69,6 +69,10 @@ Neden hızlı:
 - Bir AT-SPI çağrısı en fazla 2 sn bekler; yanıt vermeyen bir uygulama
   sunucuyu kilitlemez. Menü açan eylemler (Qt'de menü kapanana kadar yanıt
   gelmez) 400 ms sonra gönderilmiş sayılır.
+- Araç çağrıları aynı anda işlenir: bekleyen bir `wait_for` ya da yavaş bir
+  uygulama `ping`'i ve diğer çağrıları bekletmez. Claude bir çağrıyı iptal
+  ederse (`notifications/cancelled`) çağrı durdurulur. Klavye ve fare girdisi
+  gönderen araçlar yine sırayla çalışır, tuşlar birbirine karışmaz.
 
 ## Araçlar
 

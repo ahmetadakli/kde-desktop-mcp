@@ -48,7 +48,13 @@ struct Server<B: Backend> {
     allow_file: PathBuf,
     /// Title of the active window as last reported, to mention changes.
     last_active: Mutex<Option<String>>,
+    /// Held by tools that send keyboard or pointer input, so two concurrent
+    /// calls never interleave their events.
+    input: Mutex<()>,
 }
+
+/// Tools that send keyboard or pointer input.
+const INPUT_TOOLS: [&str; 6] = ["focus", "click", "key", "type_text", "mouse", "activate_window"];
 
 /// An element picked by `id`, or found by `app` + `query`.
 struct Target<Id> {
@@ -110,7 +116,7 @@ impl<B: Backend> Server<B> {
     fn new(b: B) -> Self {
         let allow_file = b.allow_file();
         Server { b, refs: Mutex::new(Refs { map: HashMap::new(), next: 1 }), allow_file,
-                 last_active: Mutex::new(None) }
+                 last_active: Mutex::new(None), input: Mutex::new(()) }
     }
 
     // ------------------------------------------------------------ allowlist
@@ -506,6 +512,7 @@ impl<B: Backend> Server<B> {
     fn call<'a>(&'a self, name: &'a str, a: &'a Json)
         -> Pin<Box<dyn Future<Output = R<String>> + 'a>> {
         Box::pin(async move {
+            let _input = if INPUT_TOOLS.contains(&name) { Some(self.input.lock().await) } else { None };
             match name {
                 "apps" => self.apps().await,
                 "tree" => self.tree(a).await,
@@ -565,33 +572,140 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
-async fn serve<B: Backend>(backend: B) -> R<()> {
+async fn serve<B: Backend + 'static>(backend: B) -> R<()> {
     // Creating virtual input devices takes a moment; do it while the client
     // is still connecting so the first key/click is not delayed.
     backend.warm_up();
     let server = Server::new(backend);
     server.b.enable().await;
     server.allowed();
+    run_loop(std::rc::Rc::new(server), BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await
+}
 
-    let mut lines = BufReader::new(tokio::io::stdin()).lines();
-    let mut stdout = tokio::io::stdout();
-    while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let reply = match serde_json::from_str::<Json>(&line) {
-            Ok(msg) => handle(&server, &msg).await,
-            Err(e) => Some(json!({ "jsonrpc": "2.0", "id": null,
-                "error": { "code": -32700, "message": format!("Parse error: {e}") } })),
-        };
-        if let Some(reply) = reply {
+/// The JSON-RPC loop over newline-delimited messages, apart from the
+/// process' stdin/stdout so tests can drive it over an in-memory pipe.
+///
+/// A `tools/call` request runs on its own local task, so a call that waits
+/// (`wait_for`, a slow app) does not hold up the messages behind it: `ping`,
+/// `initialize` and `tools/list` stay inline because they never wait. Replies
+/// are matched by `id`, so they may go out in any order. Tools that send
+/// input take `Server::input`, so their events still do not interleave.
+/// `notifications/cancelled` aborts the call it names, and no response is
+/// written for it. Every reply goes through one writer task. At end of input
+/// the loop waits for the calls still running and writes their replies.
+///
+/// Needs a `LocalSet`: backends are not `Send` (COM objects on Windows).
+async fn run_loop<B, Rd, Wr>(server: std::rc::Rc<Server<B>>, reader: Rd, stdout: Wr) -> R<()>
+where
+    B: Backend + 'static,
+    Rd: tokio::io::AsyncBufRead + Unpin,
+    Wr: tokio::io::AsyncWrite + Unpin + 'static,
+{
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Json>();
+    let writer = tokio::task::spawn_local(async move {
+        let mut stdout = stdout;
+        while let Some(reply) = rx.recv().await {
             let mut out = reply.to_string();
             out.push('\n');
             stdout.write_all(out.as_bytes()).await.map_err(|e| e.to_string())?;
             stdout.flush().await.map_err(|e| e.to_string())?;
         }
+        Ok::<(), String>(())
+    });
+    let in_flight = std::rc::Rc::new(std::cell::RefCell::new(InFlight::default()));
+    let mut calls = tokio::task::JoinSet::new();
+    let mut lines = reader.lines();
+    while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+        // Reap finished calls so a long session does not accumulate them.
+        while calls.try_join_next().is_some() {}
+        if line.trim().is_empty() {
+            continue;
+        }
+        let msg = match serde_json::from_str::<Json>(&line) {
+            Ok(msg) => msg,
+            Err(e) => {
+                let reply = json!({ "jsonrpc": "2.0", "id": null,
+                    "error": { "code": -32700, "message": format!("Parse error: {e}") } });
+                if tx.send(reply).is_err() {
+                    break;
+                }
+                continue;
+            }
+        };
+        let method = msg.get("method").and_then(Json::as_str).unwrap_or("");
+        if method == "notifications/cancelled" {
+            if let Some(id) = msg.pointer("/params/requestId") {
+                in_flight.borrow_mut().cancel(id);
+            }
+            continue;
+        }
+        if method == "tools/call" && msg.get("id").is_some_and(|id| !id.is_null()) {
+            let key = msg["id"].to_string();
+            let (server, tx, registry) = (server.clone(), tx.clone(), in_flight.clone());
+            let seq = in_flight.borrow_mut().next_seq();
+            let handle = calls.spawn_local(async move {
+                let reply = handle(&server, &msg).await;
+                // A cancellation that got here first means: say nothing.
+                if registry.borrow_mut().finish(&msg["id"].to_string(), seq)
+                    && let Some(reply) = reply
+                {
+                    let _ = tx.send(reply);
+                }
+            });
+            // The task cannot run before this: spawn_local only queues it.
+            in_flight.borrow_mut().register(key, seq, handle);
+            continue;
+        }
+        if let Some(reply) = handle(&server, &msg).await
+            && tx.send(reply).is_err()
+        {
+            break; // the writer stopped: its error is returned below
+        }
     }
-    Ok(())
+    while calls.join_next().await.is_some() {}
+    drop(tx);
+    writer.await.map_err(|e| e.to_string())?
+}
+
+/// The `tools/call` requests still running, by request id (its JSON text:
+/// `2` and `"2"` are different ids), so `notifications/cancelled` can abort
+/// the right one. The sequence number keeps a reused id from finishing or
+/// cancelling another call.
+#[derive(Default)]
+struct InFlight {
+    next: u64,
+    by_id: HashMap<String, (u64, tokio::task::AbortHandle)>,
+}
+
+impl InFlight {
+    fn next_seq(&mut self) -> u64 {
+        self.next += 1;
+        self.next
+    }
+
+    fn register(&mut self, key: String, seq: u64, handle: tokio::task::AbortHandle) {
+        self.by_id.insert(key, (seq, handle));
+    }
+
+    /// The call is done: `true` if it should reply, `false` if it was
+    /// cancelled in the meantime.
+    fn finish(&mut self, key: &str, seq: u64) -> bool {
+        match self.by_id.get(key) {
+            Some((s, _)) if *s == seq => {
+                self.by_id.remove(key);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Abort the running call with this id, if any. An unknown or finished id
+    /// is ignored, as the MCP spec asks.
+    fn cancel(&mut self, id: &Json) {
+        if let Some((_, handle)) = self.by_id.remove(&id.to_string()) {
+            handle.abort();
+        }
+    }
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
@@ -599,18 +713,255 @@ compile_error!("desktop-mcp supports Linux (KDE Plasma, Hyprland) and Windows on
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // Tool calls run as local tasks: the backends are not `Send`.
+    let local = tokio::task::LocalSet::new();
     #[cfg(target_os = "linux")]
-    let result = match linux::LinuxBackend::new().await {
-        Ok(b) => serve(b).await,
-        Err(e) => Err(e),
-    };
+    let result = local
+        .run_until(async {
+            match linux::LinuxBackend::new().await {
+                Ok(b) => serve(b).await,
+                Err(e) => Err(e),
+            }
+        })
+        .await;
     #[cfg(windows)]
-    let result = match windows::WindowsBackend::new() {
-        Ok(b) => serve(b).await,
-        Err(e) => Err(e),
-    };
+    let result = local
+        .run_until(async {
+            match windows::WindowsBackend::new() {
+                Ok(b) => serve(b).await,
+                Err(e) => Err(e),
+            }
+        })
+        .await;
     if let Err(e) = result {
         eprintln!("desktop-mcp: {e}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+
+    use backend::{AppEntry, Info};
+    use tokio::io::DuplexStream;
+
+    /// An app "fake" that is running but never shows the element asked for,
+    /// so `wait_for` keeps polling until its timeout; key presses are logged.
+    struct FakeBackend {
+        allow_file: PathBuf,
+        keys: Rc<RefCell<Vec<String>>>,
+    }
+
+    impl Backend for FakeBackend {
+        type Id = u32;
+        fn allow_file(&self) -> PathBuf {
+            self.allow_file.clone()
+        }
+        fn default_allow(&self) -> &'static str {
+            "fake\n"
+        }
+        fn apps_note(&self) -> &'static str {
+            ""
+        }
+        fn boring_roles(&self) -> &'static [&'static str] {
+            &[]
+        }
+        async fn enable(&self) {}
+        async fn list_apps(&self) -> Vec<AppEntry> {
+            Vec::new()
+        }
+        async fn app_windows(&self, app: &str) -> Option<Vec<u32>> {
+            (app == "fake").then(Vec::new)
+        }
+        async fn active_app(&self) -> String {
+            "fake".into()
+        }
+        async fn info(&self, _: &u32, _: usize) -> Info<u32> {
+            Info::default()
+        }
+        async fn prefetch(&self, _: &mut Cache<u32>, _: Vec<u32>, _: bool, _: usize, _: usize) {}
+        async fn actions(&self, _: &u32) -> Vec<String> {
+            Vec::new()
+        }
+        async fn do_action(&self, _: &u32, _: usize) -> R<bool> {
+            Ok(true)
+        }
+        async fn full_text(&self, _: &u32, _: usize) -> R<String> {
+            Ok(String::new())
+        }
+        async fn set_text(&self, _: &u32, _: &str) -> R<bool> {
+            Ok(true)
+        }
+        async fn is_focused(&self, _: &u32) -> bool {
+            false
+        }
+        async fn try_focus(&self, _: &u32) -> R<Option<String>> {
+            Ok(None)
+        }
+        async fn element_center(&self, _: &u32) -> R<(i32, i32)> {
+            Ok((0, 0))
+        }
+        fn check_combo(&self, _: &str) -> R<()> {
+            Ok(())
+        }
+        async fn press_combo(&self, combo: &str) -> R<()> {
+            self.keys.borrow_mut().push(format!("down {combo}"));
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            self.keys.borrow_mut().push(format!("up {combo}"));
+            Ok(())
+        }
+        async fn type_text(&self, _: &str) -> R<()> {
+            Ok(())
+        }
+        async fn pointer(&self, _: i64, _: i64, _: &str, _: i64, _: i64) -> R<()> {
+            Ok(())
+        }
+        async fn activate_window(&self, _: &str, _: &[String]) -> R<()> {
+            Ok(())
+        }
+        async fn screenshot(&self) -> Option<String> {
+            None
+        }
+    }
+
+    struct Session {
+        stdin: DuplexStream,
+        stdout: tokio::io::Lines<BufReader<DuplexStream>>,
+        keys: Rc<RefCell<Vec<String>>>,
+    }
+
+    /// `run_loop` over in-memory pipes, on the current LocalSet.
+    fn session(name: &str) -> Session {
+        let allow_file = std::env::temp_dir().join(format!(
+            "desktop-mcp-test-{}-{name}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&allow_file, "fake\n").unwrap();
+        let keys = Rc::new(RefCell::new(Vec::new()));
+        let server = Rc::new(Server::new(FakeBackend {
+            allow_file,
+            keys: keys.clone(),
+        }));
+        let (stdin, server_in) = tokio::io::duplex(64 * 1024);
+        let (server_out, client_out) = tokio::io::duplex(64 * 1024);
+        tokio::task::spawn_local(run_loop(server, BufReader::new(server_in), server_out));
+        Session {
+            stdin,
+            stdout: BufReader::new(client_out).lines(),
+            keys,
+        }
+    }
+
+    async fn send(s: &mut Session, msg: Json) {
+        s.stdin
+            .write_all(format!("{msg}\n").as_bytes())
+            .await
+            .unwrap();
+    }
+
+    fn waiting_call(id: u64, timeout_ms: u64) -> Json {
+        json!({"jsonrpc": "2.0", "id": id, "method": "tools/call", "params": {
+            "name": "wait_for",
+            "arguments": {"app": "fake", "query": "never there", "timeout_ms": timeout_ms}}})
+    }
+
+    fn ping(id: u64) -> Json {
+        json!({"jsonrpc": "2.0", "id": id, "method": "ping"})
+    }
+
+    /// Every reply until stdout closes or `limit` passes, by id.
+    async fn replies_within(s: &mut Session, limit: Duration) -> Vec<Json> {
+        let mut out = Vec::new();
+        let _ = tokio::time::timeout(limit, async {
+            while let Ok(Some(line)) = s.stdout.next_line().await {
+                out.push(serde_json::from_str::<Json>(&line).unwrap());
+            }
+        })
+        .await;
+        out
+    }
+
+    fn ids(replies: &[Json]) -> Vec<Json> {
+        replies.iter().map(|r| r["id"].clone()).collect()
+    }
+
+    fn local<F: Future<Output = ()>>(f: F) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(tokio::task::LocalSet::new().run_until(f));
+    }
+
+    #[test]
+    fn ping_is_answered_while_a_tool_call_waits() {
+        local(async {
+            let mut s = session("ping");
+            send(&mut s, waiting_call(2, 3000)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            send(&mut s, ping(3)).await;
+            let line = tokio::time::timeout(Duration::from_millis(500), s.stdout.next_line())
+                .await
+                .expect("no reply within 500 ms: ping queued behind the waiting tool call")
+                .unwrap()
+                .unwrap();
+            let reply: Json = serde_json::from_str(&line).unwrap();
+            assert_eq!(reply["id"], 3, "{reply}");
+        });
+    }
+
+    #[test]
+    fn a_cancelled_tool_call_gets_no_response() {
+        local(async {
+            let mut s = session("cancel");
+            send(&mut s, waiting_call(2, 800)).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                                "params": {"requestId": 2, "reason": "test"}}),
+            )
+            .await;
+            send(&mut s, ping(3)).await;
+            let got = ids(&replies_within(&mut s, Duration::from_millis(1500)).await);
+            assert!(got.contains(&json!(3)), "ping was not answered: {got:?}");
+            assert!(
+                !got.contains(&json!(2)),
+                "the cancelled call was answered: {got:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn end_of_input_still_answers_running_calls() {
+        local(async {
+            let mut s = session("eof");
+            send(&mut s, waiting_call(2, 200)).await;
+            drop(std::mem::replace(&mut s.stdin, tokio::io::duplex(1).0));
+            let replies = replies_within(&mut s, Duration::from_secs(3)).await;
+            assert_eq!(ids(&replies), vec![json!(2)], "{replies:?}");
+            assert_eq!(replies[0]["result"]["isError"], true, "{replies:?}");
+        });
+    }
+
+    #[test]
+    fn concurrent_key_calls_do_not_interleave() {
+        local(async {
+            let mut s = session("keys");
+            for (id, combo) in [(2, "a"), (3, "b")] {
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "key", "arguments": {"combo": combo}}}),
+                )
+                .await;
+            }
+            let replies = replies_within(&mut s, Duration::from_millis(500)).await;
+            assert_eq!(replies.len(), 2, "{replies:?}");
+            assert_eq!(*s.keys.borrow(), vec!["down a", "up a", "down b", "up b"]);
+        });
     }
 }
