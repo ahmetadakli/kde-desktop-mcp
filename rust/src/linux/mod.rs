@@ -24,7 +24,7 @@ use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
-    AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
+    Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
     NO_FILE_DIALOG, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
@@ -294,8 +294,25 @@ impl LinuxBackend {
     }
 }
 
-/// Fill in the terminals of each window from /proc (off the event loop).
+/// `tree` and every process below it now, read from /proc (off the event
+/// loop). Processes seen once stay in it, so apps that fork and let the
+/// parent exit are still matched by pid.
+async fn descendants_of(tree: &std::collections::HashSet<u32>) -> std::collections::HashSet<u32> {
+    let roots = tree.clone();
+    tokio::task::spawn_blocking(move || {
+        let stats = terminals::read_stats();
+        launch::descendants(&roots, stats.iter().map(|(p, s)| (*p, s.ppid)))
+    })
+    .await
+    .unwrap_or_else(|_| tree.clone())
+}
+
+/// Fill in the terminals of each window from /proc (off the event loop);
+/// no scan without windows.
 async fn with_terminals(list: &mut [WindowGeo]) {
+    if list.is_empty() {
+        return;
+    }
     let pids: Vec<u32> = list.iter().map(|w| w.pid).collect();
     let found = tokio::task::spawn_blocking(move || {
         let stats = terminals::read_stats();
@@ -310,12 +327,16 @@ async fn with_terminals(list: &mut [WindowGeo]) {
     }
 }
 
-/// How often `launch` looks for the new window.
-const LAUNCH_POLL: Duration = Duration::from_millis(150);
-/// How long `launch` waits for a new window before taking the app's changed
-/// active window, or after the started process ended its active one
-/// (handed to a running instance).
-const HANDOFF_GRACE: Duration = Duration::from_millis(1500);
+/// Which of the windows read after raising one (title, ACTIVE) is the
+/// raised one in front: an ACTIVE one titled like KWin's `caption`, or the
+/// app's only window once ACTIVE. With several windows a title is needed:
+/// the one that was in front may still report ACTIVE for a moment.
+fn active_index(caption: &str, seen: &[(String, bool)]) -> Option<usize> {
+    let want = hyprland::norm(caption);
+    seen.iter()
+        .position(|(name, active)| *active && hyprland::norm(name) == want)
+        .or_else(|| (seen.len() == 1 && seen[0].1).then_some(0))
+}
 
 fn which(cmd: &str) -> bool {
     std::env::var_os("PATH")
@@ -506,16 +527,30 @@ impl LinuxBackend {
         p
     }
 
+    /// AT-SPI apps with their process id (None when unknown), name and
+    /// top-level windows, from one registry scan.
+    async fn apps_with_pids(&self) -> Vec<(Option<u32>, Obj, String, Vec<Obj>)> {
+        let apps = self.a11y.apps_with_windows().await;
+        let pids =
+            futures_util::future::join_all(apps.iter().map(|(app, _, _)| self.pid(&app.bus))).await;
+        pids.into_iter()
+            .zip(apps)
+            .map(|(pid, (app, name, windows))| (pid, app, name, windows))
+            .collect()
+    }
+
     /// The allowlist plus pids of AT-SPI apps sorted against it, for the
     /// KWin window scripts.
+    fn allow_of(allowed: &[String], apps: &[(Option<u32>, Obj, String, Vec<Obj>)]) -> kwin::Allow {
+        let named: Vec<(u32, String)> = apps
+            .iter()
+            .filter_map(|(pid, _, name, _)| Some(((*pid)?, name.clone())))
+            .collect();
+        kwin::Allow::new(allowed, &named)
+    }
+
     async fn kwin_allow(&self, allowed: &[String]) -> kwin::Allow {
-        let mut apps = Vec::new();
-        for (app, name, _) in self.a11y.apps_with_windows().await {
-            if let Some(pid) = self.pid(&app.bus).await {
-                apps.push((pid, name));
-            }
-        }
-        kwin::Allow::new(allowed, &apps)
+        Self::allow_of(allowed, &self.apps_with_pids().await)
     }
 
     // ------------------------------------------------------------ Hyprland
@@ -758,6 +793,48 @@ impl LinuxBackend {
         match self.a11y.frame_of(id).await {
             Some(f) => self.a11y.has_state(&f, atspi::ACTIVE).await,
             None => false,
+        }
+    }
+
+    /// After KWin raised the window `raised`: wait until the toolkit
+    /// reports it ACTIVE, reading only the windows of the AT-SPI apps of its
+    /// process (`apps` is the scan the allowlist was built from). None when
+    /// no AT-SPI app has that pid (no accessibility, or a sandbox proxy owns
+    /// its bus) or the wait ran out.
+    async fn kde_wait_active(
+        &self,
+        raised: &kwin::Raised,
+        apps: &[(Option<u32>, Obj, String, Vec<Obj>)],
+    ) -> Option<Activated> {
+        let mine: Vec<(&Obj, &str, &Obj)> = apps
+            .iter()
+            .filter(|(pid, ..)| *pid == Some(raised.pid))
+            .flat_map(|(_, app, name, ws)| ws.iter().map(move |w| (app, name.as_str(), w)))
+            .collect();
+        if mine.is_empty() {
+            return None;
+        }
+        let a11y = &self.a11y;
+        let start = std::time::Instant::now();
+        loop {
+            let seen = futures_util::future::join_all(mine.iter().map(|(_, _, w)| async move {
+                let (name, st) = tokio::join!(a11y.name(w), a11y.states(w));
+                (name, atspi::has(st.unwrap_or(0), atspi::ACTIVE))
+            }))
+            .await;
+            if let Some(i) = active_index(&raised.caption, &seen) {
+                let (app, name, _) = mine[i];
+                a11y.note_active_bus(app.bus.clone());
+                return Some(Activated {
+                    app: name.to_string(),
+                    title: seen[i].0.trim().to_string(),
+                });
+            }
+            if start.elapsed() >= ACTIVATE_WAIT {
+                return None;
+            }
+            // A round reads only this app's windows: cheap enough to look often.
+            tokio::time::sleep(Duration::from_millis(2)).await;
         }
     }
 
@@ -1199,16 +1276,20 @@ impl Backend for LinuxBackend {
         self.input.button(button, down).await
     }
 
-    async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()> {
+    async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let allow = self.kwin_allow(allowed).await;
-                let caption = kwin.activate(query, &allow).await?;
-                if caption.is_empty() {
+                let apps = self.apps_with_pids().await;
+                let allow = Self::allow_of(allowed, &apps);
+                let Some(raised) = kwin.activate(query, &allow).await? else {
                     return Err(format!("no window of an allowed app matches '{query}'"));
-                }
+                };
                 // KWin switches at once; the toolkit reports ACTIVE a moment later.
-                poll(ACTIVATE_WAIT, || self.kde_frame_active(&caption)).await;
+                if apps.iter().any(|(pid, ..)| *pid == Some(raised.pid)) {
+                    return Ok(self.kde_wait_active(&raised, &apps).await);
+                }
+                // Its process has no AT-SPI app under that pid: by title.
+                poll(ACTIVATE_WAIT, || self.kde_frame_active(&raised.caption)).await;
             }
             Compositor::Hyprland(h) => {
                 let q = query.to_lowercase();
@@ -1237,12 +1318,12 @@ impl Backend for LinuxBackend {
                                 .is_some_and(|aw| aw["address"].as_str() == Some(addr.as_str()))
                         })
                         .await;
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
@@ -1253,6 +1334,26 @@ impl Backend for LinuxBackend {
                 Ok(list)
             }
             Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+        }
+    }
+
+    async fn screens_and_windows(
+        &self,
+        query: &str,
+        allowed: &[String],
+    ) -> (Vec<Screen>, R<Vec<WindowGeo>>) {
+        match &self.comp {
+            Compositor::Kde(kwin) => {
+                let allow = self.kwin_allow(allowed).await;
+                match kwin.screens_and_windows(query, &allow).await {
+                    Ok((screens, mut list)) => {
+                        with_terminals(&mut list).await;
+                        (screens, Ok(list))
+                    }
+                    Err(e) => (Vec::new(), Err(e)),
+                }
+            }
+            Compositor::Hyprland(_) => (Vec::new(), Err(NO_WINDOW_CONTROL.into())),
         }
     }
 
@@ -1309,18 +1410,24 @@ impl Backend for LinuxBackend {
             return Ok(out);
         }
         let start = std::time::Instant::now();
+        let hints = launch::arg_hints(args);
         let mut tree = std::collections::HashSet::from([pid]);
+        // Rounds since the tree last grew.
+        let mut stable = 0;
         let mut ended: Option<std::time::Instant> = None;
         loop {
-            // Children seen once stay in the tree, so apps that fork and
-            // let the parent exit are still matched by pid.
-            let roots = tree.clone();
-            tree = tokio::task::spawn_blocking(move || {
-                let stats = terminals::read_stats();
-                launch::descendants(&roots, stats.iter().map(|(p, s)| (*p, s.ppid)))
-            })
-            .await
-            .unwrap_or_else(|_| std::collections::HashSet::from([pid]));
+            let scanned = launch::tree_scan_due(stable);
+            if scanned {
+                let grown = descendants_of(&tree).await;
+                stable = if grown.len() > tree.len() {
+                    0
+                } else {
+                    stable + 1
+                };
+                tree = grown;
+            } else {
+                stable += 1;
+            }
             // Rebuilt each round: the new app joins AT-SPI after it starts.
             let allow = self.kwin_allow(allowed).await;
             let now = kwin.windows("", &allow).await?;
@@ -1328,15 +1435,21 @@ impl Backend for LinuxBackend {
             if status.is_some() && ended.is_none() {
                 ended = Some(std::time::Instant::now());
             }
-            let settled = ended.is_some_and(|t| t.elapsed() >= HANDOFF_GRACE);
-            let stage = if settled && status.is_some_and(|s| s.success()) {
-                launch::Stage::Ended
-            } else if start.elapsed() >= HANDOFF_GRACE {
-                launch::Stage::Settled
-            } else {
-                launch::Stage::Starting
-            };
-            if let Some((w, how)) = launch::pick_window(app, &before, &now, &tree, stage) {
+            let exited = status.zip(ended).map(|(s, t)| (s.success(), t.elapsed()));
+            let stage = launch::stage(start.elapsed(), exited);
+            let mut picked = launch::pick_window(app, &before, &now, &tree, stage, &hints);
+            if picked
+                .as_ref()
+                .is_some_and(|(_, how)| *how != launch::Found::Own)
+                && !scanned
+            {
+                // A skipped scan must not call the started app's own window
+                // the running instance's.
+                tree = descendants_of(&tree).await;
+                stable = 0;
+                picked = launch::pick_window(app, &before, &now, &tree, stage, &hints);
+            }
+            if let Some((w, how)) = picked {
                 let mut found = vec![w.clone()];
                 with_terminals(&mut found).await;
                 out.window = found.pop();
@@ -1348,7 +1461,9 @@ impl Backend for LinuxBackend {
                 .into();
                 return Ok(out);
             }
-            if let Some(s) = status.filter(|s| !s.success() && settled) {
+            if let (Some(s), Some((false, since))) = (status, exited)
+                && since >= launch::HANDOFF_GRACE
+            {
                 return Err(format!(
                     "{} (pid {pid}) exited with {s} without opening a window",
                     out.command
@@ -1357,7 +1472,7 @@ impl Backend for LinuxBackend {
             if start.elapsed() >= wait {
                 return Ok(out);
             }
-            tokio::time::sleep(LAUNCH_POLL).await;
+            tokio::time::sleep(launch::poll_interval(start.elapsed())).await;
         }
     }
 
@@ -1698,6 +1813,21 @@ mod tests {
         assert!(!ind.send("show x", true).await);
         assert!(ind.child.is_none() && ind.off);
         assert!(!ind.spawn());
+    }
+
+    #[test]
+    fn raised_window_is_found_by_title_or_as_the_only_one() {
+        let w = |n: &str, a: bool| (n.to_string(), a);
+        // Kate's frame name spaces the dash differently from KWin's caption.
+        let seen = [w("a.txt  — Kate", true), w("b.txt  — Kate", true)];
+        assert_eq!(active_index("b.txt — Kate", &seen), Some(1));
+        // The window that was in front still says ACTIVE: not yet.
+        let seen = [w("a.txt — Kate", true), w("b.txt — Kate", false)];
+        assert_eq!(active_index("b.txt — Kate", &seen), None);
+        // One window: its ACTIVE state is enough, whatever its name.
+        assert_eq!(active_index("Mozilla Firefox", &[w("x", true)]), Some(0));
+        assert_eq!(active_index("Mozilla Firefox", &[w("x", false)]), None);
+        assert_eq!(active_index("x", &[]), None);
     }
 
     #[test]

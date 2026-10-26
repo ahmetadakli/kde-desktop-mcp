@@ -726,7 +726,7 @@ impl<B: Backend> Server<B> {
     async fn windows(&self, a: &Json) -> R<String> {
         let query = arg_s(a, "query", "");
         let allowed = self.allowed();
-        let (screens, list) = tokio::join!(self.b.screens(), self.b.windows(&query, &allowed));
+        let (screens, list) = self.b.screens_and_windows(&query, &allowed).await;
         let mut lines: Vec<String> = screens
             .iter()
             .map(|s| {
@@ -1462,9 +1462,11 @@ impl<B: Backend> Server<B> {
             Some(t) => self.terminal_window(t).await?,
             None => req_s(a, "query")?,
         };
-        self.b.activate_window(&query, &self.allowed()).await?;
-        *self.last_active.lock().await = self.active_title().await;
-        let app = self.b.active_app().await;
+        let (title, app) = match self.b.activate_window(&query, &self.allowed()).await? {
+            Some(a) => (Some(a.title), a.app),
+            None => (self.active_title().await, self.b.active_app().await),
+        };
+        *self.last_active.lock().await = title;
         Ok(format!(
             "active app now: {}",
             if app.is_empty() { "unknown" } else { &app }
@@ -2054,8 +2056,8 @@ mod tests {
             self.keys.borrow_mut().push(format!("{what} {button}"));
             Ok(())
         }
-        async fn activate_window(&self, _: &str, _: &[String]) -> R<()> {
-            Ok(())
+        async fn activate_window(&self, _: &str, _: &[String]) -> R<Option<backend::Activated>> {
+            Ok(None)
         }
         async fn screenshot(&self) -> Option<Shot> {
             // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.

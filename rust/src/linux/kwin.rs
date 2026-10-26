@@ -154,14 +154,15 @@ function okApp(w) {
 "#;
 
 /// Raises the first window of an allowed app whose caption or class contains
-/// the query; evaluates to its caption, "" when none matched.
+/// the query; evaluates to its caption and pid as JSON, "" when none
+/// matched.
 const ACTIVATE: &str = r#"(() => { %OK_APP%
 const q = %QUERY%.toLowerCase();
 for (const w of workspace.windowList()) {
   const cls = (w.resourceClass || "").toLowerCase();
   if (okApp(w) && (w.caption.toLowerCase().includes(q) || cls.includes(q))) {
     workspace.activeWindow = w;
-    return w.caption;
+    return JSON.stringify({caption: w.caption, pid: w.pid});
   }
 }
 return "";
@@ -206,9 +207,13 @@ if (c.x !== null || c.y !== null || c.width !== null || c.height !== null) {
 return JSON.stringify(geo(w));
 })()"#;
 
-const SCREENS: &str = "JSON.stringify(workspace.screens.map(o => ({name: o.name, \
+const SCREENS_JS: &str = "workspace.screens.map(o => ({name: o.name, \
      x: o.geometry.x, y: o.geometry.y, width: o.geometry.width, \
-     height: o.geometry.height, scale: o.devicePixelRatio})))";
+     height: o.geometry.height, scale: o.devicePixelRatio}))";
+
+/// The outputs and the matching windows in one script run.
+const SCREENS_AND_WINDOWS: &str = "(() => { %JS% return JSON.stringify(\
+     {screens: %SCREENS%, windows: matching().map(geo)}); })()";
 
 const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
      const g = w.clientGeometry; const s = workspace.virtualScreenGeometry; \
@@ -346,12 +351,18 @@ impl KWin {
         Ok(data)
     }
 
-    /// Raise a window; returns its caption, or "" when nothing matched.
-    pub async fn activate(&self, query: &str, allow: &Allow) -> R<String> {
+    /// Raise a window; returns its caption and pid, None when nothing
+    /// matched.
+    pub async fn activate(&self, query: &str, allow: &Allow) -> R<Option<Raised>> {
         let script = ACTIVATE
             .replace("%OK_APP%", &allow.ok_app_js())
             .replace("%QUERY%", &Json::from(query).to_string());
-        Ok(self.query(&script).await?.unwrap_or_default())
+        let raw = self.query(&script).await?.unwrap_or_default();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let v: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
+        Ok(Some(raised_of(&v)))
     }
 
     /// Client-area origin (logical px) of KWin's active window.
@@ -399,21 +410,28 @@ impl KWin {
     }
 
     pub async fn screens(&self) -> R<Vec<Screen>> {
-        let raw = self.query(SCREENS).await?.unwrap_or_default();
+        let script = format!("JSON.stringify({SCREENS_JS})");
+        let raw = self.query(&script).await?.unwrap_or_default();
         let list: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
-        Ok(list
+        Ok(screens_of(&list))
+    }
+
+    /// `screens` and `windows` in one script run.
+    pub async fn screens_and_windows(
+        &self,
+        query: &str,
+        allow: &Allow,
+    ) -> R<(Vec<Screen>, Vec<WindowGeo>)> {
+        let script = SCREENS_AND_WINDOWS
+            .replace("%JS%", &window_js(query, allow))
+            .replace("%SCREENS%", SCREENS_JS);
+        let raw = self.query(&script).await?.unwrap_or_default();
+        let v: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
+        let windows = v["windows"]
             .as_array()
-            .into_iter()
-            .flatten()
-            .map(|o| Screen {
-                name: o["name"].as_str().unwrap_or("").to_string(),
-                x: o["x"].as_f64().unwrap_or(0.0),
-                y: o["y"].as_f64().unwrap_or(0.0),
-                width: o["width"].as_f64().unwrap_or(0.0),
-                height: o["height"].as_f64().unwrap_or(0.0),
-                scale: o["scale"].as_f64().unwrap_or(1.0),
-            })
-            .collect())
+            .map(|a| a.iter().map(window_geo).collect())
+            .unwrap_or_default();
+        Ok((screens_of(&v["screens"]), windows))
     }
 
     /// KWin's active window with its transient parent, see ACTIVE_PARENT;
@@ -609,6 +627,38 @@ fn window_js(query: &str, allow: &Allow) -> String {
         .replace("%QUERY%", &Json::from(query).to_string())
 }
 
+/// The window ACTIVATE raised.
+#[derive(Debug, PartialEq)]
+pub struct Raised {
+    pub caption: String,
+    pub pid: u32,
+}
+
+fn raised_of(v: &Json) -> Raised {
+    Raised {
+        caption: v["caption"].as_str().unwrap_or("").to_string(),
+        pid: v["pid"]
+            .as_u64()
+            .and_then(|p| u32::try_from(p).ok())
+            .unwrap_or(0),
+    }
+}
+
+fn screens_of(list: &Json) -> Vec<Screen> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .map(|o| Screen {
+            name: o["name"].as_str().unwrap_or("").to_string(),
+            x: o["x"].as_f64().unwrap_or(0.0),
+            y: o["y"].as_f64().unwrap_or(0.0),
+            width: o["width"].as_f64().unwrap_or(0.0),
+            height: o["height"].as_f64().unwrap_or(0.0),
+            scale: o["scale"].as_f64().unwrap_or(1.0),
+        })
+        .collect()
+}
+
 fn window_geo(g: &Json) -> WindowGeo {
     let num = |k: &str| g[k].as_f64().unwrap_or(0.0);
     let text = |k: &str| g[k].as_str().unwrap_or("").to_string();
@@ -718,5 +768,31 @@ mod tests {
         assert!(!js.contains('%'));
         let act = ACTIVATE.replace("%OK_APP%", &allow.ok_app_js());
         assert!(act.contains("const allowPids = [10];") && act.contains("okApp(w)"));
+        let both = SCREENS_AND_WINDOWS
+            .replace("%JS%", &js)
+            .replace("%SCREENS%", SCREENS_JS);
+        assert!(!both.contains('%') && both.contains("workspace.screens.map"));
+    }
+
+    #[test]
+    fn reads_raised_window_and_screens() {
+        let v: Json = serde_json::from_str(r#"{"caption": "a — Kate", "pid": 42}"#).unwrap();
+        let want = Raised {
+            caption: "a — Kate".into(),
+            pid: 42,
+        };
+        assert_eq!(raised_of(&v), want);
+        let v: Json = serde_json::from_str(
+            r#"{"screens": [{"name": "eDP-1", "x": 0, "y": 0, "width": 1536,
+                "height": 864, "scale": 1.25}], "windows": []}"#,
+        )
+        .unwrap();
+        let s = screens_of(&v["screens"]);
+        assert_eq!(s.len(), 1);
+        assert_eq!(
+            (s[0].name.as_str(), s[0].width, s[0].scale),
+            ("eDP-1", 1536.0, 1.25)
+        );
+        assert!(screens_of(&Json::Null).is_empty());
     }
 }
