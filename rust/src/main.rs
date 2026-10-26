@@ -54,6 +54,9 @@ fn search_fetch(text_limit: usize, limit: usize) -> Fetch {
 
 struct Refs<Id> {
     map: HashMap<u64, Ref<Id>>,
+    /// The id last issued for each element (and app), so reading the same
+    /// element again prints the same number (see `Server::add_ref`).
+    index: HashMap<(Id, String), u64>,
     next: u64,
 }
 
@@ -212,8 +215,95 @@ const INPUT_TOOLS: [&str; 13] = [
     "file_dialog",
 ];
 
+/// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
+/// when absent, empty, or the tool takes none.
+fn window_arg(tool: &str, a: &Json) -> R<Option<String>> {
+    if !tools::WINDOW_TOOLS.contains(&tool) {
+        return Ok(None);
+    }
+    match a.get("window") {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(w)) if w.trim().is_empty() => Ok(None),
+        Some(Json::String(w)) => Ok(Some(w.trim().to_string())),
+        Some(_) => Err("window must be a string (a title or app name)".into()),
+    }
+}
+
+tokio::task_local! {
+    /// The id of the element the running batch step produced, for `"$N"`
+    /// references in later steps (see `Server::batch`). Only set inside a
+    /// batch step; tools note it through `note_step_element`.
+    static STEP_ELEMENT: std::cell::Cell<Option<u64>>;
+}
+
+/// Record `rid` as the element the running batch step produced: the one a
+/// target or wait picked, or find's first hit (`replace`), else the focus
+/// note's element when the step named none. Does nothing outside a batch.
+fn note_step_element(rid: u64, replace: bool) {
+    let _ = STEP_ELEMENT.try_with(|e| {
+        if replace || e.get().is_none() {
+            e.set(Some(rid));
+        }
+    });
+}
+
+/// What an earlier batch step left for `"$N"` references.
+enum StepElement {
+    Element(u64),
+    NoElement,
+    Failed,
+}
+
+/// Replace `"$N"` in the top-level id arguments (`id`, `*_id`) of step
+/// `step` (1-based) with the element step N produced.
+fn resolve_step_refs(args: &mut Json, step: usize, done: &[(String, StepElement)]) -> R<()> {
+    let Some(map) = args.as_object_mut() else {
+        return Ok(());
+    };
+    for (key, value) in map.iter_mut() {
+        if key != "id" && !key.ends_with("_id") {
+            continue;
+        }
+        let Some(text) = value.as_str().and_then(|v| v.strip_prefix('$')) else {
+            continue;
+        };
+        let n: usize = text
+            .parse()
+            .map_err(|_| format!("`{key}` {value}: use \"$N\" for the element step N produced"))?;
+        let (tool, produced) = match n.checked_sub(1).and_then(|i| done.get(i)) {
+            Some(d) if n < step => d,
+            _ => {
+                return Err(format!(
+                    "`{key}` \"${n}\": refer to an earlier step (1 to {})",
+                    step - 1
+                ));
+            }
+        };
+        *value = match produced {
+            StepElement::Element(rid) => json!(rid),
+            StepElement::Failed => {
+                return Err(format!("`{key}` \"${n}\": step {n} ({tool}) failed"));
+            }
+            StepElement::NoElement => {
+                return Err(format!(
+                    "`{key}` \"${n}\": step {n} ({tool}) produced no element \
+                     (find, wait_for, and tools given an element do)"
+                ));
+            }
+        };
+    }
+    Ok(())
+}
+
 /// Longest `wait_for` / `pause`, in ms (10 minutes).
 const MAX_WAIT_MS: i64 = 600_000;
+/// `wait_for` re-checks when the app changed (`Backend::wait_change`), and
+/// after this long without a change in any case: for apps or events that
+/// do not report changes, such as an element scrolled into view.
+const WAIT_FALLBACK: Duration = Duration::from_millis(250);
+/// Least time between the end of one `wait_for` check and the next, so an
+/// app that changes all the time costs no more than polling did.
+const WAIT_MIN_GAP: Duration = Duration::from_millis(50);
 
 /// Requested wait in ms, clamped to 0..=MAX_WAIT_MS, and a note when it was cut.
 fn wait_ms(a: &Json, k: &str, d: i64) -> (u64, String) {
@@ -523,6 +613,7 @@ impl<B: Backend> Server<B> {
             b,
             refs: Mutex::new(Refs {
                 map: HashMap::new(),
+                index: HashMap::new(),
                 next: 1,
             }),
             allow_file,
@@ -564,14 +655,15 @@ impl<B: Backend> Server<B> {
     async fn require_active_allowed(&self) -> R<String> {
         let name = self.b.active_app().await;
         if !self.is_allowed(&name) {
-            // Name the window this server last brought forward, so one
-            // activate_window call (e.g. first step of the next batch) fixes it.
+            // Name the window this server last brought forward, so the
+            // retry (with `window`) fixes it.
             let hint = match self.last_active.lock().await.as_deref() {
-                Some(t) if !t.is_empty() => format!(" (last used: activate_window '{t}')"),
+                Some(t) if !t.is_empty() => format!(" (last used: '{t}')"),
                 _ => String::new(),
             };
             return Err(format!(
-                "active window app '{}' is not in {}; activate an allowed window first{hint}",
+                "active window app '{}' is not in {}; pass window=<title or app> to \
+                 activate an allowed window first{hint}",
                 if name.is_empty() { "unknown" } else { &name },
                 self.allow_file.display()
             ));
@@ -581,11 +673,30 @@ impl<B: Backend> Server<B> {
 
     // ------------------------------------------------------------ ids
 
-    /// Issue an id for `id`, remembering the role and name in `info`.
+    /// Issue an id for `id`, remembering the role and name in `info`. An element
+    /// read again (same backend object, same app) keeps its id while it
+    /// still passes the identity check `resolve_with_app` makes; otherwise
+    /// (renamed, other role) it gets a new one, and the old id stays stale.
     async fn add_ref(&self, id: &B::Id, info: &Info<B::Id>, app: &str) -> u64 {
-        let mut refs = self.refs.lock().await;
+        let mut guard = self.refs.lock().await;
+        let refs = &mut *guard;
+        let key = (id.clone(), app.to_string());
+        let check_name = name_is_stable(info);
+        if let Some(&rid) = refs.index.get(&key)
+            && let Some(r) = refs.map.get_mut(&rid)
+            && r.role == info.role
+            && r.check_name == check_name
+            && (!check_name || r.name == info.name)
+        {
+            // Unchecked names may change: keep the latest for messages.
+            r.name.clone_from(&info.name);
+            return rid;
+        }
         if refs.map.len() > MAX_REFS {
+            // Numbers keep counting up: a cleared id reads as unknown,
+            // never as another element.
             refs.map.clear();
+            refs.index.clear();
         }
         let rid = refs.next;
         refs.next += 1;
@@ -594,9 +705,10 @@ impl<B: Backend> Server<B> {
             app: app.to_string(),
             role: info.role.clone(),
             name: info.name.clone(),
-            check_name: name_is_stable(info),
+            check_name,
         };
         refs.map.insert(rid, r);
+        refs.index.insert(key, rid);
         rid
     }
 
@@ -650,6 +762,17 @@ impl<B: Backend> Server<B> {
         titles: bool,
     ) -> R<Option<(B::Id, Cache<B::Id>)>> {
         let windows = self.app_windows(app).await?;
+        Ok(self.locate_in(windows, query, role, titles).await)
+    }
+
+    /// `locate` in the app windows `windows`.
+    async fn locate_in(
+        &self,
+        windows: Vec<B::Id>,
+        query: &str,
+        role: &str,
+        titles: bool,
+    ) -> Option<(B::Id, Cache<B::Id>)> {
         let mut cache = Cache::new();
         self.b
             .prefetch_with(
@@ -660,7 +783,7 @@ impl<B: Backend> Server<B> {
             .await;
         loop {
             match render::locate(&cache, &windows, query, role, titles) {
-                Ok(found) => return Ok(found.map(|id| (id, cache))),
+                Ok(found) => return found.map(|id| (id, cache)),
                 Err(missing) => {
                     self.b
                         .prefetch_with(
@@ -677,10 +800,9 @@ impl<B: Backend> Server<B> {
     /// The element a tool call names: `id`, or `app` + `query` (+ `role`).
     async fn target(&self, a: &Json) -> R<Target<B::Id>> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
-            return Ok(Target {
-                id: self.resolve(rid).await?,
-                found: None,
-            });
+            let id = self.resolve(rid).await?;
+            note_step_element(rid as u64, true);
+            return Ok(Target { id, found: None });
         }
         let (Some(app), Some(query)) = (
             a.get("app").and_then(Json::as_str),
@@ -702,6 +824,7 @@ impl<B: Backend> Server<B> {
             .fill_actions(&mut cache, std::slice::from_ref(&id))
             .await;
         let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
+        note_step_element(rid, true);
         let found = Some(render::describe(&cache[&id], rid));
         Ok(Target { id, found })
     }
@@ -733,13 +856,21 @@ impl<B: Backend> Server<B> {
         reply
     }
 
-    async fn print(&self, lines: Vec<Line<B::Id>>, cache: &Cache<B::Id>, app: &str) -> String {
+    /// The lines as text, and the id of the first element printed.
+    async fn print(
+        &self,
+        lines: Vec<Line<B::Id>>,
+        cache: &Cache<B::Id>,
+        app: &str,
+    ) -> (String, Option<u64>) {
         let mut out = Vec::with_capacity(lines.len());
+        let mut first = None;
         for line in lines {
             out.push(match line {
                 Line::Raw(s) => Printed::Raw(s),
                 Line::Node { depth, id } => {
                     let rid = self.add_ref(&id, &cache[&id], app).await;
+                    first.get_or_insert(rid);
                     Printed::Node {
                         depth,
                         rid,
@@ -748,7 +879,7 @@ impl<B: Backend> Server<B> {
                 }
             });
         }
-        render::format(&out)
+        (render::format(&out), first)
     }
 
     // ------------------------------------------------------------ tools
@@ -999,7 +1130,7 @@ impl<B: Backend> Server<B> {
                 }
             }
         };
-        Ok(self.print(lines, &cache, &app).await)
+        Ok(self.print(lines, &cache, &app).await.0)
     }
 
     /// The page or document of `app`'s active window (else its first visible
@@ -1104,7 +1235,11 @@ impl<B: Backend> Server<B> {
             .into_iter()
             .map(|id| Line::Node { depth: 0, id })
             .collect();
-        Ok(self.print(lines, &cache, &app.to_lowercase()).await)
+        let (text, first) = self.print(lines, &cache, &app.to_lowercase()).await;
+        if let Some(rid) = first {
+            note_step_element(rid, true);
+        }
+        Ok(text)
     }
 
     async fn act(&self, a: &Json) -> R<String> {
@@ -1285,9 +1420,16 @@ impl<B: Backend> Server<B> {
         self.b.enable().await;
         let start = Instant::now();
         loop {
+            // Changes from here on end the wait after this check.
+            let mark = self.b.change_mark();
             // An app that is not running (yet) counts as "no match".
+            let windows = self.app_windows(&app).await.unwrap_or_default();
             // Titles hold a page's name before the page is there.
-            let found = self.locate(&app, &query, &role, false).await.ok().flatten();
+            let found = if windows.is_empty() {
+                None
+            } else {
+                self.locate_in(windows.clone(), &query, &role, false).await
+            };
             let ms = start.elapsed().as_millis();
             match found {
                 Some((id, mut cache)) if !gone => {
@@ -1295,6 +1437,7 @@ impl<B: Backend> Server<B> {
                         .fill_actions(&mut cache, std::slice::from_ref(&id))
                         .await;
                     let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
+                    note_step_element(rid, true);
                     return Ok(format!(
                         "found after {ms} ms{note}: {}",
                         render::describe(&cache[&id], rid)
@@ -1309,7 +1452,13 @@ impl<B: Backend> Server<B> {
                     "timed out after {ms} ms waiting for '{query}' in '{app}' {what}{note}"
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let checked = Instant::now();
+            let left = limit.saturating_sub(start.elapsed());
+            self.b
+                .wait_change(&windows, mark, left.min(WAIT_FALLBACK))
+                .await;
+            // Never more often than the old poll, however busy the app.
+            tokio::time::sleep(WAIT_MIN_GAP.saturating_sub(checked.elapsed()).min(left)).await;
         }
     }
 
@@ -1526,6 +1675,7 @@ impl<B: Backend> Server<B> {
             return String::new();
         }
         let rid = self.add_ref(&id, &info, &app.to_lowercase()).await;
+        note_step_element(rid, false);
         let mut note = format!("; focus: {}", render::describe(&info, rid));
         if typing && !info.states.contains(&"editable") && !TEXT_SINKS.contains(&info.role.as_str())
         {
@@ -1561,15 +1711,57 @@ impl<B: Backend> Server<B> {
             Some(t) => self.terminal_window(t).await?,
             None => req_s(a, "query")?,
         };
-        let (title, app) = match self.b.activate_window(&query, &self.allowed()).await? {
-            Some(a) => (Some(a.title), a.app),
-            None => (self.active_title().await, self.b.active_app().await),
-        };
-        *self.last_active.lock().await = title;
+        let (_, app) = self.activate(&query).await?;
         Ok(format!(
             "active app now: {}",
             if app.is_empty() { "unknown" } else { &app }
         ))
+    }
+
+    /// Bring the first allowed window matching `query` to the front (the
+    /// backend waits until it is), remember its title for
+    /// `require_active_allowed`'s hint and `act`'s change note, and return
+    /// that title and the active app. Callers hold the input lock.
+    async fn activate(&self, query: &str) -> R<(Option<String>, String)> {
+        let (title, app) = match self.b.activate_window(query, &self.allowed()).await? {
+            Some(a) => (Some(a.title), a.app),
+            None => (self.active_title().await, self.b.active_app().await),
+        };
+        *self.last_active.lock().await = title.clone();
+        Ok((title, app))
+    }
+
+    /// Whether the active window is an allowed app's and matches `query` as
+    /// activate_window would (title or app name contains it). Asks for the
+    /// app first, which usually settles it in one read.
+    async fn window_is_active(&self, query: &str) -> bool {
+        let q = query.to_lowercase();
+        let app = self.b.active_app().await;
+        if !self.is_allowed(&app) {
+            return false;
+        }
+        if app.to_lowercase().contains(&q) {
+            return true;
+        }
+        match self.b.windows(query, &self.allowed()).await {
+            Ok(list) => list.iter().any(|w| w.active),
+            Err(_) => self
+                .active_title()
+                .await
+                .is_some_and(|t| t.to_lowercase().contains(&q)),
+        }
+    }
+
+    /// An input tool's `window`: activate the matching window unless it is
+    /// already in front. Some(title) when it activated one. Runs inside
+    /// `call`, under the input lock, so nothing else takes the focus
+    /// between this and the tool's input.
+    async fn ensure_window(&self, query: &str) -> R<Option<String>> {
+        if self.window_is_active(query).await {
+            return Ok(None);
+        }
+        let (title, _) = self.activate(query).await?;
+        Ok(Some(title.unwrap_or_else(|| query.to_string())))
     }
 
     /// Title of the allowed window whose terminal runs a command, or is in a
@@ -1698,23 +1890,58 @@ impl<B: Backend> Server<B> {
         })
     }
 
+    /// Run `steps` in order. A batch with any input step holds the input
+    /// lock for its whole run (its steps are called as already holding it),
+    /// so two batches' input never interleaves. A step's `id`/`*_id`
+    /// argument "$N" names the element step N produced (`STEP_ELEMENT`).
     async fn batch(&self, a: &Json) -> R<Out> {
         let steps = a
             .get("steps")
             .and_then(Json::as_array)
             .ok_or("missing array argument 'steps'")?;
+        fn tool_of(step: &Json) -> &str {
+            step.get("tool").and_then(Json::as_str).unwrap_or("")
+        }
+        if steps.iter().any(|s| tool_of(s) == "batch") {
+            return Err("batch cannot contain batch".into());
+        }
+        // A step with `window` activates a window: input too.
+        let input = steps.iter().any(|s| {
+            let args = s.get("args").unwrap_or(&Json::Null);
+            INPUT_TOOLS.contains(&tool_of(s)) || matches!(window_arg(tool_of(s), args), Ok(Some(_)))
+        });
+        let _input = if input {
+            Some(self.input.lock().await)
+        } else {
+            None
+        };
         let mut out = Vec::new();
         let mut images = Vec::new();
+        let mut done: Vec<(String, StepElement)> = Vec::new();
         for (i, step) in steps.iter().enumerate() {
-            let tool = step.get("tool").and_then(Json::as_str).unwrap_or("");
-            let args = step.get("args").cloned().unwrap_or_else(|| json!({}));
-            if tool == "batch" {
-                return Err("batch cannot contain batch".into());
-            }
+            let tool = tool_of(step);
+            let mut args = step.get("args").cloned().unwrap_or_else(|| json!({}));
             // An optional step (typically a wait) may fail without costing
             // the steps after it, e.g. the final observation.
             let optional = step.get("optional").and_then(Json::as_bool) == Some(true);
-            match self.call(tool, &args).await {
+            let result = match resolve_step_refs(&mut args, i + 1, &done) {
+                Ok(()) => {
+                    STEP_ELEMENT
+                        .scope(std::cell::Cell::new(None), async {
+                            let r = self.call_inner(tool, &args, input).await;
+                            (r, STEP_ELEMENT.with(|e| e.get()))
+                        })
+                        .await
+                }
+                Err(e) => (Err(e), None),
+            };
+            let produced = match (&result.0, result.1) {
+                (Err(_), _) => StepElement::Failed,
+                (Ok(_), Some(rid)) => StepElement::Element(rid),
+                (Ok(_), None) => StepElement::NoElement,
+            };
+            done.push((tool.to_string(), produced));
+            match result.0 {
                 Ok(o) => {
                     out.push(format!("[{}] {tool}: {}", i + 1, o.text));
                     images.extend(o.images);
@@ -1742,8 +1969,22 @@ impl<B: Backend> Server<B> {
         name: &'a str,
         a: &'a Json,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
+        self.call_inner(name, a, false)
+    }
+
+    /// `call`, for a caller that may already hold the input lock (`held`: a
+    /// batch with input steps), which then is not taken again.
+    fn call_inner<'a>(
+        &'a self,
+        name: &'a str,
+        a: &'a Json,
+        held: bool,
+    ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         Box::pin(async move {
-            let _input = if INPUT_TOOLS.contains(&name) {
+            let window = window_arg(name, a)?;
+            // A screenshot sends no input, but activating its window does. A
+            // batch that holds the input lock already runs its steps `held`.
+            let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
                 Some(self.input.lock().await)
             } else {
                 None
@@ -1751,7 +1992,11 @@ impl<B: Backend> Server<B> {
             if let Some(label) = indicator_label(name, a) {
                 self.b.indicate(&label).await;
             }
-            match name {
+            let activated = match &window {
+                Some(q) => self.ensure_window(q).await?,
+                None => None,
+            };
+            let result = match name {
                 "apps" => self.apps().await.map(Out::from),
                 "tree" => self.tree(a).await.map(Out::from),
                 "find" => self.find(a).await.map(Out::from),
@@ -1778,6 +2023,18 @@ impl<B: Backend> Server<B> {
                 "screenshot" => self.screenshot(a).await,
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
+            };
+            match activated {
+                Some(title) => {
+                    let done = format!("activated {}; ", render::py_repr(&title));
+                    result
+                        .map(|mut o| {
+                            o.text.insert_str(0, &done);
+                            o
+                        })
+                        .map_err(|e| format!("{done}{e}"))
+                }
+                None => result,
             }
         })
     }
@@ -2026,10 +2283,10 @@ mod tests {
     use backend::{AppEntry, Info};
     use tokio::io::DuplexStream;
 
-    /// An app "fake" that is running but never shows the element asked for,
-    /// so `wait_for` keeps polling until its timeout; key presses and
-    /// actions are logged. The focused element is `focus`, which a test may
-    /// change between calls.
+    /// An app "fake" whose one window is the focused element `focus` (a
+    /// push button "OK" unless a test changes it between calls), so finds
+    /// for it hit and `wait_for` anything else keeps polling until its
+    /// timeout; key presses and actions are logged.
     struct FakeBackend {
         allow_file: PathBuf,
         keys: Rc<RefCell<Vec<String>>>,
@@ -2040,7 +2297,17 @@ mod tests {
         /// A text field like Firefox's when Some: accessibility writes do
         /// nothing, typing replaces it, and it always has focus.
         field: Rc<RefCell<Option<String>>>,
+        /// The active window (app, title); activate_window picks one of
+        /// FAKE_WINDOWS and logs "activate <title>" in `keys`.
+        active: Rc<RefCell<(String, String)>>,
     }
+
+    /// Windows on the fake desktop: (app, title).
+    const FAKE_WINDOWS: [(&str, &str); 3] = [
+        ("konsole", "~ : bash — Konsole"),
+        ("fake", "notes.txt — Fake"),
+        ("fake", "todo.txt — Fake"),
+    ];
 
     impl Backend for FakeBackend {
         type Id = u32;
@@ -2061,10 +2328,10 @@ mod tests {
             Vec::new()
         }
         async fn app_windows(&self, app: &str) -> Option<Vec<u32>> {
-            (app == "fake").then(Vec::new)
+            (app == "fake").then(|| vec![FAKE_FOCUS])
         }
         async fn active_app(&self) -> String {
-            "fake".into()
+            self.active.borrow().0.clone()
         }
         async fn info(&self, id: &u32, _: usize) -> Info<u32> {
             match *id {
@@ -2079,7 +2346,19 @@ mod tests {
                 app: self.focus_app.borrow().clone(),
             })
         }
-        async fn prefetch(&self, _: &mut Cache<u32>, _: Vec<u32>, _: bool, _: usize, _: usize) {}
+        async fn prefetch(
+            &self,
+            cache: &mut Cache<u32>,
+            roots: Vec<u32>,
+            _: bool,
+            _: usize,
+            _: usize,
+        ) {
+            for id in roots {
+                let info = self.info(&id, 0).await;
+                cache.insert(id, info);
+            }
+        }
         async fn actions(&self, id: &u32) -> Vec<String> {
             self.info(id, 0).await.actions
         }
@@ -2153,8 +2432,42 @@ mod tests {
             self.keys.borrow_mut().push(format!("{what} {button}"));
             Ok(())
         }
-        async fn activate_window(&self, _: &str, _: &[String]) -> R<Option<backend::Activated>> {
-            Ok(None)
+        async fn activate_window(
+            &self,
+            query: &str,
+            allowed: &[String],
+        ) -> R<Option<backend::Activated>> {
+            let q = query.to_lowercase();
+            let (app, title) = FAKE_WINDOWS
+                .into_iter()
+                .find(|(app, title)| {
+                    allowed.iter().any(|a| a == app)
+                        && (title.to_lowercase().contains(&q) || app.contains(&q))
+                })
+                .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
+            self.keys.borrow_mut().push(format!("activate {title}"));
+            *self.active.borrow_mut() = (app.into(), title.into());
+            Ok(Some(backend::Activated {
+                app: app.into(),
+                title: title.into(),
+            }))
+        }
+        async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
+            let q = query.to_lowercase();
+            let active = self.active.borrow().clone();
+            Ok(FAKE_WINDOWS
+                .into_iter()
+                .filter(|(app, title)| {
+                    allowed.iter().any(|a| a == app)
+                        && (title.to_lowercase().contains(&q) || app.contains(&q))
+                })
+                .map(|(app, title)| WindowGeo {
+                    title: title.into(),
+                    app: app.into(),
+                    active: (app, title) == (active.0.as_str(), active.1.as_str()),
+                    ..WindowGeo::default()
+                })
+                .collect())
         }
         async fn screenshot(&self) -> Option<Shot> {
             // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.
@@ -2184,6 +2497,7 @@ mod tests {
         focus: Rc<RefCell<Info<u32>>>,
         focus_app: Rc<RefCell<String>>,
         field: Rc<RefCell<Option<String>>>,
+        active: Rc<RefCell<(String, String)>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -2203,6 +2517,10 @@ mod tests {
         }));
         let focus_app = Rc::new(RefCell::new("fake".to_string()));
         let field = Rc::new(RefCell::new(None));
+        let active = Rc::new(RefCell::new((
+            FAKE_WINDOWS[1].0.to_string(),
+            FAKE_WINDOWS[1].1.to_string(),
+        )));
         let server = Rc::new(Server::new(FakeBackend {
             allow_file,
             keys: keys.clone(),
@@ -2210,6 +2528,7 @@ mod tests {
             focus_app: focus_app.clone(),
             clipboard: RefCell::new(String::new()),
             field: field.clone(),
+            active: active.clone(),
         }));
         let (stdin, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, client_out) = tokio::io::duplex(64 * 1024);
@@ -2221,6 +2540,7 @@ mod tests {
             focus,
             focus_app,
             field,
+            active,
         }
     }
 
@@ -2412,6 +2732,160 @@ mod tests {
         );
     }
 
+    fn set_active(s: &Session, i: usize) {
+        let (app, title) = FAKE_WINDOWS[i];
+        *s.active.borrow_mut() = (app.into(), title.into());
+    }
+
+    #[test]
+    fn window_activates_the_matching_window_before_the_input() {
+        local(async {
+            let mut s = session("window-activate");
+            set_active(&s, 0); // the user's Konsole, not allowed
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a", "window": "todo"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(
+                reply_text(&r).starts_with("activated 'todo.txt — Fake'; sent a x1 to fake"),
+                "{r}"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                vec!["activate todo.txt — Fake", "down a", "up a"]
+            );
+            // Another window of the same app is activated too.
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                3,
+                "type_text",
+                json!({"text": "x", "window": "Notes"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with("activated 'notes.txt — Fake'; typed 1 chars"),
+                "{r}"
+            );
+            assert_eq!(*s.keys.borrow(), vec!["activate notes.txt — Fake"]);
+            // A screenshot takes it as well.
+            set_active(&s, 0);
+            let r = call_tool(
+                &mut s,
+                4,
+                "screenshot",
+                json!({"window": "fake", "inline": false}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(
+                reply_text(&r).starts_with("activated 'notes.txt — Fake'; "),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn window_already_in_front_is_not_activated_again() {
+        local(async {
+            let mut s = session("window-skip");
+            // notes.txt is active: matched by title and by app name.
+            for (id, w) in [(2, "notes.TXT"), (3, "Fake")] {
+                let r = call_tool(&mut s, id, "key", json!({"combo": "a", "window": w})).await;
+                assert!(reply_text(&r).starts_with("sent a x1 to fake"), "{r}");
+            }
+            assert_eq!(*s.keys.borrow(), vec!["down a", "up a", "down a", "up a"]);
+        });
+    }
+
+    #[test]
+    fn window_without_a_match_fails_before_any_input() {
+        local(async {
+            let mut s = session("window-none");
+            set_active(&s, 0);
+            // No such window; Konsole's own does not count, it is not allowed.
+            for (id, w) in [(2, "nothing"), (3, "konsole")] {
+                let r = call_tool(&mut s, id, "key", json!({"combo": "a", "window": w})).await;
+                assert_eq!(r["result"]["isError"], true, "{r}");
+                let want = format!("no window of an allowed app matches '{w}'");
+                assert!(reply_text(&r).contains(&want), "{r}");
+            }
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "a", "window": 5})).await;
+            assert!(reply_text(&r).contains("window must be a string"), "{r}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+        });
+    }
+
+    #[test]
+    fn no_window_means_no_activation() {
+        local(async {
+            let mut s = session("window-absent");
+            set_active(&s, 0);
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains("active window app 'konsole' is not in"),
+                "{r}"
+            );
+            assert!(reply_text(&r).contains("pass window="), "{r}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            assert_eq!(s.active.borrow().0, "konsole");
+        });
+    }
+
+    #[test]
+    fn activation_and_input_hold_the_input_lock_together() {
+        local(async {
+            let mut s = session("window-lock");
+            set_active(&s, 0);
+            let calls = [
+                (2, json!({"combo": "a", "window": "todo"})),
+                (3, json!({"combo": "b"})),
+            ];
+            for (id, args) in calls {
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "key", "arguments": args}}),
+                )
+                .await;
+            }
+            let replies = replies_within(&mut s, Duration::from_millis(500)).await;
+            assert_eq!(replies.len(), 2, "{replies:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                vec![
+                    "activate todo.txt — Fake",
+                    "down a",
+                    "up a",
+                    "down b",
+                    "up b"
+                ]
+            );
+            // Inside a batch too (each step takes the lock itself).
+            s.keys.borrow_mut().clear();
+            set_active(&s, 0);
+            let steps = json!({"steps": [
+                {"tool": "key", "args": {"combo": "c", "window": "todo"}},
+                {"tool": "key", "args": {"combo": "d"}},
+            ]});
+            let r = call_tool(&mut s, 4, "batch", steps).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(
+                reply_text(&r).contains("[1] key: activated 'todo.txt — Fake'; sent c"),
+                "{r}"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                vec![
+                    "activate todo.txt — Fake",
+                    "down c",
+                    "up c",
+                    "down d",
+                    "up d"
+                ]
+            );
+        });
+    }
+
     fn batch_steps(wait_optional: bool) -> Json {
         json!({"steps": [
             {"tool": "key", "args": {"combo": "a"}},
@@ -2579,7 +3053,8 @@ mod tests {
             );
             let r = call_tool(&mut s, 3, "key", json!({"combo": "a"})).await;
             let text = r["result"]["content"][0]["text"].as_str().unwrap();
-            assert!(text.contains("; focus: [2] push button \"OK\""), "{text}");
+            // The same element again: the same id.
+            assert!(text.contains("; focus: [1] push button \"OK\""), "{text}");
             assert!(!text.contains("not an editable"), "{text}");
         });
     }
@@ -2963,6 +3438,186 @@ mod tests {
                 *s.keys.borrow(),
                 vec!["down a", "up a", "action 0 on 7", "down b", "up b"]
             );
+        });
+    }
+    /// The `[N]` ids in a reply, in order.
+    fn printed_ids(text: &str) -> Vec<i64> {
+        text.split('[')
+            .filter_map(|p| p.split(']').next()?.parse().ok())
+            .collect()
+    }
+
+    #[test]
+    fn batch_steps_refer_to_elements_earlier_steps_found() {
+        local(async {
+            let mut s = session("batch-refs");
+            let r = call_tool(
+                &mut s,
+                2,
+                "batch",
+                json!({"steps": [
+                    {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                    {"tool": "act", "args": {"id": "$1"}},
+                    {"tool": "pause", "args": {"ms": 0}},
+                    {"tool": "act", "args": {"app": "fake", "query": "ok"}},
+                    {"tool": "get_text", "args": {"id": "$4"}},
+                ]}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            let lines: Vec<&str> = reply_text(&r).lines().collect();
+            assert_eq!(lines.len(), 5, "{r}");
+            let found = printed_ids(lines[0].strip_prefix("[1] find: ").unwrap())[0];
+            assert_eq!(lines[1], "[2] act: Press -> ok", "{r}");
+            // The query picked the same element, under the same id.
+            assert_eq!(
+                lines[3],
+                format!("[4] act: [{found}] push button \"OK\": Press -> ok"),
+                "{r}"
+            );
+            assert!(lines[4].starts_with("[5] get_text: "), "{r}");
+            assert_eq!(*s.keys.borrow(), ["action 0 on 7", "action 0 on 7"], "{r}");
+        });
+    }
+
+    #[test]
+    fn a_bad_batch_reference_fails_its_step() {
+        local(async {
+            let mut s = session("batch-badref");
+            let r = call_tool(
+                &mut s,
+                2,
+                "batch",
+                json!({"steps": [
+                    {"tool": "pause", "args": {"ms": 0}},
+                    {"tool": "wait_for", "optional": true,
+                     "args": {"app": "fake", "query": "never there", "timeout_ms": 0}},
+                    {"tool": "act", "args": {"id": "$1"}, "optional": true},
+                    {"tool": "act", "args": {"id": "$2"}, "optional": true},
+                    {"tool": "act", "args": {"id": "$5"}, "optional": true},
+                    {"tool": "act", "args": {"id": "$x"}, "optional": true},
+                    // Text arguments are never references.
+                    {"tool": "clipboard_set", "args": {"text": "$1"}},
+                    {"tool": "act", "args": {"id": "$0"}},
+                    {"tool": "key", "args": {"combo": "a"}},
+                ]}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let lines: Vec<&str> = reply_text(&r).lines().collect();
+            assert_eq!(
+                lines[2],
+                "[3] act failed (optional): `id` \"$1\": step 1 (pause) produced no element \
+                 (find, wait_for, and tools given an element do)"
+            );
+            assert_eq!(
+                lines[3],
+                "[4] act failed (optional): `id` \"$2\": step 2 (wait_for) failed"
+            );
+            assert_eq!(
+                lines[4],
+                "[5] act failed (optional): `id` \"$5\": refer to an earlier step (1 to 4)"
+            );
+            assert_eq!(
+                lines[5],
+                "[6] act failed (optional): `id` \"$x\": use \"$N\" for the element step N produced"
+            );
+            assert!(lines[6].starts_with("[7] clipboard_set: "), "{r}");
+            assert_eq!(
+                lines[7],
+                "[8] act failed: `id` \"$0\": refer to an earlier step (1 to 7)"
+            );
+            assert_eq!(lines[8], "stopped; 1 step(s) not run");
+            assert_eq!(actions_run(&s), 0);
+            assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn reading_an_element_again_keeps_its_id_until_it_changes() {
+        local(async {
+            let mut s = session("stable-ids");
+            let find = json!({"app": "fake", "query": "OK"});
+            let first = printed_ids(reply_text(
+                &call_tool(&mut s, 2, "find", find.clone()).await,
+            ));
+            let again = printed_ids(reply_text(&call_tool(&mut s, 3, "find", find).await));
+            assert_eq!(first.len(), 1);
+            assert_eq!(first, again);
+            assert_eq!(focus_id(&mut s, 4).await, first[0]);
+            // Renamed: a new id, and the old one stays stale.
+            s.focus.borrow_mut().name = "Cancel".into();
+            let r = call_tool(&mut s, 5, "find", json!({"app": "fake", "query": "Cancel"})).await;
+            let renamed = printed_ids(reply_text(&r));
+            assert_ne!(renamed, first, "{r}");
+            let r = call_tool(&mut s, 6, "act", json!({"id": first[0]})).await;
+            assert!(reply_text(&r).contains(": stale id"), "{r}");
+            let r = call_tool(&mut s, 7, "act", json!({"id": renamed[0]})).await;
+            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            // A volatile name may change and keep the id.
+            *s.focus.borrow_mut() = Info {
+                role: "entry".into(),
+                name: "Search".into(),
+                showing: true,
+                ..Info::default()
+            };
+            let entry = focus_id(&mut s, 8).await;
+            s.focus.borrow_mut().name = "Search: rust".into();
+            assert_eq!(focus_id(&mut s, 9).await, entry);
+        });
+    }
+
+    #[test]
+    fn concurrent_batches_do_not_interleave_their_input() {
+        local(async {
+            let mut s = session("batch-lock");
+            for (id, a, b) in [(2, "a", "b"), (3, "c", "d")] {
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "batch", "arguments": {"steps": [
+                        {"tool": "key", "args": {"combo": a}},
+                        {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                        {"tool": "key", "args": {"combo": b}},
+                    ]}}}),
+                )
+                .await;
+            }
+            let replies = replies_within(&mut s, Duration::from_millis(800)).await;
+            assert_eq!(replies.len(), 2, "{replies:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                [
+                    "down a", "up a", "down b", "up b", "down c", "up c", "down d", "up d"
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn a_cancelled_batch_lets_go_of_the_input_lock() {
+        local(async {
+            let mut s = session("batch-cancel");
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "batch", "arguments": {"steps": [
+                    {"tool": "key", "args": {"combo": "a"}},
+                    {"tool": "pause", "args": {"ms": 5000}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                ]}}}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"requestId": 2}}),
+            )
+            .await;
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "c"})).await;
+            assert_eq!(r["id"], 3, "{r}");
+            assert_eq!(*s.keys.borrow(), ["down a", "up a", "down c", "up c"]);
         });
     }
 }

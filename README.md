@@ -169,6 +169,13 @@ it exits with the server. To turn it off, set the environment variable
   afterwards; `type_text` warns when focus is not on an editable field (KDE).
 - `activate_window`: brings a window to the front; fails when no window of an
   allowed app matches.
+- `window` on input tools (`key`, `type_text`, `click`, `mouse`, `scroll`,
+  `focus`, `drag`, `set_text`, `act`, `screenshot`): a title or app-name
+  substring, matched as by `activate_window`. When the window in front is not
+  a matching window of an allowed app, that window is activated first (the
+  reply starts with `activated '<title>'; `), in the same critical section as
+  the input, so no other call takes the focus in between; when it already is,
+  nothing extra happens. Without `window` nothing is activated.
 - `clipboard_get`, `clipboard_set`: read or write the clipboard as text (Linux
   only). Because the clipboard can hold anything the user copied anywhere
   (passwords included), both work only while a window of an allowed app is
@@ -188,7 +195,7 @@ it exits with the server. To turn it off, set the environment variable
   as `[n] tool failed (optional): …` and the remaining steps still run, so a
   final observation step (`find`, `screenshot`) is not lost.
 
-The `initialize` reply carries `instructions` (about 1.8 KB): the workflow,
+The `initialize` reply carries `instructions` (about 2.1 KB): the workflow,
 the targeting rules shared by the tools above, the allowlist and which tools
 to load together. Clients that load tool schemas on demand, such as Claude
 Code, show it at session start before any schema is loaded; the per-tool

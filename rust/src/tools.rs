@@ -39,6 +39,22 @@ const READ_ONLY: [&str; 10] = [
     "clipboard_get",
 ];
 
+/// Input tools that take an optional `window` (title or app-name
+/// substring): they activate the matching window first unless it is
+/// already in front.
+pub const WINDOW_TOOLS: [&str; 10] = [
+    "act",
+    "set_text",
+    "focus",
+    "click",
+    "drag",
+    "scroll",
+    "key",
+    "type_text",
+    "mouse",
+    "screenshot",
+];
+
 /// Sent as `instructions` in the initialize result. Clients that load tool
 /// schemas lazily show only this and the tool names at session start, so it
 /// carries the workflow and the targeting rules that every tool shares. It
@@ -56,9 +72,14 @@ name equals `query` (case-insensitive) wins, else the first whose name or text c
 Window and tab titles (frame, window, page tab) count only when nothing else matches, or when \
 `role` names that role. The reply starts with the element picked.
 - batch runs steps in one round trip: use it whenever later steps don't depend on reading a \
-result. Start it with activate_window when key/type_text/click/mouse input must reach an app. \
+result. \
 Mark waits \"optional\": true and end with an observation step (find, get_text, screenshot) so \
-one failure doesn't cost a turn. Ids printed inside a batch can't be used in it; use app + query.
+one failure doesn't cost a turn. A later step's `id` (or root_id/from_id/to_id) may be \"$N\": \
+the element step N found or acted on (find: its first hit).
+- Input tools (key, type_text, click, mouse, scroll, focus, drag, set_text, act, screenshot) \
+take `window` (title or app-name substring): pass it instead of a separate activate_window \
+step; it activates that window only when it isn't in front. Without it, input fails while \
+the user's own window (often a terminal) is in front.
 - pause for a fixed wait; wait_for only for something that visibly appears or goes away \
 (gone=true), never a query that can't match as a sleep.
 - screenshot is a last resort; the image comes back inline (don't Read the file). To click \
@@ -299,13 +320,19 @@ pub fn tools() -> Json {
         ),
         t(
             "batch",
-            "Run tool calls in order in one round trip; prefer it whenever later steps\ndon't depend on reading a result. `steps` is a list of\n{\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.\n[{\"tool\": \"activate_window\", \"args\": {\"query\": \"Kate\"}},\n {\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+o\"}},\n {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},\n {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].\nStops at the first failing step unless it is `optional`: then it is reported\nas failed (optional) and the rest still runs. Mark waits optional and end\nwith an observation step (find, get_text, screenshot). Start with\nactivate_window when input goes to an app. Ids from earlier tree/find work;\nids printed inside the same batch don't, but `app` + `query` targets do.",
+            "Run tool calls in order in one round trip; prefer it whenever later steps\ndon't depend on reading a result. `steps` is a list of\n{\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.\n[{\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+o\", \"window\": \"Kate\"}},\n {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},\n {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].\nStops at the first failing step unless it is `optional`: then it is reported\nas failed (optional) and the rest still runs. Mark waits optional and end\nwith an observation step (find, get_text, screenshot). Give the first\ninput step `window` when input goes to an app. Ids from earlier tree/find work.\nAn `id`/`*_id` arg of \"$N\" is the element step N produced: find's first\nhit, wait_for's match, the target of act/click/focus/get_text/set_text/\nscroll, else the focus key/type_text report; e.g. {\"tool\": \"act\",\n\"args\": {\"id\": \"$3\"}}. Input steps of one batch never interleave with\nanother call's.",
             batch_schema
         ),
     ]);
     for tool in list.as_array_mut().unwrap() {
         if tool["name"] == "launch" {
             tool["inputSchema"]["properties"]["args"]["items"] = json!({ "type": "string" });
+        }
+        if WINDOW_TOOLS.contains(&tool["name"].as_str().unwrap()) {
+            tool["inputSchema"]["properties"]["window"] = json!({
+                "type": "string",
+                "description": "Title or app-name substring: activate that window first unless it is already in front."
+            });
         }
         if READ_ONLY.contains(&tool["name"].as_str().unwrap()) {
             tool["annotations"] = json!({ "readOnlyHint": true });
@@ -325,6 +352,8 @@ mod tests {
             let name = tool["name"].as_str().unwrap();
             let ro = tool["annotations"]["readOnlyHint"] == json!(true);
             assert_eq!(ro, READ_ONLY.contains(&name), "{name}");
+            let w = tool["inputSchema"]["properties"]["window"]["type"] == json!("string");
+            assert_eq!(w, WINDOW_TOOLS.contains(&name), "{name} window");
         }
         let names: Vec<_> = list
             .as_array()

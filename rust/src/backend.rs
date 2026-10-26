@@ -218,6 +218,18 @@ pub trait Backend {
     /// Top-level windows of every process with this (lower-case) app name;
     /// None when no such app is running.
     async fn app_windows(&self, app: &str) -> Option<Vec<Self::Id>>;
+    /// A mark for `wait_change`, taken before a check so that changes made
+    /// during the check still end the wait after it.
+    fn change_mark(&self) -> u64 {
+        0
+    }
+    /// Wait until the app whose windows are `near` (none: not running) may
+    /// have changed after `mark`, or `timeout` passed. Backends that get
+    /// change events return once the app sent some and they settled; the
+    /// default just waits one poll interval.
+    async fn wait_change(&self, _near: &[Self::Id], _mark: u64, timeout: std::time::Duration) {
+        tokio::time::sleep(timeout.min(std::time::Duration::from_millis(50))).await;
+    }
     /// App name owning the foreground window, "" when unknown.
     async fn active_app(&self) -> String;
 
