@@ -29,6 +29,13 @@ pub struct Info<Id> {
 
 pub type Cache<Id> = HashMap<Id, Info<Id>>;
 
+/// A screenshot file and the screen area it shows, in the coordinates
+/// `pointer` takes: (x, y, width, height). None when unknown.
+pub struct Shot {
+    pub path: String,
+    pub area: Option<(f64, f64, f64, f64)>,
+}
+
 pub struct WindowEntry {
     pub kind: String,
     pub title: String,
@@ -97,5 +104,5 @@ pub trait Backend {
     /// contains `query`, and wait until it is in front.
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()>;
     /// Capture the active window to a private file and return its path.
-    async fn screenshot(&self) -> Option<String>;
+    async fn screenshot(&self) -> Option<Shot>;
 }

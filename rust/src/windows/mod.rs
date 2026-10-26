@@ -19,7 +19,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, SetProcessDpiAwarenessContext,
 };
 
-use crate::backend::{AppEntry, Backend, Cache, Info, R, WindowEntry};
+use crate::backend::{AppEntry, Backend, Cache, Info, R, Shot, WindowEntry};
 use logic::Props;
 use uia::{Elem, Uia};
 
@@ -374,7 +374,16 @@ impl Backend for WindowsBackend {
         Ok(())
     }
 
-    async fn screenshot(&self) -> Option<String> {
-        input::screenshot()
+    async fn screenshot(&self) -> Option<Shot> {
+        // The process is DPI aware: image pixels are screen pixels.
+        input::screenshot().map(|(path, r)| Shot {
+            path,
+            area: Some((
+                r.left as f64,
+                r.top as f64,
+                (r.right - r.left) as f64,
+                (r.bottom - r.top) as f64,
+            )),
+        })
     }
 }

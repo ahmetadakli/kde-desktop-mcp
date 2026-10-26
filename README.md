@@ -78,6 +78,11 @@ Neden hızlı:
   uygulama `ping`'i ve diğer çağrıları bekletmez. Claude bir çağrıyı iptal
   ederse (`notifications/cancelled`) çağrı durdurulur. Klavye ve fare girdisi
   gönderen araçlar yine sırayla çalışır, tuşlar birbirine karışmaz.
+- Web sayfalarının açılır menüleri ve üst katmanları da `tree`/`find`
+  çıktısında yer alır. Firefox bu katmanları gösterilen (SHOWING) olarak
+  işaretlemiyor; görünür ve pencerenin içinde kalan kapsayıcıların içine de
+  inilir, kaydırılarak ekran dışında kalan içerik yine atlanır. Örnek: Gemini'nin
+  "Dosya yükleyin" menüsü artık ekran görüntüsü olmadan bulunur.
 - Okuma araçları (`apps`, `tree`, `find`, `get_text`, `wait_for`,
   `screenshot`, `pause`) MCP'de `readOnlyHint` ile işaretlidir; Claude Code
   bunları tek mesajda birden fazla istendiğinde paralel çalıştırır.
@@ -100,7 +105,10 @@ Neden hızlı:
   değişikliği değil, yalnızca zamanı beklemek için
 - `key`, `type_text`: klavye
 - `activate_window`: pencereyi öne getirme
-- `mouse`, `screenshot`: yalnızca yedek
+- `mouse`, `screenshot`: yalnızca yedek. `screenshot` görüntünün ekranda
+  hangi alanı gösterdiğini de bildirir; `mouse`'a `image_x`/`image_y`
+  verilirse görüntüdeki piksel ekran koordinatına çevrilir (pencere konumu ve
+  ekran ölçeği, ör. %125, dahil)
 - `batch`: birkaç aracı tek çağrıda sırayla çalıştırır, ilk hatada durur;
   Claude'un tur sayısını azaltır
 

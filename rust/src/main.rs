@@ -29,7 +29,7 @@ use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use backend::{Backend, Cache, R};
+use backend::{Backend, Cache, R, Shot};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
@@ -48,6 +48,8 @@ struct Server<B: Backend> {
     allow_file: PathBuf,
     /// Title of the active window as last reported, to mention changes.
     last_active: Mutex<Option<String>>,
+    /// Maps pixels of the last screenshot to screen coordinates.
+    last_shot: Mutex<Option<ShotMap>>,
     /// Held by tools that send keyboard or pointer input, so two concurrent
     /// calls never interleave their events.
     input: Mutex<()>,
@@ -76,6 +78,46 @@ fn wait_ms(a: &Json, k: &str, d: i64) -> (u64, String) {
         String::new()
     };
     (ms as u64, note)
+}
+
+/// Screen point of a screenshot pixel: origin plus pixel times scale.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ShotMap {
+    x: f64,
+    y: f64,
+    sx: f64,
+    sy: f64,
+}
+
+impl ShotMap {
+    /// From the image size in pixels and the screen area it shows.
+    fn new((iw, ih): (u32, u32), (x, y, w, h): (f64, f64, f64, f64)) -> Option<Self> {
+        (iw > 0 && ih > 0 && w > 0.0 && h > 0.0).then(|| ShotMap {
+            x,
+            y,
+            sx: w / iw as f64,
+            sy: h / ih as f64,
+        })
+    }
+
+    fn to_screen(self, px: i64, py: i64) -> (i64, i64) {
+        (
+            (self.x + (px as f64 + 0.5) * self.sx).floor() as i64,
+            (self.y + (py as f64 + 0.5) * self.sy).floor() as i64,
+        )
+    }
+}
+
+/// Width and height from a PNG file's header.
+fn png_size(path: &str) -> Option<(u32, u32)> {
+    use std::io::Read;
+    let mut head = [0u8; 24];
+    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
+    if &head[..8] != b"\x89PNG\r\n\x1a\n" || &head[12..16] != b"IHDR" {
+        return None;
+    }
+    let num = |i: usize| u32::from_be_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
+    Some((num(16), num(20)))
 }
 
 /// An element picked by `id`, or found by `app` + `query`.
@@ -151,6 +193,7 @@ impl<B: Backend> Server<B> {
             }),
             allow_file,
             last_active: Mutex::new(None),
+            last_shot: Mutex::new(None),
             input: Mutex::new(()),
         }
     }
@@ -186,8 +229,14 @@ impl<B: Backend> Server<B> {
     async fn require_active_allowed(&self) -> R<String> {
         let name = self.b.active_app().await;
         if !self.is_allowed(&name) {
+            // Name the window this server last brought forward, so one
+            // activate_window call (e.g. first step of the next batch) fixes it.
+            let hint = match self.last_active.lock().await.as_deref() {
+                Some(t) if !t.is_empty() => format!(" (last used: activate_window '{t}')"),
+                _ => String::new(),
+            };
             return Err(format!(
-                "active window app '{}' is not in {}; activate an allowed window first",
+                "active window app '{}' is not in {}; activate an allowed window first{hint}",
                 if name.is_empty() { "unknown" } else { &name },
                 self.allow_file.display()
             ));
@@ -658,7 +707,14 @@ impl<B: Backend> Server<B> {
     }
 
     async fn mouse(&self, a: &Json) -> R<String> {
-        let (x, y) = (req_i(a, "x")?, req_i(a, "y")?);
+        let (x, y) = match (a.get("image_x"), a.get("image_y")) {
+            (Some(_), Some(_)) => {
+                let map = (*self.last_shot.lock().await)
+                    .ok_or("image_x/image_y need a screenshot taken first")?;
+                map.to_screen(req_i(a, "image_x")?, req_i(a, "image_y")?)
+            }
+            _ => (req_i(a, "x")?, req_i(a, "y")?),
+        };
         let app = self.require_active_allowed().await?;
         self.b
             .pointer(
@@ -685,11 +741,20 @@ impl<B: Backend> Server<B> {
 
     async fn screenshot(&self) -> R<String> {
         self.require_active_allowed().await?;
-        Ok(self
-            .b
-            .screenshot()
-            .await
-            .unwrap_or_else(|| "screenshot failed".into()))
+        let Some(Shot { path, area }) = self.b.screenshot().await else {
+            *self.last_shot.lock().await = None;
+            return Err("screenshot failed".into());
+        };
+        let size = png_size(&path);
+        let map = size.zip(area).and_then(|(s, a)| ShotMap::new(s, a));
+        *self.last_shot.lock().await = map;
+        Ok(match (size, area, map) {
+            (Some((iw, ih)), Some((x, y, w, h)), Some(_)) => format!(
+                "{path}\n{iw}x{ih} px image of screen area at ({x},{y}), {w}x{h}. To click a \
+                 point seen in it, pass its pixel position as image_x/image_y to mouse."
+            ),
+            _ => path,
+        })
     }
 
     async fn batch(&self, a: &Json) -> R<String> {
@@ -1054,7 +1119,7 @@ mod tests {
         async fn activate_window(&self, _: &str, _: &[String]) -> R<()> {
             Ok(())
         }
-        async fn screenshot(&self) -> Option<String> {
+        async fn screenshot(&self) -> Option<Shot> {
             None
         }
     }
@@ -1221,5 +1286,34 @@ mod tests {
             let text = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
             assert_eq!(text, "paused 300 ms");
         });
+    }
+
+    #[test]
+    fn screenshot_pixels_map_to_scaled_screen_points() {
+        // 125 % scaling: a 1920x1080 image of a window at (0,0), 1536x864.
+        let map = ShotMap::new((1920, 1080), (0.0, 0.0, 1536.0, 864.0)).unwrap();
+        assert_eq!(map.to_screen(867, 655), (694, 524));
+        assert_eq!(map.to_screen(0, 0), (0, 0));
+        // Unscaled window away from the origin.
+        let map = ShotMap::new((800, 600), (100.0, 50.0, 800.0, 600.0)).unwrap();
+        assert_eq!(map.to_screen(10, 20), (110, 70));
+        assert_eq!(ShotMap::new((0, 600), (0.0, 0.0, 800.0, 600.0)), None);
+    }
+
+    #[test]
+    fn png_size_reads_the_header() {
+        let dir = std::env::temp_dir().join(format!("desktop-mcp-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("a.png");
+        let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 3, 2);
+        enc.set_color(png::ColorType::Rgb);
+        enc.write_header()
+            .unwrap()
+            .write_image_data(&[0; 18])
+            .unwrap();
+        assert_eq!(png_size(path.to_str().unwrap()), Some((3, 2)));
+        std::fs::write(&path, b"not a png at all, just text").unwrap();
+        assert_eq!(png_size(path.to_str().unwrap()), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
