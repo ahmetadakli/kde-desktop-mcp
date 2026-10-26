@@ -1,0 +1,61 @@
+# Checks that need no desktop. The end-to-end test (tools/mcp_smoke_test.py)
+# drives a real KDE session and stays a local step.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux (clippy + tests)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      # wl-clipboard-rs links libwayland-client.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwayland-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+
+  windows:
+    name: Windows target (clippy)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: windows-gnu
+      # Type-checks and lints the Windows backend; linking needs mingw and
+      # running needs Windows, so neither happens here.
+      - run: cargo clippy --release --target x86_64-pc-windows-gnu -- -D warnings
+
+  tools:
+    name: Python tools (syntax)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: python3 -m py_compile tools/*.py
