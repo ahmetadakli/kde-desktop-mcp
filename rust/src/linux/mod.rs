@@ -587,6 +587,19 @@ impl Backend for LinuxBackend {
         self.a11y.set_text(id, text).await
     }
 
+    async fn focused(&self) -> Option<Obj> {
+        // Focus events keep the hint current; check it still holds focus.
+        // Only report it inside the app in front, which the caller checked
+        // is allowed: a stale hint from another app must not leak or get an id.
+        let a11y = &self.a11y;
+        let hint = a11y.focus_hint()?;
+        self.active_app().await;
+        if a11y.recent_active_bus(INSERT_ACTIVE_AGE).as_deref() != Some(&*hint.bus) {
+            return None;
+        }
+        a11y.has_state(&hint, atspi::FOCUSED).await.then_some(hint)
+    }
+
     async fn is_focused(&self, id: &Obj) -> bool {
         self.a11y.has_state(id, atspi::FOCUSED).await
     }

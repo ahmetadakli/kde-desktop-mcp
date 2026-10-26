@@ -103,10 +103,13 @@ Neden hızlı:
   süre istenirse 10 dakikaya indirilir ve yanıtta bu belirtilir.
 - `pause`: belirli bir süre bekler (`ms`, en fazla 10 dakika); görünür bir
   değişikliği değil, yalnızca zamanı beklemek için
-- `key`, `type_text`: klavye
+- `key`, `type_text`: klavye. Yanıt, ardından odakta olan öğeyi adlandırır;
+  `type_text` odak düzenlenebilir bir alanda değilse uyarır (KDE)
 - `activate_window`: pencereyi öne getirme
-- `mouse`, `screenshot`: yalnızca yedek. `screenshot` görüntünün ekranda
-  hangi alanı gösterdiğini de bildirir; `mouse`'a `image_x`/`image_y`
+- `mouse`, `screenshot`: yalnızca yedek. `screenshot` görüntüyü yanıtın
+  içinde döndürür (dosyayı ayrıca okumak gerekmez), uzun kenarı varsayılan
+  1280 px olacak şekilde küçültür (`max_size`; `inline: false` yalnızca dosya
+  yolunu verir) ve görüntünün ekranda hangi alanı gösterdiğini de bildirir; `mouse`'a `image_x`/`image_y`
   verilirse görüntüdeki piksel ekran koordinatına çevrilir (pencere konumu ve
   ekran ölçeği, ör. %125, dahil)
 - `batch`: birkaç aracı tek çağrıda sırayla çalıştırır, ilk hatada durur;
