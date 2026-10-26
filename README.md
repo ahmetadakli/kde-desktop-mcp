@@ -65,8 +65,16 @@ Why it is fast:
 - In browsers too: Firefox's "clickAncestor" action on every element and the
   embedded-object placeholder (U+FFFC) of web pages are not listed; real action
   names are read instead of Firefox's broken batched names (`;;`).
-  `tree(document=true)` shows only the active tab's page. The same Firefox page
-  went from 5,943 to 1,421 characters.
+  `tree(document=true)` shows only the active tab's page (found in one call
+  through the window's EMBEDS relation). The same Firefox page went from 5,943
+  to 1,421 characters.
+- Actions a role implies are left out (a link's jump, a button's press, a
+  tab's switch, a web section's click); a button or link without any says
+  `actions=none`. Nameless, text-free wrappers (landmarks, forms, scroll panes)
+  are left out with their children lifted, as are empty nameless leaves
+  (separators, images inside buttons) and labels around a same-named button.
+  A Google results page in Firefox went from 6,976 to 5,702 characters.
+- `apps` lists blocked apps by name on one line and skips untitled windows.
 - An AT-SPI call waits at most 2 s; an app that does not answer cannot lock
   the server. Actions that open a menu (Qt does not reply until the menu
   closes) count as sent after 400 ms.
@@ -98,7 +106,9 @@ it exits with the server. To turn it off, set the environment variable
 
 - `apps`, `tree`, `find`, `get_text`: reading and searching. With
   `document: true`, `tree` lists only the document of the active window (in a
-  browser, that tab's page without tabs and toolbars).
+  browser, that tab's page without tabs and toolbars). `get_text` on a web page
+  or another container returns the text of everything in it in reading order
+  (web containers' own text is only a placeholder per child element).
 - `set_text` reads back what it wrote: the reply says "verified", or it fails
   saying what the field holds (a length limit, reformatting). Firefox's input
   fields report accessibility writes as successful and do nothing, so when
@@ -168,7 +178,7 @@ it exits with the server. To turn it off, set the environment variable
   password manager marked as a password (`x-kde-passwordManagerHint`).
 - `mouse`, `screenshot`: fallback only. `screenshot` returns the image inside
   the reply (no need to read the file separately), shrinks it so its longer
-  side is 1280 px by default (`max_size`; `inline: false` returns only the file
+  side is 1024 px by default (`max_size`; `inline: false` returns only the file
   path) and reports which screen area it shows; given `image_x`/`image_y`,
   `mouse` converts a pixel of the image to a screen coordinate (window position
   and display scaling, e.g. 125 %, included).

@@ -105,12 +105,12 @@ pub fn tools() -> Json {
     let mut list = json!([
         t(
             "apps",
-            "List applications with their top-level windows.\nMarks which are allowed and which window is active.",
+            "List running applications: allowed ones with their titled top-level windows\n(the active one marked), blocked ones by name on one line.",
             schema(&[])
         ),
         t(
             "tree",
-            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nWith `document`=true only the page of `app`'s active window is listed: in a\nbrowser, the current tab's web page without the tabs and toolbars.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.",
+            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. Actions the role implies (a link's jump, a\nbutton's press, a tab's switch, a section's click) are omitted;\n`actions=none` marks a button or link without any. Nameless wrappers are left\nout (their children lifted). Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nWith `document`=true only the page of `app`'s active window is listed: in a\nbrowser, the current tab's web page without the tabs and toolbars.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.",
             schema(&[
                 ("app", "string", Some(json!(""))),
                 ("root_id", "integer", Some(json!(0))),
@@ -122,7 +122,7 @@ pub fn tools() -> Json {
         ),
         t(
             "find",
-            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree; with\n`role`, the role name is searched too. Window and tab titles (frame, window,\npage tab) are listed after all other matches. Usually cheaper than tree.",
+            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree; with\n`role`, the role name is searched too. Window and tab titles (frame, window,\npage tab) are listed after all other matches. Lines read as in tree (actions\nthe role implies omitted). Usually cheaper than tree.",
             schema(&[
                 ("query", "string", None),
                 ("app", "string", None),
@@ -133,7 +133,7 @@ pub fn tools() -> Json {
         t(
             "act",
             &d(
-                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find.\nMentions it when the active window changed (e.g. a dialog opened)."
+                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nMentions it when the active window changed (e.g. a dialog opened)."
             ),
             target(&[("action", "string", Some(json!("")))])
         ),
@@ -146,7 +146,9 @@ pub fn tools() -> Json {
         ),
         t(
             "get_text",
-            &d("Read the full text of an element (documents, fields, labels)."),
+            &d(
+                "Read the full text of an element (documents, fields, labels). A web page or\nother container gives the text of everything in it, in reading order."
+            ),
             target(&[("limit", "integer", Some(json!(20000)))])
         ),
         t(
@@ -291,7 +293,7 @@ pub fn tools() -> Json {
             "screenshot",
             "Last resort only: capture the active window. The image comes back in the\nreply (no need to Read the file), shrunk so its longer side is at most\n`max_size` px; `inline`=false returns only the file path. Also says which\nscreen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y.",
             schema(&[
-                ("max_size", "integer", Some(json!(1280))),
+                ("max_size", "integer", Some(json!(1024))),
                 ("inline", "boolean", Some(json!(true))),
             ])
         ),

@@ -85,6 +85,97 @@ pub fn shown_actions<Id>(info: &Info<Id>) -> Vec<&str> {
         .collect()
 }
 
+/// Actions a role implies: a link jumps, a button presses, a tab switches,
+/// a check box toggles, and in web pages any element with a click handler
+/// (a section, a panel) clicks. Listing them on every line cost about a
+/// tenth of a Firefox tree. Per role, lower case; an element that also has
+/// another action gets its full list, so `act`'s default stays the first.
+/// Elements of the roles marked `expected` that have no action at all say
+/// `actions=none`, so a button `act` cannot press still stands out.
+struct Implied {
+    roles: &'static [&'static str],
+    actions: &'static [&'static str],
+    expected: bool,
+}
+
+const IMPLIED_ACTIONS: [Implied; 8] = [
+    Implied {
+        roles: &["push button", "button"],
+        actions: &["press", "click"],
+        expected: true,
+    },
+    Implied {
+        roles: &["toggle button"],
+        actions: &["press", "toggle", "click"],
+        expected: true,
+    },
+    Implied {
+        roles: &["link"],
+        actions: &["jump", "click"],
+        expected: true,
+    },
+    Implied {
+        roles: &["page tab"],
+        actions: &["switch", "press", "click"],
+        expected: true,
+    },
+    Implied {
+        roles: &["check box", "check menu item"],
+        actions: &["toggle", "check", "uncheck", "click"],
+        expected: true,
+    },
+    Implied {
+        roles: &["radio button", "radio menu item"],
+        actions: &["select", "check", "click"],
+        expected: true,
+    },
+    Implied {
+        roles: &["menu item"],
+        actions: &["click", "press", "activate"],
+        expected: true,
+    },
+    Implied {
+        roles: &[
+            "section",
+            "panel",
+            "frame",
+            "internal frame",
+            "document web",
+            "page tab list",
+            "menu",
+        ],
+        actions: &["click"],
+        expected: false,
+    },
+];
+
+/// Actions printed: none when every one is implied by the role, `none`
+/// when a role that implies one has none.
+pub fn listed_actions<Id>(info: &Info<Id>) -> Vec<&str> {
+    let actions = shown_actions(info);
+    let Some(implied) = IMPLIED_ACTIONS
+        .iter()
+        .find(|i| i.roles.contains(&info.role.as_str()))
+    else {
+        return actions;
+    };
+    if actions.is_empty() {
+        return if implied.expected {
+            vec!["none"]
+        } else {
+            actions
+        };
+    }
+    if actions
+        .iter()
+        .all(|a| implied.actions.iter().any(|i| a.eq_ignore_ascii_case(i)))
+    {
+        Vec::new()
+    } else {
+        actions
+    }
+}
+
 fn short_name<Id>(info: &Info<Id>) -> String {
     first_chars(&info.name.replace('\n', " "), 80)
 }
@@ -120,7 +211,7 @@ pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
     if !info.states.is_empty() {
         out.push_str(&format!(" {{{}}}", info.states.join(",")));
     }
-    let actions = shown_actions(info);
+    let actions = listed_actions(info);
     if !actions.is_empty() {
         out.push_str(&format!(" actions={}", actions.join(",")));
     }
@@ -180,7 +271,7 @@ pub fn format<Id>(items: &[Printed<Id>]) -> String {
                 || next.role != info.role
                 || !plain(next)
                 || !leaf(j, depth)
-                || shown_actions(next) != shown_actions(info)
+                || listed_actions(next) != listed_actions(info)
             {
                 break;
             }
@@ -193,7 +284,7 @@ pub fn format<Id>(items: &[Printed<Id>]) -> String {
             } else {
                 &info.role
             };
-            let actions = shown_actions(info);
+            let actions = listed_actions(info);
             let actions = if actions.is_empty() {
                 String::new()
             } else {
@@ -231,8 +322,9 @@ pub struct WalkOpts {
 }
 
 /// Python `walk`: unnamed, actionless nodes of boring roles are skipped and
-/// their children lifted to the same depth. On Err, every node the walk
-/// could not reach yet, so one fetch brings them all.
+/// their children lifted to the same depth (see `Shape` for what else is
+/// left out). On Err, every node the walk could not reach yet, so one fetch
+/// brings them all.
 pub fn walk<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     children: &[Id],
@@ -243,6 +335,87 @@ pub fn walk<Id: Clone + Eq + Hash>(
     let mut missing = Vec::new();
     walk_into(cache, children, depth, opts, lines, &mut missing);
     done((), missing)
+}
+
+/// Wrapper roles beyond the backend's boring ones: printed only when they
+/// carry a name, text, states or actions. Without them they are pure
+/// structure (a web page's nameless landmarks and forms, the scroll pane
+/// around a page) and their children are lifted, keeping their ids.
+const WRAPPER_ROLES: [&str; 8] = [
+    "landmark",
+    "form",
+    "scroll pane",
+    "split pane",
+    "viewport",
+    "paragraph",
+    "article",
+    "block quote",
+];
+
+/// Roles left out when an element of them has nothing to show: no name,
+/// text, states, actions or printed children (an empty scroll pane, a
+/// separator, a nameless image inside a button, an empty live region).
+const EMPTY_LEAF_ROLES: [&str; 13] = [
+    "separator",
+    "image",
+    "icon",
+    "alert",
+    "status bar",
+    "tool bar",
+    "menu bar",
+    "label",
+    "static",
+    "heading",
+    "filler",
+    "panel",
+    "section",
+];
+
+/// Labels whose only child is the element they name (a web page's `label`
+/// around its button or link): the child is printed in their place.
+const LABEL_ROLES: [&str; 2] = ["label", "static"];
+
+/// How the walk prints an element.
+#[derive(PartialEq)]
+enum Shape {
+    /// A line of its own, children below it.
+    Line,
+    /// Left out, its children lifted to its depth.
+    Lift,
+}
+
+/// Name, text and states that describe an element beyond its role.
+fn bare<Id>(info: &Info<Id>) -> bool {
+    info.name.trim().is_empty() && info.states.is_empty() && text_preview(info, 80).is_empty()
+}
+
+fn shape<Id: Clone + Eq + Hash>(cache: &Cache<Id>, info: &Info<Id>, opts: &WalkOpts) -> Shape {
+    let role = info.role.as_str();
+    let acts = !shown_actions(info).is_empty();
+    if acts {
+        return Shape::Line;
+    }
+    if opts.boring_roles.contains(&role) && info.name.is_empty() {
+        return Shape::Lift;
+    }
+    if WRAPPER_ROLES.contains(&role) && bare(info) {
+        return Shape::Lift;
+    }
+    if LABEL_ROLES.contains(&role) && info.states.is_empty() && plain(info) {
+        let name = info.name.trim().to_lowercase();
+        let mut kids = info
+            .children
+            .iter()
+            .filter_map(|c| cache.get(c))
+            .filter(|k| k.showing || !opts.only_showing);
+        if let (Some(kid), None) = (kids.next(), kids.next())
+            && !name.is_empty()
+            && kid.name.trim().to_lowercase() == name
+        {
+            return Shape::Lift;
+        }
+    }
+    Shape::Line
 }
 
 /// `walk`, going on past missing nodes (the lines are then incomplete and
@@ -269,17 +442,25 @@ fn walk_into<Id: Clone + Eq + Hash>(
         if opts.only_showing && !info.showing {
             continue;
         }
-        let interesting = !opts.boring_roles.contains(&info.role.as_str())
-            || !info.name.is_empty()
-            || !shown_actions(info).is_empty();
-        if interesting {
-            lines.push(Line::Node {
-                depth,
-                id: c.clone(),
-            });
-            walk_into(cache, &info.children, depth + 1, opts, lines, missing);
-        } else {
+        if shape(cache, info, opts) == Shape::Lift {
             walk_into(cache, &info.children, depth, opts, lines, missing);
+            continue;
+        }
+        let at = lines.len();
+        lines.push(Line::Node {
+            depth,
+            id: c.clone(),
+        });
+        // Whether the children were looked at, not cut by budget or depth.
+        let walked = at + 1 < opts.budget && depth < opts.max_depth;
+        walk_into(cache, &info.children, depth + 1, opts, lines, missing);
+        if lines.len() == at + 1
+            && (info.children.is_empty() || walked)
+            && EMPTY_LEAF_ROLES.contains(&info.role.as_str())
+            && bare(info)
+            && shown_actions(info).is_empty()
+        {
+            lines.pop();
         }
     }
 }
@@ -460,6 +641,139 @@ pub fn first_with_role<Id: Clone + Eq + Hash>(
     done(None, missing)
 }
 
+/// Roles whose content starts on a line of its own in `container_text`.
+const BLOCK_ROLES: [&str; 30] = [
+    "paragraph",
+    "heading",
+    "section",
+    "article",
+    "block quote",
+    "landmark",
+    "form",
+    "list",
+    "list item",
+    "description list",
+    "description term",
+    "description value",
+    "table",
+    "table row",
+    "caption",
+    "header",
+    "footer",
+    "document web",
+    "document frame",
+    "internal frame",
+    "dialog",
+    "alert",
+    "panel",
+    "grouping",
+    "tool bar",
+    "page tab list",
+    "page tab panel",
+    "separator",
+    "figure",
+    "math",
+];
+
+/// Whether `container_text` should read `text` (from `full_text`) through
+/// the children: a web container's own text has U+FFFC where each child
+/// element goes, so a page reads as "￼".
+pub fn has_embedded_objects(text: &str) -> bool {
+    text.contains(EMBEDDED_OBJECT)
+}
+
+/// The text of `root` and its descendants in reading order, at most `limit`
+/// characters: each U+FFFC in an element's text is replaced by the text of
+/// the child it stands for (children in order), block elements (paragraphs,
+/// headings, list items, sections) on lines of their own. An element without
+/// text reads as its children, or as its name when it has none (an image's
+/// alt text). Nodes need their text read with a limit of at least `limit`.
+pub fn container_text<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    root: &Id,
+    limit: usize,
+) -> Result<String, Vec<Id>> {
+    let mut out = String::new();
+    let mut missing = Vec::new();
+    let mut seen = 0;
+    match cache.get(root) {
+        Some(info) => read_into(cache, info, limit, &mut out, &mut missing, &mut seen),
+        None => missing.push(root.clone()),
+    }
+    // Tidy: no blank runs, no spaces at line ends, no empty lines.
+    let text = out
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    done(first_chars(text.trim_start(), limit), missing)
+}
+
+fn new_line(out: &mut String) {
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+}
+
+fn read_into<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    info: &Info<Id>,
+    limit: usize,
+    out: &mut String,
+    missing: &mut Vec<Id>,
+    seen: &mut usize,
+) {
+    *seen += 1;
+    if *seen > FIND_MAX_SEEN || (out.len() > limit && out.chars().count() > limit) {
+        return;
+    }
+    let mut kids = info.children.iter();
+    // A child goes inline unless its role is a block; between two inline
+    // children with nothing in between, a space.
+    let mut child = |out: &mut String, id: &Id, after_child: bool| match cache.get(id) {
+        Some(k) => {
+            let block = BLOCK_ROLES.contains(&k.role.as_str());
+            if block {
+                new_line(out);
+            } else if after_child && !out.ends_with(char::is_whitespace) {
+                out.push(' ');
+            }
+            read_into(cache, k, limit, out, missing, seen);
+            if block {
+                new_line(out);
+            }
+        }
+        None => missing.push(id.clone()),
+    };
+    match info.text.as_deref() {
+        Some(text) if !text.is_empty() => {
+            let mut after_child = false;
+            for ch in text.chars() {
+                if ch == EMBEDDED_OBJECT {
+                    if let Some(id) = kids.next() {
+                        child(out, id, after_child);
+                    }
+                    after_child = true;
+                } else {
+                    out.push(ch);
+                    after_child = false;
+                }
+            }
+            // Children the text did not place (it was cut at the limit).
+            for id in kids {
+                child(out, id, true);
+            }
+        }
+        _ if info.children.is_empty() => out.push_str(info.name.trim()),
+        _ => {
+            for id in kids {
+                child(out, id, true);
+            }
+        }
+    }
+}
+
 /// Python `repr()` of a str, for window titles in `apps`.
 pub fn py_repr(s: &str) -> String {
     let quote = if s.contains('\'') && !s.contains('"') {
@@ -579,10 +893,8 @@ mod tests {
     #[test]
     fn describe_matches_python_format() {
         let cache = sample();
-        assert_eq!(
-            describe(&cache["/b1"], 7),
-            "[7] push button \"Kaydet\" actions=Press"
-        );
+        // Press is what a push button does: not listed.
+        assert_eq!(describe(&cache["/b1"], 7), "[7] push button \"Kaydet\"");
         assert_eq!(
             describe(&cache["/b2"], 8),
             "[8] text \"line break\" text=\"içerik \\\"x\\\"\" {focused,disabled}"
@@ -672,7 +984,7 @@ mod tests {
             .collect();
         assert_eq!(
             format(&printed),
-            "check box ×3 actions=Toggle: [1] \"Bold\" [2] [3] \"Italic\""
+            "check box ×3: [1] \"Bold\" [2] [3] \"Italic\""
         );
         // Two in a row stay separate lines; a node with children is no leaf.
         let printed = vec![
@@ -854,6 +1166,278 @@ mod tests {
             Some("/d1")
         );
         assert_eq!(first_with_role(&cache, &["/w"], &["table"]).unwrap(), None);
+    }
+
+    fn with_actions(mut n: Info<&'static str>, actions: &[&str]) -> Info<&'static str> {
+        n.actions = actions.iter().map(|a| a.to_string()).collect();
+        n
+    }
+
+    #[test]
+    fn actions_a_role_implies_are_not_listed() {
+        let link = with_actions(node("link", "Home", true, &[], &[]), &["jump"]);
+        assert_eq!(describe(&link, 1), "[1] link \"Home\"");
+        let tab = with_actions(node("page tab", "A", true, &["selected"], &[]), &["switch"]);
+        assert_eq!(describe(&tab, 2), "[2] page tab \"A\" {selected}");
+        let sec = with_actions(node("section", "", true, &[], &[]), &["click"]);
+        assert_eq!(describe(&sec, 3), "[3] section");
+        let boxed = with_actions(node("check box", "Bold", true, &[], &[]), &["Toggle"]);
+        assert_eq!(describe(&boxed, 4), "[4] check box \"Bold\"");
+        // Any other action and the whole list is shown, in order, so the
+        // default (the first) stays visible.
+        let menu = with_actions(
+            node("push button", "Back", true, &[], &[]),
+            &["Show Menu", "Press"],
+        );
+        assert_eq!(
+            describe(&menu, 5),
+            "[5] push button \"Back\" actions=Show Menu,Press"
+        );
+        let both = with_actions(
+            node("check box", "Edit", true, &[], &[]),
+            &["Toggle", "Press"],
+        );
+        assert_eq!(
+            describe(&both, 6),
+            "[6] check box \"Edit\" actions=Toggle,Press"
+        );
+        // Roles that imply nothing list theirs; a label's click is listed.
+        let combo = with_actions(node("combo box", "URL", true, &[], &[]), &["activate"]);
+        assert_eq!(
+            describe(&combo, 7),
+            "[7] combo box \"URL\" actions=activate"
+        );
+        let label = with_actions(node("label", "Share", true, &[], &[]), &["click"]);
+        assert_eq!(describe(&label, 8), "[8] label \"Share\" actions=click");
+        // A button without any action says so; a section never does.
+        let dead = with_actions(node("button", "Menu", true, &[], &[]), &["Set Focus"]);
+        assert_eq!(describe(&dead, 9), "[9] button \"Menu\" actions=none");
+        let named = node("section", "Player", true, &[], &[]);
+        assert_eq!(describe(&named, 10), "[10] section \"Player\"");
+    }
+
+    /// (depth, id) of the walk's node lines.
+    fn walked(
+        cache: &Cache<&'static str>,
+        roots: &[&'static str],
+        o: &WalkOpts,
+    ) -> Vec<(usize, &'static str)> {
+        let mut lines = Vec::new();
+        walk(cache, roots, 1, o, &mut lines).unwrap();
+        lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Node { depth, id } => Some((*depth, *id)),
+                Line::Raw(_) => None,
+            })
+            .collect()
+    }
+
+    /// A Firefox page in miniature: nameless landmarks and forms around
+    /// content, labels around same-named buttons, nameless images inside
+    /// buttons, empty scroll panes.
+    fn web_page() -> Cache<&'static str> {
+        let mut c = Cache::new();
+        c.insert(
+            "/doc",
+            with_actions(
+                node("document web", "Page", true, &[], &["/lm", "/sp", "/nav"]),
+                &["click"],
+            ),
+        );
+        c.insert(
+            "/lm",
+            node("landmark", "", true, &[], &["/form", "/lab2", "/sec"]),
+        );
+        c.insert("/form", node("form", "", true, &[], &["/lab"]));
+        c.insert("/lab", node("label", "Like", true, &[], &["/btn"]));
+        c.insert(
+            "/btn",
+            with_actions(node("button", "Like", true, &[], &["/img"]), &["press"]),
+        );
+        c.insert("/img", node("image", "", true, &[], &[]));
+        c.insert(
+            "/lab2",
+            with_actions(node("label", "Share", true, &[], &["/btn2"]), &["click"]),
+        );
+        c.insert(
+            "/btn2",
+            with_actions(node("button", "Share", true, &[], &[]), &["press"]),
+        );
+        c.insert(
+            "/sec",
+            with_actions(node("section", "", true, &[], &["/sep"]), &["click"]),
+        );
+        c.insert("/sep", node("separator", "", true, &[], &[]));
+        c.insert("/sp", node("scroll pane", "", true, &[], &[]));
+        c.insert("/nav", node("landmark", "Navigation", true, &[], &["/p"]));
+        c.insert("/p", node("paragraph", "", true, &[], &["/link"]));
+        c.insert(
+            "/link",
+            with_actions(node("link", "Home", true, &[], &[]), &["jump"]),
+        );
+        c
+    }
+
+    #[test]
+    fn walk_folds_wrappers_and_drops_empty_leaves() {
+        let cache = web_page();
+        let o = WalkOpts {
+            boring_roles: &["section", "panel"],
+            ..opts(300)
+        };
+        assert_eq!(
+            walked(&cache, &["/doc"], &o),
+            vec![
+                (1, "/doc"),
+                // landmark and form lifted; the label merged into its button;
+                // the nameless image inside it dropped.
+                (2, "/btn"),
+                // A label with an action of its own stays.
+                (2, "/lab2"),
+                (3, "/btn2"),
+                // A section with an action stays; its empty separator goes.
+                (2, "/sec"),
+                // The empty scroll pane is gone; a named landmark stays,
+                // the text-free paragraph in it is lifted.
+                (2, "/nav"),
+                (3, "/link"),
+            ]
+        );
+    }
+
+    #[test]
+    fn wrappers_with_something_to_show_are_kept() {
+        let mut cache = web_page();
+        // Text, states or a differently named child keep them.
+        cache.get_mut("/lm").unwrap().text = Some("Intro \u{FFFC}".into());
+        cache.get_mut("/form").unwrap().states = vec!["focused"];
+        cache.get_mut("/lab").unwrap().name = "Like this".into();
+        cache.get_mut("/sp").unwrap().states = vec!["focused"];
+        let o = WalkOpts {
+            boring_roles: &["section", "panel"],
+            ..opts(300)
+        };
+        let got = walked(&cache, &["/doc"], &o);
+        for id in ["/lm", "/form", "/lab", "/btn", "/sp"] {
+            assert!(got.iter().any(|(_, i)| *i == id), "{id} missing: {got:?}");
+        }
+        assert!(!got.iter().any(|(_, i)| *i == "/img"));
+    }
+
+    #[test]
+    fn empty_leaves_are_kept_when_their_children_were_not_walked() {
+        let mut cache = web_page();
+        cache.get_mut("/sep").unwrap().children = vec!["/link"];
+        // At the depth limit its child is not walked: the separator stays,
+        // so its subtree can still be expanded by id.
+        let shallow = WalkOpts {
+            max_depth: 1,
+            ..opts(300)
+        };
+        assert_eq!(walked(&cache, &["/sep"], &shallow), vec![(1, "/sep")]);
+        // Same when the budget ran out on it.
+        assert_eq!(walked(&cache, &["/sep"], &opts(1)), vec![(1, "/sep")]);
+        assert_eq!(
+            walked(&cache, &["/sep"], &opts(300)),
+            vec![(1, "/sep"), (2, "/link")]
+        );
+        cache.get_mut("/sep").unwrap().children = vec![];
+        assert_eq!(walked(&cache, &["/sep"], &shallow), vec![]);
+    }
+
+    #[test]
+    fn find_output_uses_the_same_action_rules() {
+        let cache = web_page();
+        let printed: Vec<Printed<&str>> = ["/link", "/lab2", "/btn2"]
+            .iter()
+            .enumerate()
+            .map(|(k, id)| Printed::Node {
+                depth: 0,
+                rid: k as u64 + 1,
+                info: &cache[id],
+            })
+            .collect();
+        assert_eq!(
+            format(&printed),
+            "[1] link \"Home\"\n[2] label \"Share\" actions=click\n[3] button \"Share\""
+        );
+    }
+
+    fn texted(
+        role: &str,
+        name: &str,
+        text: Option<&str>,
+        kids: &[&'static str],
+    ) -> Info<&'static str> {
+        let mut n = node(role, name, true, &[], kids);
+        n.text = text.map(str::to_string);
+        n
+    }
+
+    /// A page as Firefox exposes it: the document's text is one U+FFFC per
+    /// child element; a paragraph's text has its links as U+FFFC.
+    fn page_text() -> Cache<&'static str> {
+        let mut c = Cache::new();
+        c.insert(
+            "/doc",
+            texted(
+                "document web",
+                "Page",
+                Some("\u{FFFC}\u{FFFC}\u{FFFC}"),
+                &["/h", "/p", "/ul"],
+            ),
+        );
+        c.insert("/h", texted("heading", "Title", Some("Title"), &[]));
+        c.insert(
+            "/p",
+            texted(
+                "paragraph",
+                "",
+                Some("Read \u{FFFC} or \u{FFFC}\u{FFFC}."),
+                &["/a", "/b", "/img"],
+            ),
+        );
+        c.insert("/a", texted("link", "the docs", Some("the docs"), &[]));
+        c.insert("/b", texted("link", "", Some("\u{FFFC}"), &["/bimg"]));
+        c.insert("/bimg", texted("image", "logo", None, &[]));
+        c.insert("/img", texted("image", "star", None, &[]));
+        c.insert(
+            "/ul",
+            texted("list", "", Some("\u{FFFC}\u{FFFC}"), &["/li1", "/li2"]),
+        );
+        c.insert("/li1", texted("list item", "", Some("• one"), &[]));
+        c.insert("/li2", texted("list item", "", Some("• two"), &[]));
+        c
+    }
+
+    #[test]
+    fn container_text_reads_children_in_place_of_placeholders() {
+        let cache = page_text();
+        assert!(has_embedded_objects(cache["/doc"].text.as_deref().unwrap()));
+        assert_eq!(
+            container_text(&cache, &"/doc", 1000).unwrap(),
+            "Title\nRead the docs or logo star.\n• one\n• two"
+        );
+        // Cut at the limit.
+        assert_eq!(container_text(&cache, &"/doc", 8).unwrap(), "Title\nRe");
+        // A container without text reads as its children.
+        let mut cache = page_text();
+        cache.get_mut("/ul").unwrap().text = None;
+        assert_eq!(
+            container_text(&cache, &"/ul", 1000).unwrap(),
+            "• one\n• two"
+        );
+    }
+
+    #[test]
+    fn container_text_reports_missing_nodes() {
+        let mut cache = page_text();
+        cache.remove("/a");
+        cache.remove("/li2");
+        let mut missing = container_text(&cache, &"/doc", 1000).unwrap_err();
+        missing.sort();
+        assert_eq!(missing, vec!["/a", "/li2"]);
     }
 
     #[test]

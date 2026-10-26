@@ -24,7 +24,7 @@ use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
-    AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
+    Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
     NO_FILE_DIALOG, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
@@ -102,17 +102,51 @@ enum FocusMethod {
     SetFocusAction,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
-struct Tried {
-    failed: bool,
-    worked: bool,
+/// Failures in a row of a focus method, on elements of one role in one app,
+/// after which `try_focus` skips it there (Qt widgets mostly ignore both
+/// methods, and each try costs a poll).
+const FOCUS_FAILS_TO_SKIP: u32 = 2;
+/// Skips after which a skipped method is tried once more, so an app or
+/// role where it works again gets it back.
+const FOCUS_RETRY_AFTER: u32 = 8;
+
+/// What each `try_focus` method did so far, per (app bus, role). Keyed by
+/// role, so one element that cannot take focus (a label, a disabled row)
+/// does not turn a method off for the whole app.
+#[derive(Default)]
+struct FocusRecord {
+    map: HashMap<(String, String, FocusMethod), Tried>,
 }
 
-impl Tried {
-    /// Skip a method that failed in this app and never worked there (Qt
-    /// widgets mostly ignore both, and each try costs a poll).
-    fn skip(self) -> bool {
-        self.failed && !self.worked
+#[derive(Clone, Copy, Debug, Default)]
+struct Tried {
+    /// Failures since the last success.
+    fails: u32,
+    /// Tries skipped since the last one made.
+    skipped: u32,
+}
+
+impl FocusRecord {
+    /// Whether to try `m` on an element of `role` in the app on `bus`;
+    /// counts a skip when not.
+    fn should_try(&mut self, bus: &str, role: &str, m: FocusMethod) -> bool {
+        let Some(t) = self.map.get_mut(&(bus.to_string(), role.to_string(), m)) else {
+            return true;
+        };
+        if t.fails < FOCUS_FAILS_TO_SKIP || t.skipped >= FOCUS_RETRY_AFTER {
+            t.skipped = 0;
+            return true;
+        }
+        t.skipped += 1;
+        false
+    }
+
+    fn note(&mut self, bus: &str, role: &str, m: FocusMethod, worked: bool) {
+        let t = self
+            .map
+            .entry((bus.to_string(), role.to_string(), m))
+            .or_default();
+        t.fails = if worked { 0 } else { t.fails.saturating_add(1) };
     }
 }
 
@@ -130,8 +164,8 @@ pub struct LinuxBackend {
     pids: Mutex<HashMap<String, Option<u32>>>,
     /// Toolkit name per AT-SPI bus name.
     toolkits: Mutex<HashMap<String, String>>,
-    /// What each `try_focus` method did so far, per AT-SPI bus name.
-    focus_record: Mutex<HashMap<(String, FocusMethod), Tried>>,
+    /// What each `try_focus` method did so far, per AT-SPI bus and role.
+    focus_record: Mutex<FocusRecord>,
     /// KWin refused ScreenShot2; use spectacle from now on.
     shot_unauthorized: AtomicBool,
     indicator: tokio::sync::Mutex<IndicatorProc>,
@@ -260,8 +294,25 @@ impl LinuxBackend {
     }
 }
 
-/// Fill in the terminals of each window from /proc (off the event loop).
+/// `tree` and every process below it now, read from /proc (off the event
+/// loop). Processes seen once stay in it, so apps that fork and let the
+/// parent exit are still matched by pid.
+async fn descendants_of(tree: &std::collections::HashSet<u32>) -> std::collections::HashSet<u32> {
+    let roots = tree.clone();
+    tokio::task::spawn_blocking(move || {
+        let stats = terminals::read_stats();
+        launch::descendants(&roots, stats.iter().map(|(p, s)| (*p, s.ppid)))
+    })
+    .await
+    .unwrap_or_else(|_| tree.clone())
+}
+
+/// Fill in the terminals of each window from /proc (off the event loop);
+/// no scan without windows.
 async fn with_terminals(list: &mut [WindowGeo]) {
+    if list.is_empty() {
+        return;
+    }
     let pids: Vec<u32> = list.iter().map(|w| w.pid).collect();
     let found = tokio::task::spawn_blocking(move || {
         let stats = terminals::read_stats();
@@ -276,12 +327,16 @@ async fn with_terminals(list: &mut [WindowGeo]) {
     }
 }
 
-/// How often `launch` looks for the new window.
-const LAUNCH_POLL: Duration = Duration::from_millis(150);
-/// How long `launch` waits for a new window before taking the app's changed
-/// active window, or after the started process ended its active one
-/// (handed to a running instance).
-const HANDOFF_GRACE: Duration = Duration::from_millis(1500);
+/// Which of the windows read after raising one (title, ACTIVE) is the
+/// raised one in front: an ACTIVE one titled like KWin's `caption`, or the
+/// app's only window once ACTIVE. With several windows a title is needed:
+/// the one that was in front may still report ACTIVE for a moment.
+fn active_index(caption: &str, seen: &[(String, bool)]) -> Option<usize> {
+    let want = hyprland::norm(caption);
+    seen.iter()
+        .position(|(name, active)| *active && hyprland::norm(name) == want)
+        .or_else(|| (seen.len() == 1 && seen[0].1).then_some(0))
+}
 
 fn which(cmd: &str) -> bool {
     std::env::var_os("PATH")
@@ -438,10 +493,14 @@ impl LinuxBackend {
             None => Compositor::Kde(KWin::new(session.clone()).await?),
         };
         let absolute = matches!(comp, Compositor::Kde(_));
-        if absolute {
-            // Without it `type_text` falls back to pasting more often.
-            let _ = a11y.track_focus().await;
-        }
+        let focus = async {
+            if absolute {
+                // Without it `type_text` falls back to pasting more often.
+                let _ = a11y.track_focus().await;
+            }
+        };
+        // Lets `act` return as soon as a menu or dialog opened.
+        let _ = tokio::join!(focus, a11y.track_actions());
         Ok(LinuxBackend {
             session,
             a11y,
@@ -449,7 +508,7 @@ impl LinuxBackend {
             input: Arc::new(Input::new(absolute)),
             pids: Mutex::new(HashMap::new()),
             toolkits: Mutex::new(HashMap::new()),
-            focus_record: Mutex::new(HashMap::new()),
+            focus_record: Mutex::new(FocusRecord::default()),
             shot_unauthorized: AtomicBool::new(false),
             indicator: tokio::sync::Mutex::new(IndicatorProc::default()),
         })
@@ -468,16 +527,30 @@ impl LinuxBackend {
         p
     }
 
+    /// AT-SPI apps with their process id (None when unknown), name and
+    /// top-level windows, from one registry scan.
+    async fn apps_with_pids(&self) -> Vec<(Option<u32>, Obj, String, Vec<Obj>)> {
+        let apps = self.a11y.apps_with_windows().await;
+        let pids =
+            futures_util::future::join_all(apps.iter().map(|(app, _, _)| self.pid(&app.bus))).await;
+        pids.into_iter()
+            .zip(apps)
+            .map(|(pid, (app, name, windows))| (pid, app, name, windows))
+            .collect()
+    }
+
     /// The allowlist plus pids of AT-SPI apps sorted against it, for the
     /// KWin window scripts.
+    fn allow_of(allowed: &[String], apps: &[(Option<u32>, Obj, String, Vec<Obj>)]) -> kwin::Allow {
+        let named: Vec<(u32, String)> = apps
+            .iter()
+            .filter_map(|(pid, _, name, _)| Some(((*pid)?, name.clone())))
+            .collect();
+        kwin::Allow::new(allowed, &named)
+    }
+
     async fn kwin_allow(&self, allowed: &[String]) -> kwin::Allow {
-        let mut apps = Vec::new();
-        for (app, name, _) in self.a11y.apps_with_windows().await {
-            if let Some(pid) = self.pid(&app.bus).await {
-                apps.push((pid, name));
-            }
-        }
-        kwin::Allow::new(allowed, &apps)
+        Self::allow_of(allowed, &self.apps_with_pids().await)
     }
 
     // ------------------------------------------------------------ Hyprland
@@ -521,23 +594,18 @@ impl LinuxBackend {
 
     // ------------------------------------------------------------ focus
 
-    fn focus_tried(&self, id: &Obj, m: FocusMethod) -> Tried {
+    fn focus_should_try(&self, id: &Obj, role: &str, m: FocusMethod) -> bool {
         self.focus_record
             .lock()
             .unwrap()
-            .get(&(id.bus.to_string(), m))
-            .copied()
-            .unwrap_or_default()
+            .should_try(&id.bus, role, m)
     }
 
-    fn focus_note(&self, id: &Obj, m: FocusMethod, worked: bool) {
-        let mut rec = self.focus_record.lock().unwrap();
-        let t = rec.entry((id.bus.to_string(), m)).or_default();
-        if worked {
-            t.worked = true;
-        } else {
-            t.failed = true;
-        }
+    fn focus_note(&self, id: &Obj, role: &str, m: FocusMethod, worked: bool) {
+        self.focus_record
+            .lock()
+            .unwrap()
+            .note(&id.bus, role, m, worked);
     }
 
     // ------------------------------------------------------------ KDE
@@ -728,6 +796,48 @@ impl LinuxBackend {
         }
     }
 
+    /// After KWin raised the window `raised`: wait until the toolkit
+    /// reports it ACTIVE, reading only the windows of the AT-SPI apps of its
+    /// process (`apps` is the scan the allowlist was built from). None when
+    /// no AT-SPI app has that pid (no accessibility, or a sandbox proxy owns
+    /// its bus) or the wait ran out.
+    async fn kde_wait_active(
+        &self,
+        raised: &kwin::Raised,
+        apps: &[(Option<u32>, Obj, String, Vec<Obj>)],
+    ) -> Option<Activated> {
+        let mine: Vec<(&Obj, &str, &Obj)> = apps
+            .iter()
+            .filter(|(pid, ..)| *pid == Some(raised.pid))
+            .flat_map(|(_, app, name, ws)| ws.iter().map(move |w| (app, name.as_str(), w)))
+            .collect();
+        if mine.is_empty() {
+            return None;
+        }
+        let a11y = &self.a11y;
+        let start = std::time::Instant::now();
+        loop {
+            let seen = futures_util::future::join_all(mine.iter().map(|(_, _, w)| async move {
+                let (name, st) = tokio::join!(a11y.name(w), a11y.states(w));
+                (name, atspi::has(st.unwrap_or(0), atspi::ACTIVE))
+            }))
+            .await;
+            if let Some(i) = active_index(&raised.caption, &seen) {
+                let (app, name, _) = mine[i];
+                a11y.note_active_bus(app.bus.clone());
+                return Some(Activated {
+                    app: name.to_string(),
+                    title: seen[i].0.trim().to_string(),
+                });
+            }
+            if start.elapsed() >= ACTIVATE_WAIT {
+                return None;
+            }
+            // A round reads only this app's windows: cheap enough to look often.
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
     async fn kde_frame_active(&self, caption: &str) -> bool {
         let want = hyprland::norm(caption);
         let a11y = &self.a11y;
@@ -861,6 +971,10 @@ impl Backend for LinuxBackend {
         self.a11y.fill_actions(cache, ids).await
     }
 
+    async fn embedded_document(&self, window: &Obj) -> Option<Obj> {
+        self.a11y.relation(window, atspi::RELATION_EMBEDS).await
+    }
+
     async fn actions(&self, id: &Obj) -> Vec<String> {
         self.a11y.actions(id).await
     }
@@ -896,6 +1010,11 @@ impl Backend for LinuxBackend {
             return Err("element is not editable text; use focus + type".into());
         }
         self.a11y.set_text(id, text).await
+    }
+
+    fn app_key(&self, id: &Obj) -> Option<String> {
+        // A unique connection name, never reused for another process.
+        Some(id.bus.to_string())
     }
 
     async fn focused(&self) -> Option<Focused<Obj>> {
@@ -950,14 +1069,18 @@ impl Backend for LinuxBackend {
     async fn try_focus(&self, id: &Obj) -> R<Option<String>> {
         // Qt only honours GrabFocus when the element exposes a "Set Focus"
         // action, so try both before the caller falls back to a click.
-        let (ifaces, actions) = tokio::join!(self.a11y.interfaces(id), self.a11y.actions(id));
+        let (ifaces, actions, role) = tokio::join!(
+            self.a11y.interfaces(id),
+            self.a11y.actions(id),
+            self.a11y.role(id)
+        );
         if !ifaces.iter().any(|i| i == "org.a11y.atspi.Component") {
             return Err("element cannot take focus".into());
         }
         let wait = FOCUS_POLL;
-        if !self.focus_tried(id, FocusMethod::GrabFocus).skip() {
+        if self.focus_should_try(id, &role, FocusMethod::GrabFocus) {
             let ok = self.a11y.grab_focus(id).await && poll(wait, || self.is_focused(id)).await;
-            self.focus_note(id, FocusMethod::GrabFocus, ok);
+            self.focus_note(id, &role, FocusMethod::GrabFocus, ok);
             if ok {
                 return Ok(Some("grab_focus".into()));
             }
@@ -967,11 +1090,11 @@ impl Backend for LinuxBackend {
             .map(|n| n.to_lowercase().replace(' ', ""))
             .collect();
         if let Some(i) = names.iter().position(|n| n == "setfocus")
-            && !self.focus_tried(id, FocusMethod::SetFocusAction).skip()
+            && self.focus_should_try(id, &role, FocusMethod::SetFocusAction)
         {
             let _ = self.a11y.do_action(id, i as i32).await;
             let ok = poll(wait, || self.is_focused(id)).await;
-            self.focus_note(id, FocusMethod::SetFocusAction, ok);
+            self.focus_note(id, &role, FocusMethod::SetFocusAction, ok);
             if ok {
                 return Ok(Some("set focus action".into()));
             }
@@ -1157,16 +1280,20 @@ impl Backend for LinuxBackend {
         self.input.button(button, down).await
     }
 
-    async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()> {
+    async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let allow = self.kwin_allow(allowed).await;
-                let caption = kwin.activate(query, &allow).await?;
-                if caption.is_empty() {
+                let apps = self.apps_with_pids().await;
+                let allow = Self::allow_of(allowed, &apps);
+                let Some(raised) = kwin.activate(query, &allow).await? else {
                     return Err(format!("no window of an allowed app matches '{query}'"));
-                }
+                };
                 // KWin switches at once; the toolkit reports ACTIVE a moment later.
-                poll(ACTIVATE_WAIT, || self.kde_frame_active(&caption)).await;
+                if apps.iter().any(|(pid, ..)| *pid == Some(raised.pid)) {
+                    return Ok(self.kde_wait_active(&raised, &apps).await);
+                }
+                // Its process has no AT-SPI app under that pid: by title.
+                poll(ACTIVATE_WAIT, || self.kde_frame_active(&raised.caption)).await;
             }
             Compositor::Hyprland(h) => {
                 let q = query.to_lowercase();
@@ -1195,12 +1322,12 @@ impl Backend for LinuxBackend {
                                 .is_some_and(|aw| aw["address"].as_str() == Some(addr.as_str()))
                         })
                         .await;
-                        return Ok(());
+                        return Ok(None);
                     }
                 }
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
@@ -1211,6 +1338,26 @@ impl Backend for LinuxBackend {
                 Ok(list)
             }
             Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+        }
+    }
+
+    async fn screens_and_windows(
+        &self,
+        query: &str,
+        allowed: &[String],
+    ) -> (Vec<Screen>, R<Vec<WindowGeo>>) {
+        match &self.comp {
+            Compositor::Kde(kwin) => {
+                let allow = self.kwin_allow(allowed).await;
+                match kwin.screens_and_windows(query, &allow).await {
+                    Ok((screens, mut list)) => {
+                        with_terminals(&mut list).await;
+                        (screens, Ok(list))
+                    }
+                    Err(e) => (Vec::new(), Err(e)),
+                }
+            }
+            Compositor::Hyprland(_) => (Vec::new(), Err(NO_WINDOW_CONTROL.into())),
         }
     }
 
@@ -1267,18 +1414,24 @@ impl Backend for LinuxBackend {
             return Ok(out);
         }
         let start = std::time::Instant::now();
+        let hints = launch::arg_hints(args);
         let mut tree = std::collections::HashSet::from([pid]);
+        // Rounds since the tree last grew.
+        let mut stable = 0;
         let mut ended: Option<std::time::Instant> = None;
         loop {
-            // Children seen once stay in the tree, so apps that fork and
-            // let the parent exit are still matched by pid.
-            let roots = tree.clone();
-            tree = tokio::task::spawn_blocking(move || {
-                let stats = terminals::read_stats();
-                launch::descendants(&roots, stats.iter().map(|(p, s)| (*p, s.ppid)))
-            })
-            .await
-            .unwrap_or_else(|_| std::collections::HashSet::from([pid]));
+            let scanned = launch::tree_scan_due(stable);
+            if scanned {
+                let grown = descendants_of(&tree).await;
+                stable = if grown.len() > tree.len() {
+                    0
+                } else {
+                    stable + 1
+                };
+                tree = grown;
+            } else {
+                stable += 1;
+            }
             // Rebuilt each round: the new app joins AT-SPI after it starts.
             let allow = self.kwin_allow(allowed).await;
             let now = kwin.windows("", &allow).await?;
@@ -1286,15 +1439,21 @@ impl Backend for LinuxBackend {
             if status.is_some() && ended.is_none() {
                 ended = Some(std::time::Instant::now());
             }
-            let settled = ended.is_some_and(|t| t.elapsed() >= HANDOFF_GRACE);
-            let stage = if settled && status.is_some_and(|s| s.success()) {
-                launch::Stage::Ended
-            } else if start.elapsed() >= HANDOFF_GRACE {
-                launch::Stage::Settled
-            } else {
-                launch::Stage::Starting
-            };
-            if let Some((w, how)) = launch::pick_window(app, &before, &now, &tree, stage) {
+            let exited = status.zip(ended).map(|(s, t)| (s.success(), t.elapsed()));
+            let stage = launch::stage(start.elapsed(), exited);
+            let mut picked = launch::pick_window(app, &before, &now, &tree, stage, &hints);
+            if picked
+                .as_ref()
+                .is_some_and(|(_, how)| *how != launch::Found::Own)
+                && !scanned
+            {
+                // A skipped scan must not call the started app's own window
+                // the running instance's.
+                tree = descendants_of(&tree).await;
+                stable = 0;
+                picked = launch::pick_window(app, &before, &now, &tree, stage, &hints);
+            }
+            if let Some((w, how)) = picked {
                 let mut found = vec![w.clone()];
                 with_terminals(&mut found).await;
                 out.window = found.pop();
@@ -1306,7 +1465,9 @@ impl Backend for LinuxBackend {
                 .into();
                 return Ok(out);
             }
-            if let Some(s) = status.filter(|s| !s.success() && settled) {
+            if let (Some(s), Some((false, since))) = (status, exited)
+                && since >= launch::HANDOFF_GRACE
+            {
                 return Err(format!(
                     "{} (pid {pid}) exited with {s} without opening a window",
                     out.command
@@ -1315,7 +1476,7 @@ impl Backend for LinuxBackend {
             if start.elapsed() >= wait {
                 return Ok(out);
             }
-            tokio::time::sleep(LAUNCH_POLL).await;
+            tokio::time::sleep(launch::poll_interval(start.elapsed())).await;
         }
     }
 
@@ -1556,6 +1717,47 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn one_unfocusable_element_does_not_turn_focus_off_for_the_app() {
+        let g = FocusMethod::GrabFocus;
+        let mut rec = FocusRecord::default();
+        assert!(rec.should_try(":1.5", "label", g));
+        rec.note(":1.5", "label", g, false);
+        // Other roles in the app, and a second try on the role, still go.
+        assert!(rec.should_try(":1.5", "push button", g));
+        assert!(rec.should_try(":1.5", "label", g));
+        rec.note(":1.5", "label", g, false);
+        // Failed twice in a row on labels there: skipped, for labels only,
+        // in that app only, for that method only.
+        assert!(!rec.should_try(":1.5", "label", g));
+        assert!(rec.should_try(":1.5", "text", g));
+        assert!(rec.should_try(":1.9", "label", g));
+        assert!(rec.should_try(":1.5", "label", FocusMethod::SetFocusAction));
+    }
+
+    #[test]
+    fn a_skipped_focus_method_is_retried_and_a_success_restores_it() {
+        let g = FocusMethod::GrabFocus;
+        let mut rec = FocusRecord::default();
+        rec.note(":1.5", "text", g, false);
+        rec.note(":1.5", "text", g, false);
+        for _ in 0..FOCUS_RETRY_AFTER {
+            assert!(!rec.should_try(":1.5", "text", g));
+        }
+        // The probe after the skips; it works, so the method is back.
+        assert!(rec.should_try(":1.5", "text", g));
+        rec.note(":1.5", "text", g, true);
+        assert!(rec.should_try(":1.5", "text", g));
+        rec.note(":1.5", "text", g, false);
+        assert!(
+            rec.should_try(":1.5", "text", g),
+            "one failure after a success"
+        );
+        // A failed probe keeps it skipped.
+        rec.note(":1.5", "text", g, false);
+        assert!(!rec.should_try(":1.5", "text", g));
+    }
+
+    #[test]
     fn file_dialog_parts_are_matched_by_qt_ids() {
         // As seen in xdg-desktop-portal-kde and kdialog (KF6).
         let base = "QApplication.FileDialog.KFileWidget.QSplitter.QWidget";
@@ -1615,6 +1817,21 @@ mod tests {
         assert!(!ind.send("show x", true).await);
         assert!(ind.child.is_none() && ind.off);
         assert!(!ind.spawn());
+    }
+
+    #[test]
+    fn raised_window_is_found_by_title_or_as_the_only_one() {
+        let w = |n: &str, a: bool| (n.to_string(), a);
+        // Kate's frame name spaces the dash differently from KWin's caption.
+        let seen = [w("a.txt  — Kate", true), w("b.txt  — Kate", true)];
+        assert_eq!(active_index("b.txt — Kate", &seen), Some(1));
+        // The window that was in front still says ACTIVE: not yet.
+        let seen = [w("a.txt — Kate", true), w("b.txt — Kate", false)];
+        assert_eq!(active_index("b.txt — Kate", &seen), None);
+        // One window: its ACTIVE state is enough, whatever its name.
+        assert_eq!(active_index("Mozilla Firefox", &[w("x", true)]), Some(0));
+        assert_eq!(active_index("Mozilla Firefox", &[w("x", false)]), None);
+        assert_eq!(active_index("x", &[]), None);
     }
 
     #[test]

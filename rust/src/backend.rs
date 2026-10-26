@@ -119,6 +119,14 @@ pub struct Launched {
     pub note: String,
 }
 
+/// The window `activate_window` brought to the front: the app's name (""
+/// when it has none) and the window's title.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Activated {
+    pub app: String,
+    pub title: String,
+}
+
 /// What `move_window` changes; None keeps the current value.
 #[derive(Clone, Debug, Default)]
 pub struct WindowChange {
@@ -243,12 +251,25 @@ pub trait Backend {
     /// actions keeps this default, which does nothing.
     async fn fill_actions(&self, _cache: &mut Cache<Self::Id>, _ids: &[Self::Id]) {}
 
+    /// The document a top-level window shows, when the platform says so in
+    /// one call (Firefox: the window's EMBEDS relation names the current
+    /// tab's page). None to search the window for it instead.
+    async fn embedded_document(&self, _window: &Self::Id) -> Option<Self::Id> {
+        None
+    }
+
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
     /// Complete text content (falls back to the name).
     async fn full_text(&self, id: &Self::Id, limit: usize) -> R<String>;
     /// Replace the contents; Err when the element is not editable.
     async fn set_text(&self, id: &Self::Id, text: &str) -> R<bool>;
+    /// Names the application `id` belongs to for as long as it runs (Linux:
+    /// its AT-SPI bus name), so what was learnt about it (set_text writes
+    /// that do nothing) is reused; None when the backend has no such key.
+    fn app_key(&self, _id: &Self::Id) -> Option<String> {
+        None
+    }
     async fn is_focused(&self, id: &Self::Id) -> bool;
     /// The element holding keyboard focus now, when the backend tracks it.
     /// Only an element whose app has the active window; None otherwise.
@@ -278,12 +299,22 @@ pub trait Backend {
     /// Press (`down`) or release a mouse button where the cursor is.
     async fn button(&self, button: &str, down: bool) -> R<()>;
     /// Raise the first window of an allowed app whose title or app name
-    /// contains `query`, and wait until it is in front.
-    async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()>;
+    /// contains `query`, and wait until it is in front. Some names the
+    /// window in front when that wait already found it; None leaves it to
+    /// the caller to look.
+    async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>>;
     /// Windows of allowed apps whose title or app contains `query` (all when
     /// empty).
     async fn windows(&self, _query: &str, _allowed: &[String]) -> R<Vec<WindowGeo>> {
         Err(NO_WINDOW_CONTROL.into())
+    }
+    /// `screens` and `windows` together, for backends that read both at once.
+    async fn screens_and_windows(
+        &self,
+        query: &str,
+        allowed: &[String],
+    ) -> (Vec<Screen>, R<Vec<WindowGeo>>) {
+        tokio::join!(self.screens(), self.windows(query, allowed))
     }
     /// Move, resize, maximize, minimize or restore the first such window.
     async fn set_window(

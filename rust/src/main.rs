@@ -20,7 +20,7 @@ mod windows;
 #[allow(dead_code)]
 mod windows_logic;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -118,6 +118,64 @@ fn name_is_stable<Id>(info: &Info<Id>) -> bool {
         && !VOLATILE_NAME_ROLES.contains(&info.role.as_str())
 }
 
+/// `apps` output. Allowed apps list their windows (untitled ones only when
+/// active: plasmashell alone has a dozen); blocked apps share one line,
+/// since nothing can be done with their windows. The allowlist path and the
+/// accessibility note (both in `doctor`) only come when no app is allowed.
+fn apps_text(
+    list: Vec<backend::AppEntry>,
+    allow: &[String],
+    allow_file: &std::path::Path,
+    note: &str,
+) -> String {
+    let mut lines = Vec::new();
+    // Name, and whether one of its windows is the active one.
+    let mut blocked: Vec<(String, bool)> = Vec::new();
+    for app in list {
+        if app.windows.is_empty() {
+            continue;
+        }
+        if !allow.contains(&app.name.to_lowercase()) {
+            let active = app.windows.iter().any(|w| w.active);
+            match blocked.iter_mut().find(|(n, _)| *n == app.name) {
+                Some((_, a)) => *a |= active,
+                None => blocked.push((app.name, active)),
+            }
+            continue;
+        }
+        lines.push(format!("{} (allowed)", app.name));
+        for w in app.windows {
+            if w.title.is_empty() && !w.active {
+                continue;
+            }
+            let act = if w.active { " [active]" } else { "" };
+            lines.push(format!(
+                "  - {}: {}{act}",
+                w.kind,
+                render::py_repr(&w.title)
+            ));
+        }
+    }
+    let none_allowed = lines.is_empty();
+    if !blocked.is_empty() {
+        let names: Vec<String> = blocked
+            .into_iter()
+            .map(|(n, active)| if active { format!("{n} [active]") } else { n })
+            .collect();
+        lines.push(format!("blocked: {}", names.join(", ")));
+    }
+    if none_allowed {
+        lines.push(format!(
+            "no allowed app has a window; allowlist file: {}",
+            allow_file.display()
+        ));
+        if !note.is_empty() {
+            lines.push(note.into());
+        }
+    }
+    lines.join("\n")
+}
+
 struct Server<B: Backend> {
     b: B,
     refs: Mutex<Refs<B::Id>>,
@@ -129,6 +187,9 @@ struct Server<B: Backend> {
     /// Held by tools that send keyboard or pointer input, so two concurrent
     /// calls never interleave their events.
     input: Mutex<()>,
+    /// `app_key`s of apps whose accessibility text writes report success
+    /// and change nothing (Firefox); set_text types there right away.
+    inert_writes: Mutex<HashSet<String>>,
 }
 
 /// Tools that send keyboard or pointer input, run an app's actions (`act`
@@ -214,7 +275,9 @@ impl From<String> for Out {
 }
 
 /// Longest side of a screenshot sent back, unless `max_size` says otherwise.
-const SHOT_MAX_SIZE: i64 = 1280;
+/// Image tokens grow with the area: 1024 costs about 0.64 of 1280 and
+/// still shows a 1536 px wide window's text legibly.
+const SHOT_MAX_SIZE: i64 = 1024;
 
 /// How long set_text waits for the field to show what was written.
 const SET_TEXT_VERIFY: Duration = Duration::from_millis(300);
@@ -466,6 +529,7 @@ impl<B: Backend> Server<B> {
             last_active: Mutex::new(None),
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
+            inert_writes: Mutex::new(HashSet::new()),
         }
     }
 
@@ -691,38 +755,19 @@ impl<B: Backend> Server<B> {
 
     async fn apps(&self) -> R<String> {
         self.b.enable().await;
-        let allow = self.allowed();
-        let mut lines = Vec::new();
-        for app in self.b.list_apps().await {
-            if app.windows.is_empty() {
-                continue;
-            }
-            let flag = if allow.contains(&app.name.to_lowercase()) {
-                "allowed"
-            } else {
-                "blocked"
-            };
-            lines.push(format!("{} ({flag})", app.name));
-            for w in app.windows {
-                let act = if w.active { " [active]" } else { "" };
-                lines.push(format!(
-                    "  - {}: {}{act}",
-                    w.kind,
-                    render::py_repr(&w.title)
-                ));
-            }
-        }
-        lines.push(format!("allowlist file: {}", self.allow_file.display()));
-        if !self.b.apps_note().is_empty() {
-            lines.push(self.b.apps_note().into());
-        }
-        Ok(lines.join("\n"))
+        let list = self.b.list_apps().await;
+        Ok(apps_text(
+            list,
+            &self.allowed(),
+            &self.allow_file,
+            self.b.apps_note(),
+        ))
     }
 
     async fn windows(&self, a: &Json) -> R<String> {
         let query = arg_s(a, "query", "");
         let allowed = self.allowed();
-        let (screens, list) = tokio::join!(self.b.screens(), self.b.windows(&query, &allowed));
+        let (screens, list) = self.b.screens_and_windows(&query, &allowed).await;
         let mut lines: Vec<String> = screens
             .iter()
             .map(|s| {
@@ -972,15 +1017,32 @@ impl<B: Backend> Server<B> {
             stop_roles: &render::DOCUMENT_ROLES,
             ..search_fetch(TREE_TEXT_LIMIT, limit)
         };
-        self.b
-            .prefetch_with(cache, windows.clone(), &fetch(render::FIND_MAX_SEEN))
-            .await;
-        let window = windows
+        // The windows themselves (limit 1 stops after their level), and the
+        // document each says it shows, at once.
+        let level = fetch(1);
+        let (_, embedded) = tokio::join!(
+            self.b.prefetch_with(cache, windows.clone(), &level),
+            futures_util::future::join_all(windows.iter().map(|w| self.b.embedded_document(w)))
+        );
+        let (window, embedded) = windows
             .iter()
-            .filter(|w| cache.get(*w).is_some_and(|i| i.showing))
-            .max_by_key(|w| cache[*w].states.contains(&"active"))
-            .cloned()
+            .zip(embedded)
+            .filter(|(w, _)| cache.get(*w).is_some_and(|i| i.showing))
+            .max_by_key(|(w, _)| cache[*w].states.contains(&"active"))
+            .map(|(w, d)| (w.clone(), d))
             .ok_or_else(|| format!("'{app}' has no visible window"))?;
+        if let Some(doc) = embedded {
+            let info = self.b.info(&doc, TREE_TEXT_LIMIT).await;
+            if info.showing && render::DOCUMENT_ROLES.contains(&info.role.as_str()) {
+                cache.insert(doc.clone(), info);
+                return Ok(doc);
+            }
+        }
+        // Otherwise search the window for it.
+        let below = cache[&window].children.clone();
+        self.b
+            .prefetch_with(cache, below, &fetch(render::FIND_MAX_SEEN))
+            .await;
         loop {
             match render::first_with_role(
                 cache,
@@ -1082,14 +1144,33 @@ impl<B: Backend> Server<B> {
         if self.b.info(&t.id, 0).await.role.contains("password") {
             return Ok(t.reply("ok (password field: contents cannot be read back)"));
         }
-        let mut how = "";
-        let mut seen = self.read_back(&t.id, &text).await;
         // Firefox reports success for accessibility writes and changes
         // nothing. Retype through the keyboard when the element takes focus;
         // never with a newline, which Enter would turn into a submit.
-        if matches!(&seen, Ok(Some(_))) && !text.contains('\n') && self.retype(&t.id, &text).await {
+        let retypable = !text.contains('\n');
+        let key = self.b.app_key(&t.id);
+        let inert = match &key {
+            Some(k) if retypable => self.inert_writes.lock().await.contains(k),
+            _ => false,
+        };
+        // Where writes are known to do nothing, one look instead of waiting
+        // SET_TEXT_VERIFY for the write to show.
+        let patience = if inert {
+            Duration::ZERO
+        } else {
+            SET_TEXT_VERIFY
+        };
+        let mut how = "";
+        let mut seen = self.read_back(&t.id, &text, patience).await;
+        if matches!(&seen, Ok(Some(_))) && retypable && self.retype(&t.id, &text).await {
             how = "; typed, the accessibility write had no effect";
-            seen = self.read_back(&t.id, &text).await;
+            seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+            if let (Ok(None), Some(k)) = (&seen, key) {
+                self.inert_writes.lock().await.insert(k);
+            }
+        } else if inert && matches!(&seen, Ok(Some(_))) {
+            // Could not retype: give the write its usual time after all.
+            seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
         }
         match seen {
             Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
@@ -1107,9 +1188,10 @@ impl<B: Backend> Server<B> {
         }
     }
 
-    /// Ok(None) once the element holds `text` (polled briefly, as some
-    /// toolkits apply a change a moment later), else Ok(Some(what it holds)).
-    async fn read_back(&self, id: &B::Id, text: &str) -> R<Option<String>> {
+    /// Ok(None) once the element holds `text` (polled for up to `patience`,
+    /// as some toolkits apply a change a moment later), else Ok(Some(what
+    /// it holds)).
+    async fn read_back(&self, id: &B::Id, text: &str, patience: Duration) -> R<Option<String>> {
         let limit = text.chars().count() + 64;
         let start = Instant::now();
         loop {
@@ -1117,7 +1199,7 @@ impl<B: Backend> Server<B> {
             if written_matches(text, &now) {
                 return Ok(None);
             }
-            if start.elapsed() >= SET_TEXT_VERIFY {
+            if start.elapsed() >= patience {
                 return Ok(Some(now));
             }
             tokio::time::sleep(Duration::from_millis(30)).await;
@@ -1139,14 +1221,55 @@ impl<B: Backend> Server<B> {
 
     async fn get_text(&self, a: &Json) -> R<String> {
         let t = self.target(a).await?;
-        let text = self
-            .b
-            .full_text(&t.id, arg_i(a, "limit", 20000).max(0) as usize)
-            .await?;
+        let limit = arg_i(a, "limit", 20000).max(0) as usize;
+        let mut text = self.b.full_text(&t.id, limit).await?;
+        if render::has_embedded_objects(&text) {
+            text = self.container_text(&t.id, limit).await;
+        }
         Ok(match t.found {
             Some(d) => format!("{d}:\n{text}"),
             None => text,
         })
+    }
+
+    /// A web container's text with its descendants' text in place of the
+    /// U+FFFC placeholders (see `render::container_text`). Hidden nodes are
+    /// read too: text scrolled out of view is part of the page.
+    async fn container_text(&self, id: &B::Id, limit: usize) -> String {
+        let fetch = |nodes| Fetch {
+            only_showing: false,
+            ..search_fetch(limit, nodes)
+        };
+        let mut cache = Cache::new();
+        self.b
+            .prefetch_with(&mut cache, vec![id.clone()], &fetch(render::FIND_MAX_SEEN))
+            .await;
+        loop {
+            match render::container_text(&cache, id, limit) {
+                Ok(text) => return text,
+                Err(missing) => {
+                    let before = cache.len();
+                    self.b
+                        .prefetch_with(&mut cache, missing.clone(), &fetch(PREFETCH_MORE))
+                        .await;
+                    if cache.len() == before {
+                        // Nodes that cannot be read (gone meanwhile) read
+                        // as nothing.
+                        for m in missing {
+                            cache.entry(m).or_insert_with(|| Info {
+                                role: String::new(),
+                                name: String::new(),
+                                states: Vec::new(),
+                                showing: false,
+                                actions: Vec::new(),
+                                text: None,
+                                children: Vec::new(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
     }
 
     async fn wait_for(&self, a: &Json) -> R<String> {
@@ -1438,9 +1561,11 @@ impl<B: Backend> Server<B> {
             Some(t) => self.terminal_window(t).await?,
             None => req_s(a, "query")?,
         };
-        self.b.activate_window(&query, &self.allowed()).await?;
-        *self.last_active.lock().await = self.active_title().await;
-        let app = self.b.active_app().await;
+        let (title, app) = match self.b.activate_window(&query, &self.allowed()).await? {
+            Some(a) => (Some(a.title), a.app),
+            None => (self.active_title().await, self.b.active_app().await),
+        };
+        *self.last_active.lock().await = title;
         Ok(format!(
             "active app now: {}",
             if app.is_empty() { "unknown" } else { &app }
@@ -1482,7 +1607,7 @@ impl<B: Backend> Server<B> {
         if !self.b.set_text(&d.field, &text).await? {
             return Err("the file name field refused the path".into());
         }
-        if let Some(now) = self.read_back(&d.field, &text).await? {
+        if let Some(now) = self.read_back(&d.field, &text, SET_TEXT_VERIFY).await? {
             return Err(format!(
                 "the file name field holds {now:?} instead of the path; nothing was chosen"
             ));
@@ -1560,10 +1685,8 @@ impl<B: Backend> Server<B> {
         let (iw, ih) = size;
         let mut text = format!("{path}\n{iw}x{ih} px");
         if let (Some((x, y, w, h)), Some(_)) = (area, map) {
-            text.push_str(&format!(
-                " image of screen area at ({x},{y}), {w}x{h}. To click a point seen in it, \
-                 pass its pixel position as image_x/image_y to mouse."
-            ));
+            // How to click a point in it is in the server instructions.
+            text.push_str(&format!(" of screen area at ({x},{y}), {w}x{h}"));
         }
         Ok(Out {
             text,
@@ -1914,6 +2037,9 @@ mod tests {
         /// App the focused element belongs to.
         focus_app: Rc<RefCell<String>>,
         clipboard: RefCell<String>,
+        /// A text field like Firefox's when Some: accessibility writes do
+        /// nothing, typing replaces it, and it always has focus.
+        field: Rc<RefCell<Option<String>>>,
     }
 
     impl Backend for FakeBackend {
@@ -1964,13 +2090,20 @@ mod tests {
             Ok(true)
         }
         async fn full_text(&self, _: &u32, _: usize) -> R<String> {
-            Ok(String::new())
+            let field = self.field.borrow().clone();
+            if field.is_some() {
+                self.keys.borrow_mut().push("read".into());
+            }
+            Ok(field.unwrap_or_default())
         }
         async fn set_text(&self, _: &u32, _: &str) -> R<bool> {
             Ok(true)
         }
+        fn app_key(&self, _: &u32) -> Option<String> {
+            Some("fake".into())
+        }
         async fn is_focused(&self, _: &u32) -> bool {
-            false
+            self.field.borrow().is_some()
         }
         async fn try_focus(&self, _: &u32) -> R<Option<String>> {
             Ok(None)
@@ -1987,7 +2120,10 @@ mod tests {
             self.keys.borrow_mut().push(format!("up {combo}"));
             Ok(())
         }
-        async fn type_text(&self, _: &str) -> R<String> {
+        async fn type_text(&self, text: &str) -> R<String> {
+            if let Some(f) = self.field.borrow_mut().as_mut() {
+                *f = text.to_string();
+            }
             Ok(String::new())
         }
         async fn clipboard_get(&self, limit: usize) -> R<Clip> {
@@ -2017,8 +2153,8 @@ mod tests {
             self.keys.borrow_mut().push(format!("{what} {button}"));
             Ok(())
         }
-        async fn activate_window(&self, _: &str, _: &[String]) -> R<()> {
-            Ok(())
+        async fn activate_window(&self, _: &str, _: &[String]) -> R<Option<backend::Activated>> {
+            Ok(None)
         }
         async fn screenshot(&self) -> Option<Shot> {
             // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.
@@ -2047,6 +2183,7 @@ mod tests {
         keys: Rc<RefCell<Vec<String>>>,
         focus: Rc<RefCell<Info<u32>>>,
         focus_app: Rc<RefCell<String>>,
+        field: Rc<RefCell<Option<String>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -2065,12 +2202,14 @@ mod tests {
             ..Info::default()
         }));
         let focus_app = Rc::new(RefCell::new("fake".to_string()));
+        let field = Rc::new(RefCell::new(None));
         let server = Rc::new(Server::new(FakeBackend {
             allow_file,
             keys: keys.clone(),
             focus: focus.clone(),
             focus_app: focus_app.clone(),
             clipboard: RefCell::new(String::new()),
+            field: field.clone(),
         }));
         let (stdin, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, client_out) = tokio::io::duplex(64 * 1024);
@@ -2081,6 +2220,7 @@ mod tests {
             keys,
             focus,
             focus_app,
+            field,
         }
     }
 
@@ -2353,7 +2493,7 @@ mod tests {
             let content = &r["result"]["content"];
             let text = content[0]["text"].as_str().unwrap();
             assert!(
-                text.contains("100x50 px image of screen area at (10,20), 400x200"),
+                text.contains("100x50 px of screen area at (10,20), 400x200"),
                 "{text}"
             );
             assert_eq!(content[1]["type"], "image", "{r}");
@@ -2565,6 +2705,57 @@ mod tests {
     }
 
     #[test]
+    fn apps_lists_allowed_windows_and_blocked_names_on_one_line() {
+        let w = |title: &str, active: bool| backend::WindowEntry {
+            kind: "frame".into(),
+            title: title.into(),
+            active,
+        };
+        let app = |name: &str, windows| AppEntry {
+            name: name.into(),
+            windows,
+        };
+        let list = || {
+            vec![
+                app("kwin", vec![w("", false)]),
+                app("konsole", vec![w("~ : claude", false)]),
+                app(
+                    "Firefox",
+                    vec![w("Page — Mozilla Firefox", true), w("", false)],
+                ),
+                app("konsole", vec![w("other", false)]),
+                app("plasmashell", vec![w("Desktop", false), w("", false)]),
+                app("idle", vec![]),
+            ]
+        };
+        let file = PathBuf::from("/home/u/.config/desktop-mcp/allow.txt");
+        let allow = vec!["firefox".to_string()];
+        assert_eq!(
+            apps_text(list(), &allow, &file, "restart note"),
+            "Firefox (allowed)\n  - frame: 'Page — Mozilla Firefox' [active]\n\
+             blocked: kwin, konsole, plasmashell"
+        );
+        // An untitled window is listed when it is the active one; so is
+        // a blocked app's.
+        let mut l = list();
+        l[1].windows[0].active = true;
+        l[2].windows[0].active = false;
+        l[2].windows[1].active = true;
+        assert_eq!(
+            apps_text(l, &allow, &file, "restart note"),
+            "Firefox (allowed)\n  - frame: 'Page — Mozilla Firefox'\n  - frame: '' [active]\n\
+             blocked: kwin, konsole [active], plasmashell"
+        );
+        // Nothing allowed: where the allowlist is, and the note.
+        assert_eq!(
+            apps_text(list(), &[], &file, "restart note"),
+            "blocked: kwin, konsole, Firefox [active], plasmashell\n\
+             no allowed app has a window; allowlist file: \
+             /home/u/.config/desktop-mcp/allow.txt\nrestart note"
+        );
+    }
+
+    #[test]
     fn window_reached_checks_asked_fields_only() {
         let w = WindowGeo {
             x: 100.0,
@@ -2712,6 +2903,36 @@ mod tests {
             let id = focus_id(&mut s, 3).await;
             let r = call_tool(&mut s, 4, "act", json!({"id": id})).await;
             assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+        });
+    }
+
+    #[test]
+    fn set_text_types_right_away_where_writes_did_nothing_before() {
+        local(async {
+            let mut s = session("inert");
+            *s.field.borrow_mut() = Some("old".into());
+            let id = focus_id(&mut s, 2).await;
+            let reads = |s: &Session| s.keys.borrow().iter().filter(|k| *k == "read").count();
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "set_text", json!({"id": id, "text": "one"})).await;
+            let first = start.elapsed();
+            assert!(reply_text(&r).contains("ok (verified; typed"), "{r}");
+            assert!(first >= SET_TEXT_VERIFY, "{first:?}");
+            assert_eq!(s.field.borrow().as_deref(), Some("one"));
+            // Known now: one look at the field, then typing, then verified.
+            s.keys.borrow_mut().clear();
+            let start = Instant::now();
+            let r = call_tool(&mut s, 4, "set_text", json!({"id": id, "text": "two"})).await;
+            assert!(reply_text(&r).contains("ok (verified; typed"), "{r}");
+            assert!(start.elapsed() < SET_TEXT_VERIFY, "{:?}", start.elapsed());
+            assert_eq!(s.field.borrow().as_deref(), Some("two"));
+            assert_eq!(reads(&s), 2, "{:?}", s.keys.borrow());
+            // Text with a newline is never retyped: the usual wait, unchanged.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 5, "set_text", json!({"id": id, "text": "a\nb"})).await;
+            assert!(r.to_string().contains("the field now holds"), "{r}");
+            assert!(start.elapsed() >= SET_TEXT_VERIFY);
+            assert_eq!(s.field.borrow().as_deref(), Some("two"));
         });
     }
 
