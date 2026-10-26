@@ -1,227 +1,218 @@
 # kde-desktop-mcp
 
-KDE Plasma (Wayland), Hyprland ve Windows için ekran görüntüsü almadan çalışan bir
-masaüstü kontrol MCP sunucusu. Claude Code gibi MCP istemcilerine
-uygulamaların içini erişilebilirlik ağacından okuma ve öğelere doğrudan işlem
-yapma yeteneği verir. Rust ile yazılmıştır; tek bir çalıştırılabilir dosyadır.
+A screenshot-free desktop control MCP server for KDE Plasma (Wayland),
+Hyprland and Windows. It lets MCP clients such as Claude Code read the inside
+of applications through the accessibility tree and act on elements directly.
+Written in Rust; a single executable.
 
-*A screenshot-free desktop control MCP server for KDE Plasma (Wayland), Hyprland
-and Windows, built on the platform accessibility APIs, with a per-app allowlist.*
+> Verified on a real KDE Plasma desktop. Hyprland was verified in a nested
+> session inside KDE. On Windows, keyboard, mouse and screenshots were tried
+> under Wine; tree reading (`tree`, `find`, `get_text`, `focus`, `click`) has
+> not yet been tried on real Windows. Please share results from
+> `tools/mcp_smoke_test.py`.
 
-> KDE Plasma gerçek masaüstünde doğrulanmıştır. Hyprland, KDE içinde iç içe
-> çalışan bir oturumda doğrulanmıştır. Windows'ta klavye, fare ve ekran
-> görüntüsü Wine'da denenmiştir; ağaç okuma (`tree`, `find`, `get_text`,
-> `focus`, `click`) henüz gerçek Windows'ta denenmemiştir. Sonuçları
-> `tools/mcp_smoke_test.py` ile paylaşın.
+## How it works
 
-## Nasıl çalışır
+Instead of looking at the screen, Claude reads the elements of a window as a
+list like `[55] button "Save"` and acts on an element by its number.
 
-Claude ekrana bakmak yerine pencerelerdeki öğeleri `[55] button "Kaydet"` gibi
-bir liste olarak okur ve öğelere numarasıyla doğrudan işlem yapar.
-
-| Katman | KDE Plasma (Wayland) | Hyprland | Windows |
+| Layer | KDE Plasma (Wayland) | Hyprland | Windows |
 |---|---|---|---|
-| Okuma | AT-SPI (D-Bus) | AT-SPI (D-Bus) | UI Automation önbellek istekleri |
-| Öğe işlemleri | AT-SPI eylemleri, EditableText | AT-SPI eylemleri, EditableText | Invoke, Toggle, ExpandCollapse, SelectionItem, Value desenleri |
-| Klavye | `/dev/uinput` | `/dev/uinput` | Win32 `SendInput` |
-| Fare | Mutlak konumlu uinput | Hyprland `movecursor` + uinput tuşları | `SetCursorPos` + `SendInput` |
-| Metin yazma | Qt'nin çok satırlı alanlarına AT-SPI ile doğrudan ekleme (panoya dokunmaz); diğerlerinde süreç içi pano + Ctrl+V, ardından panodaki metin geri konur | `wtype` (panoya dokunmaz); yoksa KDE'deki gibi pano + Ctrl+V | `KEYEVENTF_UNICODE` (panoya dokunmaz) |
-| Pencere | KWin betikleri (D-Bus) | Hyprland soketi: `clients`, `focuswindow` | `SetForegroundWindow` |
-| Ekran görüntüsü (yedek) | KWin `ScreenShot2` (D-Bus); yoksa `spectacle` | `grim` | GDI |
+| Reading | AT-SPI (D-Bus) | AT-SPI (D-Bus) | UI Automation cache requests |
+| Element actions | AT-SPI actions, EditableText | AT-SPI actions, EditableText | Invoke, Toggle, ExpandCollapse, SelectionItem, Value patterns |
+| Keyboard | `/dev/uinput` | `/dev/uinput` | Win32 `SendInput` |
+| Mouse | Absolute uinput pointer | Hyprland `movecursor` + uinput buttons | `SetCursorPos` + `SendInput` |
+| Typing text | Direct insertion via AT-SPI into Qt multi-line fields (clipboard untouched); elsewhere in-process clipboard + Ctrl+V, after which the previous clipboard text is put back | `wtype` (clipboard untouched); otherwise clipboard + Ctrl+V as on KDE | `KEYEVENTF_UNICODE` (clipboard untouched) |
+| Windows | KWin scripting (D-Bus) | Hyprland socket: `clients`, `focuswindow` | `SetForegroundWindow` |
+| Screenshot (fallback) | KWin `ScreenShot2` (D-Bus); else `spectacle` | `grim` | GDI |
 
-Kod `rust/src/` altındadır: `main.rs` MCP protokolünü, izin listesini, öğe
-numaralarını ve araçları; `render.rs` ağaç ve arama çıktısını; `backend.rs`
-platform arayüzünü tanımlar. Platform kodu `linux/` (KDE ve Hyprland ortak
-AT-SPI katmanıyla) ve `windows/` altındadır. Claude her platformda aynı
-araçları görür.
+The code lives in `rust/src/`: `main.rs` holds the MCP protocol, the
+allowlist, element ids and the tools; `render.rs` the tree and search output;
+`backend.rs` defines the platform interface. Platform code is in `linux/`
+(KDE and Hyprland share an AT-SPI layer) and `windows/`. Claude sees the same
+tools on every platform.
 
-Masaüstü otomatik seçilir: Windows'ta Windows, Linux'ta
-`HYPRLAND_INSTANCE_SIGNATURE` tanımlıysa Hyprland, değilse KDE. Linux'ta elle
-seçmek için `DESKTOP_MCP_BACKEND` ortam değişkenine `kde` ya da `hyprland`
-verin.
+The desktop is chosen automatically: Windows on Windows; on Linux, Hyprland if
+`HYPRLAND_INSTANCE_SIGNATURE` is set, otherwise KDE. To choose by hand on
+Linux, set `DESKTOP_MCP_BACKEND` to `kde` or `hyprland`.
 
-Hyprland'de etkin pencere, AT-SPI'deki uygulamayla süreç kimliği (pid)
-üzerinden eşleştirilir; böylece araç takımının odak bayrağına güvenmek
-gerekmez.
+On Hyprland the active window is matched to its AT-SPI application by process
+id (pid), so the toolkit's focus flag does not have to be trusted.
 
-`focus` önce erişilebilirlik altyapısından odak ister. Uygulama bunu reddederse
-(Qt'de sık görülür) öğenin ortasına gerçek bir tıklama yapar.
+`focus` first asks the accessibility layer for focus. If the app refuses (common
+with Qt), it clicks the centre of the element for real.
 
-Neden hızlı:
-- AT-SPI'ye libatspi olmadan doğrudan D-Bus ile konuşur ve istekleri
-  beklemeden art arda gönderir (pipelining): bir öğenin bütün öznitelikleri ve
-  ağacın her seviyesi aynı anda istenir; süre gidiş-dönüş gecikmesiyle değil
-  uygulamanın yanıt hızıyla sınırlanır.
-- Windows'ta bir pencerenin bütün alt ağacı, gereken özellikleriyle tek bir
-  UI Automation önbellek isteğiyle (`BuildUpdatedCache`) gelir.
-- KWin betikleri `qdbus6` süreçleri yerine D-Bus'tan, Hyprland komutları
-  `hyprctl` süreçleri yerine doğrudan Hyprland'in soketinden gider.
-- Açılış 2 ms; sanal klavye ve fare açılışta, aynı anda hazırlanır.
-- KDE'de bekleme süreleri ölçülerek kısaltıldı (uinput olayları sırayla
-  işlenir); `focus`, bir uygulamada işe yaramayan odak yöntemlerini hatırlayıp
-  atlar; `type_text` süreç başlatmaz; ekran görüntüsü `spectacle` yerine
-  doğrudan KWin'den alınır.
-- Çıktı kısadır, Claude daha az okur: girinti seviye başına bir boşluk, aynı
-  rol ve eylemli kardeş yapraklar tek satırda
-  (`list item ×3: [8] "a" [9] "b" [10] "c"`), Qt'nin hemen her öğeye verdiği
-  "Set Focus" eylemi listelenmez. Dolphin + Kate `tree` çıktısı 15.182'den
-  7.092 karaktere indi.
-- Tarayıcılarda da: Firefox'un her öğeye verdiği "clickAncestor" eylemi ve
-  web sayfalarının gömülü öğe yer tutucusu (U+FFFC) listelenmez; Firefox'un
-  bozuk toplu eylem adları (`;;`) yerine gerçek adlar okunur.
-  `tree(document=true)` yalnızca etkin sekmenin sayfasını gösterir. Aynı
-  Firefox sayfası 5.943 karakterden 1.421'e indi.
-- Bir AT-SPI çağrısı en fazla 2 sn bekler; yanıt vermeyen bir uygulama
-  sunucuyu kilitlemez. Menü açan eylemler (Qt'de menü kapanana kadar yanıt
-  gelmez) 400 ms sonra gönderilmiş sayılır.
-- Araç çağrıları aynı anda işlenir: bekleyen bir `wait_for` ya da yavaş bir
-  uygulama `ping`'i ve diğer çağrıları bekletmez. Claude bir çağrıyı iptal
-  ederse (`notifications/cancelled`) çağrı durdurulur. Klavye ve fare girdisi
-  gönderen araçlar yine sırayla çalışır, tuşlar birbirine karışmaz.
-- Web sayfalarının açılır menüleri ve üst katmanları da `tree`/`find`
-  çıktısında yer alır. Firefox bu katmanları gösterilen (SHOWING) olarak
-  işaretlemiyor; görünür ve pencerenin içinde kalan kapsayıcıların içine de
-  inilir, kaydırılarak ekran dışında kalan içerik yine atlanır. Örnek: Gemini'nin
-  "Dosya yükleyin" menüsü artık ekran görüntüsü olmadan bulunur.
-- Okuma araçları (`apps`, `tree`, `find`, `get_text`, `wait_for`,
-  `screenshot`, `pause`, `clipboard_get`) MCP'de `readOnlyHint` ile işaretlidir; Claude Code
-  bunları tek mesajda birden fazla istendiğinde paralel çalıştırır.
+Why it is fast:
+- It talks to AT-SPI over D-Bus directly, without libatspi, and pipelines
+  requests: all attributes of an element, and every level of the tree, are
+  requested at once, so the time is bound by the app's response speed rather
+  than by round-trip latency.
+- On Windows a window's whole subtree, with the properties needed, arrives in
+  a single UI Automation cache request (`BuildUpdatedCache`).
+- KWin scripts go over D-Bus instead of `qdbus6` processes, Hyprland commands
+  over Hyprland's socket instead of `hyprctl` processes.
+- Start-up takes 2 ms; the virtual keyboard and mouse are prepared in parallel
+  at start-up.
+- On KDE the waits were measured and shortened (uinput events are processed
+  in order); `focus` remembers focus methods that do not work in an app and
+  skips them; `type_text` starts no process; screenshots come straight from
+  KWin instead of `spectacle`.
+- Output is short, so Claude reads less: one space of indent per level, sibling
+  leaves with the same role and actions share one line
+  (`list item ×3: [8] "a" [9] "b" [10] "c"`), and the "Set Focus" action Qt
+  gives almost every element is not listed. A Dolphin + Kate `tree` went from
+  15,182 to 7,092 characters.
+- In browsers too: Firefox's "clickAncestor" action on every element and the
+  embedded-object placeholder (U+FFFC) of web pages are not listed; real action
+  names are read instead of Firefox's broken batched names (`;;`).
+  `tree(document=true)` shows only the active tab's page. The same Firefox page
+  went from 5,943 to 1,421 characters.
+- An AT-SPI call waits at most 2 s; an app that does not answer cannot lock
+  the server. Actions that open a menu (Qt does not reply until the menu
+  closes) count as sent after 400 ms.
+- Tool calls are handled concurrently: a pending `wait_for` or a slow app does
+  not hold up `ping` and other calls. If Claude cancels a call
+  (`notifications/cancelled`), it is stopped. Tools that send keyboard or
+  pointer input still run one at a time, so keystrokes never interleave.
+- Popup menus and overlays of web pages are part of `tree`/`find` output.
+  Firefox does not mark these layers as SHOWING; containers that are visible
+  and lie inside the window are entered as well, while content scrolled out of
+  view is still skipped. Example: Gemini's upload menu ("Dosya yükleyin") is
+  now found without a screenshot.
+- Read tools (`apps`, `tree`, `find`, `get_text`, `wait_for`, `screenshot`,
+  `pause`, `clipboard_get`, `windows`, `doctor`) carry MCP's `readOnlyHint`;
+  Claude Code runs several of them in parallel when asked for in one message.
 
-## Ekran göstergesi
+## On-screen indicator
 
-Ajan klavye ya da fare kullanırken ekran kenarları turuncu parlar, üstte
-"Claude · typing" gibi ne yaptığını söyleyen bir etiket çıkar ve her işaretçi
-hedefinde bir halka belirir. Hepsi tıklamaları alttaki pencereye geçiren
-katmanlardır (wlr-layer-shell; KDE Plasma ve Hyprland), son işlemden 2,5 sn
-sonra kaybolur ve ekran görüntüsü alınmadan önce gizlenir. Sunucu göstergeyi
-ilk işlemde `desktop-mcp --indicator` olarak başlatır; kendisi kapanınca o da
-kapanır. Kapatmak için MCP ayarında `DESKTOP_MCP_INDICATOR=0` ortam
-değişkenini verin.
+While the agent uses the keyboard or mouse, the screen edges glow orange, a
+label at the top says what it is doing (e.g. "Claude · typing") and a ring
+marks each pointer target. All of them are layers that pass clicks through to
+the window below (wlr-layer-shell; KDE Plasma and Hyprland). They disappear
+2.5 s after the last action and are hidden before a screenshot is taken. The
+server starts the indicator on the first action as `desktop-mcp --indicator`;
+it exits with the server. To turn it off, set the environment variable
+`DESKTOP_MCP_INDICATOR=0` in the MCP configuration.
 
-## Araçlar
+## Tools
 
-- `apps`, `tree`, `find`, `get_text`: okuma ve arama. `tree`'ye
-  `document: true` verilirse yalnızca etkin penceredeki belge listelenir
-  (tarayıcıda o sekmenin sayfası, sekmeler ve araç çubukları olmadan)
-- `set_text` yazdığını geri okur: yanıt "verified" der ya da alanda ne
-  olduğunu söyleyerek hata verir (uzunluk sınırı, biçimlendirme). Firefox'un
-  giriş kutuları erişilebilirlik yazımını "başarılı" sayıp hiçbir şey
-  yapmadığından, tek satırlık metin tutmazsa öğeye odaklanıp Ctrl+A ile
-  seçerek yeniden yazar. Parola alanları geri okunamaz.
-- `scroll`: bir öğenin (liste, sayfa, panel) üzerinde tekerlek döndürür.
-- `drag`: basılı tutup adım adım taşır ve bırakır (sürükle-bırak, kaydırıcı,
-  seçim). Uçlar öğe numarası (`from_id`/`to_id`), ekran koordinatı ya da
-  `image: true` ile son ekran görüntüsündeki piksel olabilir.
-- `act`, `set_text`, `focus`, `click`: öğeye işlem. Öğe, `tree`/`find`
-  numarasıyla (`id`) ya da tek çağrıda `app` + `query` (+ `role`) ile seçilir:
-  adı `query` ile birebir aynı olan ilk görünür öğe, yoksa adında, metninde ya
-  da rolünde geçen ilk öğe. `act`, etkin pencere değiştiyse (ör. bir iletişim
-  kutusu açıldıysa) bunu bildirir.
-- Eskimiş numaralar: her `id` kullanımında öğenin rolü ve adı yeniden okunur
-  (tek gidiş-dönüş). Öğe kaybolduysa ya da rolü veya adı değiştiyse (sayfa
-  yeniden çizildi, nesne yolu başka öğeye geçti) hiçbir şey yapılmaz ve
-  `stale id N (was <rol> "<ad>", now ...); call tree/find again` hatası
-  döner. Adı içeriğiyle ya da başlığıyla değişen öğelerde (pencere, sekme,
-  belge, etiket, durum çubuğu, metin alanı, açılır kutu, düzenlenebilir
-  öğeler) ve adsız öğelerde yalnızca rol karşılaştırılır.
-- `wait_for`: bir öğe görünene ya da kaybolana kadar bekler (her 50 ms'de bir
-  bakar, en fazla 10 dakika); tuş veya tıklamadan sonra açılan iletişim
-  kutularını, uzun bir yüklemeyi ya da derlemeyi beklemek için. Daha uzun bir
-  süre istenirse 10 dakikaya indirilir ve yanıtta bu belirtilir.
-- `pause`: belirli bir süre bekler (`ms`, en fazla 10 dakika); görünür bir
-  değişikliği değil, yalnızca zamanı beklemek için
-- `windows`: izin verilen uygulamaların pencerelerini ekran koordinatlarında
-  konum, boyut, durum (etkin, büyütülmüş, simge durumunda) ve ekranla, önce
-  ekran düzeniyle (ad, alan, ölçek) listeler (yalnızca KDE)
-- `move_window`: pencereyi taşır, boyutlandırır ya da büyütür, simge durumuna
-  küçültür, eski haline getirir; pencere yeni boyutu alana kadar (en fazla
-  1 sn) bekleyip gerçek sonucu bildirir (yalnızca KDE)
-- `launch`: izin listesindeki bir uygulamayı (`app`, ör. `kate`) isteğe bağlı
-  `args` listesiyle başlatır (kabuk kullanmaz; önce `.desktop` dosyası, yoksa
-  `PATH`'teki program) ve penceresi açılana kadar bekler (`wait_ms`,
-  varsayılan 15 sn, en fazla 60 sn; 0 beklemez). Pencereyi `windows` gibi
-  yazar; zaten çalışan bir örneğe devredilen açılışları (firefox, kate) da
-  bulur. Pencere takibi yalnızca KDE'de
-- Terminal pencereleri: `windows`, her terminal sekmesinin pts aygıtını, ön
-  planda çalışan komutu ve klasörünü de listeler; `activate_window`
-  `terminal: "pytest"` ile o komutu çalıştıran (ya da o klasördeki)
-  terminali öne getirir. Birden çok sekmeli terminal, o an gösterdiği sekmeyle
-  öne gelir. Terminalin izin listesinde olması gerekir (ör. `konsole`)
-- `file_dialog`: öndeki dosya Aç/Kaydet iletişim kutusunu doldurur: `path`
-  (tam yol ya da `~/…`) dosya adı alanına yazılır, varsayılan düğmeye (Aç,
-  Kaydet) basılır ve kutunun kapanması beklenir. İzinli bir uygulamanın
-  kendi KDE iletişim kutusunda ve tarayıcının yükleme/indirme için açtığı
-  portal kutusunda (`xdg-desktop-portal-kde`) çalışır; portal kutusu
-  yalnızca KWin'in bildirdiği üst pencere izinli bir uygulamanınsa
-  doldurulur; üst penceresi bildirilmeyen kutu reddedilir. Portal
-  izin listesine eklenmez; kutunun başka hiçbir öğesine erişilemez.
-  `action: "open"` için dosya var olmalı, `"save"` için klasörü (yalnızca
-  KDE)
-- `doctor`: kurulumu tek raporda denetler: sürüm, izin listesi, çalışan
-  uygulamalardan hangilerinin izinli olduğu, oturum, AT-SPI, sanal klavye ve
-  fare, KWin betikleri, ekranlar ve ekran görüntüsü yolu
-- `key`, `type_text`: klavye. Yanıt, ardından odakta olan öğeyi adlandırır;
-  `type_text` odak düzenlenebilir bir alanda değilse uyarır (KDE)
-- `activate_window`: pencereyi öne getirme
-- `clipboard_get`, `clipboard_set`: panoyu metin olarak okur ya da yazar
-  (yalnızca Linux). Pano, kullanıcının herhangi bir yerden kopyaladığı her şeyi
-  (parolalar dahil) tutabildiği için ikisi de yalnızca izin verilen bir
-  uygulamanın penceresi etkinken çalışır. `clipboard_get` en fazla `limit`
-  karakter döndürür (varsayılan 20.000; kesildiyse yanıtta yazar); pano metin
-  değil de resim ya da dosya tutuyorsa yalnızca türlerini söyler, bir parola
-  yöneticisinin parola olarak işaretlediği içeriği (`x-kde-passwordManagerHint`)
-  okumaz.
-- `mouse`, `screenshot`: yalnızca yedek. `screenshot` görüntüyü yanıtın
-  içinde döndürür (dosyayı ayrıca okumak gerekmez), uzun kenarı varsayılan
-  1280 px olacak şekilde küçültür (`max_size`; `inline: false` yalnızca dosya
-  yolunu verir) ve görüntünün ekranda hangi alanı gösterdiğini de bildirir; `mouse`'a `image_x`/`image_y`
-  verilirse görüntüdeki piksel ekran koordinatına çevrilir (pencere konumu ve
-  ekran ölçeği, ör. %125, dahil)
-- `batch`: birkaç aracı tek çağrıda sırayla çalıştırır, ilk hatada durur;
-  Claude'un tur sayısını azaltır
+- `apps`, `tree`, `find`, `get_text`: reading and searching. With
+  `document: true`, `tree` lists only the document of the active window (in a
+  browser, that tab's page without tabs and toolbars).
+- `set_text` reads back what it wrote: the reply says "verified", or it fails
+  saying what the field holds (a length limit, reformatting). Firefox's input
+  fields report accessibility writes as successful and do nothing, so when
+  single-line text does not take, it focuses the element, selects all with
+  Ctrl+A and types it. Password fields cannot be read back.
+- `scroll`: turns the wheel over an element (a list, a page, a panel).
+- `drag`: presses, moves in steps and releases (drag and drop, sliders,
+  selections). Each end is an element id (`from_id`/`to_id`), a screen
+  coordinate, or with `image: true` a pixel of the last screenshot.
+- `act`, `set_text`, `focus`, `click`: act on an element. The element is picked
+  by its `tree`/`find` number (`id`) or in one call by `app` + `query`
+  (+ `role`): the first visible element whose name equals `query`, else the
+  first whose name, text or role contains it. `act` reports when the active
+  window changed (e.g. a dialog opened).
+- Stale ids: every use of an `id` reads the element's role and name again (one
+  round trip). If the element is gone, or its role or name changed (the page
+  was redrawn, the object path now belongs to another element), nothing is
+  done and the reply is `stale id N (was <role> "<name>", now ...); call
+  tree/find again`. For elements whose name follows their content or title
+  (windows, tabs, documents, labels, status bars, text fields, combo boxes,
+  editable elements) and for unnamed elements, only the role is compared.
+- `wait_for`: waits until an element appears or disappears (checks every
+  50 ms, at most 10 minutes); for dialogs opened by a key or click, a long
+  load or a build. A longer timeout is cut to 10 minutes and the reply says so.
+- `pause`: waits a fixed time (`ms`, at most 10 minutes); for waiting on time
+  only, not on a visible change.
+- `windows`: lists windows of allowed apps with position, size, state (active,
+  maximized, minimized) and output in screen coordinates, after the screen
+  layout (name, area, scale) (KDE only).
+- `move_window`: moves, resizes, maximizes, minimizes or restores a window;
+  waits (at most 1 s) until the window has its new geometry and reports the
+  real result (KDE only).
+- `launch`: starts an allowed app (`app`, e.g. `kate`) with an optional `args`
+  list (no shell; its `.desktop` file first, else the program on `PATH`) and
+  waits until its window opens (`wait_ms`, default 15 s, at most 60 s; 0 does
+  not wait). Prints the window as `windows` does; also finds launches handed
+  to an already running instance (firefox, kate). Window tracking is KDE only.
+- Terminal windows: `windows` also lists each terminal tab's pts device,
+  foreground command and directory; `activate_window` with
+  `terminal: "pytest"` brings forward the terminal running that command (or in
+  that directory). A terminal with several tabs comes forward on whichever tab
+  it shows. The terminal must be in the allowlist (e.g. `konsole`).
+- `file_dialog`: fills in the file Open/Save dialog in front: `path` (absolute
+  or `~/…`) is written into its file name field, the default button (Open,
+  Save) is pressed and the dialog's closing is awaited. Works on an allowed
+  app's own KDE dialog and on the portal dialog (`xdg-desktop-portal-kde`) a
+  browser opens for uploads and downloads; a portal dialog is filled only when
+  the parent window KWin reports for it belongs to an allowed app, and a
+  dialog without a reported parent is refused. The portal is not added to the
+  allowlist; no other element of the dialog is reachable. For
+  `action: "open"` the file must exist, for `"save"` its folder (KDE only).
+- `doctor`: checks the setup in one report: version, allowlist, which running
+  apps are allowed, the session, AT-SPI, the virtual keyboard and mouse, KWin
+  scripting, screens and the screenshot path.
+- `key`, `type_text`: keyboard. The reply names the element that has focus
+  afterwards; `type_text` warns when focus is not on an editable field (KDE).
+- `activate_window`: brings a window to the front; fails when no window of an
+  allowed app matches.
+- `clipboard_get`, `clipboard_set`: read or write the clipboard as text (Linux
+  only). Because the clipboard can hold anything the user copied anywhere
+  (passwords included), both work only while a window of an allowed app is
+  active. `clipboard_get` returns at most `limit` characters (default 20,000;
+  the reply says when it was cut); if the clipboard holds an image or files
+  rather than text, it only names the types, and it does not read content a
+  password manager marked as a password (`x-kde-passwordManagerHint`).
+- `mouse`, `screenshot`: fallback only. `screenshot` returns the image inside
+  the reply (no need to read the file separately), shrinks it so its longer
+  side is 1280 px by default (`max_size`; `inline: false` returns only the file
+  path) and reports which screen area it shows; given `image_x`/`image_y`,
+  `mouse` converts a pixel of the image to a screen coordinate (window position
+  and display scaling, e.g. 125 %, included).
+- `batch`: runs several tools in order in one call and stops at the first
+  error; reduces Claude's number of turns.
 
-## İzin listesi
+## Allowlist
 
-Her çağrıda yeniden okunur; ilk çalıştırmada varsayılan liste oluşturulur.
+Re-read on every call; a default list is created on first run.
 
-- KDE ve Hyprland: `~/.config/desktop-mcp/allow.txt`, satır başına AT-SPI
-  uygulama adı (`kate`, `firefox`…). Pencere araçları (`windows`,
-  `move_window`, `activate_window`) pencereyi, sürecinin (pid) AT-SPI
-  uygulama adıyla eşleştirir; böylece pencere sınıfı farklı olan uygulamalar
-  da (Ferdium: `electron`) bulunur. Erişilebilirliği olmayan uygulamalar
-  pencere sınıfıyla (`xterm` gibi) eşleşir.
-- Windows: `%APPDATA%\desktop-mcp\allow.txt`, satır başına `.exe` olmadan
-  program adı (`notepad`, `firefox`, `chrome`…)
+- KDE and Hyprland: `~/.config/desktop-mcp/allow.txt`, one AT-SPI application
+  name per line (`kate`, `firefox`…). Window tools (`windows`, `move_window`,
+  `activate_window`) match a window by the AT-SPI application name of its
+  process (pid), so apps whose window class differs are found too (Ferdium:
+  `electron`). Apps without accessibility match by window class (like `xterm`).
+- Windows: `%APPDATA%\desktop-mcp\allow.txt`, one program name per line without
+  `.exe` (`notepad`, `firefox`, `chrome`…).
 
-Kurallar:
-- Listede olmayan uygulamaların öğeleri okunamaz ve onlara işlem yapılamaz.
-- Klavye ve fare girdisi yalnızca öndeki pencere listedeki bir uygulamaya
-  aitse gönderilir.
-- `activate_window` yalnızca listedeki uygulamaların pencerelerini öne getirir.
-- `launch` listede olmayan bir uygulamayı hiçbir şey başlatmadan reddeder.
-- `file_dialog`, listede olmayan portalın iletişim kutusunu yalnızca
-  listedeki bir uygulama için açılmışsa doldurur; başka bir uygulamanın
-  açtığı kutu reddedilir.
+Rules:
+- Elements of apps not in the list cannot be read or acted on.
+- Keyboard and mouse input is sent only when the window in front belongs to an
+  app in the list.
+- `activate_window` only brings windows of listed apps to the front.
+- `launch` refuses an app not in the list before starting anything.
+- `file_dialog` fills in the dialog of the (unlisted) portal only when it was
+  opened for a listed app; a dialog opened by another app is refused.
 
-Doğru adları görmek için `apps` aracını kullanın.
+Use the `apps` tool to see the right names.
 
-## Kurulum
+## Installation
 
-Her platformda [Rust](https://rustup.rs/) gerekir. Kurduktan sonra yeni bir
-Claude Code oturumu açıp `/mcp` ile `desktop` sunucusunun bağlı olduğunu
-kontrol edin.
+Every platform needs [Rust](https://rustup.rs/). After installing, open a new
+Claude Code session and check with `/mcp` that the `desktop` server is
+connected.
 
 ### KDE Plasma (Wayland)
 
-Gereksinimler:
-- KDE Plasma 6, Wayland oturumu
-- Sistem paketleri (Arch): `at-spi2-core`, `libkscreen`, `wl-clipboard`,
+Requirements:
+- KDE Plasma 6, Wayland session
+- System packages (Arch): `at-spi2-core`, `libkscreen`, `wl-clipboard`,
   `spectacle`
-- Hızlı ekran görüntüsü için KWin 6.8 ya da üstü. Daha eski KWin'de
-  `screenshot` `spectacle`'a döner; KWin'in `ScreenShot2` arayüzünü açmak için
-  bir kez elle bir `.desktop` dosyası kurmak gerekir (ayrıntısı
-  `rust/src/linux/kwin.rs` içinde `SHOT_NOT_AUTHORIZED` açıklamasında)
-- `/dev/uinput` üzerinde kullanıcı yazma izni (`getfacl /dev/uinput`)
+- KWin 6.8 or later for fast screenshots. On older KWin, `screenshot` falls
+  back to `spectacle`; enabling KWin's `ScreenShot2` interface takes installing
+  a `.desktop` file by hand once (details in the `SHOT_NOT_AUTHORIZED` comment
+  in `rust/src/linux/kwin.rs`)
+- Write access for the user on `/dev/uinput` (`getfacl /dev/uinput`)
 
 ```bash
 git clone https://github.com/ahmetadakli/kde-desktop-mcp.git
@@ -232,20 +223,21 @@ claude mcp add --scope user desktop -- "$PWD/target/release/desktop-mcp"
 
 ### Hyprland
 
-Gereksinimler:
-- Hyprland oturumu (`movecursor` dispatcher'ı)
-- Sistem paketleri (Arch): `at-spi2-core`, `wl-clipboard`; önerilen: `wtype`
-  (panoya dokunmadan yazma), `grim` (yedek ekran görüntüsü)
-- Oturumda AT-SPI veri yolunun çalışması. Qt uygulamaları için Hyprland
-  yapılandırmasına `env = QT_LINUX_ACCESSIBILITY_ALWAYS_ON,1` eklemek gerekebilir.
-- `/dev/uinput` üzerinde kullanıcı yazma izni
+Requirements:
+- A Hyprland session (the `movecursor` dispatcher)
+- System packages (Arch): `at-spi2-core`, `wl-clipboard`; recommended: `wtype`
+  (typing without touching the clipboard), `grim` (fallback screenshots)
+- A working AT-SPI bus in the session. Qt apps may need
+  `env = QT_LINUX_ACCESSIBILITY_ALWAYS_ON,1` in the Hyprland configuration.
+- Write access for the user on `/dev/uinput`
 
-Kurulum komutları KDE ile aynıdır. Claude Code'u Hyprland oturumunun içinden
-başlatın ki `HYPRLAND_INSTANCE_SIGNATURE` sunucuya geçsin.
+The installation commands are the same as for KDE. Start Claude Code from
+inside the Hyprland session so `HYPRLAND_INSTANCE_SIGNATURE` reaches the
+server.
 
 ### Windows
 
-Gereksinimler: Windows 10 veya 11. PowerShell'de:
+Requirements: Windows 10 or 11. In PowerShell:
 
 ```powershell
 git clone https://github.com/ahmetadakli/kde-desktop-mcp.git
@@ -254,56 +246,57 @@ cargo build --release
 claude mcp add --scope user desktop -- "$PWD\target\release\desktop-mcp.exe"
 ```
 
-Linux'ta Windows için derlemek de mümkündür (`mingw-w64-gcc` ve
-`rustup target add x86_64-pc-windows-gnu`, sonra
+Building for Windows on Linux also works (`mingw-w64-gcc` and
+`rustup target add x86_64-pc-windows-gnu`, then
 `cargo build --release --target x86_64-pc-windows-gnu`).
 
-### Hız: izin sorusunu atlamak
+### Speed: skipping the permission prompt
 
-Claude Code, izin listesinde olmayan her MCP çağrısını onaya ya da auto
-mode'da güvenlik sınıflandırıcısına gönderir; bu çağrı başına yaklaşık
-0,7–2,5 sn ekler. Sunucunun bütün araçlarına güveniyorsanız
-`~/.claude/settings.json` dosyasına tek kural ekleyin:
+Claude Code sends every MCP call that is not in its allow list to a prompt or,
+in auto mode, to its safety classifier; that adds roughly 0.7–2.5 s per call.
+If you trust all of the server's tools, add one rule to
+`~/.claude/settings.json`:
 
 ```json
 { "permissions": { "allow": ["mcp__desktop"] } }
 ```
 
-## Test
+## Testing
 
-Birim testleri gerçek masaüstü gerektirmez (Windows mantığının saf kısmı
-Linux'ta da çalışır):
+Unit tests need no real desktop (the pure part of the Windows logic runs on
+Linux too):
 
 ```bash
 cd rust && cargo test --release
 ```
 
-`tools/mcp_smoke_test.py` gerçek masaüstünde, gerçek MCP protokolü üzerinden
-uçtan uca test yapar (Linux, Kate): düzenleyiciyi geçici bir dosyayla açar,
-öğeyi bulur, odak başka yere kaydıktan sonra geri odaklar, `batch` ile Türkçe
-karakterli metin yazar, art arda hızlı yazmayı ve tuş tekrarını dener, Ctrl+S
-ile kaydeder, diskten geri okur ve izin listesinin bilinmeyen bir uygulamayı
-engellediğini kontrol eder. Her çağrının süresini yazar. Yalnızca Python
-standart kütüphanesi gerekir. Çalışırken klavye ve fareye dokunmayın.
+`tools/mcp_smoke_test.py` tests end to end on the real desktop over the real
+MCP protocol (Linux, Kate): it opens the editor with a temporary file, finds the
+element, refocuses it after focus moved elsewhere, types text with Turkish
+characters through `batch`, tries rapid consecutive typing and key repeat,
+saves with Ctrl+S, reads the file back from disk, launches Kate with `launch`,
+and checks that the allowlist blocks an unknown app. It prints the duration of
+every call. Only the Python standard library is needed. Do not touch the
+keyboard and mouse while it runs.
 
 ```bash
 python3 tools/mcp_smoke_test.py rust/target/release/desktop-mcp
 ```
 
-`tools/mcp_bench.py` bir ya da daha fazla sunucuyu aynı çağrılarla ölçer ve
-medyan ms tablosu yazar (pencere açık olmalı):
+`tools/mcp_bench.py` measures one or more servers with the same calls and
+prints a table of median ms (the window must be open):
 
 ```bash
 python3 tools/mcp_bench.py --app kate --window notes.txt \
     --server "Rust=rust/target/release/desktop-mcp"
 ```
 
-## Ölçümler: KDE hızlandırması
+## Measurements: KDE speed-up
 
-`tools/mcp_bench.py`, KDE Plasma 6.8, Kate; 5 turun medyanı (ms). "Önce"
-`2f2e5df` (Python'un kaldırıldığı sürüm), "Sonra" bu sürüm:
+`tools/mcp_bench.py`, KDE Plasma 6.8, Kate; median of 5 rounds (ms). "Before"
+is `2f2e5df` (the version that removed Python), "After" this version:
 
-| İşlem | Önce (ms) | Sonra (ms) | Hızlanma |
+| Operation | Before (ms) | After (ms) | Speed-up |
 |---|---:|---:|---:|
 | `initialize` | 4.4 | 3.3 | 1.4x |
 | `apps` | 3.8 | 4.2 | 0.9x |
@@ -318,23 +311,23 @@ python3 tools/mcp_bench.py --app kate --window notes.txt \
 | `mouse` | 29.3 | 4.9 | 6.0x |
 | `screenshot` | 258.8 | 12.1 | 21x |
 
-`activate_window`'daki ~2 ms, `act`'in pencere değişikliğini bildirebilmesi
-için etkin pencere başlığının okunmasıdır. Asıl kazanç milisaniyelerin
-ötesindedir: kısa çıktı, `app` + `query` ile tek çağrıda hedefleme, `wait_for`
-ve `batch` Claude'un tur sayısını ve okuduğu metni azaltır.
+The ~2 ms in `activate_window` is reading the active window title so `act` can
+report a window change. The real gain lies beyond milliseconds: short output,
+targeting with `app` + `query` in one call, `wait_for` and `batch` reduce the
+number of Claude's turns and the text it reads.
 
-## Ölçümler: eski Python sürümüyle karşılaştırma
+## Measurements: compared with the old Python version
 
-Sunucu önceden Python ile yazılmıştı; son hali git geçmişinde `4cd2632`
-commit'indedir.
-Rust sürümü aynı araçları aynı çıktıyla verir: KDE'de 1499, Hyprland'de 2025
-satırlık çıktı Python sürümüyle karşılaştırıldı, fark yoktu. Değerler
-`tools/mcp_bench.py` ile iki sunucuya aynı çağrı dizisi sırayla uygulanarak
-alındı; 5 turun medyanıdır (ms, Kate penceresinde, aynı makine).
+The server used to be written in Python; its last state is commit `4cd2632` in
+the git history. The Rust version offers the same tools with the same output:
+1,499 lines of output on KDE and 2,025 on Hyprland were compared with the
+Python version, with no difference. The values were taken with
+`tools/mcp_bench.py` applying the same call sequence to both servers in turn;
+median of 5 rounds (ms, in a Kate window, same machine).
 
 KDE Plasma 6 (Wayland):
 
-| İşlem | Python (ms) | Rust (ms) | Hızlanma |
+| Operation | Python (ms) | Rust (ms) | Speed-up |
 |---|---:|---:|---:|
 | `initialize` | 400.5 | 2.2 | 181x |
 | `apps` | 48.8 | 4.2 | 11.6x |
@@ -349,9 +342,9 @@ KDE Plasma 6 (Wayland):
 | `mouse` | 66.4 | 28.8 | 2.3x |
 | `screenshot` | 269.0 | 254.3 | 1.1x |
 
-Hyprland 0.56 (KDE içinde iç içe çalışan oturum):
+Hyprland 0.56 (nested session inside KDE):
 
-| İşlem | Python (ms) | Rust (ms) | Hızlanma |
+| Operation | Python (ms) | Rust (ms) | Speed-up |
 |---|---:|---:|---:|
 | `initialize` | 394.5 | 2.2 | 178x |
 | `apps` | 145.6 | 4.3 | 34x |
@@ -366,9 +359,9 @@ Hyprland 0.56 (KDE içinde iç içe çalışan oturum):
 | `mouse` | 69.1 | 28.3 | 2.4x |
 | `screenshot` | 38.1 | 24.2 | 1.6x |
 
-Windows (Wine 11.20 içinde Not Defteri; gerçek Windows ölçümü değildir):
+Windows (Notepad inside Wine 11.20; not a real Windows measurement):
 
-| İşlem | Python (ms) | Rust (ms) | Hızlanma |
+| Operation | Python (ms) | Rust (ms) | Speed-up |
 |---|---:|---:|---:|
 | `initialize` | 1998.6 | 62.8 | 32x |
 | `apps` | 43.0 | 1.4 | 32x |
@@ -378,68 +371,66 @@ Windows (Wine 11.20 içinde Not Defteri; gerçek Windows ölçümü değildir):
 | `mouse` | 55.6 | 30.5 | 1.8x |
 | `screenshot` | 82.3 | 8.3 | 9.9x |
 
-Wine'ın UI Automation istemcisi önbellek isteklerini, ağaç gezmeyi ve çoğu
-özelliği desteklemediği için (`E_NOTIMPL`) `tree`, `find`, `get_text`,
-`focus` ve `click` Wine'da iki sunucuda da çalışmaz; tablodaki `apps`
-ve `activate_window` pencere bulamadan dönen sürelerdir. Girdi adımlarındaki
-farkın çoğu Rust'taki daha kısa beklemelerden gelir.
+Wine's UI Automation client does not support cache requests, tree walking and
+most properties (`E_NOTIMPL`), so `tree`, `find`, `get_text`, `focus` and
+`click` do not work under Wine on either server; the `apps` and
+`activate_window` figures in the table are for returning without finding a
+window. Most of the difference in the input steps comes from Rust's shorter
+waits.
 
-Daha büyük ağaçlarda fark büyür: Dolphin'de gizliler dahil 2000 öğelik `tree`
-Python'da 507 ms, Rust'ta 48 ms. `screenshot` süresi çoğunlukla `spectacle`
-ve `grim` programlarının kendisidir.
+The gap grows with larger trees: a 2,000-element `tree` of Dolphin including
+hidden elements takes 507 ms in Python and 48 ms in Rust. `screenshot` time is
+mostly the `spectacle` and `grim` programs themselves.
 
-İç içe Hyprland'de uinput'tan gelen Ctrl/Alt'lı kısayollar dış KWin
-üzerinden geçerken kaybolur (iki sunucuda da); bu yüzden orada kısayol
-denemeleri yapılmadı. Gerçek bir Hyprland oturumunda uinput doğrudan
-Hyprland'e gider.
+In nested Hyprland, Ctrl/Alt shortcuts from uinput get lost on their way
+through the outer KWin (on both servers), so no shortcut tests were run there.
+In a real Hyprland session uinput goes straight to Hyprland.
 
-## Bilinen sınırlar
+## Known limitations
 
 KDE:
-- Sunucu erişilebilirlik veri yolunu çalışma zamanında açar. Ondan önce
-  başlamış uygulamaların bir kez yeniden başlatılması gerekir.
-- Chromium, Chrome ve Electron uygulamaları ağaçlarını yalnızca
-  `--force-renderer-accessibility` ile başlatılırlarsa gösterir.
-- `type_text`, Qt'nin çok satırlı düzenleyicileri (Kate gibi) dışındaki
-  alanlara pano üzerinden yapıştırır. Önce panodaki metni saklar; hedef
-  uygulama yapıştırılanı okuyunca (Wayland data-control ile görülür) onu geri
-  koyar. Yazılan metin Klipper geçmişine girmez (parola işaretiyle sunulur).
-  Pano resim, dosya ya da 4 MiB'tan büyük metin tutuyorsa geri konmaz;
-  uygulama 1 sn içinde okumazsa da geri konmaz (geç okuyan uygulama
-  kullanıcının panosunu yapıştırmasın diye). İki durumda da yanıt bunu söyler.
-  Zengin metin (HTML) yalnızca düz metin olarak geri gelir.
-- Doğrudan eklemede yazma, yapıştırmadan biraz farklıdır: seçili metni
-  değiştirmek iki geri alma adımıdır, çoklu imleçte yalnızca birincil imlece
-  yazılır, üzerine yazma kipi ve Kate'in vi kipi atlanır; yapıştırmadaki gibi
-  otomatik girinti ve parantez tamamlama çalışmaz.
+- The server turns on the accessibility bus at run time. Apps started before
+  that need one restart.
+- Chromium, Chrome and Electron apps show their tree only when started with
+  `--force-renderer-accessibility`.
+- `type_text` pastes through the clipboard into fields other than Qt's
+  multi-line editors (such as Kate). It first saves the clipboard text and
+  puts it back once the target app has read the paste (seen through Wayland
+  data-control). The typed text does not enter Klipper's history (it is
+  offered with the password hint). The clipboard is not put back when it held
+  an image, files or text over 4 MiB, nor when the app does not read the paste
+  within 1 s (so that a late reader does not paste the user's clipboard); the
+  reply says so in both cases. Rich text (HTML) comes back as plain text only.
+- Direct insertion differs slightly from pasting: replacing selected text is
+  two undo steps, with multiple cursors only the primary cursor gets the text,
+  overwrite mode and Kate's vi mode are bypassed, and auto-indent and bracket
+  completion do not run as they would on a paste.
 
 Hyprland:
-- GTK uygulamalarının istemci tarafı gölgeleri, `click` ve `focus` tıklamalarını
-  birkaç piksel kaydırabilir.
-- Aynı süreçte aynı başlığı taşıyan iki pencere ayırt edilemez.
-- `wtype` yoksa `type_text` KDE'deki gibi pano üzerinden yapıştırır ve
-  panodaki metni sonra geri koyar.
+- Client-side shadows of GTK apps can shift `click` and `focus` clicks by a
+  few pixels.
+- Two windows of the same process with the same title cannot be told apart.
+- Without `wtype`, `type_text` pastes through the clipboard as on KDE and puts
+  the clipboard text back afterwards.
 
 Windows:
-- Yönetici olarak çalışan pencerelere, yönetici olmayan bir sunucudan girdi
-  gönderilemez (Windows UIPI kuralı).
-- Microsoft Store uygulamaları `applicationframehost` adı altında görünebilir.
-- Tuş adları ABD klavye düzenindeki konumlara göredir; metin için `type_text`
-  kullanın.
-- Çok büyük pencerelerde (tarayıcı, Word) `tree` ve `find` bütün alt ağacı
-  tek seferde aldığı için yavaşlayabilir.
+- Input cannot be sent to windows running as administrator from a server that
+  is not (Windows UIPI).
+- Microsoft Store apps may show up as `applicationframehost`.
+- Key names follow the US keyboard layout positions; use `type_text` for text.
+- In very large windows (browsers, Word) `tree` and `find` can be slow because
+  they fetch the whole subtree at once.
 
-Hepsi için:
-- Oyunlar ve canvas tabanlı arayüzler erişilebilirlik ağacında çoğunlukla boş
-  görünür.
+All:
+- Games and canvas-based interfaces mostly show up empty in the accessibility
+  tree.
 
-## Güvenlik
+## Security
 
-Sunucu sizin kullanıcı yetkilerinizle çalışır. İzin listesi bir güvenlik
-katmanıdır ama işletim sistemi düzeyinde bir yalıtım değildir. Terminalleri,
-dosya yöneticisini ve sistem ayarlarını listeye eklemeden önce iki kez
-düşünün.
+The server runs with your user's permissions. The allowlist is a safety layer,
+not operating-system level isolation. Think twice before adding terminals, the
+file manager or system settings to the list.
 
-## Lisans
+## License
 
 MIT
