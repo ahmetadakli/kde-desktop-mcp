@@ -212,6 +212,20 @@ const INPUT_TOOLS: [&str; 13] = [
     "file_dialog",
 ];
 
+/// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
+/// when absent, empty, or the tool takes none.
+fn window_arg(tool: &str, a: &Json) -> R<Option<String>> {
+    if !tools::WINDOW_TOOLS.contains(&tool) {
+        return Ok(None);
+    }
+    match a.get("window") {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::String(w)) if w.trim().is_empty() => Ok(None),
+        Some(Json::String(w)) => Ok(Some(w.trim().to_string())),
+        Some(_) => Err("window must be a string (a title or app name)".into()),
+    }
+}
+
 /// Longest `wait_for` / `pause`, in ms (10 minutes).
 const MAX_WAIT_MS: i64 = 600_000;
 
@@ -564,14 +578,15 @@ impl<B: Backend> Server<B> {
     async fn require_active_allowed(&self) -> R<String> {
         let name = self.b.active_app().await;
         if !self.is_allowed(&name) {
-            // Name the window this server last brought forward, so one
-            // activate_window call (e.g. first step of the next batch) fixes it.
+            // Name the window this server last brought forward, so the
+            // retry (with `window`) fixes it.
             let hint = match self.last_active.lock().await.as_deref() {
-                Some(t) if !t.is_empty() => format!(" (last used: activate_window '{t}')"),
+                Some(t) if !t.is_empty() => format!(" (last used: '{t}')"),
                 _ => String::new(),
             };
             return Err(format!(
-                "active window app '{}' is not in {}; activate an allowed window first{hint}",
+                "active window app '{}' is not in {}; pass window=<title or app> to \
+                 activate an allowed window first{hint}",
                 if name.is_empty() { "unknown" } else { &name },
                 self.allow_file.display()
             ));
@@ -1561,15 +1576,57 @@ impl<B: Backend> Server<B> {
             Some(t) => self.terminal_window(t).await?,
             None => req_s(a, "query")?,
         };
-        let (title, app) = match self.b.activate_window(&query, &self.allowed()).await? {
-            Some(a) => (Some(a.title), a.app),
-            None => (self.active_title().await, self.b.active_app().await),
-        };
-        *self.last_active.lock().await = title;
+        let (_, app) = self.activate(&query).await?;
         Ok(format!(
             "active app now: {}",
             if app.is_empty() { "unknown" } else { &app }
         ))
+    }
+
+    /// Bring the first allowed window matching `query` to the front (the
+    /// backend waits until it is), remember its title for
+    /// `require_active_allowed`'s hint and `act`'s change note, and return
+    /// that title and the active app. Callers hold the input lock.
+    async fn activate(&self, query: &str) -> R<(Option<String>, String)> {
+        let (title, app) = match self.b.activate_window(query, &self.allowed()).await? {
+            Some(a) => (Some(a.title), a.app),
+            None => (self.active_title().await, self.b.active_app().await),
+        };
+        *self.last_active.lock().await = title.clone();
+        Ok((title, app))
+    }
+
+    /// Whether the active window is an allowed app's and matches `query` as
+    /// activate_window would (title or app name contains it). Asks for the
+    /// app first, which usually settles it in one read.
+    async fn window_is_active(&self, query: &str) -> bool {
+        let q = query.to_lowercase();
+        let app = self.b.active_app().await;
+        if !self.is_allowed(&app) {
+            return false;
+        }
+        if app.to_lowercase().contains(&q) {
+            return true;
+        }
+        match self.b.windows(query, &self.allowed()).await {
+            Ok(list) => list.iter().any(|w| w.active),
+            Err(_) => self
+                .active_title()
+                .await
+                .is_some_and(|t| t.to_lowercase().contains(&q)),
+        }
+    }
+
+    /// An input tool's `window`: activate the matching window unless it is
+    /// already in front. Some(title) when it activated one. Runs inside
+    /// `call`, under the input lock, so nothing else takes the focus
+    /// between this and the tool's input.
+    async fn ensure_window(&self, query: &str) -> R<Option<String>> {
+        if self.window_is_active(query).await {
+            return Ok(None);
+        }
+        let (title, _) = self.activate(query).await?;
+        Ok(Some(title.unwrap_or_else(|| query.to_string())))
     }
 
     /// Title of the allowed window whose terminal runs a command, or is in a
@@ -1743,7 +1800,9 @@ impl<B: Backend> Server<B> {
         a: &'a Json,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         Box::pin(async move {
-            let _input = if INPUT_TOOLS.contains(&name) {
+            let window = window_arg(name, a)?;
+            // A screenshot sends no input, but activating its window does.
+            let _input = if INPUT_TOOLS.contains(&name) || window.is_some() {
                 Some(self.input.lock().await)
             } else {
                 None
@@ -1751,7 +1810,11 @@ impl<B: Backend> Server<B> {
             if let Some(label) = indicator_label(name, a) {
                 self.b.indicate(&label).await;
             }
-            match name {
+            let activated = match &window {
+                Some(q) => self.ensure_window(q).await?,
+                None => None,
+            };
+            let result = match name {
                 "apps" => self.apps().await.map(Out::from),
                 "tree" => self.tree(a).await.map(Out::from),
                 "find" => self.find(a).await.map(Out::from),
@@ -1778,6 +1841,18 @@ impl<B: Backend> Server<B> {
                 "screenshot" => self.screenshot(a).await,
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
+            };
+            match activated {
+                Some(title) => {
+                    let done = format!("activated {}; ", render::py_repr(&title));
+                    result
+                        .map(|mut o| {
+                            o.text.insert_str(0, &done);
+                            o
+                        })
+                        .map_err(|e| format!("{done}{e}"))
+                }
+                None => result,
             }
         })
     }
@@ -2040,7 +2115,17 @@ mod tests {
         /// A text field like Firefox's when Some: accessibility writes do
         /// nothing, typing replaces it, and it always has focus.
         field: Rc<RefCell<Option<String>>>,
+        /// The active window (app, title); activate_window picks one of
+        /// FAKE_WINDOWS and logs "activate <title>" in `keys`.
+        active: Rc<RefCell<(String, String)>>,
     }
+
+    /// Windows on the fake desktop: (app, title).
+    const FAKE_WINDOWS: [(&str, &str); 3] = [
+        ("konsole", "~ : bash — Konsole"),
+        ("fake", "notes.txt — Fake"),
+        ("fake", "todo.txt — Fake"),
+    ];
 
     impl Backend for FakeBackend {
         type Id = u32;
@@ -2064,7 +2149,7 @@ mod tests {
             (app == "fake").then(Vec::new)
         }
         async fn active_app(&self) -> String {
-            "fake".into()
+            self.active.borrow().0.clone()
         }
         async fn info(&self, id: &u32, _: usize) -> Info<u32> {
             match *id {
@@ -2153,8 +2238,42 @@ mod tests {
             self.keys.borrow_mut().push(format!("{what} {button}"));
             Ok(())
         }
-        async fn activate_window(&self, _: &str, _: &[String]) -> R<Option<backend::Activated>> {
-            Ok(None)
+        async fn activate_window(
+            &self,
+            query: &str,
+            allowed: &[String],
+        ) -> R<Option<backend::Activated>> {
+            let q = query.to_lowercase();
+            let (app, title) = FAKE_WINDOWS
+                .into_iter()
+                .find(|(app, title)| {
+                    allowed.iter().any(|a| a == app)
+                        && (title.to_lowercase().contains(&q) || app.contains(&q))
+                })
+                .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
+            self.keys.borrow_mut().push(format!("activate {title}"));
+            *self.active.borrow_mut() = (app.into(), title.into());
+            Ok(Some(backend::Activated {
+                app: app.into(),
+                title: title.into(),
+            }))
+        }
+        async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
+            let q = query.to_lowercase();
+            let active = self.active.borrow().clone();
+            Ok(FAKE_WINDOWS
+                .into_iter()
+                .filter(|(app, title)| {
+                    allowed.iter().any(|a| a == app)
+                        && (title.to_lowercase().contains(&q) || app.contains(&q))
+                })
+                .map(|(app, title)| WindowGeo {
+                    title: title.into(),
+                    app: app.into(),
+                    active: (app, title) == (active.0.as_str(), active.1.as_str()),
+                    ..WindowGeo::default()
+                })
+                .collect())
         }
         async fn screenshot(&self) -> Option<Shot> {
             // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.
@@ -2184,6 +2303,7 @@ mod tests {
         focus: Rc<RefCell<Info<u32>>>,
         focus_app: Rc<RefCell<String>>,
         field: Rc<RefCell<Option<String>>>,
+        active: Rc<RefCell<(String, String)>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -2203,6 +2323,10 @@ mod tests {
         }));
         let focus_app = Rc::new(RefCell::new("fake".to_string()));
         let field = Rc::new(RefCell::new(None));
+        let active = Rc::new(RefCell::new((
+            FAKE_WINDOWS[1].0.to_string(),
+            FAKE_WINDOWS[1].1.to_string(),
+        )));
         let server = Rc::new(Server::new(FakeBackend {
             allow_file,
             keys: keys.clone(),
@@ -2210,6 +2334,7 @@ mod tests {
             focus_app: focus_app.clone(),
             clipboard: RefCell::new(String::new()),
             field: field.clone(),
+            active: active.clone(),
         }));
         let (stdin, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, client_out) = tokio::io::duplex(64 * 1024);
@@ -2221,6 +2346,7 @@ mod tests {
             focus,
             focus_app,
             field,
+            active,
         }
     }
 
@@ -2410,6 +2536,160 @@ mod tests {
             indicator_label("launch", &json!({"app": "kate"})).as_deref(),
             Some("launching kate")
         );
+    }
+
+    fn set_active(s: &Session, i: usize) {
+        let (app, title) = FAKE_WINDOWS[i];
+        *s.active.borrow_mut() = (app.into(), title.into());
+    }
+
+    #[test]
+    fn window_activates_the_matching_window_before_the_input() {
+        local(async {
+            let mut s = session("window-activate");
+            set_active(&s, 0); // the user's Konsole, not allowed
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a", "window": "todo"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(
+                reply_text(&r).starts_with("activated 'todo.txt — Fake'; sent a x1 to fake"),
+                "{r}"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                vec!["activate todo.txt — Fake", "down a", "up a"]
+            );
+            // Another window of the same app is activated too.
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                3,
+                "type_text",
+                json!({"text": "x", "window": "Notes"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with("activated 'notes.txt — Fake'; typed 1 chars"),
+                "{r}"
+            );
+            assert_eq!(*s.keys.borrow(), vec!["activate notes.txt — Fake"]);
+            // A screenshot takes it as well.
+            set_active(&s, 0);
+            let r = call_tool(
+                &mut s,
+                4,
+                "screenshot",
+                json!({"window": "fake", "inline": false}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(
+                reply_text(&r).starts_with("activated 'notes.txt — Fake'; "),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn window_already_in_front_is_not_activated_again() {
+        local(async {
+            let mut s = session("window-skip");
+            // notes.txt is active: matched by title and by app name.
+            for (id, w) in [(2, "notes.TXT"), (3, "Fake")] {
+                let r = call_tool(&mut s, id, "key", json!({"combo": "a", "window": w})).await;
+                assert!(reply_text(&r).starts_with("sent a x1 to fake"), "{r}");
+            }
+            assert_eq!(*s.keys.borrow(), vec!["down a", "up a", "down a", "up a"]);
+        });
+    }
+
+    #[test]
+    fn window_without_a_match_fails_before_any_input() {
+        local(async {
+            let mut s = session("window-none");
+            set_active(&s, 0);
+            // No such window; Konsole's own does not count, it is not allowed.
+            for (id, w) in [(2, "nothing"), (3, "konsole")] {
+                let r = call_tool(&mut s, id, "key", json!({"combo": "a", "window": w})).await;
+                assert_eq!(r["result"]["isError"], true, "{r}");
+                let want = format!("no window of an allowed app matches '{w}'");
+                assert!(reply_text(&r).contains(&want), "{r}");
+            }
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "a", "window": 5})).await;
+            assert!(reply_text(&r).contains("window must be a string"), "{r}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+        });
+    }
+
+    #[test]
+    fn no_window_means_no_activation() {
+        local(async {
+            let mut s = session("window-absent");
+            set_active(&s, 0);
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains("active window app 'konsole' is not in"),
+                "{r}"
+            );
+            assert!(reply_text(&r).contains("pass window="), "{r}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            assert_eq!(s.active.borrow().0, "konsole");
+        });
+    }
+
+    #[test]
+    fn activation_and_input_hold_the_input_lock_together() {
+        local(async {
+            let mut s = session("window-lock");
+            set_active(&s, 0);
+            let calls = [
+                (2, json!({"combo": "a", "window": "todo"})),
+                (3, json!({"combo": "b"})),
+            ];
+            for (id, args) in calls {
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                    "params": {"name": "key", "arguments": args}}),
+                )
+                .await;
+            }
+            let replies = replies_within(&mut s, Duration::from_millis(500)).await;
+            assert_eq!(replies.len(), 2, "{replies:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                vec![
+                    "activate todo.txt — Fake",
+                    "down a",
+                    "up a",
+                    "down b",
+                    "up b"
+                ]
+            );
+            // Inside a batch too (each step takes the lock itself).
+            s.keys.borrow_mut().clear();
+            set_active(&s, 0);
+            let steps = json!({"steps": [
+                {"tool": "key", "args": {"combo": "c", "window": "todo"}},
+                {"tool": "key", "args": {"combo": "d"}},
+            ]});
+            let r = call_tool(&mut s, 4, "batch", steps).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(
+                reply_text(&r).contains("[1] key: activated 'todo.txt — Fake'; sent c"),
+                "{r}"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                vec![
+                    "activate todo.txt — Fake",
+                    "down c",
+                    "up c",
+                    "down d",
+                    "up d"
+                ]
+            );
+        });
     }
 
     fn batch_steps(wait_optional: bool) -> Json {
