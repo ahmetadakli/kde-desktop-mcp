@@ -134,6 +134,16 @@ değişkenini verin.
   `terminal: "pytest"` ile o komutu çalıştıran (ya da o klasördeki)
   terminali öne getirir. Birden çok sekmeli terminal, o an gösterdiği sekmeyle
   öne gelir. Terminalin izin listesinde olması gerekir (ör. `konsole`)
+- `file_dialog`: öndeki dosya Aç/Kaydet iletişim kutusunu doldurur: `path`
+  (tam yol ya da `~/…`) dosya adı alanına yazılır, varsayılan düğmeye (Aç,
+  Kaydet) basılır ve kutunun kapanması beklenir. İzinli bir uygulamanın
+  kendi KDE iletişim kutusunda ve tarayıcının yükleme/indirme için açtığı
+  portal kutusunda (`xdg-desktop-portal-kde`) çalışır; portal kutusu
+  yalnızca izinli bir uygulamanın penceresine aitse doldurulur (KWin'in
+  bildirdiği üst pencere, yoksa başlıktaki "… - <pencere başlığı>"). Portal
+  izin listesine eklenmez; kutunun başka hiçbir öğesine erişilemez.
+  `action: "open"` için dosya var olmalı, `"save"` için klasörü (yalnızca
+  KDE)
 - `doctor`: kurulumu tek raporda denetler: sürüm, izin listesi, çalışan
   uygulamalardan hangilerinin izinli olduğu, oturum, AT-SPI, sanal klavye ve
   fare, KWin betikleri, ekranlar ve ekran görüntüsü yolu
@@ -164,6 +174,9 @@ Kurallar:
 - Klavye ve fare girdisi yalnızca öndeki pencere listedeki bir uygulamaya
   aitse gönderilir.
 - `activate_window` yalnızca listedeki uygulamaların pencerelerini öne getirir.
+- `file_dialog`, listede olmayan portalın iletişim kutusunu yalnızca
+  listedeki bir uygulama için açılmışsa doldurur; başka bir uygulamanın
+  açtığı kutu reddedilir.
 
 Doğru adları görmek için `apps` aracını kullanın.
 

@@ -30,7 +30,7 @@ use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use backend::{Backend, Cache, R, Shot, WindowChange, WindowGeo};
+use backend::{Backend, Cache, FileDialog, R, Shot, WindowChange, WindowGeo};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
@@ -57,7 +57,7 @@ struct Server<B: Backend> {
 }
 
 /// Tools that send keyboard or pointer input.
-const INPUT_TOOLS: [&str; 8] = [
+const INPUT_TOOLS: [&str; 9] = [
     "focus",
     "click",
     "drag",
@@ -66,6 +66,7 @@ const INPUT_TOOLS: [&str; 8] = [
     "type_text",
     "mouse",
     "activate_window",
+    "file_dialog",
 ];
 
 /// Longest `wait_for` / `pause`, in ms (10 minutes).
@@ -155,6 +156,7 @@ fn indicator_label(tool: &str, a: &Json) -> Option<String> {
         "scroll" => "scrolling".into(),
         "activate_window" => "switching windows".into(),
         "move_window" => "arranging windows".into(),
+        "file_dialog" => "choosing a file".into(),
         _ => return None,
     })
 }
@@ -210,6 +212,108 @@ fn describe_window(w: &WindowGeo) -> String {
         ));
     }
     line
+}
+
+/// Apps whose file dialogs serve other apps (the desktop portal): one of
+/// theirs is only filled in for the allowed app it belongs to.
+const PORTAL_APPS: [&str; 1] = ["xdg-desktop-portal-kde"];
+/// How long file_dialog waits for the default button to become enabled
+/// after the path was written.
+const ACCEPT_ENABLE_WAIT: Duration = Duration::from_millis(1000);
+
+/// Whether a dialog title names `window` as its parent: the portal titles
+/// its dialog "<dialog title> - <parent window title>".
+fn title_names_parent(dialog: &str, window: &str) -> bool {
+    let window = window.trim();
+    !window.is_empty()
+        && dialog
+            .trim()
+            .strip_suffix(window)
+            .and_then(|rest| rest.strip_suffix(" - "))
+            .is_some_and(|title| !title.trim().is_empty())
+}
+
+/// The allowed app a file dialog belongs to, or why it may not be filled
+/// in. An allowed app's own (in-process) dialog is that app's. A portal
+/// dialog belongs to its transient parent when the compositor reports one,
+/// else to the allowed window its title names; `windows` are (app, title)
+/// of allowed apps' windows.
+fn file_dialog_owner<Id>(
+    d: &FileDialog<Id>,
+    allowed: &[String],
+    windows: &[(String, String)],
+) -> R<String> {
+    let app = d.app.to_lowercase();
+    if allowed.contains(&app) {
+        return Ok(app);
+    }
+    if !PORTAL_APPS.contains(&app.as_str()) {
+        return Err(format!(
+            "the active file dialog belongs to '{}', which is not allowed",
+            d.app
+        ));
+    }
+    if let Some(parent) = &d.parent {
+        let parent = parent.to_lowercase();
+        return if allowed.contains(&parent) {
+            Ok(parent)
+        } else {
+            Err(format!(
+                "the active file dialog was opened by '{}', which is not allowed",
+                if parent.is_empty() {
+                    "unknown"
+                } else {
+                    &parent
+                }
+            ))
+        };
+    }
+    windows
+        .iter()
+        .find(|(_, w)| d.titles.iter().any(|t| title_names_parent(t, w)))
+        .map(|(a, _)| a.clone())
+        .ok_or_else(|| {
+            format!(
+                "the active file dialog ({}) does not belong to a window of an allowed app",
+                render::py_repr(d.titles.first().map(String::as_str).unwrap_or(""))
+            )
+        })
+}
+
+/// `raw` with a leading `~` expanded to `home`; Err unless the result is an
+/// absolute path on one line.
+fn expand_path(raw: &str, home: Option<&std::path::Path>) -> R<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw.contains(['\n', '\r']) {
+        return Err("path must be one non-empty line".into());
+    }
+    let path = match raw.strip_prefix('~') {
+        Some(rest) if rest.is_empty() || rest.starts_with('/') => home
+            .ok_or("cannot expand ~: HOME is not set")?
+            .join(rest.trim_start_matches('/')),
+        Some(_) => return Err("only ~ and ~/… are expanded, not ~user".into()),
+        None => PathBuf::from(raw),
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "'{raw}' is not absolute; give a full path or one starting with ~/"
+        ));
+    }
+    Ok(path)
+}
+
+/// Check `path` can be what an Open or Save dialog returns: an existing
+/// file (or folder) to open, a name in an existing folder to save.
+fn check_dialog_path(path: &std::path::Path, action: &str) -> R<()> {
+    match action {
+        "open" if !path.exists() => Err(format!("{} does not exist", path.display())),
+        "save" if path.is_dir() => Err(format!("{} is a folder", path.display())),
+        "save" if !path.parent().is_some_and(|p| p.is_dir()) => {
+            Err(format!("the folder of {} does not exist", path.display()))
+        }
+        "open" | "save" => Ok(()),
+        other => Err(format!("action must be open or save, not '{other}'")),
+    }
 }
 
 /// Roles that take typed text without the editable state.
@@ -1119,6 +1223,98 @@ impl<B: Backend> Server<B> {
             })
     }
 
+    /// Fill in the active file Open/Save dialog of an allowed app: write the
+    /// path into its file name field, press its default button and wait for
+    /// it to close. Nothing else in the dialog (or the portal) is exposed.
+    async fn file_dialog(&self, a: &Json) -> R<String> {
+        let action = arg_s(a, "action", "open").to_lowercase();
+        let home = std::env::var_os("HOME").map(PathBuf::from);
+        let path = expand_path(&req_s(a, "path")?, home.as_deref())?;
+        check_dialog_path(&path, &action)?;
+        let (limit_ms, note) = wait_ms(a, "timeout_ms", 5000);
+        self.b.enable().await;
+        let d = self.b.active_file_dialog().await?;
+        let allowed = self.allowed();
+        let windows: Vec<(String, String)> = self
+            .b
+            .list_apps()
+            .await
+            .into_iter()
+            .filter(|app| allowed.contains(&app.name.to_lowercase()))
+            .flat_map(|app| {
+                let name = app.name.to_lowercase();
+                app.windows
+                    .into_iter()
+                    .map(move |w| (name.clone(), w.title))
+            })
+            .collect();
+        let owner = file_dialog_owner(&d, &allowed, &windows)
+            .map_err(|e| format!("{e} (allowlist: {})", self.allow_file.display()))?;
+        let text = path.display().to_string();
+        if !self.b.set_text(&d.field, &text).await? {
+            return Err("the file name field refused the path".into());
+        }
+        if let Some(now) = self.read_back(&d.field, &text).await? {
+            return Err(format!(
+                "the file name field holds {now:?} instead of the path; nothing was chosen"
+            ));
+        }
+        // The default button (Open/Save) gets its Press action once the
+        // dialog accepts the name; pressing it sends no keyboard input.
+        let mut how = "pressed the default button";
+        let press = match &d.accept {
+            Some(btn) => {
+                let start = Instant::now();
+                let mut names = self.b.actions(btn).await;
+                while names.is_empty() && start.elapsed() < ACCEPT_ENABLE_WAIT {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    names = self.b.actions(btn).await;
+                }
+                names
+                    .iter()
+                    .position(|n| n.eq_ignore_ascii_case("press"))
+                    .or((!names.is_empty()).then_some(0))
+            }
+            None => None,
+        };
+        match (press, &d.accept) {
+            (Some(i), Some(btn)) => {
+                self.b.do_action(btn, i).await?;
+            }
+            _ => {
+                // Enter in the field accepts too; only while that same
+                // dialog is still in front, and the field holds the focus.
+                let now = self.b.active_file_dialog().await?;
+                if now.window != d.window {
+                    return Err("the file dialog is no longer the active window".into());
+                }
+                if !matches!(self.b.try_focus(&d.field).await, Ok(Some(_)))
+                    && !self.b.is_focused(&d.field).await
+                {
+                    return Err("could not focus the file name field to press Enter".into());
+                }
+                self.b.press_combo("enter").await?;
+                how = "pressed Enter in the file name field";
+            }
+        }
+        let start = Instant::now();
+        let closed = wait_for(Duration::from_millis(limit_ms), || async {
+            !self.b.info(&d.window, 0).await.showing
+        })
+        .await;
+        let ms = start.elapsed().as_millis();
+        if !closed {
+            return Err(format!(
+                "wrote {text} and {how}, but the dialog is still open after {ms} ms{note}: \
+                 it may ask to confirm overwriting a file, or show an error"
+            ));
+        }
+        *self.last_active.lock().await = self.active_title().await;
+        Ok(format!(
+            "chose {text} in {owner}'s {action} dialog ({how}); dialog closed after {ms} ms{note}"
+        ))
+    }
+
     async fn screenshot(&self, a: &Json) -> R<Out> {
         self.require_active_allowed().await?;
         *self.last_shot.lock().await = None;
@@ -1226,6 +1422,7 @@ impl<B: Backend> Server<B> {
                 "type_text" => self.type_text(a).await.map(Out::from),
                 "mouse" => self.mouse(a).await.map(Out::from),
                 "activate_window" => self.activate_window(a).await.map(Out::from),
+                "file_dialog" => self.file_dialog(a).await.map(Out::from),
                 "screenshot" => self.screenshot(a).await,
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
@@ -1881,6 +2078,105 @@ mod tests {
                 std::env::temp_dir()
                     .join(format!("desktop-mcp-test-{}-drag.png", std::process::id())),
             );
+        });
+    }
+
+    #[test]
+    fn dialog_titles_name_their_parent_window() {
+        let gemini = "Google Gemini — Mozilla Firefox";
+        assert!(title_names_parent(
+            "Dosya gönder - Google Gemini — Mozilla Firefox",
+            gemini
+        ));
+        // A dialog title that itself has " - " in it.
+        assert!(title_names_parent("Yükle - Dosya - x — Kate", "x — Kate"));
+        assert!(!title_names_parent(gemini, gemini));
+        assert!(!title_names_parent(
+            " - Google Gemini — Mozilla Firefox",
+            gemini
+        ));
+        assert!(!title_names_parent("Aç - Başka — Mozilla Firefox", gemini));
+        assert!(!title_names_parent("Aç - ", ""));
+    }
+
+    fn dialog(app: &str, title: &str, parent: Option<&str>) -> FileDialog<u32> {
+        FileDialog {
+            window: 1,
+            app: app.into(),
+            titles: vec![title.into()],
+            parent: parent.map(str::to_string),
+            field: 2,
+            accept: None,
+        }
+    }
+
+    #[test]
+    fn file_dialogs_are_filled_only_for_allowed_apps() {
+        let allowed = vec!["firefox".to_string(), "kate".to_string()];
+        let windows = vec![(
+            "firefox".to_string(),
+            "Google Gemini — Mozilla Firefox".to_string(),
+        )];
+        let owner = |d: &FileDialog<u32>| file_dialog_owner(d, &allowed, &windows);
+        let portal = "xdg-desktop-portal-kde";
+        let title = "Dosya gönder - Google Gemini — Mozilla Firefox";
+        // The compositor's transient parent decides when it is known.
+        assert_eq!(
+            owner(&dialog(portal, "x", Some("Firefox"))).unwrap(),
+            "firefox"
+        );
+        assert!(owner(&dialog(portal, title, Some("telegram-desktop"))).is_err());
+        assert!(owner(&dialog(portal, title, Some(""))).is_err());
+        // Else the window its title names.
+        assert_eq!(owner(&dialog(portal, title, None)).unwrap(), "firefox");
+        assert!(owner(&dialog(portal, "Dosya gönder - Telegram", None)).is_err());
+        // An allowed app's own dialog; any other app's is refused.
+        assert_eq!(owner(&dialog("Kate", "Aç", None)).unwrap(), "kate");
+        assert!(owner(&dialog("telegram-desktop", title, Some("firefox"))).is_err());
+    }
+
+    #[test]
+    fn dialog_paths_expand_home_and_must_be_absolute() {
+        let home = std::path::Path::new("/home/u");
+        let exp = |p: &str| expand_path(p, Some(home));
+        assert_eq!(
+            exp("~/İndirilenler/deneme3.mp4").unwrap(),
+            PathBuf::from("/home/u/İndirilenler/deneme3.mp4")
+        );
+        assert_eq!(exp(" ~ ").unwrap(), PathBuf::from("/home/u"));
+        assert_eq!(exp("/tmp/a b.txt").unwrap(), PathBuf::from("/tmp/a b.txt"));
+        assert!(exp("~root/x").is_err());
+        assert!(exp("relative/x").is_err());
+        assert!(exp("/tmp/a\nb").is_err());
+        assert!(exp("").is_err());
+        assert!(expand_path("~/x", None).is_err());
+    }
+
+    #[test]
+    fn open_needs_an_existing_path_and_save_a_folder() {
+        let dir = std::env::temp_dir().join(format!("desktop-mcp-fd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("there.txt");
+        std::fs::write(&file, "x").unwrap();
+        let missing = dir.join("missing.txt");
+        assert!(check_dialog_path(&file, "open").is_ok());
+        assert!(check_dialog_path(&missing, "open").is_err());
+        assert!(check_dialog_path(&missing, "save").is_ok());
+        assert!(check_dialog_path(&file, "save").is_ok());
+        assert!(check_dialog_path(&dir, "save").is_err());
+        assert!(check_dialog_path(&dir.join("no/such.txt"), "save").is_err());
+        assert!(check_dialog_path(&file, "delete").is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn file_dialog_needs_a_backend_that_has_them() {
+        local(async {
+            let mut s = session("filedialog");
+            let r = call_tool(&mut s, 2, "file_dialog", json!({"path": "/"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains(backend::NO_FILE_DIALOG), "{text}");
         });
     }
 

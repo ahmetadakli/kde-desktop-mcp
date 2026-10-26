@@ -216,6 +216,15 @@ pub fn tools() -> Json {
             ])
         ),
         t(
+            "file_dialog",
+            "Fill in the file Open/Save dialog in front: write `path` (absolute or\n~/…) into its file name field, press its default button and wait up to\n`timeout_ms` for it to close. Works on an allowed app's own KDE dialog and\non the desktop portal's dialog (a browser's upload or download) when it\nbelongs to an allowed app's window; nothing else in the portal is reachable.\nFor `action`=\"open\" the path must exist; for \"save\" its folder must.\nOpen the dialog first (e.g. the page's upload button), then call this.\nKDE Plasma only.",
+            schema(&[
+                ("path", "string", None),
+                ("action", "string", Some(json!("open"))),
+                ("timeout_ms", "integer", Some(json!(5000))),
+            ])
+        ),
+        t(
             "doctor",
             "Check the setup in one report: version, allowlist, which running apps\nare allowed or blocked, the session, AT-SPI, the virtual keyboard and\npointer, KWin scripting, screens and the screenshot path. Run it first\nwhen tools fail in ways that look like a broken installation.",
             schema(&[])
