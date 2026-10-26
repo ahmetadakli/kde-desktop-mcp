@@ -25,7 +25,7 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    NO_FILE_DIALOG, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -336,6 +336,20 @@ fn active_index(caption: &str, seen: &[(String, bool)]) -> Option<usize> {
         .or_else(|| (seen.len() == 1 && seen[0].1).then_some(0))
 }
 
+/// The doctor's line about the outputs.
+fn screens_line(screens: &[Screen]) -> String {
+    screens
+        .iter()
+        .map(|s| {
+            format!(
+                "{} at ({},{}) {}x{} scale {}",
+                s.name, s.x, s.y, s.width, s.height, s.scale
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn which(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
@@ -633,6 +647,40 @@ impl LinuxBackend {
         }
         hyprland::norm(&self.a11y.name(frame).await)
             == hyprland::norm(client["title"].as_str().unwrap_or(""))
+    }
+
+    /// Hyprland's monitors, and the clients of allowed apps whose title or
+    /// class contains `query`, from one batched request. Like KWin's
+    /// windows: a client's pid sorted by its AT-SPI app name decides, else
+    /// its class.
+    async fn hypr_clients(
+        &self,
+        h: &Hypr,
+        query: &str,
+        allowed: &[String],
+    ) -> R<(hyprland::Snapshot, Vec<hyprland::Client>)> {
+        let (snap, allow) = tokio::join!(h.snapshot(), self.kwin_allow(allowed));
+        let snap = snap?;
+        let q = query.to_lowercase();
+        let list = hyprland::clients_of(&snap)
+            .into_iter()
+            .filter(|c| allow.permits(c.geo.pid, &[&c.geo.app, &c.initial_class]) && c.matches(&q))
+            .collect();
+        Ok((snap, list))
+    }
+
+    /// Every window of an allowed app, without terminals (launch's poll).
+    async fn all_windows(&self, allowed: &[String]) -> R<Vec<WindowGeo>> {
+        match &self.comp {
+            Compositor::Kde(kwin) => kwin.windows("", &self.kwin_allow(allowed).await).await,
+            Compositor::Hyprland(h) => Ok(self
+                .hypr_clients(h, "", allowed)
+                .await?
+                .1
+                .into_iter()
+                .map(|c| c.geo)
+                .collect()),
+        }
     }
 
     // ------------------------------------------------------------ focus
@@ -1398,7 +1446,12 @@ impl Backend for LinuxBackend {
                 with_terminals(&mut list).await;
                 Ok(list)
             }
-            Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+            Compositor::Hyprland(h) => {
+                let (_, clients) = self.hypr_clients(h, query, allowed).await?;
+                let mut list: Vec<WindowGeo> = clients.into_iter().map(|c| c.geo).collect();
+                with_terminals(&mut list).await;
+                Ok(list)
+            }
         }
     }
 
@@ -1418,7 +1471,14 @@ impl Backend for LinuxBackend {
                     Err(e) => (Vec::new(), Err(e)),
                 }
             }
-            Compositor::Hyprland(_) => (Vec::new(), Err(NO_WINDOW_CONTROL.into())),
+            Compositor::Hyprland(h) => match self.hypr_clients(h, query, allowed).await {
+                Ok((snap, clients)) => {
+                    let mut list: Vec<WindowGeo> = clients.into_iter().map(|c| c.geo).collect();
+                    with_terminals(&mut list).await;
+                    (hyprland::screens_of(&snap.monitors), Ok(list))
+                }
+                Err(e) => (Vec::new(), Err(e)),
+            },
         }
     }
 
@@ -1433,7 +1493,26 @@ impl Backend for LinuxBackend {
                 .set_window(query, &self.kwin_allow(allowed).await, change)
                 .await?
                 .ok_or_else(|| format!("no window of an allowed app matches '{query}'")),
-            Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+            Compositor::Hyprland(h) => {
+                let (snap, clients) = self.hypr_clients(h, query, allowed).await?;
+                // The active window when it matches, else the first.
+                let c = clients
+                    .iter()
+                    .find(|c| c.geo.active)
+                    .or(clients.first())
+                    .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
+                let back = hyprland::monitor_workspace(&snap.monitors, c.monitor);
+                h.dispatch_all(&hyprland::change_commands(c, change, back)?)
+                    .await?;
+                // Hyprland applies geometry at once; the caller waits for the
+                // app (and the state) by re-reading `windows`.
+                let snap = h.snapshot().await?;
+                hyprland::clients_of(&snap)
+                    .into_iter()
+                    .find(|n| n.address == c.address)
+                    .map(|n| n.geo)
+                    .ok_or_else(|| format!("the window '{}' closed", c.geo.title))
+            }
         }
     }
 
@@ -1448,27 +1527,13 @@ impl Backend for LinuxBackend {
         let r = tokio::task::spawn_blocking(move || launch::resolve(&name, &argv))
             .await
             .map_err(|e| e.to_string())??;
-        let kwin = match &self.comp {
-            Compositor::Kde(k) => Some(k),
-            Compositor::Hyprland(_) => None,
-        };
         // Windows already open, to tell a new one of a running instance.
-        let before = match kwin {
-            Some(k) => k
-                .windows("", &self.kwin_allow(allowed).await)
-                .await
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let before = self.all_windows(allowed).await.unwrap_or_default();
         let (pid, exit) = launch::spawn(&r)?;
         let mut out = Launched {
             command: launch::describe(&r),
             pid,
             ..Launched::default()
-        };
-        let Some(kwin) = kwin else {
-            out.note = format!("not waiting for its window: {NO_WINDOW_CONTROL}");
-            return Ok(out);
         };
         if wait.is_zero() {
             out.note = "not waiting for its window (wait_ms=0)".into();
@@ -1493,9 +1558,9 @@ impl Backend for LinuxBackend {
             } else {
                 stable += 1;
             }
-            // Rebuilt each round: the new app joins AT-SPI after it starts.
-            let allow = self.kwin_allow(allowed).await;
-            let now = kwin.windows("", &allow).await?;
+            // The allowlist's pids are rebuilt each round: the new app
+            // joins AT-SPI after it starts.
+            let now = self.all_windows(allowed).await?;
             let status = *exit.lock().unwrap();
             if status.is_some() && ended.is_none() {
                 ended = Some(std::time::Instant::now());
@@ -1544,7 +1609,11 @@ impl Backend for LinuxBackend {
     async fn screens(&self) -> Vec<Screen> {
         match &self.comp {
             Compositor::Kde(kwin) => kwin.screens().await.unwrap_or_default(),
-            Compositor::Hyprland(_) => Vec::new(),
+            Compositor::Hyprland(h) => h
+                .json("monitors")
+                .await
+                .map(|m| hyprland::screens_of(&m))
+                .unwrap_or_default(),
         }
     }
 
@@ -1662,16 +1731,7 @@ impl Backend for LinuxBackend {
                 out.push(Check {
                     name: "screens",
                     ok: !screens.is_empty(),
-                    detail: screens
-                        .iter()
-                        .map(|s| {
-                            format!(
-                                "{} at ({},{}) {}x{} scale {}",
-                                s.name, s.x, s.y, s.width, s.height, s.scale
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; "),
+                    detail: screens_line(&screens),
                 });
                 let fallback = self.shot_unauthorized.load(Ordering::Relaxed);
                 out.push(Check {
@@ -1690,6 +1750,12 @@ impl Backend for LinuxBackend {
                     name: "hyprctl",
                     ok: ok.is_ok(),
                     detail: ok.err().unwrap_or_else(|| "reachable".into()),
+                });
+                let screens = self.screens().await;
+                out.push(Check {
+                    name: "screens",
+                    ok: !screens.is_empty(),
+                    detail: screens_line(&screens),
                 });
             }
         }
