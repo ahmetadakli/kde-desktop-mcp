@@ -133,7 +133,7 @@ pub fn tools() -> Json {
         t(
             "act",
             &d(
-                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find.\nMentions it when the active window changed (e.g. a dialog opened)."
+                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nMentions it when the active window changed (e.g. a dialog opened)."
             ),
             target(&[("action", "string", Some(json!("")))])
         ),
