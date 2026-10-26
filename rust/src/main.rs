@@ -56,8 +56,9 @@ struct Server<B: Backend> {
     input: Mutex<()>,
 }
 
-/// Tools that send keyboard or pointer input.
-const INPUT_TOOLS: [&str; 8] = [
+/// Tools that send keyboard or pointer input, and `launch`, whose new
+/// window takes the focus that concurrent input would go to.
+const INPUT_TOOLS: [&str; 9] = [
     "focus",
     "click",
     "drag",
@@ -66,6 +67,7 @@ const INPUT_TOOLS: [&str; 8] = [
     "type_text",
     "mouse",
     "activate_window",
+    "launch",
 ];
 
 /// Longest `wait_for` / `pause`, in ms (10 minutes).
@@ -82,6 +84,10 @@ fn wait_ms(a: &Json, k: &str, d: i64) -> (u64, String) {
     };
     (ms as u64, note)
 }
+
+/// How long `launch` waits for the app's window by default, and at most.
+const LAUNCH_WAIT_MS: i64 = 15_000;
+const MAX_LAUNCH_WAIT_MS: i64 = 60_000;
 
 /// Screen point of a screenshot pixel: origin plus pixel times scale.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -155,6 +161,7 @@ fn indicator_label(tool: &str, a: &Json) -> Option<String> {
         "scroll" => "scrolling".into(),
         "activate_window" => "switching windows".into(),
         "move_window" => "arranging windows".into(),
+        "launch" => format!("launching {}", arg_s(a, "app", "an app")),
         _ => return None,
     })
 }
@@ -580,6 +587,51 @@ impl<B: Backend> Server<B> {
             " (not what was asked: the app may limit its size or position)"
         };
         Ok(format!("now: {}{note}", describe_window(&w)))
+    }
+
+    async fn launch(&self, a: &Json) -> R<String> {
+        let app = req_s(a, "app")?.trim().to_lowercase();
+        // Refused before anything is resolved or started.
+        if !self.is_allowed(&app) {
+            return Err(self.not_allowed(&app));
+        }
+        let bad_args = || "args must be a list of strings".to_string();
+        let args = match a.get("args") {
+            None | Some(Json::Null) => Vec::new(),
+            Some(Json::Array(v)) => v
+                .iter()
+                .map(|x| x.as_str().map(str::to_string).ok_or_else(bad_args))
+                .collect::<R<Vec<_>>>()?,
+            Some(_) => return Err(bad_args()),
+        };
+        let asked = arg_i(a, "wait_ms", LAUNCH_WAIT_MS);
+        let ms = asked.clamp(0, MAX_LAUNCH_WAIT_MS);
+        let cut = if asked > MAX_LAUNCH_WAIT_MS {
+            format!(" (wait_ms {asked} is above the {MAX_LAUNCH_WAIT_MS} ms limit)")
+        } else {
+            String::new()
+        };
+        let wait = Duration::from_millis(ms as u64);
+        let l = self.b.launch(&app, &args, &self.allowed(), wait).await?;
+        let started = format!("started {} (pid {})", l.command, l.pid);
+        match l.window {
+            Some(w) => {
+                if w.active {
+                    *self.last_active.lock().await = Some(w.title.clone());
+                }
+                let how = if l.note.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", l.note)
+                };
+                Ok(format!("{started}; window{how}: {}", describe_window(&w)))
+            }
+            None if !l.note.is_empty() => Ok(format!("{started}; {}", l.note)),
+            None => Err(format!(
+                "{started}, but no window of '{app}' appeared within {ms} ms{cut}; \
+                 it may still be starting (see windows)"
+            )),
+        }
     }
 
     async fn doctor(&self) -> R<String> {
@@ -1220,6 +1272,7 @@ impl<B: Backend> Server<B> {
                 "drag" => self.drag(a).await.map(Out::from),
                 "windows" => self.windows(a).await.map(Out::from),
                 "move_window" => self.move_window(a).await.map(Out::from),
+                "launch" => self.launch(a).await.map(Out::from),
                 "doctor" => self.doctor().await.map(Out::from),
                 "scroll" => self.scroll(a).await.map(Out::from),
                 "key" => self.key(a).await.map(Out::from),
@@ -1778,6 +1831,31 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn launch_checks_the_allowlist_before_starting_anything() {
+        local(async {
+            let mut s = session("launch");
+            let text = |r: &Json| {
+                r["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            let r = call_tool(&mut s, 2, "launch", json!({"app": "Evil"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(text(&r).contains("app 'evil' is not in"), "{r}");
+            let r = call_tool(&mut s, 3, "launch", json!({"app": "fake", "args": [1]})).await;
+            assert!(text(&r).contains("args must be a list of strings"), "{r}");
+            // Allowed: it reaches the backend, which cannot launch here.
+            let r = call_tool(&mut s, 4, "launch", json!({"app": " Fake ", "args": ["x"]})).await;
+            assert!(text(&r).contains("not supported"), "{r}");
+        });
+        assert_eq!(
+            indicator_label("launch", &json!({"app": "kate"})).as_deref(),
+            Some("launching kate")
+        );
     }
 
     #[test]

@@ -129,6 +129,12 @@ değişkenini verin.
 - `move_window`: pencereyi taşır, boyutlandırır ya da büyütür, simge durumuna
   küçültür, eski haline getirir; pencere yeni boyutu alana kadar (en fazla
   1 sn) bekleyip gerçek sonucu bildirir (yalnızca KDE)
+- `launch`: izin listesindeki bir uygulamayı (`app`, ör. `kate`) isteğe bağlı
+  `args` listesiyle başlatır (kabuk kullanmaz; önce `.desktop` dosyası, yoksa
+  `PATH`'teki program) ve penceresi açılana kadar bekler (`wait_ms`,
+  varsayılan 15 sn, en fazla 60 sn; 0 beklemez). Pencereyi `windows` gibi
+  yazar; zaten çalışan bir örneğe devredilen açılışları (firefox, kate) da
+  bulur. Pencere takibi yalnızca KDE'de
 - Terminal pencereleri: `windows`, her terminal sekmesinin pts aygıtını, ön
   planda çalışan komutu ve klasörünü de listeler; `activate_window`
   `terminal: "pytest"` ile o komutu çalıştıran (ya da o klasördeki)
@@ -164,6 +170,7 @@ Kurallar:
 - Klavye ve fare girdisi yalnızca öndeki pencere listedeki bir uygulamaya
   aitse gönderilir.
 - `activate_window` yalnızca listedeki uygulamaların pencerelerini öne getirir.
+- `launch` listede olmayan bir uygulamayı hiçbir şey başlatmadan reddeder.
 
 Doğru adları görmek için `apps` aracını kullanın.
 
