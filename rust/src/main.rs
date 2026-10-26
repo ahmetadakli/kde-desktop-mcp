@@ -63,6 +63,21 @@ const INPUT_TOOLS: [&str; 6] = [
     "activate_window",
 ];
 
+/// Longest `wait_for` / `pause`, in ms (10 minutes).
+const MAX_WAIT_MS: i64 = 600_000;
+
+/// Requested wait in ms, clamped to 0..=MAX_WAIT_MS, and a note when it was cut.
+fn wait_ms(a: &Json, k: &str, d: i64) -> (u64, String) {
+    let asked = arg_i(a, k, d);
+    let ms = asked.clamp(0, MAX_WAIT_MS);
+    let note = if asked > MAX_WAIT_MS {
+        format!(" ({k} {asked} is above the {MAX_WAIT_MS} ms limit; used {MAX_WAIT_MS})")
+    } else {
+        String::new()
+    };
+    (ms as u64, note)
+}
+
 /// An element picked by `id`, or found by `app` + `query`.
 struct Target<Id> {
     id: Id,
@@ -557,7 +572,8 @@ impl<B: Backend> Server<B> {
         let query = req_s(a, "query")?;
         let role = arg_s(a, "role", "");
         let gone = arg_b(a, "gone", false);
-        let limit = Duration::from_millis(arg_i(a, "timeout_ms", 5000).clamp(0, 60_000) as u64);
+        let (limit_ms, note) = wait_ms(a, "timeout_ms", 5000);
+        let limit = Duration::from_millis(limit_ms);
         if !self.is_allowed(&app) {
             return Err(self.not_allowed(&app));
         }
@@ -571,21 +587,27 @@ impl<B: Backend> Server<B> {
                 Some((id, cache)) if !gone => {
                     let rid = self.add_ref(&id, &app.to_lowercase()).await;
                     return Ok(format!(
-                        "found after {ms} ms: {}",
+                        "found after {ms} ms{note}: {}",
                         render::describe(&cache[&id], rid)
                     ));
                 }
-                None if gone => return Ok(format!("gone after {ms} ms")),
+                None if gone => return Ok(format!("gone after {ms} ms{note}")),
                 _ => {}
             }
             if start.elapsed() >= limit {
                 let what = if gone { "to disappear" } else { "to appear" };
                 return Err(format!(
-                    "timed out after {ms} ms waiting for '{query}' in '{app}' {what}"
+                    "timed out after {ms} ms waiting for '{query}' in '{app}' {what}{note}"
                 ));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    async fn pause(&self, a: &Json) -> R<String> {
+        let (ms, note) = wait_ms(a, "ms", 1000);
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        Ok(format!("paused {ms} ms{note}"))
     }
 
     async fn focus(&self, a: &Json) -> R<String> {
@@ -715,6 +737,7 @@ impl<B: Backend> Server<B> {
                 "set_text" => self.set_text(a).await,
                 "get_text" => self.get_text(a).await,
                 "wait_for" => self.wait_for(a).await,
+                "pause" => self.pause(a).await,
                 "focus" => self.focus(a).await,
                 "click" => self.click(a).await,
                 "key" => self.key(a).await,
@@ -1171,6 +1194,32 @@ mod tests {
             let replies = replies_within(&mut s, Duration::from_millis(500)).await;
             assert_eq!(replies.len(), 2, "{replies:?}");
             assert_eq!(*s.keys.borrow(), vec!["down a", "up a", "down b", "up b"]);
+        });
+    }
+    #[test]
+    fn waits_above_the_limit_are_cut_and_reported() {
+        assert_eq!(wait_ms(&json!({"ms": 250}), "ms", 0), (250, String::new()));
+        assert_eq!(wait_ms(&json!({"ms": -5}), "ms", 0), (0, String::new()));
+        let (ms, note) = wait_ms(&json!({"timeout_ms": 900_000}), "timeout_ms", 5000);
+        assert_eq!(ms, 600_000);
+        assert!(note.contains("900000") && note.contains("600000"), "{note}");
+    }
+
+    #[test]
+    fn pause_sleeps_and_does_not_block_other_calls() {
+        local(async {
+            let mut s = session("pause");
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "pause", "arguments": {"ms": 300}}}),
+            )
+            .await;
+            send(&mut s, ping(3)).await;
+            let replies = replies_within(&mut s, Duration::from_millis(600)).await;
+            assert_eq!(ids(&replies), vec![json!(3), json!(2)], "{replies:?}");
+            let text = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(text, "paused 300 ms");
         });
     }
 }

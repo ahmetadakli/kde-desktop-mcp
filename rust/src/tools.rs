@@ -25,6 +25,17 @@ fn schema(params: &[(&str, &str, Option<Json>)]) -> Json {
     s
 }
 
+/// Tools that only read, marked `readOnlyHint` so clients may run them in parallel.
+const READ_ONLY: [&str; 7] = [
+    "apps",
+    "tree",
+    "find",
+    "get_text",
+    "wait_for",
+    "screenshot",
+    "pause",
+];
+
 /// How act/click/focus/get_text/set_text pick their element.
 const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`) to find and act in\none call: the first visible element whose name equals `query`\n(case-insensitive) wins, else the first whose name, text or role contains it.\nThe reply then starts with the element that was picked.";
 
@@ -50,7 +61,7 @@ pub fn tools() -> Json {
         "properties": { "tool": { "type": "string" }, "args": { "type": "object" } },
         "required": ["tool"],
     });
-    json!([
+    let mut list = json!([
         t(
             "apps",
             "List applications with their top-level windows.\nMarks which are allowed and which window is active.",
@@ -114,7 +125,7 @@ pub fn tools() -> Json {
         ),
         t(
             "wait_for",
-            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms`. Use instead\nof polling with tree/find after an action that takes time (a dialog, a load).",
+            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). To just wait a fixed time, use pause, not a query\nthat never matches.",
             schema(&[
                 ("app", "string", None),
                 ("query", "string", None),
@@ -122,6 +133,11 @@ pub fn tools() -> Json {
                 ("gone", "boolean", Some(json!(false))),
                 ("timeout_ms", "integer", Some(json!(5000)))
             ])
+        ),
+        t(
+            "pause",
+            "Sleep for `ms` milliseconds (at most 600000 = 10 minutes), e.g. to let an\nanimation or video play. When waiting for something visible to appear or go\naway, use wait_for instead: it returns as soon as that happens.",
+            schema(&[("ms", "integer", None)])
         ),
         t(
             "key",
@@ -162,5 +178,35 @@ pub fn tools() -> Json {
             "Run several tool calls in order in one round trip, stopping at the first\nerror. Prefer it whenever the next steps don't depend on reading a result. `steps` is a list of {\"tool\": name, \"args\": {...}}, e.g.\n[{\"tool\": \"activate_window\", \"args\": {\"query\": \"Kate\"}},\n {\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+end\"}},\n {\"tool\": \"type_text\", \"args\": {\"text\": \"hello\"}}].\nIds from tree/find made earlier can be used; ids printed inside the same\nbatch cannot, but `app` + `query` targets can name elements instead.",
             batch_schema
         ),
-    ])
+    ]);
+    for tool in list.as_array_mut().unwrap() {
+        if READ_ONLY.contains(&tool["name"].as_str().unwrap()) {
+            tool["annotations"] = json!({ "readOnlyHint": true });
+        }
+    }
+    list
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_reading_tools_are_marked_read_only() {
+        let list = tools();
+        for tool in list.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let ro = tool["annotations"]["readOnlyHint"] == json!(true);
+            assert_eq!(ro, READ_ONLY.contains(&name), "{name}");
+        }
+        let names: Vec<_> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].clone())
+            .collect();
+        for name in READ_ONLY {
+            assert!(names.contains(&json!(name)), "{name} missing");
+        }
+    }
 }
