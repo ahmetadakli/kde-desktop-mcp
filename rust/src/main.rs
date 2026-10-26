@@ -30,7 +30,7 @@ use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use backend::{Backend, Cache, Clip, FileDialog, Info, R, Shot, WindowChange, WindowGeo};
+use backend::{Backend, Cache, Clip, FileDialog, Focused, Info, R, Shot, WindowChange, WindowGeo};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
@@ -117,9 +117,13 @@ struct Server<B: Backend> {
     input: Mutex<()>,
 }
 
-/// Tools that send keyboard or pointer input, or use the clipboard that
-/// type_text pastes through; they run one at a time.
-const INPUT_TOOLS: [&str; 11] = [
+/// Tools that send keyboard or pointer input, run an app's actions (`act`
+/// presses buttons and opens menus; `set_text` may retype through the
+/// keyboard), or use the clipboard that type_text pastes through; they run
+/// one at a time.
+const INPUT_TOOLS: [&str; 13] = [
+    "act",
+    "set_text",
     "focus",
     "click",
     "drag",
@@ -366,6 +370,12 @@ fn check_dialog_path(path: &std::path::Path, action: &str) -> R<()> {
 
 /// Roles that take typed text without the editable state.
 const TEXT_SINKS: [&str; 2] = ["terminal", "console"];
+
+/// One end of a drag before the element (if any) is measured.
+enum DragEnd<Id> {
+    Element(Id),
+    Point((i64, i64)),
+}
 
 /// An element picked by `id`, or found by `app` + `query`.
 struct Target<Id> {
@@ -1095,8 +1105,8 @@ impl<B: Backend> Server<B> {
 
     /// Focus the element, select all and type `text`; false when the element
     /// would not take focus in an allowed active window (nothing typed).
+    /// Runs under the input lock `set_text` (an INPUT_TOOLS entry) holds.
     async fn retype(&self, id: &B::Id, text: &str) -> bool {
-        let _input = self.input.lock().await;
         if self.require_active_allowed().await.is_err() {
             return false;
         }
@@ -1167,8 +1177,7 @@ impl<B: Backend> Server<B> {
         if let Some(method) = self.b.try_focus(id).await? {
             return Ok(t.reply(&format!("ok ({method})")));
         }
-        self.require_active_allowed().await?;
-        let (x, y) = self.b.element_center(id).await?;
+        let (x, y) = self.active_center(id).await?;
         self.b.pointer(x as i64, y as i64, "left", 1, 0).await?;
         if wait_for(Duration::from_millis(150), || self.b.is_focused(id)).await {
             return Ok(t.reply(&format!("ok (clicked at {x},{y})")));
@@ -1181,22 +1190,44 @@ impl<B: Backend> Server<B> {
     async fn click(&self, a: &Json) -> R<String> {
         let button = arg_s(a, "button", "left");
         let clicks = arg_i(a, "clicks", 1);
-        let t = self.target(a).await?;
-        self.require_active_allowed().await?;
-        let (x, y) = self.b.element_center(&t.id).await?;
+        let (t, (x, y)) = self.target_center(a).await?;
         self.b
             .pointer(x as i64, y as i64, &button, clicks, 0)
             .await?;
         Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}")))
     }
 
-    /// One end of a drag: `<end>_id` (an element's centre), else
+    /// Centre of `id` for a pointer tool, once the active window is checked
+    /// to be an allowed app's. Both lookups are reads and independent, so
+    /// they run together; the allowlist error still comes first.
+    async fn active_center(&self, id: &B::Id) -> R<(i32, i32)> {
+        let (active, center) =
+            tokio::join!(self.require_active_allowed(), self.b.element_center(id));
+        active?;
+        center
+    }
+
+    /// The element a pointer tool names and its centre, once the active
+    /// window is checked to be an allowed app's. The active-window check
+    /// runs alongside finding and measuring the element (all reads); errors
+    /// keep the order of doing it step by step: the target, the active
+    /// window, then the centre.
+    async fn target_center(&self, a: &Json) -> R<(Target<B::Id>, (i32, i32))> {
+        let (active, found) = tokio::join!(self.require_active_allowed(), async {
+            let t = self.target(a).await?;
+            let center = self.b.element_center(&t.id).await;
+            Ok::<_, String>((t, center))
+        });
+        let (t, center) = found?;
+        active?;
+        Ok((t, center?))
+    }
+
+    /// One end of a drag: `<end>_id` (an element, resolved), else
     /// `<end>_x`/`<end>_y`, as screenshot pixels when `image` is true.
-    async fn drag_point(&self, a: &Json, end: &str) -> R<(i64, i64)> {
+    async fn drag_end(&self, a: &Json, end: &str) -> R<DragEnd<B::Id>> {
         if let Some(rid) = a.get(format!("{end}_id")).and_then(Json::as_i64) {
-            let (id, _) = self.resolve_with_app(rid).await?;
-            let (x, y) = self.b.element_center(&id).await?;
-            return Ok((x as i64, y as i64));
+            return Ok(DragEnd::Element(self.resolve_with_app(rid).await?.0));
         }
         let (x, y) = (
             req_i(a, &format!("{end}_x"))?,
@@ -1205,16 +1236,52 @@ impl<B: Backend> Server<B> {
         if arg_b(a, "image", false) {
             let map = (*self.last_shot.lock().await)
                 .ok_or("image=true needs a screenshot taken first")?;
-            return Ok(map.to_screen(x, y));
+            return Ok(DragEnd::Point(map.to_screen(x, y)));
         }
-        Ok((x, y))
+        Ok(DragEnd::Point((x, y)))
+    }
+
+    /// Both ends of a drag in screen coordinates. The active-window check,
+    /// both ends and their element centres are looked up together (the
+    /// backend reads the window origin once); errors are reported in the
+    /// order they would come one by one: active window, `from`, `to`.
+    async fn drag_points(&self, a: &Json) -> R<(String, (i64, i64), (i64, i64))> {
+        let (app, from, to) = tokio::join!(
+            self.require_active_allowed(),
+            self.drag_end(a, "from"),
+            self.drag_end(a, "to")
+        );
+        let app = app?;
+        let ids: Vec<B::Id> = [&from, &to]
+            .into_iter()
+            .filter_map(|e| match e {
+                Ok(DragEnd::Element(id)) => Some(id.clone()),
+                _ => None,
+            })
+            .collect();
+        let mut centers = if ids.is_empty() {
+            Vec::new()
+        } else {
+            self.b.element_centers(&ids).await
+        }
+        .into_iter();
+        let mut point = |end: R<DragEnd<B::Id>>| -> R<(i64, i64)> {
+            match end? {
+                DragEnd::Point(p) => Ok(p),
+                DragEnd::Element(_) => {
+                    let (x, y) = centers.next().ok_or("element centre missing")??;
+                    Ok((x as i64, y as i64))
+                }
+            }
+        };
+        let from = point(from)?;
+        let to = point(to)?;
+        Ok((app, from, to))
     }
 
     async fn drag(&self, a: &Json) -> R<String> {
         let button = arg_s(a, "button", "left");
-        let app = self.require_active_allowed().await?;
-        let (x0, y0) = self.drag_point(a, "from").await?;
-        let (x1, y1) = self.drag_point(a, "to").await?;
+        let (app, (x0, y0), (x1, y1)) = self.drag_points(a).await?;
         self.b.move_pointer(x0, y0).await?;
         self.b.button(&button, true).await?;
         let mut moved = Ok(());
@@ -1238,9 +1305,7 @@ impl<B: Backend> Server<B> {
 
     async fn scroll(&self, a: &Json) -> R<String> {
         let amount = arg_i(a, "amount", 3).clamp(-50, 50);
-        let t = self.target(a).await?;
-        self.require_active_allowed().await?;
-        let (x, y) = self.b.element_center(&t.id).await?;
+        let (t, (x, y)) = self.target_center(a).await?;
         self.b
             .pointer(x as i64, y as i64, "left", 0, amount)
             .await?;
@@ -1255,7 +1320,7 @@ impl<B: Backend> Server<B> {
         for _ in 0..repeat.clamp(1, 100) {
             self.b.press_combo(&combo).await?;
         }
-        let focus = self.focus_note(&app, false).await;
+        let focus = self.focus_note(false).await;
         Ok(format!("sent {combo} x{repeat} to {app}{focus}"))
     }
 
@@ -1263,7 +1328,7 @@ impl<B: Backend> Server<B> {
         let text = req_s(a, "text")?;
         let app = self.require_active_allowed().await?;
         let note = self.b.type_text(&text).await?;
-        let focus = self.focus_note(&app, true).await;
+        let focus = self.focus_note(true).await;
         Ok(format!(
             "typed {} chars into {app}{focus}{note}",
             text.chars().count()
@@ -1301,12 +1366,17 @@ impl<B: Backend> Server<B> {
 
     /// "; focus: [id] role "name"" for the element now holding focus, so a
     /// key or typed text that went somewhere unexpected shows at once. With
-    /// `typing`, warns when that element does not take text.
-    async fn focus_note(&self, app: &str, typing: bool) -> String {
-        let Some(id) = self.b.focused().await else {
+    /// `typing`, warns when that element does not take text. The backend
+    /// names the app the element belongs to (it may differ from the one the
+    /// input was sent to, when the input moved focus); nothing is reported,
+    /// and no id issued, unless that app is allowed.
+    async fn focus_note(&self, typing: bool) -> String {
+        let Some(Focused { id, info, app }) = self.b.focused().await else {
             return String::new();
         };
-        let info = self.b.info(&id, 0).await;
+        if !self.is_allowed(&app) {
+            return String::new();
+        }
         let rid = self.add_ref(&id, &info, &app.to_lowercase()).await;
         let mut note = format!("; focus: {}", render::describe(&info, rid));
         if typing && !info.states.contains(&"editable") && !TEXT_SINKS.contains(&info.role.as_str())
@@ -1816,6 +1886,8 @@ mod tests {
         allow_file: PathBuf,
         keys: Rc<RefCell<Vec<String>>>,
         focus: Rc<RefCell<Info<u32>>>,
+        /// App the focused element belongs to.
+        focus_app: Rc<RefCell<String>>,
         clipboard: RefCell<String>,
     }
 
@@ -1849,8 +1921,12 @@ mod tests {
                 _ => Info::default(),
             }
         }
-        async fn focused(&self) -> Option<u32> {
-            Some(FAKE_FOCUS)
+        async fn focused(&self) -> Option<Focused<u32>> {
+            Some(Focused {
+                id: FAKE_FOCUS,
+                info: self.focus.borrow().clone(),
+                app: self.focus_app.borrow().clone(),
+            })
         }
         async fn prefetch(&self, _: &mut Cache<u32>, _: Vec<u32>, _: bool, _: usize, _: usize) {}
         async fn actions(&self, id: &u32) -> Vec<String> {
@@ -1945,6 +2021,7 @@ mod tests {
         stdout: tokio::io::Lines<BufReader<DuplexStream>>,
         keys: Rc<RefCell<Vec<String>>>,
         focus: Rc<RefCell<Info<u32>>>,
+        focus_app: Rc<RefCell<String>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -1962,10 +2039,12 @@ mod tests {
             actions: vec!["Press".into()],
             ..Info::default()
         }));
+        let focus_app = Rc::new(RefCell::new("fake".to_string()));
         let server = Rc::new(Server::new(FakeBackend {
             allow_file,
             keys: keys.clone(),
             focus: focus.clone(),
+            focus_app: focus_app.clone(),
             clipboard: RefCell::new(String::new()),
         }));
         let (stdin, server_in) = tokio::io::duplex(64 * 1024);
@@ -1976,6 +2055,7 @@ mod tests {
             stdout: BufReader::new(client_out).lines(),
             keys,
             focus,
+            focus_app,
         }
     }
 
@@ -2594,5 +2674,49 @@ mod tests {
         assert!(!name_is_stable(&info("frame", "Untitled - Kate", vec![])));
         assert!(!name_is_stable(&info("page tab", "Loading…", vec![])));
         assert!(!name_is_stable(&info("section", "x", vec!["editable"])));
+    }
+    #[test]
+    fn focus_in_an_app_not_allowed_is_not_reported() {
+        local(async {
+            let mut s = session("focusapp");
+            *s.focus_app.borrow_mut() = "secret".into();
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(reply_text(&r), "sent a x1 to fake", "{r}");
+            // Focus moved to another allowed app: the id is tagged with it.
+            *s.focus_app.borrow_mut() = "Fake".into();
+            let id = focus_id(&mut s, 3).await;
+            let r = call_tool(&mut s, 4, "act", json!({"id": id})).await;
+            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+        });
+    }
+
+    #[test]
+    fn act_and_set_text_wait_for_running_input() {
+        local(async {
+            let mut s = session("actlock");
+            let id = focus_id(&mut s, 2).await;
+            s.keys.borrow_mut().clear();
+            for (n, tool, args) in [
+                (3, "key", json!({"combo": "a"})),
+                (4, "act", json!({"id": id})),
+                (5, "key", json!({"combo": "b"})),
+                (6, "set_text", json!({"id": id, "text": "x"})),
+            ] {
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": n, "method": "tools/call",
+                    "params": {"name": tool, "arguments": args}}),
+                )
+                .await;
+            }
+            // set_text's read-back keeps polling for SET_TEXT_VERIFY, then
+            // its retype must not wait for the lock it already holds.
+            let replies = replies_within(&mut s, Duration::from_secs(4)).await;
+            assert_eq!(replies.len(), 4, "{replies:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                vec!["down a", "up a", "action 0 on 7", "down b", "up b"]
+            );
+        });
     }
 }

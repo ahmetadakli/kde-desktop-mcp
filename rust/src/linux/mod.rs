@@ -24,7 +24,7 @@ use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
-    AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_FILE_DIALOG,
+    AppEntry, Backend, Cache, Check, Clip, FileDialog, Focused, Info, Launched, NO_FILE_DIALOG,
     NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
@@ -58,6 +58,7 @@ const BORING: &[&str] = &[
     "grouping",
 ];
 const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
+const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
 /// How old the active-app check before `type_text` may be for the
 /// accessibility insert to trust it.
 const INSERT_ACTIVE_AGE: Duration = Duration::from_secs(1);
@@ -708,6 +709,25 @@ impl LinuxBackend {
         (field, accept)
     }
 
+    /// Whether a top-level window of `app` (an app root) is ACTIVE.
+    async fn app_active(&self, app: &Obj) -> bool {
+        let a11y = &self.a11y;
+        let windows = a11y.children(app).await;
+        futures_util::future::join_all(windows.iter().map(|w| a11y.states(w)))
+            .await
+            .into_iter()
+            .any(|st| atspi::has(st.unwrap_or(0), atspi::ACTIVE))
+    }
+
+    /// Whether the window holding `id` (its nearest frame, window or
+    /// dialog ancestor) is ACTIVE.
+    async fn frame_active(&self, id: &Obj) -> bool {
+        match self.a11y.frame_of(id).await {
+            Some(f) => self.a11y.has_state(&f, atspi::ACTIVE).await,
+            None => false,
+        }
+    }
+
     async fn kde_frame_active(&self, caption: &str) -> bool {
         let want = hyprland::norm(caption);
         let a11y = &self.a11y;
@@ -870,17 +890,49 @@ impl Backend for LinuxBackend {
         self.a11y.set_text(id, text).await
     }
 
-    async fn focused(&self) -> Option<Obj> {
-        // Focus events keep the hint current; check it still holds focus.
-        // Only report it inside the app in front, which the caller checked
-        // is allowed: a stale hint from another app must not leak or get an id.
-        let a11y = &self.a11y;
-        let hint = a11y.focus_hint()?;
-        self.active_app().await;
-        if a11y.recent_active_bus(INSERT_ACTIVE_AGE).as_deref() != Some(&*hint.bus) {
+    async fn focused(&self) -> Option<Focused<Obj>> {
+        // Focus events keep the hint current; check it still holds focus,
+        // and that its own app has the active window. The app's name comes
+        // from the hint's own bus (a unique connection name, never reused),
+        // so the caller checks the right app against the allowlist even
+        // when the input moved focus to another app. All of it in one go:
+        // two round trips, instead of a registry scan and then a fetch of
+        // children and text the note never shows.
+        if !matches!(self.comp, Compositor::Kde(_)) {
+            // Hyprland's active window is not an AT-SPI state.
             return None;
         }
-        a11y.has_state(&hint, atspi::FOCUSED).await.then_some(hint)
+        let a11y = &self.a11y;
+        let hint = a11y.focus_hint()?;
+        let app = Self::app_of(&hint);
+        let (name, active, (role, label, states, actions)) =
+            tokio::join!(a11y.name(&app), self.app_active(&app), async {
+                tokio::join!(
+                    a11y.role(&hint),
+                    a11y.name(&hint),
+                    a11y.states(&hint),
+                    // No Action interface: an error, so no actions.
+                    a11y.actions(&hint)
+                )
+            });
+        let st = states?;
+        if !active || !atspi::has(st, atspi::FOCUSED) || role.is_empty() || name.is_empty() {
+            return None;
+        }
+        let info = Info {
+            role,
+            name: label,
+            states: atspi::state_labels(Some(st)),
+            showing: atspi::has(st, atspi::SHOWING),
+            actions,
+            text: None,
+            children: Vec::new(),
+        };
+        Some(Focused {
+            id: hint,
+            info,
+            app: name,
+        })
     }
 
     async fn is_focused(&self, id: &Obj) -> bool {
@@ -920,36 +972,14 @@ impl Backend for LinuxBackend {
     }
 
     async fn element_center(&self, id: &Obj) -> R<(i32, i32)> {
-        const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
         let a11y = &self.a11y;
         let no_area = || "element has no on-screen area".to_string();
         match &self.comp {
-            Compositor::Kde(kwin) => {
-                // AT-SPI extents are relative to the toplevel surface on
-                // Wayland, so add the active window's client origin.
-                let (frame_active, ext, origin) = tokio::join!(
-                    async {
-                        match a11y.frame_of(id).await {
-                            Some(f) => a11y.has_state(&f, atspi::ACTIVE).await,
-                            None => false,
-                        }
-                    },
-                    a11y.extents(id, atspi::COORD_WINDOW),
-                    kwin.active_window_origin()
-                );
-                if !frame_active {
-                    return Err(NOT_ACTIVE.into());
-                }
-                let (x, y, w, h) = ext?;
-                if w <= 0 || h <= 0 {
-                    return Err(no_area());
-                }
-                let (gx, gy) = origin?;
-                Ok((
-                    (gx + x as f64 + w as f64 / 2.0) as i32,
-                    (gy + y as f64 + h as f64 / 2.0) as i32,
-                ))
-            }
+            Compositor::Kde(_) => self
+                .element_centers(std::slice::from_ref(id))
+                .await
+                .pop()
+                .unwrap_or_else(|| Err(no_area())),
             Compositor::Hyprland(h) => {
                 let (aw, frame) = tokio::join!(h.active_window(), a11y.frame_of(id));
                 let (Some(aw), Some(frame)) = (aw?, frame) else {
@@ -982,6 +1012,40 @@ impl Backend for LinuxBackend {
                 ))
             }
         }
+    }
+
+    async fn element_centers(&self, ids: &[Obj]) -> Vec<R<(i32, i32)>> {
+        let Compositor::Kde(kwin) = &self.comp else {
+            return futures_util::future::join_all(ids.iter().map(|id| self.element_center(id)))
+                .await;
+        };
+        let a11y = &self.a11y;
+        // AT-SPI extents are relative to the toplevel surface on Wayland,
+        // so add the active window's client origin: one KWin script for
+        // all the elements.
+        let (origin, parts) = tokio::join!(
+            kwin.active_window_origin(),
+            futures_util::future::join_all(ids.iter().map(|id| async move {
+                tokio::join!(self.frame_active(id), a11y.extents(id, atspi::COORD_WINDOW))
+            }))
+        );
+        parts
+            .into_iter()
+            .map(|(frame_active, ext)| {
+                if !frame_active {
+                    return Err(NOT_ACTIVE.into());
+                }
+                let (x, y, w, h) = ext?;
+                if w <= 0 || h <= 0 {
+                    return Err("element has no on-screen area".into());
+                }
+                let (gx, gy) = origin.clone()?;
+                Ok((
+                    (gx + x as f64 + w as f64 / 2.0) as i32,
+                    (gy + y as f64 + h as f64 / 2.0) as i32,
+                ))
+            })
+            .collect()
     }
 
     fn check_combo(&self, combo: &str) -> R<()> {

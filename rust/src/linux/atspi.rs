@@ -642,14 +642,18 @@ impl A11y {
         reply.body().deserialize().ok()
     }
 
-    /// Nearest frame/window/dialog ancestor (or self).
+    /// Nearest frame/window/dialog ancestor (or self). Role and parent of
+    /// each level are asked together: one round trip per level instead of
+    /// two (Firefox elements sit 15-25 levels deep); the parent read at the
+    /// frame itself is the only extra call.
     pub async fn frame_of(&self, o: &Obj) -> Option<Obj> {
         let mut cur = Some(o.clone());
         while let Some(c) = cur {
-            if matches!(self.role(&c).await.as_str(), "frame" | "window" | "dialog") {
+            let (role, parent) = tokio::join!(self.role(&c), self.parent(&c));
+            if matches!(role.as_str(), "frame" | "window" | "dialog") {
                 return Some(c);
             }
-            cur = self.parent(&c).await;
+            cur = parent;
         }
         None
     }
