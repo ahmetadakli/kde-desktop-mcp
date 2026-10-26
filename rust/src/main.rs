@@ -30,13 +30,27 @@ use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use backend::{Backend, Cache, Clip, FileDialog, Focused, Info, R, Shot, WindowChange, WindowGeo};
+use backend::{
+    Backend, Cache, Clip, Fetch, FileDialog, Focused, Info, R, Shot, WindowChange, WindowGeo,
+};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
 const TREE_TEXT_LIMIT: usize = 80;
 /// Nodes fetched ahead when rendering reaches an unfetched part of the tree.
 const PREFETCH_MORE: usize = 500;
+
+/// How searches (find, locate, the active document) fetch: showing nodes,
+/// without action names, which only the nodes they return need.
+fn search_fetch(text_limit: usize, limit: usize) -> Fetch {
+    Fetch {
+        only_showing: true,
+        text_limit,
+        limit,
+        actions: false,
+        stop_roles: &[],
+    }
+}
 
 struct Refs<Id> {
     map: HashMap<u64, Ref<Id>>,
@@ -561,30 +575,34 @@ impl<B: Backend> Server<B> {
             .ok_or_else(|| format!("app '{name}' not found in the accessibility tree"))
     }
 
-    /// Fetch the visible part of `app` and pick the element `query` names.
-    async fn locate(&self, app: &str, query: &str, role: &str) -> R<Option<(B::Id, Cache<B::Id>)>> {
+    /// Fetch the visible part of `app` and pick the element `query` names;
+    /// window and tab titles only with `titles` (see render::TITLE_ROLES).
+    /// The cache holds no action names: `fill_actions` before describing.
+    async fn locate(
+        &self,
+        app: &str,
+        query: &str,
+        role: &str,
+        titles: bool,
+    ) -> R<Option<(B::Id, Cache<B::Id>)>> {
         let windows = self.app_windows(app).await?;
         let mut cache = Cache::new();
         self.b
-            .prefetch(
+            .prefetch_with(
                 &mut cache,
                 windows.clone(),
-                true,
-                render::FIND_TEXT_LIMIT,
-                render::FIND_MAX_SEEN,
+                &search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
             )
             .await;
         loop {
-            match render::locate(&cache, &windows, query, role) {
+            match render::locate(&cache, &windows, query, role, titles) {
                 Ok(found) => return Ok(found.map(|id| (id, cache))),
                 Err(missing) => {
                     self.b
-                        .prefetch(
+                        .prefetch_with(
                             &mut cache,
                             missing,
-                            true,
-                            render::FIND_TEXT_LIMIT,
-                            PREFETCH_MORE,
+                            &search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
                         )
                         .await;
                 }
@@ -608,7 +626,7 @@ impl<B: Backend> Server<B> {
         };
         self.b.enable().await;
         let role = arg_s(a, "role", "");
-        let (id, cache) = self.locate(app, query, &role).await?.ok_or_else(|| {
+        let (id, mut cache) = self.locate(app, query, &role, true).await?.ok_or_else(|| {
             let role = if role.is_empty() {
                 String::new()
             } else {
@@ -616,6 +634,9 @@ impl<B: Backend> Server<B> {
             };
             format!("no visible element in '{app}' matches '{query}'{role}")
         })?;
+        self.b
+            .fill_actions(&mut cache, std::slice::from_ref(&id))
+            .await;
         let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
         let found = Some(render::describe(&cache[&id], rid));
         Ok(Target { id, found })
@@ -945,14 +966,14 @@ impl<B: Backend> Server<B> {
         windows: Vec<B::Id>,
         cache: &mut Cache<B::Id>,
     ) -> R<B::Id> {
+        // The window around the document only: the tree fetches the
+        // document's content itself, with what it needs.
+        let fetch = |limit| Fetch {
+            stop_roles: &render::DOCUMENT_ROLES,
+            ..search_fetch(TREE_TEXT_LIMIT, limit)
+        };
         self.b
-            .prefetch(
-                cache,
-                windows.clone(),
-                true,
-                TREE_TEXT_LIMIT,
-                render::FIND_MAX_SEEN,
-            )
+            .prefetch_with(cache, windows.clone(), &fetch(render::FIND_MAX_SEEN))
             .await;
         let window = windows
             .iter()
@@ -966,7 +987,10 @@ impl<B: Backend> Server<B> {
                 std::slice::from_ref(&window),
                 &render::DOCUMENT_ROLES,
             ) {
-                Ok(Some(doc)) => return Ok(doc),
+                Ok(Some(doc)) => {
+                    self.b.fill_actions(cache, std::slice::from_ref(&doc)).await;
+                    return Ok(doc);
+                }
                 Ok(None) => {
                     return Err(format!(
                         "no document in the active window of '{app}'; call tree without `document`"
@@ -974,7 +998,7 @@ impl<B: Backend> Server<B> {
                 }
                 Err(missing) => {
                     self.b
-                        .prefetch(cache, missing, true, TREE_TEXT_LIMIT, PREFETCH_MORE)
+                        .prefetch_with(cache, missing, &fetch(PREFETCH_MORE))
                         .await;
                 }
             }
@@ -990,12 +1014,10 @@ impl<B: Backend> Server<B> {
         let windows = self.app_windows(&app).await?;
         let mut cache = Cache::new();
         self.b
-            .prefetch(
+            .prefetch_with(
                 &mut cache,
                 windows.clone(),
-                true,
-                render::FIND_TEXT_LIMIT,
-                render::FIND_MAX_SEEN,
+                &search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
             )
             .await;
         let hits = loop {
@@ -1003,12 +1025,10 @@ impl<B: Backend> Server<B> {
                 Ok(h) => break h,
                 Err(missing) => {
                     self.b
-                        .prefetch(
+                        .prefetch_with(
                             &mut cache,
                             missing,
-                            true,
-                            render::FIND_TEXT_LIMIT,
-                            PREFETCH_MORE,
+                            &search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
                         )
                         .await;
                 }
@@ -1017,6 +1037,7 @@ impl<B: Backend> Server<B> {
         if hits.is_empty() {
             return Ok("no matches".into());
         }
+        self.b.fill_actions(&mut cache, &hits).await;
         let lines = hits
             .into_iter()
             .map(|id| Line::Node { depth: 0, id })
@@ -1142,10 +1163,14 @@ impl<B: Backend> Server<B> {
         let start = Instant::now();
         loop {
             // An app that is not running (yet) counts as "no match".
-            let found = self.locate(&app, &query, &role).await.ok().flatten();
+            // Titles hold a page's name before the page is there.
+            let found = self.locate(&app, &query, &role, false).await.ok().flatten();
             let ms = start.elapsed().as_millis();
             match found {
-                Some((id, cache)) if !gone => {
+                Some((id, mut cache)) if !gone => {
+                    self.b
+                        .fill_actions(&mut cache, std::slice::from_ref(&id))
+                        .await;
                     let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
                     return Ok(format!(
                         "found after {ms} ms{note}: {}",

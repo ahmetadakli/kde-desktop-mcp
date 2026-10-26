@@ -17,6 +17,7 @@ use super::roles;
 pub use crate::backend::R;
 
 pub type Info = crate::backend::Info<Obj>;
+pub use crate::backend::Fetch;
 
 const ACC: &str = "org.a11y.atspi.Accessible";
 const PROPS: &str = "org.freedesktop.DBus.Properties";
@@ -30,6 +31,11 @@ const CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const ACTION_WAIT: std::time::Duration = std::time::Duration::from_millis(400);
 /// Requests kept in flight at once; well under the bus' pending-reply limit.
 const IN_FLIGHT: usize = 512;
+/// How long an app's overlay viewport (its largest window) is reused: one
+/// tool call fetches in several rounds, and wait_for polls; a window is
+/// rarely resized in between.
+const VIEW_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
 
 // AtspiStateType bit positions.
 pub const ACTIVE: u32 = 1;
@@ -99,6 +105,9 @@ pub fn state_labels(states: Option<u64>) -> Vec<&'static str> {
     out
 }
 
+/// Width and height of an app's largest window; None when unknown.
+type Viewport = Option<(i32, i32)>;
+
 pub struct A11y {
     pub conn: Connection,
     /// Last element seen gaining or holding focus: from focus events, and
@@ -106,6 +115,8 @@ pub struct A11y {
     focus_hint: Mutex<Option<Obj>>,
     /// Bus name of the app `active_app` last found in front, and when.
     active_bus: Mutex<Option<(Arc<str>, Instant)>>,
+    /// Overlay viewport per application bus, and when it was measured.
+    views: tokio::sync::Mutex<HashMap<Arc<str>, (Instant, Viewport)>>,
 }
 
 impl A11y {
@@ -131,6 +142,7 @@ impl A11y {
             conn,
             focus_hint: Mutex::new(None),
             active_bus: Mutex::new(None),
+            views: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -447,13 +459,13 @@ impl A11y {
 
     /// All attributes of one node, requested together.
     pub async fn info(&self, o: &Obj, text_limit: usize) -> Info {
-        self.info_flagged(o, text_limit).await.0
+        self.info_flagged(o, text_limit, true).await.0
     }
 
     /// `info`, and whether the node is visible but not showing: an overlay
     /// container that toolkits (Firefox's popover layer) never mark showing,
-    /// or content scrolled out of view.
-    async fn info_flagged(&self, o: &Obj, text_limit: usize) -> (Info, bool) {
+    /// or content scrolled out of view. Action names only `with_actions`.
+    async fn info_flagged(&self, o: &Obj, text_limit: usize, with_actions: bool) -> (Info, bool) {
         let (role, name, states, ifaces, children) = tokio::join!(
             self.role(o),
             self.name(o),
@@ -467,7 +479,7 @@ impl A11y {
         let has_iface = |i: &str| ifaces.iter().any(|x| x == i);
         let (actions, text) = tokio::join!(
             async {
-                if has_iface("org.a11y.atspi.Action") {
+                if with_actions && has_iface("org.a11y.atspi.Action") {
                     self.actions(o).await
                 } else {
                     Vec::new()
@@ -506,21 +518,31 @@ impl A11y {
         (info, hidden_visible)
     }
 
-    /// Size of the largest window among the frames of `roots`, in window
-    /// coordinates; None when no frame answers.
-    async fn viewport(&self, roots: &[Obj]) -> Option<(i32, i32)> {
-        let mut best: Option<(i32, i32)> = None;
-        for r in roots.iter().take(8) {
-            let Some(f) = self.frame_of(r).await else {
-                continue;
-            };
-            if let Ok((_, _, w, h)) = self.extents(&f, COORD_WINDOW).await
-                && w > 0
-                && h > 0
-            {
-                best = Some(best.map_or((w, h), |(bw, bh)| (bw.max(w), bh.max(h))));
-            }
+    /// Size of the largest window of the app on `bus`, in window
+    /// coordinates; None when no window answers. Measured once per VIEW_TTL.
+    async fn viewport(&self, bus: &Arc<str>) -> Viewport {
+        // Held while measuring, so concurrent nodes measure once.
+        let mut views = self.views.lock().await;
+        if let Some((at, view)) = views.get(bus)
+            && at.elapsed() < VIEW_TTL
+        {
+            return *view;
         }
+        let app = Obj::new(bus, OwnedObjectPath::try_from(APP_ROOT).unwrap());
+        let windows = self.children(&app).await;
+        let sizes = futures_util::future::join_all(windows.iter().take(8).map(|w| async move {
+            let (role, extents) = tokio::join!(self.role(w), self.extents(w, COORD_WINDOW));
+            match (role.as_str(), extents) {
+                ("frame" | "window" | "dialog", Ok((_, _, w, h))) if w > 0 && h > 0 => Some((w, h)),
+                _ => None,
+            }
+        }))
+        .await;
+        let best = sizes
+            .into_iter()
+            .flatten()
+            .reduce(|(bw, bh), (w, h)| (bw.max(w), bh.max(h)));
+        views.insert(bus.clone(), (Instant::now(), best));
         best
     }
 
@@ -535,33 +557,40 @@ impl A11y {
         text_limit: usize,
         limit: usize,
     ) {
+        let f = Fetch {
+            only_showing,
+            text_limit,
+            limit,
+            actions: true,
+            stop_roles: &[],
+        };
+        self.prefetch_with(cache, roots, &f).await
+    }
+
+    /// `prefetch` reading what `f` asks for.
+    pub async fn prefetch_with(&self, cache: &mut HashMap<Obj, Info>, roots: Vec<Obj>, f: &Fetch) {
         let mut level: Vec<Obj> = roots
             .into_iter()
             .filter(|o| !cache.contains_key(o))
             .collect();
         let mut fetched = 0;
-        let view = tokio::sync::OnceCell::new();
-        let first: Vec<Obj> = level.clone();
-        let view = LazyView {
-            cell: view,
-            a11y: self,
-            roots: first,
-        };
-        while !level.is_empty() && fetched < limit {
+        while !level.is_empty() && fetched < f.limit {
             level.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
             level.dedup();
-            let view = &view;
             let infos: Vec<(Obj, Info)> = stream::iter(level)
                 .map(|o| async move {
-                    let (mut info, hidden_visible) = self.info_flagged(&o, text_limit).await;
+                    let (mut info, hidden_visible) =
+                        self.info_flagged(&o, f.text_limit, f.actions).await;
                     // A visible node that is not showing yet lies inside the
                     // window holds an overlay (a web page's popup menu): treat
-                    // it as showing so its showing children are reached.
-                    if hidden_visible
-                        && let Some((vw, vh)) = view.get().await
+                    // it as showing so its showing children are reached. Only
+                    // a walk over showing nodes needs to know.
+                    if f.only_showing
+                        && hidden_visible
+                        && let Some((vw, vh)) = self.viewport(&o.bus).await
                         && let Ok((x, y, w, h)) = self.extents(&o, COORD_WINDOW).await
                     {
-                        info.showing = overlaps((x, y, w, h), (*vw, *vh));
+                        info.showing = overlaps((x, y, w, h), (vw, vh));
                     }
                     (o, info)
                 })
@@ -571,7 +600,8 @@ impl A11y {
             fetched += infos.len();
             let mut next = Vec::new();
             for (o, info) in infos {
-                if !only_showing || info.showing {
+                if (!f.only_showing || info.showing) && !f.stop_roles.contains(&info.role.as_str())
+                {
                     next.extend(
                         info.children
                             .iter()
@@ -582,6 +612,20 @@ impl A11y {
                 cache.insert(o, info);
             }
             level = next;
+        }
+    }
+
+    /// Read the action names of `ids` (fetched without them) into `cache`.
+    pub async fn fill_actions(&self, cache: &mut HashMap<Obj, Info>, ids: &[Obj]) {
+        let names: Vec<Vec<String>> = stream::iter(ids)
+            .map(|o| self.actions(o))
+            .buffered(IN_FLIGHT)
+            .collect()
+            .await;
+        for (o, names) in ids.iter().zip(names) {
+            if let Some(info) = cache.get_mut(o) {
+                info.actions = names;
+            }
         }
     }
 
@@ -672,21 +716,6 @@ const OVERLAY_EXCLUDED_ROLES: [&str; 9] = [
     "dialog",
     "application",
 ];
-
-/// The viewport size, looked up only when a node needs it.
-struct LazyView<'a> {
-    cell: tokio::sync::OnceCell<Option<(i32, i32)>>,
-    a11y: &'a A11y,
-    roots: Vec<Obj>,
-}
-
-impl LazyView<'_> {
-    async fn get(&self) -> &Option<(i32, i32)> {
-        self.cell
-            .get_or_init(|| self.a11y.viewport(&self.roots))
-            .await
-    }
-}
 
 /// Whether a box in window coordinates has area inside a `w`×`h` window.
 fn overlaps((x, y, bw, bh): (i32, i32, i32, i32), (w, h): (i32, i32)) -> bool {

@@ -24,8 +24,8 @@ use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
-    AppEntry, Backend, Cache, Check, Clip, FileDialog, Focused, Info, Launched, NO_FILE_DIALOG,
-    NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
+    NO_FILE_DIALOG, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -851,6 +851,14 @@ impl Backend for LinuxBackend {
         self.a11y
             .prefetch(cache, roots, only_showing, text_limit, limit)
             .await
+    }
+
+    async fn prefetch_with(&self, cache: &mut Cache<Obj>, roots: Vec<Obj>, f: &Fetch) {
+        self.a11y.prefetch_with(cache, roots, f).await
+    }
+
+    async fn fill_actions(&self, cache: &mut Cache<Obj>, ids: &[Obj]) {
+        self.a11y.fill_actions(cache, ids).await
     }
 
     async fn actions(&self, id: &Obj) -> Vec<String> {

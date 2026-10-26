@@ -41,6 +41,24 @@ pub struct Focused<Id> {
     pub app: String,
 }
 
+/// What `Backend::prefetch_with` reads, and how far.
+// The Windows backend reads everything and looks at the first fields only.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub struct Fetch {
+    /// Skip the children of hidden nodes.
+    pub only_showing: bool,
+    pub text_limit: usize,
+    /// Stop after roughly this many new nodes.
+    pub limit: usize,
+    /// Read action names. Searches match on role, name and text only and
+    /// leave them out (on AT-SPI they cost a call or more per node); they
+    /// call `fill_actions` for the nodes they return.
+    pub actions: bool,
+    /// Do not descend below nodes of these roles.
+    pub stop_roles: &'static [&'static str],
+}
+
 /// Window management the desktop does not offer (only KDE does so far).
 pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma";
 
@@ -213,6 +231,17 @@ pub trait Backend {
         text_limit: usize,
         limit: usize,
     );
+
+    /// `prefetch` with the reads of `Fetch`. Backends that cannot skip
+    /// anything read everything; `actions` and `stop_roles` only save work.
+    async fn prefetch_with(&self, cache: &mut Cache<Self::Id>, roots: Vec<Self::Id>, f: &Fetch) {
+        self.prefetch(cache, roots, f.only_showing, f.text_limit, f.limit)
+            .await
+    }
+    /// Read the action names of `ids` into `cache`, for nodes fetched with
+    /// `Fetch::actions` false. A backend whose `prefetch_with` always reads
+    /// actions keeps this default, which does nothing.
+    async fn fill_actions(&self, _cache: &mut Cache<Self::Id>, _ids: &[Self::Id]) {}
 
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
