@@ -29,6 +29,36 @@ pub struct Info<Id> {
 
 pub type Cache<Id> = HashMap<Id, Info<Id>>;
 
+/// The element holding keyboard focus, as `focus_note` reports it.
+#[derive(Clone, Debug)]
+pub struct Focused<Id> {
+    pub id: Id,
+    /// Role, name, states and actions only: no children or text.
+    pub info: Info<Id>,
+    /// Name of the app the element belongs to, read from that app itself
+    /// (not from the caller's earlier active-window check), so the caller
+    /// can check it against the allowlist and tag the id with it.
+    pub app: String,
+}
+
+/// What `Backend::prefetch_with` reads, and how far.
+// The Windows backend reads everything and looks at the first fields only.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Clone, Copy, Debug)]
+pub struct Fetch {
+    /// Skip the children of hidden nodes.
+    pub only_showing: bool,
+    pub text_limit: usize,
+    /// Stop after roughly this many new nodes.
+    pub limit: usize,
+    /// Read action names. Searches match on role, name and text only and
+    /// leave them out (on AT-SPI they cost a call or more per node); they
+    /// call `fill_actions` for the nodes they return.
+    pub actions: bool,
+    /// Do not descend below nodes of these roles.
+    pub stop_roles: &'static [&'static str],
+}
+
 /// Window management the desktop does not offer (only KDE does so far).
 pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma";
 
@@ -118,10 +148,14 @@ pub struct Check {
     pub detail: String,
 }
 
-/// A screenshot file and the screen area it shows, in the coordinates
-/// `pointer` takes: (x, y, width, height). None when unknown.
+/// A screenshot and the screen area it shows, in the coordinates `pointer`
+/// takes: (x, y, width, height). None when unknown.
 pub struct Shot {
+    /// A private file that ends up holding the image sent back.
     pub path: String,
+    /// The captured pixels, converted off the event loop; None when an
+    /// external tool already wrote a PNG to `path`.
+    pub pixels: Option<crate::shot::Convert>,
     pub area: Option<(f64, f64, f64, f64)>,
 }
 
@@ -198,6 +232,17 @@ pub trait Backend {
         limit: usize,
     );
 
+    /// `prefetch` with the reads of `Fetch`. Backends that cannot skip
+    /// anything read everything; `actions` and `stop_roles` only save work.
+    async fn prefetch_with(&self, cache: &mut Cache<Self::Id>, roots: Vec<Self::Id>, f: &Fetch) {
+        self.prefetch(cache, roots, f.only_showing, f.text_limit, f.limit)
+            .await
+    }
+    /// Read the action names of `ids` into `cache`, for nodes fetched with
+    /// `Fetch::actions` false. A backend whose `prefetch_with` always reads
+    /// actions keeps this default, which does nothing.
+    async fn fill_actions(&self, _cache: &mut Cache<Self::Id>, _ids: &[Self::Id]) {}
+
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
     /// Complete text content (falls back to the name).
@@ -206,7 +251,8 @@ pub trait Backend {
     async fn set_text(&self, id: &Self::Id, text: &str) -> R<bool>;
     async fn is_focused(&self, id: &Self::Id) -> bool;
     /// The element holding keyboard focus now, when the backend tracks it.
-    async fn focused(&self) -> Option<Self::Id> {
+    /// Only an element whose app has the active window; None otherwise.
+    async fn focused(&self) -> Option<Focused<Self::Id>> {
         None
     }
     /// Focus without synthesising pointer input. Ok(Some(method)) when it
@@ -214,6 +260,11 @@ pub trait Backend {
     async fn try_focus(&self, id: &Self::Id) -> R<Option<String>>;
     /// Centre of the element in the coordinate space `pointer` accepts.
     async fn element_center(&self, id: &Self::Id) -> R<(i32, i32)>;
+    /// `element_center` of several elements at once (a drag's two ends), so
+    /// what they share (the active window's origin) is looked up once.
+    async fn element_centers(&self, ids: &[Self::Id]) -> Vec<R<(i32, i32)>> {
+        futures_util::future::join_all(ids.iter().map(|id| self.element_center(id))).await
+    }
 
     /// Check a chord such as "ctrl+s" without pressing it.
     fn check_combo(&self, combo: &str) -> R<()>;
@@ -275,6 +326,6 @@ pub trait Backend {
     async fn doctor(&self) -> Vec<Check> {
         Vec::new()
     }
-    /// Capture the active window to a private file and return its path.
+    /// Capture the active window; `path` is a new private file.
     async fn screenshot(&self) -> Option<Shot>;
 }

@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use evdev::uinput::VirtualDevice;
 use evdev::{
@@ -20,12 +20,15 @@ const DEVICE_SETTLE: Duration = Duration::from_millis(300);
 // Plasma 6.8 with Kate: 0 ms for each still delivered 90 rapid keys and 120
 // clicks (placed by line) correctly; the values below keep a small margin.
 const KEY_HOLD: Duration = Duration::from_millis(2);
+/// Between a chord's release and the next chord's press; waited before the
+/// next press, so a call's last key returns at once.
 const KEY_GAP: Duration = Duration::from_millis(1);
 /// After an absolute move on the pointer device, before its button events.
 const POINTER_SETTLE: Duration = Duration::from_millis(2);
 /// After the cursor was moved outside uinput (Hyprland IPC), which is not
 /// ordered with the button events.
 const EXTERNAL_MOVE_SETTLE: Duration = Duration::from_millis(25);
+/// After a button press, before its release or a drag's first move.
 const BUTTON_HOLD: Duration = Duration::from_millis(3);
 /// Between the clicks of a double or triple click.
 const BUTTON_GAP: Duration = Duration::from_millis(30);
@@ -86,6 +89,8 @@ fn ev(kind: EventType, code: u16, value: i32) -> InputEvent {
 pub struct Input {
     kbd: Mutex<Option<VirtualDevice>>,
     ptr: Mutex<Option<VirtualDevice>>,
+    /// When the last chord was released, for KEY_GAP.
+    key_up: Mutex<Option<Instant>>,
     /// Absolute X/Y axes on the pointer device. Off where the compositor
     /// places the cursor itself (Hyprland) and uinput only supplies buttons.
     absolute: bool,
@@ -100,6 +105,7 @@ impl Input {
         Input {
             kbd: Mutex::new(None),
             ptr: Mutex::new(None),
+            key_up: Mutex::new(None),
             absolute,
         }
     }
@@ -185,11 +191,15 @@ impl Input {
             .rev()
             .map(|c| ev(EventType::KEY, c.0, 0))
             .collect();
+        let since_up = self.key_up.lock().unwrap().map(|t| t.elapsed());
+        if let Some(gap) = since_up.and_then(|e| KEY_GAP.checked_sub(e)) {
+            tokio::time::sleep(gap).await;
+        }
         self.with_kbd(|d| d.emit(&down).map_err(io))?;
         tokio::time::sleep(KEY_HOLD).await;
-        self.with_kbd(|d| d.emit(&up).map_err(io))?;
-        tokio::time::sleep(KEY_GAP).await;
-        Ok(())
+        let released = self.with_kbd(|d| d.emit(&up).map_err(io));
+        *self.key_up.lock().unwrap() = Some(Instant::now());
+        released
     }
 
     /// Move to absolute device coordinates (0..=ABS_MAX) and let the
@@ -211,14 +221,18 @@ impl Input {
         tokio::time::sleep(EXTERNAL_MOVE_SETTLE).await;
     }
 
-    /// Press or release one button at the current cursor position.
+    /// Press or release one button at the current cursor position. Only a
+    /// press waits (the hold before what follows); events of the device
+    /// stay in order, so nothing needs to wait after a release.
     pub async fn button(&self, button: &str, down: bool) -> R<()> {
         let btn = button_code(button)?;
         self.with_ptr(|d| {
             d.emit(&[ev(EventType::KEY, btn.0, i32::from(down))])
                 .map_err(io)
         })?;
-        tokio::time::sleep(BUTTON_HOLD).await;
+        if down {
+            tokio::time::sleep(BUTTON_HOLD).await;
+        }
         Ok(())
     }
 

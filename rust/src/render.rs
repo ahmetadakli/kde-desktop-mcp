@@ -22,17 +22,28 @@ pub enum Line<Id> {
     Raw(String),
 }
 
+/// The fetched nodes among `ids`, in order; the others go to `missing`.
 fn get<'a, Id: Clone + Eq + Hash>(
     cache: &'a Cache<Id>,
-    ids: &[Id],
-) -> Result<Vec<&'a Info<Id>>, Vec<Id>> {
-    let missing: Vec<Id> = ids
-        .iter()
-        .filter(|o| !cache.contains_key(o))
-        .cloned()
-        .collect();
+    ids: &'a [Id],
+    missing: &mut Vec<Id>,
+) -> Vec<(&'a Id, &'a Info<Id>)> {
+    ids.iter()
+        .filter_map(|o| match cache.get(o) {
+            Some(info) => Some((o, info)),
+            None => {
+                missing.push(o.clone());
+                None
+            }
+        })
+        .collect()
+}
+
+/// `Ok(value)` once nothing was missing, else every missing node at once,
+/// so the caller fetches them in one round.
+fn done<T, Id>(value: T, missing: Vec<Id>) -> Result<T, Vec<Id>> {
     if missing.is_empty() {
-        Ok(ids.iter().map(|o| &cache[o]).collect())
+        Ok(value)
     } else {
         Err(missing)
     }
@@ -220,7 +231,8 @@ pub struct WalkOpts {
 }
 
 /// Python `walk`: unnamed, actionless nodes of boring roles are skipped and
-/// their children lifted to the same depth.
+/// their children lifted to the same depth. On Err, every node the walk
+/// could not reach yet, so one fetch brings them all.
 pub fn walk<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     children: &[Id],
@@ -228,17 +240,31 @@ pub fn walk<Id: Clone + Eq + Hash>(
     opts: &WalkOpts,
     lines: &mut Vec<Line<Id>>,
 ) -> Result<(), Vec<Id>> {
+    let mut missing = Vec::new();
+    walk_into(cache, children, depth, opts, lines, &mut missing);
+    done((), missing)
+}
+
+/// `walk`, going on past missing nodes (the lines are then incomplete and
+/// get thrown away) to collect all of them.
+fn walk_into<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    children: &[Id],
+    depth: usize,
+    opts: &WalkOpts,
+    lines: &mut Vec<Line<Id>>,
+    missing: &mut Vec<Id>,
+) {
     if lines.len() >= opts.budget || depth > opts.max_depth {
-        return Ok(());
+        return;
     }
-    let infos = get(cache, children)?;
-    for (c, info) in children.iter().zip(infos) {
+    for (c, info) in get(cache, children, missing) {
         if lines.len() >= opts.budget {
             // Once, not once per open level.
             if !matches!(lines.last(), Some(Line::Raw(s)) if s == TRUNCATED) {
                 lines.push(Line::Raw(TRUNCATED.into()));
             }
-            return Ok(());
+            return;
         }
         if opts.only_showing && !info.showing {
             continue;
@@ -251,16 +277,55 @@ pub fn walk<Id: Clone + Eq + Hash>(
                 depth,
                 id: c.clone(),
             });
-            walk(cache, &info.children, depth + 1, opts, lines)?;
+            walk_into(cache, &info.children, depth + 1, opts, lines, missing);
         } else {
-            walk(cache, &info.children, depth, opts, lines)?;
+            walk_into(cache, &info.children, depth, opts, lines, missing);
         }
     }
-    Ok(())
+}
+
+/// Roles whose name is a window or tab title. A title names the page or
+/// document as soon as it starts loading, so it would satisfy a query meant
+/// for the content (`wait_for "Inbox"` returning on the tab title before
+/// the page is there). Elements of these roles match a query only when no
+/// other element does, or when `role` names their role.
+pub const TITLE_ROLES: [&str; 3] = ["frame", "window", "page tab"];
+
+/// How an element matches a query.
+#[derive(Clone, Copy, PartialEq)]
+enum Hit {
+    /// The name equals the query (case-insensitive, trimmed).
+    Exact,
+    /// Name or text contains the query; with `role` given, the role too.
+    Partial,
+}
+
+/// Whether `info` matches lower-cased query `q` and the exact `role`
+/// filter. The role name is searched only when `role` is given: otherwise
+/// a short query ("a") would match every frame, panel and alert.
+fn matches<Id>(info: &Info<Id>, q: &str, role: &str) -> Option<Hit> {
+    if !role.is_empty() && info.role != role {
+        return None;
+    }
+    if info.name.trim().to_lowercase() == q {
+        return Some(Hit::Exact);
+    }
+    let mut hay = format!("{} {}", info.name, text_preview(info, FIND_TEXT_LIMIT));
+    if !role.is_empty() {
+        hay.push(' ');
+        hay.push_str(&info.role);
+    }
+    hay.to_lowercase().contains(q).then_some(Hit::Partial)
+}
+
+/// A window or tab title, which ranks below every other element.
+fn is_title<Id>(info: &Info<Id>, role: &str) -> bool {
+    role.is_empty() && TITLE_ROLES.contains(&info.role.as_str())
 }
 
 /// Python `find`: depth-first, hidden subtrees skipped, case-insensitive
-/// substring match over name, text and role.
+/// substring match over name and text (and role, when `role` is given).
+/// Window and tab titles come after all other hits.
 pub fn find<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     roots: &[Id],
@@ -270,6 +335,8 @@ pub fn find<Id: Clone + Eq + Hash>(
 ) -> Result<Vec<Id>, Vec<Id>> {
     let q = query.to_lowercase();
     let mut hits = Vec::new();
+    let mut titles = Vec::new();
+    let mut missing = Vec::new();
     // None is the synthetic root whose children are `roots`.
     let mut stack: Vec<Option<&Id>> = vec![None];
     let mut seen = 0;
@@ -282,52 +349,62 @@ pub fn find<Id: Clone + Eq + Hash>(
             None => roots,
             Some(o) => &cache[o].children,
         };
-        let infos = get(cache, kids)?;
-        for (c, info) in kids.iter().zip(infos).rev() {
+        for (c, info) in get(cache, kids, &mut missing).into_iter().rev() {
             if !info.showing {
                 continue;
             }
             stack.push(Some(c));
-            if !role.is_empty() && info.role != role {
-                continue;
-            }
-            let hay = format!(
-                "{} {} {}",
-                info.name,
-                text_preview(info, FIND_TEXT_LIMIT),
-                info.role
-            )
-            .to_lowercase();
-            if hay.contains(&q) {
-                hits.push(c.clone());
+            if matches(info, &q, role).is_some() {
+                if is_title(info, role) {
+                    titles.push(c.clone());
+                } else {
+                    hits.push(c.clone());
+                }
             }
         }
     }
-    Ok(hits)
+    let room = max_results.saturating_sub(hits.len());
+    hits.extend(titles.into_iter().take(room));
+    done(hits, missing)
+}
+
+/// The visible children of a node (or the visible `roots`), reversed so
+/// that popping a stack visits them in document order.
+fn push_showing<'a, Id: Clone + Eq + Hash>(
+    cache: &'a Cache<Id>,
+    ids: &'a [Id],
+    stack: &mut Vec<&'a Id>,
+    missing: &mut Vec<Id>,
+) {
+    stack.extend(
+        get(cache, ids, missing)
+            .into_iter()
+            .filter(|(_, i)| i.showing)
+            .map(|(c, _)| c)
+            .rev(),
+    );
 }
 
 /// The element a query names: depth-first in document order over visible
 /// elements, the first whose name equals `query` (case-insensitive) wins,
-/// else the first whose name, text or role contains it. Ok(None) when
-/// nothing matches.
+/// else the first whose name or text contains it (or role, when `role` is
+/// given). Window and tab titles (TITLE_ROLES) count only when nothing else
+/// matches, and with `titles` false not at all. Ok(None) when nothing
+/// matches.
 pub fn locate<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     roots: &[Id],
     query: &str,
     role: &str,
+    titles: bool,
 ) -> Result<Option<Id>, Vec<Id>> {
     let q = query.trim().to_lowercase();
     let mut first_partial = None;
+    let mut title_exact = None;
+    let mut title_partial = None;
+    let mut missing = Vec::new();
     let mut stack: Vec<&Id> = Vec::new();
-    let infos = get(cache, roots)?;
-    stack.extend(
-        roots
-            .iter()
-            .zip(infos)
-            .filter(|(_, i)| i.showing)
-            .map(|(r, _)| r)
-            .rev(),
-    );
+    push_showing(cache, roots, &mut stack, &mut missing);
     let mut seen = 0;
     while let Some(id) = stack.pop() {
         seen += 1;
@@ -335,34 +412,23 @@ pub fn locate<Id: Clone + Eq + Hash>(
             break;
         }
         let info = &cache[id];
-        if role.is_empty() || info.role == role {
-            if info.name.trim().to_lowercase() == q {
-                return Ok(Some(id.clone()));
+        match (matches(info, &q, role), is_title(info, role)) {
+            (Some(Hit::Exact), false) => return done(Some(id.clone()), missing),
+            (Some(Hit::Exact), true) if titles => {
+                title_exact.get_or_insert(id);
             }
-            if first_partial.is_none() {
-                let hay = format!(
-                    "{} {} {}",
-                    info.name,
-                    text_preview(info, FIND_TEXT_LIMIT),
-                    info.role
-                )
-                .to_lowercase();
-                if hay.contains(&q) {
-                    first_partial = Some(id.clone());
-                }
+            (Some(Hit::Partial), false) => {
+                first_partial.get_or_insert(id);
             }
+            (Some(Hit::Partial), true) if titles => {
+                title_partial.get_or_insert(id);
+            }
+            _ => {}
         }
-        let kids = get(cache, &info.children)?;
-        stack.extend(
-            info.children
-                .iter()
-                .zip(kids)
-                .filter(|(_, k)| k.showing)
-                .map(|(c, _)| c)
-                .rev(),
-        );
+        push_showing(cache, &info.children, &mut stack, &mut missing);
     }
-    Ok(first_partial)
+    let best = first_partial.or(title_exact).or(title_partial);
+    done(best.cloned(), missing)
 }
 
 /// Roles of the page or document inside an app window: a browser tab's web
@@ -376,16 +442,9 @@ pub fn first_with_role<Id: Clone + Eq + Hash>(
     roots: &[Id],
     roles: &[&str],
 ) -> Result<Option<Id>, Vec<Id>> {
+    let mut missing = Vec::new();
     let mut stack: Vec<&Id> = Vec::new();
-    let infos = get(cache, roots)?;
-    stack.extend(
-        roots
-            .iter()
-            .zip(infos)
-            .filter(|(_, i)| i.showing)
-            .map(|(r, _)| r)
-            .rev(),
-    );
+    push_showing(cache, roots, &mut stack, &mut missing);
     let mut seen = 0;
     while let Some(id) = stack.pop() {
         seen += 1;
@@ -394,19 +453,11 @@ pub fn first_with_role<Id: Clone + Eq + Hash>(
         }
         let info = &cache[id];
         if roles.contains(&info.role.as_str()) {
-            return Ok(Some(id.clone()));
+            return done(Some(id.clone()), missing);
         }
-        let kids = get(cache, &info.children)?;
-        stack.extend(
-            info.children
-                .iter()
-                .zip(kids)
-                .filter(|(_, k)| k.showing)
-                .map(|(c, _)| c)
-                .rev(),
-        );
+        push_showing(cache, &info.children, &mut stack, &mut missing);
     }
-    Ok(None)
+    done(None, missing)
 }
 
 /// Python `repr()` of a str, for window titles in `apps`.
@@ -655,8 +706,9 @@ mod tests {
     #[test]
     fn find_is_depth_first_with_reversed_siblings() {
         let cache = sample();
+        // The frame is a window title: after every other hit.
         let hits = find(&cache, &["/w"], "", "", 10).unwrap();
-        assert_eq!(hits, vec!["/w", "/p", "/b2", "/b1"]);
+        assert_eq!(hits, vec!["/p", "/b2", "/b1", "/w"]);
         let hits = find(&cache, &["/w"], "KAYDET", "push button", 10).unwrap();
         assert_eq!(hits, vec!["/b1"]);
     }
@@ -666,12 +718,129 @@ mod tests {
         let mut cache = sample();
         cache.insert("/b3", node("push button", "Farklı Kaydet", true, &[], &[]));
         cache.get_mut("/p").unwrap().children = vec!["/b3", "/b1", "/b2", "/h"];
-        assert_eq!(locate(&cache, &["/w"], "kaydet", "").unwrap(), Some("/b1"));
-        assert_eq!(locate(&cache, &["/w"], "farklı", "").unwrap(), Some("/b3"));
-        assert_eq!(locate(&cache, &["/w"], "kaydet", "text").unwrap(), None);
-        assert_eq!(locate(&cache, &["/w"], "hidden", "").unwrap(), None);
+        assert_eq!(
+            locate(&cache, &["/w"], "kaydet", "", true).unwrap(),
+            Some("/b1")
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "farklı", "", true).unwrap(),
+            Some("/b3")
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "kaydet", "text", true).unwrap(),
+            None
+        );
+        assert_eq!(locate(&cache, &["/w"], "hidden", "", true).unwrap(), None);
         cache.remove("/b2");
-        assert_eq!(locate(&cache, &["/w"], "x", "").unwrap_err(), vec!["/b2"]);
+        assert_eq!(
+            locate(&cache, &["/w"], "x", "", true).unwrap_err(),
+            vec!["/b2"]
+        );
+    }
+
+    #[test]
+    fn queries_do_not_match_role_names_unless_role_is_given() {
+        let cache = sample();
+        // "a" is in "frame" and "panel"; only names and text count.
+        assert_eq!(
+            find(&cache, &["/w"], "a", "", 10).unwrap(),
+            vec!["/b2", "/b1"]
+        );
+        assert_eq!(
+            find(&cache, &["/w"], "pan", "", 10).unwrap(),
+            Vec::<&str>::new()
+        );
+        assert_eq!(locate(&cache, &["/w"], "pan", "", true).unwrap(), None);
+        // With `role`, the role filter is exact and the role is searched.
+        assert_eq!(
+            find(&cache, &["/w"], "pan", "panel", 10).unwrap(),
+            vec!["/p"]
+        );
+        assert_eq!(
+            find(&cache, &["/w"], "button", "push button", 10).unwrap(),
+            vec!["/b1"]
+        );
+        assert_eq!(
+            find(&cache, &["/w"], "butt", "", 10).unwrap(),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn window_and_tab_titles_rank_last() {
+        let mut cache = sample();
+        cache.insert("/t", node("page tab", "Kaydet", true, &[], &[]));
+        cache.get_mut("/p").unwrap().children = vec!["/t", "/b1", "/b2", "/h"];
+        // find lists titles after the rest, and drops them first.
+        assert_eq!(
+            find(&cache, &["/w"], "kaydet", "", 10).unwrap(),
+            vec!["/b1", "/t"]
+        );
+        assert_eq!(find(&cache, &["/w"], "kaydet", "", 1).unwrap(), vec!["/b1"]);
+        assert_eq!(
+            find(&cache, &["/w"], "kaydet", "page tab", 10).unwrap(),
+            vec!["/t"]
+        );
+        // locate takes a content match over an exact title, a title only
+        // when nothing else matches, and no title at all with `titles` off.
+        assert_eq!(
+            locate(&cache, &["/w"], "kaydet", "", true).unwrap(),
+            Some("/b1")
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "ayde", "", true).unwrap(),
+            Some("/b1")
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "win", "", true).unwrap(),
+            Some("/w")
+        );
+        assert_eq!(locate(&cache, &["/w"], "win", "", false).unwrap(), None);
+        assert_eq!(
+            locate(&cache, &["/w"], "win", "frame", false).unwrap(),
+            Some("/w")
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "kaydet", "page tab", false).unwrap(),
+            Some("/t")
+        );
+        // An exact title beats a partial one.
+        cache.insert("/t2", node("page tab", "Kaydet sekmesi", true, &[], &[]));
+        cache.insert("/t3", node("page tab", "Sekme", true, &[], &[]));
+        cache.get_mut("/p").unwrap().children = vec!["/t2", "/t3"];
+        assert_eq!(
+            locate(&cache, &["/w"], "sekme", "", true).unwrap(),
+            Some("/t3")
+        );
+    }
+
+    #[test]
+    fn every_missing_node_is_reported_in_one_pass() {
+        let mut cache = sample();
+        cache.insert("/q", node("panel", "", true, &[], &["/c"]));
+        cache.get_mut("/w").unwrap().children = vec!["/p", "/q"];
+        cache.remove("/b2");
+        // Two branches, each with a node not fetched yet.
+        let mut lines = Vec::new();
+        let missing = walk(&cache, &["/w"], 1, &opts(300), &mut lines).unwrap_err();
+        assert_eq!(missing, vec!["/b2", "/c"]);
+        let mut missing = find(&cache, &["/w"], "zz", "", 10).unwrap_err();
+        missing.sort();
+        assert_eq!(missing, vec!["/b2", "/c"]);
+        let mut missing = locate(&cache, &["/w"], "zz", "", true).unwrap_err();
+        missing.sort();
+        assert_eq!(missing, vec!["/b2", "/c"]);
+        let mut missing = first_with_role(&cache, &["/w"], &DOCUMENT_ROLES).unwrap_err();
+        missing.sort();
+        assert_eq!(missing, vec!["/b2", "/c"]);
+        // A match found while nodes are missing is not final yet.
+        assert!(locate(&cache, &["/w"], "kaydet", "", true).is_err());
+        cache.insert("/b2", node("text", "b2", true, &[], &[]));
+        cache.insert("/c", node("push button", "Kaydet", true, &[], &[]));
+        assert_eq!(
+            locate(&cache, &["/w"], "kaydet", "", true).unwrap(),
+            Some("/b1")
+        );
     }
 
     #[test]

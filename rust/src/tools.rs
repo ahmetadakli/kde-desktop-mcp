@@ -39,8 +39,42 @@ const READ_ONLY: [&str; 10] = [
     "clipboard_get",
 ];
 
-/// How act/click/focus/get_text/set_text pick their element.
-const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`) to find and act in\none call: the first visible element whose name equals `query`\n(case-insensitive) wins, else the first whose name, text or role contains it.\nThe reply then starts with the element that was picked.";
+/// Sent as `instructions` in the initialize result. Clients that load tool
+/// schemas lazily show only this and the tool names at session start, so it
+/// carries the workflow and the targeting rules that every tool shares. It
+/// costs context in every session: keep it short.
+pub const INSTRUCTIONS: &str = "\
+Controls GUI apps on the user's desktop (KDE Plasma; also Hyprland, Windows) through the \
+accessibility tree, with real keyboard and mouse input where needed.
+
+Workflow:
+- apps lists running apps and marks the allowed ones. find (app + query) locates elements; \
+act, click, focus, get_text, set_text and scroll take the target themselves, so find-and-act \
+is one call. tree shows structure (document=true: a browser's page only); find is cheaper.
+- Target: `id` from tree/find, or `app` + `query` (+ `role`): the first visible element whose \
+name equals `query` (case-insensitive) wins, else the first whose name or text contains it. \
+Window and tab titles (frame, window, page tab) count only when nothing else matches, or when \
+`role` names that role. The reply starts with the element picked.
+- batch runs steps in one round trip: use it whenever later steps don't depend on reading a \
+result. Start it with activate_window when key/type_text/click/mouse input must reach an app. \
+Mark waits \"optional\": true and end with an observation step (find, get_text, screenshot) so \
+one failure doesn't cost a turn. Ids printed inside a batch can't be used in it; use app + query.
+- pause for a fixed wait; wait_for only for something that visibly appears or goes away \
+(gone=true), never a query that can't match as a sleep.
+- screenshot is a last resort; the image comes back inline (don't Read the file). To click \
+something seen only in it, pass its pixel position to mouse as image_x/image_y.
+
+Allowlist: only apps listed in the user's allowlist file can be read, activated or sent input, \
+and input only goes to an allowed active window. Errors name the file; adding apps is the \
+user's decision. When tools fail as if the setup were broken (AT-SPI, virtual input, KWin, \
+screenshots), run doctor.
+
+Clients that load tool schemas on demand: load the common ones in one search: batch, find, \
+act, activate_window, key, type_text, wait_for, screenshot, tree, apps.";
+
+/// Shared by the tools that take a target; the matching rules are in
+/// INSTRUCTIONS.
+const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`); rules in the server instructions.";
 
 pub fn tools() -> Json {
     let target = |extra: &[(&'static str, &'static str, Option<Json>)]| {
@@ -61,7 +95,11 @@ pub fn tools() -> Json {
     let mut batch_schema = schema(&[("steps", "array", None)]);
     batch_schema["properties"]["steps"]["items"] = json!({
         "type": "object",
-        "properties": { "tool": { "type": "string" }, "args": { "type": "object" } },
+        "properties": {
+            "tool": { "type": "string" },
+            "args": { "type": "object" },
+            "optional": { "type": "boolean", "default": false },
+        },
         "required": ["tool"],
     });
     let mut list = json!([
@@ -84,7 +122,7 @@ pub fn tools() -> Json {
         ),
         t(
             "find",
-            "Search an allowed app for elements whose name, text or role contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree.\nUsually cheaper than tree.",
+            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree; with\n`role`, the role name is searched too. Window and tab titles (frame, window,\npage tab) are listed after all other matches. Usually cheaper than tree.",
             schema(&[
                 ("query", "string", None),
                 ("app", "string", None),
@@ -151,7 +189,7 @@ pub fn tools() -> Json {
         ),
         t(
             "wait_for",
-            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). To just wait a fixed time, use pause, not a query\nthat never matches.",
+            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). Matches like act's `query`, except that window and\ntab titles (frame, window, page tab), which name a page before it has loaded,\nmatch only when `role` names that role. To just wait a fixed time, use pause,\nnot a query that never matches.",
             schema(&[
                 ("app", "string", None),
                 ("query", "string", None),
@@ -259,7 +297,7 @@ pub fn tools() -> Json {
         ),
         t(
             "batch",
-            "Run several tool calls in order in one round trip, stopping at the first\nerror. Prefer it whenever the next steps don't depend on reading a result. `steps` is a list of {\"tool\": name, \"args\": {...}}, e.g.\n[{\"tool\": \"activate_window\", \"args\": {\"query\": \"Kate\"}},\n {\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+end\"}},\n {\"tool\": \"type_text\", \"args\": {\"text\": \"hello\"}}].\nIds from tree/find made earlier can be used; ids printed inside the same\nbatch cannot, but `app` + `query` targets can name elements instead.",
+            "Run tool calls in order in one round trip; prefer it whenever later steps\ndon't depend on reading a result. `steps` is a list of\n{\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.\n[{\"tool\": \"activate_window\", \"args\": {\"query\": \"Kate\"}},\n {\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+o\"}},\n {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},\n {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].\nStops at the first failing step unless it is `optional`: then it is reported\nas failed (optional) and the rest still runs. Mark waits optional and end\nwith an observation step (find, get_text, screenshot). Start with\nactivate_window when input goes to an app. Ids from earlier tree/find work;\nids printed inside the same batch don't, but `app` + `query` targets do.",
             batch_schema
         ),
     ]);

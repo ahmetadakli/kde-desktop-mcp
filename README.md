@@ -111,8 +111,10 @@ it exits with the server. To turn it off, set the environment variable
 - `act`, `set_text`, `focus`, `click`: act on an element. The element is picked
   by its `tree`/`find` number (`id`) or in one call by `app` + `query`
   (+ `role`): the first visible element whose name equals `query`, else the
-  first whose name, text or role contains it. `act` reports when the active
-  window changed (e.g. a dialog opened).
+  first whose name or text contains it. Window and tab titles (frame, window,
+  page tab) count only when nothing else matches or `role` names that role;
+  `wait_for` skips them unless `role` names them. `act` reports when the
+  active window changed (e.g. a dialog opened).
 - Stale ids: every use of an `id` reads the element's role and name again (one
   round trip). If the element is gone, or its role or name changed (the page
   was redrawn, the object path now belongs to another element), nothing is
@@ -171,7 +173,16 @@ it exits with the server. To turn it off, set the environment variable
   `mouse` converts a pixel of the image to a screen coordinate (window position
   and display scaling, e.g. 125 %, included).
 - `batch`: runs several tools in order in one call and stops at the first
-  error; reduces Claude's number of turns.
+  error; reduces Claude's number of turns. A step with `"optional": true`
+  (typically a `wait_for`) may fail without stopping the batch: it is reported
+  as `[n] tool failed (optional): …` and the remaining steps still run, so a
+  final observation step (`find`, `screenshot`) is not lost.
+
+The `initialize` reply carries `instructions` (about 1.8 KB): the workflow,
+the targeting rules shared by the tools above, the allowlist and which tools
+to load together. Clients that load tool schemas on demand, such as Claude
+Code, show it at session start before any schema is loaded; the per-tool
+descriptions only point to it.
 
 ## Allowlist
 

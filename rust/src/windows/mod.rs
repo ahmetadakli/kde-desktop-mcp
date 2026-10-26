@@ -389,8 +389,9 @@ impl Backend for WindowsBackend {
 
     async fn screenshot(&self) -> Option<Shot> {
         // The process is DPI aware: image pixels are screen pixels.
-        input::screenshot().map(|(path, r)| Shot {
+        input::screenshot().map(|(path, pixels, r)| Shot {
             path,
+            pixels: Some(Box::new(move || Ok(pixels))),
             area: Some((
                 r.left as f64,
                 r.top as f64,

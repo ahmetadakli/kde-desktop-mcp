@@ -24,8 +24,8 @@ use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
-    AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_FILE_DIALOG,
-    NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
+    NO_FILE_DIALOG, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -58,6 +58,7 @@ const BORING: &[&str] = &[
     "grouping",
 ];
 const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
+const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
 /// How old the active-app check before `type_text` may be for the
 /// accessibility insert to trust it.
 const INSERT_ACTIVE_AGE: Duration = Duration::from_secs(1);
@@ -187,22 +188,46 @@ impl IndicatorProc {
         true
     }
 
-    /// Send one command line; a child that cannot take it is dropped and
-    /// the indicator stays off.
-    async fn send(&mut self, line: &str) -> bool {
+    async fn write(&mut self, line: &str) -> bool {
         let Some((_, stdin, _)) = self.child.as_mut() else {
             return false;
         };
-        let sent = stdin
+        stdin
             .write_all(format!("{line}\n").as_bytes())
             .await
             .is_ok()
-            && stdin.flush().await.is_ok();
-        if !sent {
-            self.child = None;
-            self.off = true;
+            && stdin.flush().await.is_ok()
+    }
+
+    /// Drop a child that stopped answering. It may come back only when it
+    /// ended cleanly, i.e. on its idle exit; whether it did.
+    fn drop_child(&mut self) -> bool {
+        let idle_exit = match self.child.as_mut() {
+            Some((child, _, _)) => matches!(child.try_wait(), Ok(Some(s)) if s.success()),
+            None => false,
+        };
+        self.child = None;
+        self.off |= !idle_exit;
+        idle_exit
+    }
+
+    /// Send one command line. A child that cannot take it is dropped; after
+    /// its idle exit, with `restart`, a fresh one gets the line. The
+    /// indicator stays off after a child failed, or when a fresh one cannot
+    /// take the line either.
+    async fn send(&mut self, line: &str, restart: bool) -> bool {
+        if self.write(line).await {
+            return true;
         }
-        sent
+        if !self.drop_child() || !restart {
+            return false;
+        }
+        if self.spawn() && self.write(line).await {
+            return true;
+        }
+        self.child = None;
+        self.off = true;
+        false
     }
 }
 
@@ -211,7 +236,8 @@ impl LinuxBackend {
     /// to confirm (briefly; a stuck indicator is dropped).
     async fn hide_indicator(&self) {
         let mut ind = self.indicator.lock().await;
-        if ind.child.is_none() || !ind.send("hide").await {
+        // A child that exited shows nothing: no need for a new one.
+        if ind.child.is_none() || !ind.send("hide", false).await {
             return;
         }
         let answered = match ind.child.as_mut() {
@@ -220,9 +246,16 @@ impl LinuxBackend {
             }
             None => return,
         };
-        if !matches!(answered, Ok(Ok(Some(ref l))) if l == "hidden") {
-            ind.child = None;
-            ind.off = true;
+        match answered {
+            Ok(Ok(Some(l))) if l == "hidden" => {}
+            // Closed: it may just have reached its idle exit.
+            Ok(Ok(None)) => {
+                ind.drop_child();
+            }
+            _ => {
+                ind.child = None;
+                ind.off = true;
+            }
         }
     }
 }
@@ -676,6 +709,25 @@ impl LinuxBackend {
         (field, accept)
     }
 
+    /// Whether a top-level window of `app` (an app root) is ACTIVE.
+    async fn app_active(&self, app: &Obj) -> bool {
+        let a11y = &self.a11y;
+        let windows = a11y.children(app).await;
+        futures_util::future::join_all(windows.iter().map(|w| a11y.states(w)))
+            .await
+            .into_iter()
+            .any(|st| atspi::has(st.unwrap_or(0), atspi::ACTIVE))
+    }
+
+    /// Whether the window holding `id` (its nearest frame, window or
+    /// dialog ancestor) is ACTIVE.
+    async fn frame_active(&self, id: &Obj) -> bool {
+        match self.a11y.frame_of(id).await {
+            Some(f) => self.a11y.has_state(&f, atspi::ACTIVE).await,
+            None => false,
+        }
+    }
+
     async fn kde_frame_active(&self, caption: &str) -> bool {
         let want = hyprland::norm(caption);
         let a11y = &self.a11y;
@@ -801,6 +853,14 @@ impl Backend for LinuxBackend {
             .await
     }
 
+    async fn prefetch_with(&self, cache: &mut Cache<Obj>, roots: Vec<Obj>, f: &Fetch) {
+        self.a11y.prefetch_with(cache, roots, f).await
+    }
+
+    async fn fill_actions(&self, cache: &mut Cache<Obj>, ids: &[Obj]) {
+        self.a11y.fill_actions(cache, ids).await
+    }
+
     async fn actions(&self, id: &Obj) -> Vec<String> {
         self.a11y.actions(id).await
     }
@@ -838,17 +898,49 @@ impl Backend for LinuxBackend {
         self.a11y.set_text(id, text).await
     }
 
-    async fn focused(&self) -> Option<Obj> {
-        // Focus events keep the hint current; check it still holds focus.
-        // Only report it inside the app in front, which the caller checked
-        // is allowed: a stale hint from another app must not leak or get an id.
-        let a11y = &self.a11y;
-        let hint = a11y.focus_hint()?;
-        self.active_app().await;
-        if a11y.recent_active_bus(INSERT_ACTIVE_AGE).as_deref() != Some(&*hint.bus) {
+    async fn focused(&self) -> Option<Focused<Obj>> {
+        // Focus events keep the hint current; check it still holds focus,
+        // and that its own app has the active window. The app's name comes
+        // from the hint's own bus (a unique connection name, never reused),
+        // so the caller checks the right app against the allowlist even
+        // when the input moved focus to another app. All of it in one go:
+        // two round trips, instead of a registry scan and then a fetch of
+        // children and text the note never shows.
+        if !matches!(self.comp, Compositor::Kde(_)) {
+            // Hyprland's active window is not an AT-SPI state.
             return None;
         }
-        a11y.has_state(&hint, atspi::FOCUSED).await.then_some(hint)
+        let a11y = &self.a11y;
+        let hint = a11y.focus_hint()?;
+        let app = Self::app_of(&hint);
+        let (name, active, (role, label, states, actions)) =
+            tokio::join!(a11y.name(&app), self.app_active(&app), async {
+                tokio::join!(
+                    a11y.role(&hint),
+                    a11y.name(&hint),
+                    a11y.states(&hint),
+                    // No Action interface: an error, so no actions.
+                    a11y.actions(&hint)
+                )
+            });
+        let st = states?;
+        if !active || !atspi::has(st, atspi::FOCUSED) || role.is_empty() || name.is_empty() {
+            return None;
+        }
+        let info = Info {
+            role,
+            name: label,
+            states: atspi::state_labels(Some(st)),
+            showing: atspi::has(st, atspi::SHOWING),
+            actions,
+            text: None,
+            children: Vec::new(),
+        };
+        Some(Focused {
+            id: hint,
+            info,
+            app: name,
+        })
     }
 
     async fn is_focused(&self, id: &Obj) -> bool {
@@ -888,36 +980,14 @@ impl Backend for LinuxBackend {
     }
 
     async fn element_center(&self, id: &Obj) -> R<(i32, i32)> {
-        const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
         let a11y = &self.a11y;
         let no_area = || "element has no on-screen area".to_string();
         match &self.comp {
-            Compositor::Kde(kwin) => {
-                // AT-SPI extents are relative to the toplevel surface on
-                // Wayland, so add the active window's client origin.
-                let (frame_active, ext, origin) = tokio::join!(
-                    async {
-                        match a11y.frame_of(id).await {
-                            Some(f) => a11y.has_state(&f, atspi::ACTIVE).await,
-                            None => false,
-                        }
-                    },
-                    a11y.extents(id, atspi::COORD_WINDOW),
-                    kwin.active_window_origin()
-                );
-                if !frame_active {
-                    return Err(NOT_ACTIVE.into());
-                }
-                let (x, y, w, h) = ext?;
-                if w <= 0 || h <= 0 {
-                    return Err(no_area());
-                }
-                let (gx, gy) = origin?;
-                Ok((
-                    (gx + x as f64 + w as f64 / 2.0) as i32,
-                    (gy + y as f64 + h as f64 / 2.0) as i32,
-                ))
-            }
+            Compositor::Kde(_) => self
+                .element_centers(std::slice::from_ref(id))
+                .await
+                .pop()
+                .unwrap_or_else(|| Err(no_area())),
             Compositor::Hyprland(h) => {
                 let (aw, frame) = tokio::join!(h.active_window(), a11y.frame_of(id));
                 let (Some(aw), Some(frame)) = (aw?, frame) else {
@@ -950,6 +1020,40 @@ impl Backend for LinuxBackend {
                 ))
             }
         }
+    }
+
+    async fn element_centers(&self, ids: &[Obj]) -> Vec<R<(i32, i32)>> {
+        let Compositor::Kde(kwin) = &self.comp else {
+            return futures_util::future::join_all(ids.iter().map(|id| self.element_center(id)))
+                .await;
+        };
+        let a11y = &self.a11y;
+        // AT-SPI extents are relative to the toplevel surface on Wayland,
+        // so add the active window's client origin: one KWin script for
+        // all the elements.
+        let (origin, parts) = tokio::join!(
+            kwin.active_window_origin(),
+            futures_util::future::join_all(ids.iter().map(|id| async move {
+                tokio::join!(self.frame_active(id), a11y.extents(id, atspi::COORD_WINDOW))
+            }))
+        );
+        parts
+            .into_iter()
+            .map(|(frame_active, ext)| {
+                if !frame_active {
+                    return Err(NOT_ACTIVE.into());
+                }
+                let (x, y, w, h) = ext?;
+                if w <= 0 || h <= 0 {
+                    return Err("element has no on-screen area".into());
+                }
+                let (gx, gy) = origin.clone()?;
+                Ok((
+                    (gx + x as f64 + w as f64 / 2.0) as i32,
+                    (gy + y as f64 + h as f64 / 2.0) as i32,
+                ))
+            })
+            .collect()
     }
 
     fn check_combo(&self, combo: &str) -> R<()> {
@@ -1016,19 +1120,22 @@ impl Backend for LinuxBackend {
     }
 
     async fn indicate(&self, label: &str) {
-        let mut ind = self.indicator.lock().await;
+        // Busy (a screenshot waits for it to hide): skip rather than delay
+        // the action.
+        let Ok(mut ind) = self.indicator.try_lock() else {
+            return;
+        };
         if ind.spawn() {
-            ind.send(&format!("show {}", label.replace('\n', " ")))
+            ind.send(&format!("show {}", label.replace('\n', " ")), true)
                 .await;
         }
     }
 
     async fn move_pointer(&self, x: i64, y: i64) -> R<()> {
+        if let Ok(mut ind) = self.indicator.try_lock()
+            && ind.child.is_some()
         {
-            let mut ind = self.indicator.lock().await;
-            if ind.child.is_some() {
-                ind.send(&format!("point {x} {y}")).await;
-            }
+            ind.send(&format!("point {x} {y}"), true).await;
         }
         match &self.comp {
             Compositor::Kde(kwin) => {
@@ -1372,19 +1479,31 @@ impl Backend for LinuxBackend {
         let area;
         let mut cmd = match &self.comp {
             Compositor::Kde(kwin) => {
-                area = kwin.active_frame().await;
+                // One script run gives the frame and the window's handle, so
+                // the capture is of the window the area belongs to.
+                let frame = kwin.active_frame().await;
+                area = frame.as_ref().map(|f| f.area);
                 if !self.shot_unauthorized.load(Ordering::Relaxed) {
-                    match kwin.capture_active_window().await {
+                    let handle = frame.as_ref().and_then(|f| f.handle.as_deref());
+                    let mut captured = kwin.capture_window(handle).await;
+                    // The window closed meanwhile, or the handle was refused:
+                    // the active window still beats spectacle.
+                    if handle.is_some()
+                        && captured
+                            .as_ref()
+                            .is_err_and(|e| !e.starts_with(kwin::SHOT_NOT_AUTHORIZED))
+                    {
+                        captured = kwin.capture_window(None).await;
+                    }
+                    match captured {
                         Ok(raw) => {
                             let (path, file) = temp_png()?;
-                            let mut out = std::io::BufWriter::new(file);
-                            let written = image::write_png(&raw, &mut out).and_then(|()| {
-                                std::io::Write::flush(&mut out).map_err(|e| e.to_string())
+                            drop(file);
+                            return Some(Shot {
+                                path: path.display().to_string(),
+                                pixels: Some(Box::new(move || image::to_pixels(&raw))),
+                                area,
                             });
-                            if written.is_ok() {
-                                return keep_if_written(path).map(|path| Shot { path, area });
-                            }
-                            let _ = std::fs::remove_file(&path);
                         }
                         // Older KWin without the desktop-file grant: stop asking.
                         Err(e) if e.starts_with(kwin::SHOT_NOT_AUTHORIZED) => {
@@ -1423,7 +1542,11 @@ impl Backend for LinuxBackend {
         let (path, file) = temp_png()?;
         drop(file);
         let _ = cmd.arg(&path).output().await;
-        keep_if_written(path).map(|path| Shot { path, area })
+        keep_if_written(path).map(|path| Shot {
+            path,
+            pixels: None,
+            area,
+        })
     }
 }
 
@@ -1455,6 +1578,43 @@ mod tests {
         ));
         assert!(is_file_dialog_button(&format!("{base}.QPushButton")));
         assert!(!is_file_dialog_button("QApplication.Settings.QPushButton"));
+    }
+
+    /// An indicator whose child is `program` (with nothing to read), already
+    /// exited.
+    async fn exited_indicator(program: &str) -> IndicatorProc {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new(program)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        assert!(lines.next_line().await.unwrap().is_none());
+        // Wait for the exit without reaping it, as after an idle exit.
+        while std::fs::read_to_string(format!("/proc/{}/stat", child.id().unwrap()))
+            .is_ok_and(|st| !st.contains(") Z "))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        IndicatorProc {
+            child: Some((child, stdin, lines)),
+            off: false,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn indicator_may_come_back_after_its_idle_exit_only() {
+        // Exit code 0 (idle exit): dropped, but not turned off for good.
+        let mut ind = exited_indicator("true").await;
+        assert!(!ind.send("hide", false).await);
+        assert!(ind.child.is_none() && !ind.off);
+        // A child that failed keeps the indicator off.
+        let mut ind = exited_indicator("false").await;
+        assert!(!ind.send("show x", true).await);
+        assert!(ind.child.is_none() && ind.off);
+        assert!(!ind.spawn());
     }
 
     #[test]
