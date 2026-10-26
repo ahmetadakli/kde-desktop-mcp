@@ -26,8 +26,10 @@ fn schema(params: &[(&str, &str, Option<Json>)]) -> Json {
 }
 
 /// Tools that only read, marked `readOnlyHint` so clients may run them in parallel.
-const READ_ONLY: [&str; 7] = [
+const READ_ONLY: [&str; 9] = [
     "apps",
+    "windows",
+    "doctor",
     "tree",
     "find",
     "get_text",
@@ -192,6 +194,28 @@ pub fn tools() -> Json {
             "activate_window",
             "Bring an allowed app's window to the front by title or app-name substring.",
             schema(&[("query", "string", None)])
+        ),
+        t(
+            "windows",
+            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state and output, after the\nscreens (name, geometry, scale). `query` filters by title or app name.\nKDE Plasma only.",
+            schema(&[("query", "string", Some(json!("")))])
+        ),
+        t(
+            "move_window",
+            "Move and/or resize the first window of an allowed app whose title or\napp name contains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), or set `state` to maximize, minimize or restore.\nReplies with the new geometry. KDE Plasma only.",
+            schema(&[
+                ("query", "string", None),
+                ("x", "integer", Some(Json::Null)),
+                ("y", "integer", Some(Json::Null)),
+                ("width", "integer", Some(Json::Null)),
+                ("height", "integer", Some(Json::Null)),
+                ("state", "string", Some(Json::Null)),
+            ])
+        ),
+        t(
+            "doctor",
+            "Check the setup in one report: version, allowlist, which running apps\nare allowed or blocked, the session, AT-SPI, the virtual keyboard and\npointer, KWin scripting, screens and the screenshot path. Run it first\nwhen tools fail in ways that look like a broken installation.",
+            schema(&[])
         ),
         t(
             "screenshot",

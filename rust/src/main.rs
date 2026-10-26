@@ -30,7 +30,7 @@ use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use backend::{Backend, Cache, R, Shot};
+use backend::{Backend, Cache, R, Shot, WindowChange, WindowGeo};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
@@ -140,6 +140,51 @@ const DRAG_STEP_GAP: Duration = Duration::from_millis(12);
 fn written_matches(written: &str, now: &str) -> bool {
     let norm = |t: &str| t.replace("\r\n", "\n").trim_end_matches('\n').to_string();
     norm(written) == norm(now)
+}
+
+/// How long move_window waits for a window to take its new geometry.
+const WINDOW_SETTLE: Duration = Duration::from_millis(1000);
+
+/// Whether a window shows what `change` asked for (within a pixel, as
+/// fractional scaling rounds sizes).
+fn window_reached(w: &WindowGeo, c: &WindowChange) -> bool {
+    let near = |want: Option<f64>, got: f64| want.is_none_or(|v| (v - got).abs() <= 1.0);
+    let state = match c.state.as_deref() {
+        Some("maximize") => w.maximized && !w.minimized,
+        Some("minimize") => w.minimized,
+        Some("restore") => !w.maximized && !w.minimized,
+        _ => true,
+    };
+    state && near(c.x, w.x) && near(c.y, w.y) && near(c.width, w.width) && near(c.height, w.height)
+}
+
+/// `"title" [app] at (x,y) WxH {active,maximized} on OUTPUT`.
+fn describe_window(w: &WindowGeo) -> String {
+    let states: Vec<&str> = [
+        (w.active, "active"),
+        (w.maximized, "maximized"),
+        (w.minimized, "minimized"),
+    ]
+    .iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, s)| *s)
+    .collect();
+    let mut line = format!(
+        "{} [{}] at ({},{}) {}x{}",
+        render::py_repr(&w.title),
+        w.app,
+        w.x,
+        w.y,
+        w.width,
+        w.height
+    );
+    if !states.is_empty() {
+        line.push_str(&format!(" {{{}}}", states.join(",")));
+    }
+    if !w.output.is_empty() {
+        line.push_str(&format!(" on {}", w.output));
+    }
+    line
 }
 
 /// Roles that take typed text without the editable state.
@@ -438,6 +483,138 @@ impl<B: Backend> Server<B> {
         lines.push(format!("allowlist file: {}", self.allow_file.display()));
         if !self.b.apps_note().is_empty() {
             lines.push(self.b.apps_note().into());
+        }
+        Ok(lines.join("\n"))
+    }
+
+    async fn windows(&self, a: &Json) -> R<String> {
+        let query = arg_s(a, "query", "");
+        let allowed = self.allowed();
+        let (screens, list) = tokio::join!(self.b.screens(), self.b.windows(&query, &allowed));
+        let mut lines: Vec<String> = screens
+            .iter()
+            .map(|s| {
+                format!(
+                    "screen {}: at ({},{}) {}x{}, scale {}",
+                    s.name, s.x, s.y, s.width, s.height, s.scale
+                )
+            })
+            .collect();
+        let list = list?;
+        if list.is_empty() {
+            lines.push(if query.is_empty() {
+                "no windows of allowed apps".into()
+            } else {
+                format!("no window of an allowed app matches '{query}'")
+            });
+        }
+        lines.extend(list.iter().map(describe_window));
+        Ok(lines.join("\n"))
+    }
+
+    async fn move_window(&self, a: &Json) -> R<String> {
+        let query = req_s(a, "query")?;
+        let num = |k: &str| a.get(k).and_then(Json::as_f64);
+        let change = WindowChange {
+            x: num("x"),
+            y: num("y"),
+            width: num("width").map(|w| w.max(1.0)),
+            height: num("height").map(|h| h.max(1.0)),
+            state: a.get("state").and_then(Json::as_str).map(str::to_string),
+        };
+        if let Some(st) = &change.state
+            && !["maximize", "minimize", "restore"].contains(&st.as_str())
+        {
+            return Err(format!(
+                "state must be maximize, minimize or restore, not '{st}'"
+            ));
+        }
+        if change.state.is_none()
+            && [change.x, change.y, change.width, change.height]
+                .iter()
+                .all(Option::is_none)
+        {
+            return Err("pass x/y, width/height or state".into());
+        }
+        let allowed = self.allowed();
+        let mut w = self.b.set_window(&query, &allowed, &change).await?;
+        // On Wayland the app applies a new size (and KWin a state) a moment
+        // later; wait for it so the reply, and the next call, see the result.
+        let start = Instant::now();
+        while !window_reached(&w, &change) && start.elapsed() < WINDOW_SETTLE {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let now = self.b.windows(&w.title, &allowed).await?;
+            match now.into_iter().find(|n| n.app == w.app) {
+                Some(n) => w = n,
+                None => break,
+            }
+        }
+        let note = if window_reached(&w, &change) {
+            ""
+        } else {
+            " (not what was asked: the app may limit its size or position)"
+        };
+        Ok(format!("now: {}{note}", describe_window(&w)))
+    }
+
+    async fn doctor(&self) -> R<String> {
+        self.b.enable().await;
+        let allow = self.allowed();
+        let mut lines = vec![format!(
+            "desktop-mcp {} ({} {})",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            std::env::consts::ARCH
+        )];
+        let mut row = |ok: bool, name: &str, detail: &str| {
+            lines.push(format!(
+                "[{}] {name}: {detail}",
+                if ok { "ok" } else { "FAIL" }
+            ));
+        };
+        row(
+            !allow.is_empty(),
+            "allowlist",
+            &format!(
+                "{} ({} apps: {})",
+                self.allow_file.display(),
+                allow.len(),
+                allow.join(", ")
+            ),
+        );
+        let (mut allowed, mut blocked) = (Vec::new(), Vec::new());
+        for app in self.b.list_apps().await {
+            if app.windows.is_empty() {
+                continue;
+            }
+            if allow.contains(&app.name.to_lowercase()) {
+                allowed.push(app.name);
+            } else {
+                blocked.push(app.name);
+            }
+        }
+        row(
+            true,
+            "running apps with windows",
+            &format!(
+                "allowed: {}; blocked: {}",
+                if allowed.is_empty() {
+                    "none".into()
+                } else {
+                    allowed.join(", ")
+                },
+                if blocked.is_empty() {
+                    "none".into()
+                } else {
+                    blocked.join(", ")
+                }
+            ),
+        );
+        for c in self.b.doctor().await {
+            row(c.ok, c.name, &c.detail);
+        }
+        if !self.b.apps_note().is_empty() {
+            lines.push(format!("note: {}", self.b.apps_note()));
         }
         Ok(lines.join("\n"))
     }
@@ -993,6 +1170,9 @@ impl<B: Backend> Server<B> {
                 "focus" => self.focus(a).await.map(Out::from),
                 "click" => self.click(a).await.map(Out::from),
                 "drag" => self.drag(a).await.map(Out::from),
+                "windows" => self.windows(a).await.map(Out::from),
+                "move_window" => self.move_window(a).await.map(Out::from),
+                "doctor" => self.doctor().await.map(Out::from),
                 "scroll" => self.scroll(a).await.map(Out::from),
                 "key" => self.key(a).await.map(Out::from),
                 "type_text" => self.type_text(a).await.map(Out::from),
@@ -1646,5 +1826,32 @@ mod tests {
                     .join(format!("desktop-mcp-test-{}-drag.png", std::process::id())),
             );
         });
+    }
+
+    #[test]
+    fn window_reached_checks_asked_fields_only() {
+        let w = WindowGeo {
+            x: 100.0,
+            y: 80.0,
+            width: 700.0,
+            height: 450.4,
+            ..WindowGeo::default()
+        };
+        let ask = |x, width, state: Option<&str>| WindowChange {
+            x,
+            width,
+            state: state.map(str::to_string),
+            ..WindowChange::default()
+        };
+        assert!(window_reached(&w, &ask(Some(100.0), Some(700.0), None)));
+        assert!(window_reached(&w, &ask(None, None, Some("restore"))));
+        assert!(!window_reached(&w, &ask(Some(300.0), None, None)));
+        assert!(!window_reached(&w, &ask(None, None, Some("maximize"))));
+        let max = WindowGeo {
+            maximized: true,
+            ..w.clone()
+        };
+        assert!(window_reached(&max, &ask(None, None, Some("maximize"))));
+        assert!(!window_reached(&max, &ask(None, None, Some("restore"))));
     }
 }

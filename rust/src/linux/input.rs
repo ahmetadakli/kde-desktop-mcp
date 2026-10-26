@@ -172,6 +172,11 @@ impl Input {
         let _ = self.with_ptr(|_| Ok(()));
     }
 
+    /// Whether the virtual keyboard and pointer exist or can be created.
+    pub fn check(&self) -> (R<()>, R<()>) {
+        (self.with_kbd(|_| Ok(())), self.with_ptr(|_| Ok(())))
+    }
+
     pub async fn press_combo(&self, combo: &str) -> R<()> {
         let codes = parse_combo(combo)?;
         let down: Vec<InputEvent> = codes.iter().map(|c| ev(EventType::KEY, c.0, 1)).collect();
