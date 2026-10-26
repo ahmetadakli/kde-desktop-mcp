@@ -92,6 +92,15 @@ Neden hızlı:
 - `apps`, `tree`, `find`, `get_text`: okuma ve arama. `tree`'ye
   `document: true` verilirse yalnızca etkin penceredeki belge listelenir
   (tarayıcıda o sekmenin sayfası, sekmeler ve araç çubukları olmadan)
+- `set_text` yazdığını geri okur: yanıt "verified" der ya da alanda ne
+  olduğunu söyleyerek hata verir (uzunluk sınırı, biçimlendirme). Firefox'un
+  giriş kutuları erişilebilirlik yazımını "başarılı" sayıp hiçbir şey
+  yapmadığından, tek satırlık metin tutmazsa öğeye odaklanıp Ctrl+A ile
+  seçerek yeniden yazar. Parola alanları geri okunamaz.
+- `scroll`: bir öğenin (liste, sayfa, panel) üzerinde tekerlek döndürür.
+- `drag`: basılı tutup adım adım taşır ve bırakır (sürükle-bırak, kaydırıcı,
+  seçim). Uçlar öğe numarası (`from_id`/`to_id`), ekran koordinatı ya da
+  `image: true` ile son ekran görüntüsündeki piksel olabilir.
 - `act`, `set_text`, `focus`, `click`: öğeye işlem. Öğe, `tree`/`find`
   numarasıyla (`id`) ya da tek çağrıda `app` + `query` (+ `role`) ile seçilir:
   adı `query` ile birebir aynı olan ilk görünür öğe, yoksa adında, metninde ya

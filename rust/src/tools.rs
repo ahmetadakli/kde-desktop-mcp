@@ -98,7 +98,9 @@ pub fn tools() -> Json {
         ),
         t(
             "set_text",
-            &d("Replace the contents of an editable text element."),
+            &d(
+                "Replace the contents of an editable text element, then read it back:\nthe reply says \"verified\", or fails with what the field holds instead\n(a length limit, reformatting). Password fields cannot be read back."
+            ),
             target(&[("text", "string", None)])
         ),
         t(
@@ -121,6 +123,27 @@ pub fn tools() -> Json {
             target(&[
                 ("button", "string", Some(json!("left"))),
                 ("clicks", "integer", Some(json!(1)))
+            ])
+        ),
+        t(
+            "scroll",
+            &d(
+                "Scroll the wheel over an element (a list, a page, a panel): `amount`\nnotches, positive = down. The element's window must be active."
+            ),
+            target(&[("amount", "integer", Some(json!(3)))])
+        ),
+        t(
+            "drag",
+            "Press a mouse button, move in steps, release: drag and drop, sliders,\nselections, splitters. Each end is `from_id`/`to_id` (an element's centre,\nids from tree/find) or `from_x`/`from_y` and `to_x`/`to_y`: screen\ncoordinates, or pixels of the last screenshot with `image`=true. The\nactive window must belong to an allowed app.",
+            schema(&[
+                ("from_id", "integer", Some(Json::Null)),
+                ("from_x", "integer", Some(Json::Null)),
+                ("from_y", "integer", Some(Json::Null)),
+                ("to_id", "integer", Some(Json::Null)),
+                ("to_x", "integer", Some(Json::Null)),
+                ("to_y", "integer", Some(Json::Null)),
+                ("image", "boolean", Some(json!(false))),
+                ("button", "string", Some(json!("left"))),
             ])
         ),
         t(

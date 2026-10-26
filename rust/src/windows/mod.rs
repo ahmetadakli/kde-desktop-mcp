@@ -349,6 +349,19 @@ impl Backend for WindowsBackend {
         Ok(())
     }
 
+    async fn move_pointer(&self, x: i64, y: i64) -> R<()> {
+        input::set_cursor(x, y)?;
+        tokio::time::sleep(POINTER_SETTLE).await;
+        Ok(())
+    }
+
+    async fn button(&self, button: &str, down: bool) -> R<()> {
+        let (d, u) = input::button_flags(button)?;
+        input::button(if down { d } else { u })?;
+        tokio::time::sleep(BUTTON_HOLD).await;
+        Ok(())
+    }
+
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()> {
         let q = query.to_lowercase();
         for (_, p) in self.uia.top_level() {

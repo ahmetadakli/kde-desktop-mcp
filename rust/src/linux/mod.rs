@@ -739,6 +739,11 @@ impl Backend for LinuxBackend {
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {
         input::button_code(button)?;
+        self.move_pointer(x, y).await?;
+        self.input.buttons(button, clicks, scroll).await
+    }
+
+    async fn move_pointer(&self, x: i64, y: i64) -> R<()> {
         match &self.comp {
             Compositor::Kde(kwin) => {
                 let (x0, y0, x1, y1) = kwin.screen_box().await;
@@ -752,7 +757,11 @@ impl Backend for LinuxBackend {
                 self.input.settle().await;
             }
         }
-        self.input.buttons(button, clicks, scroll).await
+        Ok(())
+    }
+
+    async fn button(&self, button: &str, down: bool) -> R<()> {
+        self.input.button(button, down).await
     }
 
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()> {

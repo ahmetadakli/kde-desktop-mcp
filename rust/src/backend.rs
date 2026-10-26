@@ -104,6 +104,10 @@ pub trait Backend {
     async fn press_combo(&self, combo: &str) -> R<()>;
     async fn type_text(&self, text: &str) -> R<()>;
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()>;
+    /// Move the cursor to screen coordinates without clicking.
+    async fn move_pointer(&self, x: i64, y: i64) -> R<()>;
+    /// Press (`down`) or release a mouse button where the cursor is.
+    async fn button(&self, button: &str, down: bool) -> R<()>;
     /// Raise the first window of an allowed app whose title or app name
     /// contains `query`, and wait until it is in front.
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()>;
