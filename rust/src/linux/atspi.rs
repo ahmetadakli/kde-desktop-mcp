@@ -57,6 +57,33 @@ const EFFECT_EVENTS: [(&str, &str, &str, Option<&str>); 3] = [
         None,
     ),
 ];
+/// Events that can make an element appear, disappear, or match a query
+/// differently, besides EFFECT_EVENTS: `wait_for` re-checks on them. A
+/// child added or removed (also a window, on an application's root), a
+/// name changed, text changed. (event, interface, member, first argument)
+const CHANGE_EVENTS: [(&str, &str, &str, Option<&str>); 3] = [
+    (
+        "object:children-changed",
+        "org.a11y.atspi.Event.Object",
+        "ChildrenChanged",
+        None,
+    ),
+    (
+        "object:property-change:accessible-name",
+        "org.a11y.atspi.Event.Object",
+        "PropertyChange",
+        Some("accessible-name"),
+    ),
+    (
+        "object:text-changed",
+        "org.a11y.atspi.Event.Object",
+        "TextChanged",
+        None,
+    ),
+];
+/// How long `wait_change` lets a burst of events (a dialog building its
+/// widgets, a page loading) go on before the waiter re-checks once.
+const CHANGE_SETTLE: std::time::Duration = std::time::Duration::from_millis(15);
 /// Requests kept in flight at once; well under the bus' pending-reply limit.
 const IN_FLIGHT: usize = 512;
 /// How long an app's overlay viewport (its largest window) is reused: one
@@ -151,6 +178,9 @@ pub struct A11y {
     /// Bus names of apps that just sent one of EFFECT_EVENTS or a focus
     /// change; only fed while a `do_action` listens.
     effects: tokio::sync::broadcast::Sender<Arc<str>>,
+    /// Which apps changed lately (CHANGE_EVENTS, EFFECT_EVENTS, an app
+    /// leaving the bus), for `wait_change`.
+    changes: Changes,
 }
 
 impl A11y {
@@ -178,6 +208,7 @@ impl A11y {
             active_bus: Mutex::new(None),
             views: tokio::sync::Mutex::new(HashMap::new()),
             effects: tokio::sync::broadcast::channel(64).0,
+            changes: Changes::default(),
         })
     }
 
@@ -319,8 +350,10 @@ impl A11y {
     /// registering per action would race the app learning of it.
     pub async fn track_actions(self: &Arc<Self>) -> R<()> {
         let all = EFFECT_EVENTS.map(|(event, iface, member, arg0)| {
-            self.listen(event, iface, member, arg0, |a11y, sender, _, _| {
-                a11y.note_effect(sender)
+            let window = event.starts_with("window:");
+            self.listen(event, iface, member, arg0, move |a11y, sender, _, _| {
+                a11y.note_effect(sender);
+                a11y.changes.note(sender, window);
             })
         });
         futures_util::future::join_all(all)
@@ -340,7 +373,6 @@ impl A11y {
         arg0: Option<&str>,
         on: impl Fn(&A11y, &str, &zbus::zvariant::ObjectPath<'_>, &zbus::Message) + Send + 'static,
     ) -> R<()> {
-        use futures_util::StreamExt;
         let mut rule = zbus::MatchRule::builder()
             .msg_type(zbus::message::Type::Signal)
             .interface(iface)
@@ -350,7 +382,7 @@ impl A11y {
         if let Some(arg) = arg0 {
             rule = rule.add_arg(arg).map_err(err)?;
         }
-        let mut stream = zbus::MessageStream::for_match_rule(rule.build(), &self.conn, Some(256))
+        let stream = zbus::MessageStream::for_match_rule(rule.build(), &self.conn, Some(1024))
             .await
             .map_err(err)?;
         let args = (event, Vec::<String>::new(), "");
@@ -365,6 +397,19 @@ impl A11y {
             .await
             .map_err(|_| "RegisterEvent: no reply".to_string())?
             .map_err(err)?;
+        self.dispatch(stream, on);
+        Ok(())
+    }
+
+    /// Run `on` for each message of `stream` until this A11y is dropped.
+    /// `on` must be quick: a stream that is not read holds up the whole
+    /// connection once its queue is full.
+    fn dispatch(
+        self: &Arc<Self>,
+        mut stream: zbus::MessageStream,
+        on: impl Fn(&A11y, &str, &zbus::zvariant::ObjectPath<'_>, &zbus::Message) + Send + 'static,
+    ) {
+        use futures_util::StreamExt;
         let me = Arc::downgrade(self);
         tokio::spawn(async move {
             while let Some(Ok(msg)) = stream.next().await {
@@ -375,7 +420,75 @@ impl A11y {
                 }
             }
         });
+    }
+
+    /// Listen for CHANGE_EVENTS and for apps leaving the bus, so
+    /// `wait_change` can wake a `wait_for` when the app it watches changed
+    /// instead of polling it. Registered once for the connection's
+    /// lifetime, like `track_actions`; the registration ends with it.
+    pub async fn track_changes(self: &Arc<Self>) -> R<()> {
+        let all = CHANGE_EVENTS.map(|(event, iface, member, arg0)| {
+            self.listen(event, iface, member, arg0, |a11y, sender, path, _| {
+                // A child of an app's root is a window; of the registry's
+                // desktop (same path), an app.
+                let windows = path.as_str() == APP_ROOT;
+                a11y.changes.note(sender, windows);
+            })
+        });
+        let gone = async {
+            // A bus daemon signal: no registration needed.
+            let rule = zbus::MatchRule::builder()
+                .msg_type(zbus::message::Type::Signal)
+                .sender("org.freedesktop.DBus")
+                .map_err(err)?
+                .interface("org.freedesktop.DBus")
+                .map_err(err)?
+                .member("NameOwnerChanged")
+                .map_err(err)?
+                .build();
+            let stream = zbus::MessageStream::for_match_rule(rule, &self.conn, Some(256))
+                .await
+                .map_err(err)?;
+            self.dispatch(stream, |a11y, _, _, msg| {
+                if let Ok((name, _, new)) = msg.body().deserialize::<(String, String, String)>()
+                    && name.starts_with(':')
+                    && new.is_empty()
+                {
+                    a11y.changes.forget(&name);
+                }
+            });
+            R::Ok(())
+        };
+        let (events, gone) = tokio::join!(futures_util::future::join_all(all), gone);
+        events.into_iter().collect::<R<()>>()?;
+        gone?;
+        self.changes
+            .live
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    /// A mark for `wait_change`, taken before a check so that changes
+    /// during the check count.
+    pub fn change_mark(&self) -> u64 {
+        self.changes.mark()
+    }
+
+    /// Wait until an app on one of `buses` (or the set of apps or windows)
+    /// changed after `mark`, and the burst of events settled, or until
+    /// `timeout`. True on a change. Without change events (registering
+    /// them failed), one poll interval.
+    pub async fn wait_change(
+        &self,
+        buses: &[&str],
+        mark: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
+        if !self.changes.live.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(timeout.min(std::time::Duration::from_millis(50))).await;
+            return true;
+        }
+        self.changes.wait(buses, mark, timeout, CHANGE_SETTLE).await
     }
 
     fn note_effect(&self, bus: &str) {
@@ -845,6 +958,104 @@ pub async fn enable(session: &Connection) {
         .await;
 }
 
+/// Change counters per application bus, fed by the event listeners and
+/// read by waiters. Every event bumps one global sequence number and
+/// stores it for its bus; a waiter compares the numbers of the buses it
+/// watches with the mark it took before its check. Bursts coalesce: a
+/// waiter wakes once per change it has not seen, however many events came,
+/// and events of other apps never wake it.
+#[derive(Default)]
+struct Changes {
+    seq: std::sync::atomic::AtomicU64,
+    /// Last change per bus. Dropped when the bus' owner leaves; a waiter
+    /// for a bus without an entry adds one.
+    buses: Mutex<HashMap<Arc<str>, tokio::sync::watch::Sender<u64>>>,
+    /// Last change to the set of apps or of any app's windows: watched by
+    /// every waiter, as the app waited for may not be running yet, or may
+    /// open a window from another process.
+    windows: WatchCell,
+    /// The events above are registered and listened to.
+    live: std::sync::atomic::AtomicBool,
+}
+
+/// A watch channel that starts at 0, for `#[derive(Default)]`.
+struct WatchCell(tokio::sync::watch::Sender<u64>);
+
+impl Default for WatchCell {
+    fn default() -> Self {
+        WatchCell(tokio::sync::watch::channel(0).0)
+    }
+}
+
+impl Changes {
+    fn mark(&self) -> u64 {
+        self.seq.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Something on `bus` changed; `windows`: its windows, or the set of apps.
+    fn note(&self, bus: &str, windows: bool) {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let mut buses = self.buses.lock().unwrap();
+        match buses.get(bus) {
+            Some(tx) => {
+                tx.send_replace(n);
+            }
+            None => {
+                buses.insert(bus.into(), tokio::sync::watch::channel(n).0);
+            }
+        }
+        drop(buses);
+        if windows {
+            self.windows.0.send_replace(n);
+        }
+    }
+
+    /// The app on `bus` left: wake its waiters (a window is gone) and
+    /// drop its entry.
+    fn forget(&self, bus: &str) {
+        let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if let Some(tx) = self.buses.lock().unwrap().remove(bus) {
+            tx.send_replace(n);
+        }
+        self.windows.0.send_replace(n);
+    }
+
+    /// See `A11y::wait_change`; `settle` is the time a burst gets.
+    async fn wait(
+        &self,
+        buses: &[&str],
+        mark: u64,
+        timeout: std::time::Duration,
+        settle: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut watches: Vec<_> = {
+            let mut map = self.buses.lock().unwrap();
+            buses
+                .iter()
+                .map(|bus| {
+                    map.entry((*bus).into())
+                        .or_insert_with(|| tokio::sync::watch::channel(0).0)
+                        .subscribe()
+                })
+                .collect()
+        };
+        watches.push(self.windows.0.subscribe());
+        // Changes since the mark, before subscribing, are in the values.
+        let seen = watches.iter().any(|w| *w.borrow() > mark);
+        if !seen {
+            let any =
+                futures_util::future::select_all(watches.iter_mut().map(|w| Box::pin(w.changed())));
+            if tokio::time::timeout_at(deadline, any).await.is_err() {
+                return false;
+            }
+        }
+        // Let the burst finish, so one check sees all of it.
+        tokio::time::sleep_until((tokio::time::Instant::now() + settle).min(deadline)).await;
+        true
+    }
+}
+
 /// The reply of an action, or Ok(true) once it is overdue: `grace` after
 /// `effects` named `bus`, or after `wait` in any case.
 async fn await_action(
@@ -951,6 +1162,127 @@ mod tests {
         let (out, ms) = run_action(5000, false, None);
         assert_eq!(out, Ok(true));
         assert!(ms >= 390, "{ms} ms");
+    }
+
+    /// `Changes::wait` for `buses` with a 300 ms timeout and 15 ms settle,
+    /// while `events` (bus, windows, after ms) are noted: (changed, ms).
+    fn run_wait(
+        changes: Arc<Changes>,
+        buses: &[&str],
+        events: Vec<(&'static str, bool, u64)>,
+    ) -> (bool, u128) {
+        use std::time::Duration;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mark = changes.mark();
+            let feed = changes.clone();
+            tokio::spawn(async move {
+                for (bus, windows, ms) in events {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    feed.note(bus, windows);
+                }
+            });
+            let start = std::time::Instant::now();
+            let changed = changes
+                .wait(
+                    buses,
+                    mark,
+                    Duration::from_millis(300),
+                    Duration::from_millis(15),
+                )
+                .await;
+            (changed, start.elapsed().as_millis())
+        })
+    }
+
+    #[test]
+    fn a_change_of_the_watched_app_ends_the_wait_once_it_settled() {
+        let changes = Arc::new(Changes::default());
+        let (changed, ms) = run_wait(changes.clone(), &[":1.5"], vec![(":1.5", false, 20)]);
+        assert!(changed);
+        assert!((30..150).contains(&ms), "{ms} ms");
+        // A burst wakes the waiter once; once it is over, a new mark sees
+        // nothing left over.
+        let burst = (0..20).map(|_| (":1.5", false, 0)).collect();
+        let (changed, ms) = run_wait(changes.clone(), &[":1.5"], burst);
+        assert!(changed && ms < 150, "{ms} ms");
+        let (changed, ms) = run_wait(changes, &[":1.5"], vec![]);
+        assert!(!changed && ms >= 290, "{ms} ms");
+    }
+
+    #[test]
+    fn changes_of_other_apps_do_not_wake_the_waiter() {
+        let changes = Arc::new(Changes::default());
+        let others = (0..30).map(|i| (":1.7", false, 5 + i % 2)).collect();
+        let (changed, ms) = run_wait(changes, &[":1.5", ":1.6"], others);
+        assert!(!changed);
+        assert!(ms >= 290, "{ms} ms");
+    }
+
+    #[test]
+    fn a_change_between_mark_and_wait_is_not_missed() {
+        let changes = Changes::default();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        // Before the mark: old news.
+        changes.note(":1.5", false);
+        let mark = changes.mark();
+        // During the check, before the waiter subscribed.
+        changes.note(":1.5", false);
+        let wait = |mark| {
+            changes.wait(
+                &[":1.5"],
+                mark,
+                std::time::Duration::from_millis(200),
+                std::time::Duration::from_millis(5),
+            )
+        };
+        let start = std::time::Instant::now();
+        assert!(rt.block_on(wait(mark)));
+        assert!(start.elapsed().as_millis() < 100);
+        let start = std::time::Instant::now();
+        assert!(!rt.block_on(wait(changes.mark())));
+        assert!(start.elapsed().as_millis() >= 190);
+    }
+
+    #[test]
+    fn window_changes_and_apps_leaving_wake_every_waiter() {
+        let changes = Arc::new(Changes::default());
+        // An app not running yet (no buses): a window or app appearing on
+        // any bus counts, other changes do not.
+        let (changed, _) = run_wait(changes.clone(), &[], vec![(":1.9", false, 10)]);
+        assert!(!changed);
+        let (changed, ms) = run_wait(changes.clone(), &[], vec![(":1.9", true, 10)]);
+        assert!(changed && ms < 150, "{ms} ms");
+        // The watched app leaving the bus ends the wait, too.
+        let feed = changes.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let start = std::time::Instant::now();
+        let changed = rt.block_on(async {
+            let mark = feed.mark();
+            let gone = feed.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                gone.forget(":1.5");
+            });
+            feed.wait(
+                &[":1.5"],
+                mark,
+                std::time::Duration::from_millis(300),
+                std::time::Duration::from_millis(5),
+            )
+            .await
+        });
+        assert!(changed && start.elapsed().as_millis() < 150);
+        assert!(!changes.buses.lock().unwrap().contains_key(":1.5"));
     }
 
     #[test]

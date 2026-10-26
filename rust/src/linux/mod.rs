@@ -499,8 +499,9 @@ impl LinuxBackend {
                 let _ = a11y.track_focus().await;
             }
         };
-        // Lets `act` return as soon as a menu or dialog opened.
-        let _ = tokio::join!(focus, a11y.track_actions());
+        // Lets `act` return as soon as a menu or dialog opened, and
+        // `wait_for` wait for the app to change rather than poll it.
+        let _ = tokio::join!(focus, a11y.track_actions(), a11y.track_changes());
         Ok(LinuxBackend {
             session,
             a11y,
@@ -930,6 +931,17 @@ impl Backend for LinuxBackend {
             }
         }
         found.then_some(windows)
+    }
+
+    fn change_mark(&self) -> u64 {
+        self.a11y.change_mark()
+    }
+
+    async fn wait_change(&self, near: &[Obj], mark: u64, timeout: Duration) {
+        let mut buses: Vec<&str> = near.iter().map(|o| o.bus.as_ref()).collect();
+        buses.sort_unstable();
+        buses.dedup();
+        self.a11y.wait_change(&buses, mark, timeout).await;
     }
 
     async fn active_app(&self) -> String {

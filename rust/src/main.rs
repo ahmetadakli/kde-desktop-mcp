@@ -297,6 +297,13 @@ fn resolve_step_refs(args: &mut Json, step: usize, done: &[(String, StepElement)
 
 /// Longest `wait_for` / `pause`, in ms (10 minutes).
 const MAX_WAIT_MS: i64 = 600_000;
+/// `wait_for` re-checks when the app changed (`Backend::wait_change`), and
+/// after this long without a change in any case: for apps or events that
+/// do not report changes, such as an element scrolled into view.
+const WAIT_FALLBACK: Duration = Duration::from_millis(250);
+/// Least time between the end of one `wait_for` check and the next, so an
+/// app that changes all the time costs no more than polling did.
+const WAIT_MIN_GAP: Duration = Duration::from_millis(50);
 
 /// Requested wait in ms, clamped to 0..=MAX_WAIT_MS, and a note when it was cut.
 fn wait_ms(a: &Json, k: &str, d: i64) -> (u64, String) {
@@ -755,6 +762,17 @@ impl<B: Backend> Server<B> {
         titles: bool,
     ) -> R<Option<(B::Id, Cache<B::Id>)>> {
         let windows = self.app_windows(app).await?;
+        Ok(self.locate_in(windows, query, role, titles).await)
+    }
+
+    /// `locate` in the app windows `windows`.
+    async fn locate_in(
+        &self,
+        windows: Vec<B::Id>,
+        query: &str,
+        role: &str,
+        titles: bool,
+    ) -> Option<(B::Id, Cache<B::Id>)> {
         let mut cache = Cache::new();
         self.b
             .prefetch_with(
@@ -765,7 +783,7 @@ impl<B: Backend> Server<B> {
             .await;
         loop {
             match render::locate(&cache, &windows, query, role, titles) {
-                Ok(found) => return Ok(found.map(|id| (id, cache))),
+                Ok(found) => return found.map(|id| (id, cache)),
                 Err(missing) => {
                     self.b
                         .prefetch_with(
@@ -1402,9 +1420,16 @@ impl<B: Backend> Server<B> {
         self.b.enable().await;
         let start = Instant::now();
         loop {
+            // Changes from here on end the wait after this check.
+            let mark = self.b.change_mark();
             // An app that is not running (yet) counts as "no match".
+            let windows = self.app_windows(&app).await.unwrap_or_default();
             // Titles hold a page's name before the page is there.
-            let found = self.locate(&app, &query, &role, false).await.ok().flatten();
+            let found = if windows.is_empty() {
+                None
+            } else {
+                self.locate_in(windows.clone(), &query, &role, false).await
+            };
             let ms = start.elapsed().as_millis();
             match found {
                 Some((id, mut cache)) if !gone => {
@@ -1427,7 +1452,13 @@ impl<B: Backend> Server<B> {
                     "timed out after {ms} ms waiting for '{query}' in '{app}' {what}{note}"
                 ));
             }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+            let checked = Instant::now();
+            let left = limit.saturating_sub(start.elapsed());
+            self.b
+                .wait_change(&windows, mark, left.min(WAIT_FALLBACK))
+                .await;
+            // Never more often than the old poll, however busy the app.
+            tokio::time::sleep(WAIT_MIN_GAP.saturating_sub(checked.elapsed()).min(left)).await;
         }
     }
 
