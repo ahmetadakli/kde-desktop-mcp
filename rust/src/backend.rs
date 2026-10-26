@@ -118,10 +118,14 @@ pub struct Check {
     pub detail: String,
 }
 
-/// A screenshot file and the screen area it shows, in the coordinates
-/// `pointer` takes: (x, y, width, height). None when unknown.
+/// A screenshot and the screen area it shows, in the coordinates `pointer`
+/// takes: (x, y, width, height). None when unknown.
 pub struct Shot {
+    /// A private file that ends up holding the image sent back.
     pub path: String,
+    /// The captured pixels, converted off the event loop; None when an
+    /// external tool already wrote a PNG to `path`.
+    pub pixels: Option<crate::shot::Convert>,
     pub area: Option<(f64, f64, f64, f64)>,
 }
 
@@ -275,6 +279,6 @@ pub trait Backend {
     async fn doctor(&self) -> Vec<Check> {
         Vec::new()
     }
-    /// Capture the active window to a private file and return its path.
+    /// Capture the active window; `path` is a new private file.
     async fn screenshot(&self) -> Option<Shot>;
 }

@@ -26,6 +26,7 @@ use windows::core::PWSTR;
 
 use super::logic::{self, KeyEv};
 use crate::backend::R;
+use crate::shot;
 
 const WHEEL_DELTA: i64 = 120;
 
@@ -254,30 +255,25 @@ fn grab_foreground() -> Option<(u32, u32, Vec<u8>, RECT)> {
     }
 }
 
-/// Capture the foreground window to a new private PNG in %TEMP%.
-pub fn screenshot() -> Option<(String, RECT)> {
-    let (w, h, rgb, rect) = grab_foreground()?;
+/// Capture the foreground window: its RGB pixels and screen rectangle,
+/// plus a new private file in %TEMP% for the PNG made from them.
+pub fn screenshot() -> Option<(String, shot::Pixels, RECT)> {
+    let (width, height, data, rect) = grab_foreground()?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let path: PathBuf = std::env::temp_dir().join(format!("desktop-mcp-{nanos}.png"));
-    let file = std::fs::OpenOptions::new()
+    std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&path)
         .ok()?;
-    let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
-    enc.set_color(png::ColorType::Rgb);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png::Compression::Fast);
-    let ok = enc
-        .write_header()
-        .and_then(|mut wr| wr.write_image_data(&rgb))
-        .is_ok();
-    if !ok {
-        let _ = std::fs::remove_file(&path);
-        return None;
-    }
-    Some((path.display().to_string(), rect))
+    let pixels = shot::Pixels {
+        width,
+        height,
+        channels: 3,
+        data,
+    };
+    Some((path.display().to_string(), pixels, rect))
 }
