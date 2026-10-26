@@ -167,6 +167,14 @@ def main() -> int:
         step("ctrl+s saved Unicode text to disk", bool(saved),
              repr(path.read_text(encoding="utf-8")[-60:]))
 
+        second = tmp / f"{tmp.name}-launch.txt"
+        second.write_text("ikinci\n", encoding="utf-8")
+        ok, out = c.call("launch", app="kate", args=[str(second)])
+        step("launch opens a file in kate and returns its window",
+             ok and "[" in out and " at (" in out, out.replace("\n", " | "))
+        ok, out = c.call("launch", app="definitely-not-allowed-app")
+        step("launch refuses an app not in the allowlist", not ok and "not in" in out, out)
+
         ok, out = c.call("find", query="x", app="definitely-not-allowed-app")
         step("allowlist blocks unknown app", not ok and "not in" in out, out)
         ok, out = c.call("get_text", id=999999999)

@@ -42,6 +42,7 @@ pub const MULTI_LINE: u32 = 17;
 pub const SELECTED: u32 = 23;
 pub const SHOWING: u32 = 25;
 pub const VISIBLE: u32 = 30;
+pub const IS_DEFAULT: u32 = 39;
 
 // AtspiCoordType.
 pub const COORD_SCREEN: u32 = 0;
@@ -67,7 +68,7 @@ impl Obj {
     }
 }
 
-fn has(states: u64, state: u32) -> bool {
+pub fn has(states: u64, state: u32) -> bool {
     states & (1u64 << state) != 0
 }
 
@@ -161,6 +162,15 @@ impl A11y {
 
     pub async fn name(&self, o: &Obj) -> String {
         match self.prop(o, ACC, "Name").await {
+            Ok(v) => String::try_from(v).unwrap_or_default(),
+            Err(_) => String::new(),
+        }
+    }
+
+    /// Toolkit's id for the element (Qt: the object names of the widget
+    /// path, e.g. `QApplication.FileDialog.KFileWidget...`); "" when none.
+    pub async fn accessible_id(&self, o: &Obj) -> String {
+        match self.prop(o, ACC, "AccessibleId").await {
             Ok(v) => String::try_from(v).unwrap_or_default(),
             Err(_) => String::new(),
         }
@@ -428,6 +438,11 @@ impl A11y {
     pub async fn extents(&self, o: &Obj, coord: u32) -> R<(i32, i32, i32, i32)> {
         self.call(o, "org.a11y.atspi.Component", "GetExtents", &(coord,))
             .await
+    }
+
+    /// Role and name, requested together.
+    pub async fn identity(&self, o: &Obj) -> (String, String) {
+        tokio::join!(self.role(o), self.name(o))
     }
 
     /// All attributes of one node, requested together.

@@ -55,6 +55,59 @@ pub struct RawImage {
 /// (x0, y0, x1, y1) in logical px.
 type ScreenBox = (i32, i32, i32, i32);
 
+/// Which apps the window tools may touch: the allowlist, plus the pids of
+/// AT-SPI apps sorted by their name against it. A window's pid decides
+/// first, so an app whose window class differs from its AT-SPI name
+/// (Ferdium: `electron`) still matches, and a blocked app stays blocked
+/// whatever its class. Windows of other pids fall back to class matching.
+#[derive(Debug, Default, PartialEq)]
+pub struct Allow {
+    pub names: Vec<String>,
+    pub pids: Vec<u32>,
+    pub blocked_pids: Vec<u32>,
+}
+
+impl Allow {
+    /// `apps` holds (pid, AT-SPI app name). A pid with several apps is
+    /// blocked when any of them is; unnamed apps say nothing.
+    pub fn new(allowed: &[String], apps: &[(u32, String)]) -> Self {
+        let mut pids = Vec::new();
+        let mut blocked_pids = Vec::new();
+        for (pid, name) in apps {
+            let name = name.trim().to_lowercase();
+            if name.is_empty() {
+                continue;
+            }
+            if allowed.contains(&name) {
+                pids.push(*pid);
+            } else {
+                blocked_pids.push(*pid);
+            }
+        }
+        pids.retain(|p| !blocked_pids.contains(p));
+        pids.sort_unstable();
+        pids.dedup();
+        blocked_pids.sort_unstable();
+        blocked_pids.dedup();
+        Allow {
+            names: allowed.to_vec(),
+            pids,
+            blocked_pids,
+        }
+    }
+
+    /// OK_APP with this allowlist filled in.
+    fn ok_app_js(&self) -> String {
+        OK_APP
+            .replace("%ALLOW%", &Json::from(self.names.clone()).to_string())
+            .replace("%ALLOW_PIDS%", &Json::from(self.pids.clone()).to_string())
+            .replace(
+                "%BLOCK_PIDS%",
+                &Json::from(self.blocked_pids.clone()).to_string(),
+            )
+    }
+}
+
 struct Sink {
     tx: mpsc::UnboundedSender<(String, String)>,
 }
@@ -73,16 +126,29 @@ pub struct KWin {
     screen: Mutex<Option<(Instant, ScreenBox)>>,
 }
 
+/// Whether a window belongs to an allowed app: by its pid's AT-SPI app name
+/// when it has one (the name tree and find use), else by its class or
+/// resource name containing an allowlist entry.
+const OK_APP: &str = r#"
+const allow = %ALLOW%;
+const allowPids = %ALLOW_PIDS%;
+const blockPids = %BLOCK_PIDS%;
+function okApp(w) {
+  if (blockPids.includes(w.pid)) return false;
+  if (allowPids.includes(w.pid)) return true;
+  const cls = (w.resourceClass || "").toLowerCase();
+  const name = (w.resourceName || "").toLowerCase();
+  return allow.some(a => cls.includes(a) || name.includes(a));
+}
+"#;
+
 /// Raises the first window of an allowed app whose caption or class contains
 /// the query; evaluates to its caption, "" when none matched.
-const ACTIVATE: &str = r#"(() => {
-const allow = %ALLOW%;
+const ACTIVATE: &str = r#"(() => { %OK_APP%
 const q = %QUERY%.toLowerCase();
 for (const w of workspace.windowList()) {
   const cls = (w.resourceClass || "").toLowerCase();
-  const name = (w.resourceName || "").toLowerCase();
-  const okApp = allow.some(a => cls.includes(a) || name.includes(a));
-  if (okApp && (w.caption.toLowerCase().includes(q) || cls.includes(q))) {
+  if (okApp(w) && (w.caption.toLowerCase().includes(q) || cls.includes(q))) {
     workspace.activeWindow = w;
     return w.caption;
   }
@@ -90,16 +156,10 @@ for (const w of workspace.windowList()) {
 return "";
 })()"#;
 
-/// Shared by WINDOWS and SET_WINDOW: windows of allowed apps (matched like
-/// ACTIVATE) whose caption or class contains the query, and their geometry.
-const WINDOW_JS: &str = r#"
-const allow = %ALLOW%;
+/// Shared by WINDOWS and SET_WINDOW: windows of allowed apps whose caption
+/// or class contains the query, and their geometry.
+const WINDOW_JS: &str = r#"%OK_APP%
 const q = %QUERY%.toLowerCase();
-function okApp(w) {
-  const cls = (w.resourceClass || "").toLowerCase();
-  const name = (w.resourceName || "").toLowerCase();
-  return allow.some(a => cls.includes(a) || name.includes(a));
-}
 function matching() {
   return workspace.windowList().filter(w => (w.normalWindow || w.dialog) && okApp(w)
     && (!q || w.caption.toLowerCase().includes(q)
@@ -145,6 +205,13 @@ const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow
 
 const FRAME: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
      const g = w.frameGeometry; return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
+
+/// The active window's caption and process, and the window it is a
+/// transient (dialog) for. A portal dialog gets its parent from the window
+/// handle the requesting app exported (xdg-foreign), not from its title.
+const ACTIVE_PARENT: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
+     const p = w.transientFor; return {caption: w.caption, pid: w.pid, \
+     parent: p ? {pid: p.pid, class: p.resourceClass || '', caption: p.caption} : null}; })())";
 
 const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtualScreenGeometry; \
      return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
@@ -268,9 +335,9 @@ impl KWin {
     }
 
     /// Raise a window; returns its caption, or "" when nothing matched.
-    pub async fn activate(&self, query: &str, allowed: &[String]) -> R<String> {
+    pub async fn activate(&self, query: &str, allow: &Allow) -> R<String> {
         let script = ACTIVATE
-            .replace("%ALLOW%", &Json::from(allowed.to_vec()).to_string())
+            .replace("%OK_APP%", &allow.ok_app_js())
             .replace("%QUERY%", &Json::from(query).to_string());
         Ok(self.query(&script).await?.unwrap_or_default())
     }
@@ -285,8 +352,8 @@ impl KWin {
         }
     }
 
-    pub async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
-        let script = WINDOWS.replace("%JS%", &window_js(query, allowed));
+    pub async fn windows(&self, query: &str, allow: &Allow) -> R<Vec<WindowGeo>> {
+        let script = WINDOWS.replace("%JS%", &window_js(query, allow));
         let raw = self.query(&script).await?.unwrap_or_default();
         let list: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
         Ok(list
@@ -298,7 +365,7 @@ impl KWin {
     pub async fn set_window(
         &self,
         query: &str,
-        allowed: &[String],
+        allow: &Allow,
         change: &WindowChange,
     ) -> R<Option<WindowGeo>> {
         let change = serde_json::json!({
@@ -306,7 +373,7 @@ impl KWin {
             "height": change.height, "state": change.state,
         });
         let script = SET_WINDOW
-            .replace("%JS%", &window_js(query, allowed))
+            .replace("%JS%", &window_js(query, allow))
             .replace("%CHANGE%", &change.to_string());
         let raw = self.query(&script).await?.unwrap_or_default();
         if raw.is_empty() {
@@ -332,6 +399,14 @@ impl KWin {
                 scale: o["scale"].as_f64().unwrap_or(1.0),
             })
             .collect())
+    }
+
+    /// KWin's active window with its transient parent, see ACTIVE_PARENT;
+    /// None without an active window.
+    pub async fn active_parent(&self) -> R<Option<Json>> {
+        let raw = self.query(ACTIVE_PARENT).await?.unwrap_or_default();
+        let v: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
+        Ok((!v.is_null()).then_some(v))
     }
 
     /// Frame (with title bar) of KWin's active window in logical px:
@@ -450,9 +525,9 @@ impl KWin {
     }
 }
 
-fn window_js(query: &str, allowed: &[String]) -> String {
+fn window_js(query: &str, allow: &Allow) -> String {
     WINDOW_JS
-        .replace("%ALLOW%", &Json::from(allowed.to_vec()).to_string())
+        .replace("%OK_APP%", &allow.ok_app_js())
         .replace("%QUERY%", &Json::from(query).to_string())
 }
 
@@ -503,4 +578,55 @@ async fn read_screen_box() -> Option<(i32, i32, i32, i32)> {
         y1 = y1.max(py + h);
     }
     (x0 <= x1).then_some((x0 as i32, y0 as i32, x1 as i32, y1 as i32))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn allow_sorts_pids_by_atspi_name() {
+        let apps = [
+            (10, "electron".to_string()), // Ferdium: class is not "electron"
+            (20, "Kate".to_string()),
+            (30, "konsole".to_string()),
+            (40, String::new()),
+        ];
+        let allow = Allow::new(&names(&["electron", "kate"]), &apps);
+        assert_eq!(allow.pids, vec![10, 20]);
+        assert_eq!(allow.blocked_pids, vec![30]);
+        assert_eq!(allow.names, names(&["electron", "kate"]));
+    }
+
+    #[test]
+    fn allow_blocks_pid_with_any_blocked_app() {
+        let apps = [
+            (10, "electron".to_string()),
+            (10, "secret-vault".to_string()),
+            (10, "electron".to_string()),
+        ];
+        let allow = Allow::new(&names(&["electron"]), &apps);
+        assert!(allow.pids.is_empty());
+        assert_eq!(allow.blocked_pids, vec![10]);
+    }
+
+    #[test]
+    fn scripts_get_allowlist_and_pids() {
+        let allow = Allow::new(
+            &names(&["electron"]),
+            &[(10, "electron".into()), (30, "konsole".into())],
+        );
+        let js = window_js("Ferdium", &allow);
+        assert!(js.contains(r#"const allow = ["electron"];"#));
+        assert!(js.contains("const allowPids = [10];"));
+        assert!(js.contains("const blockPids = [30];"));
+        assert!(js.contains(r#"const q = "Ferdium".toLowerCase();"#));
+        assert!(!js.contains('%'));
+        let act = ACTIVATE.replace("%OK_APP%", &allow.ok_app_js());
+        assert!(act.contains("const allowPids = [10];") && act.contains("okApp(w)"));
+    }
 }

@@ -32,6 +32,26 @@ pub type Cache<Id> = HashMap<Id, Info<Id>>;
 /// Window management the desktop does not offer (only KDE does so far).
 pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma";
 
+/// Clipboard access the desktop does not offer (only Linux so far).
+pub const NO_CLIPBOARD: &str = "the clipboard tools are only available on Linux (Wayland)";
+
+/// What `clipboard_get` found on the clipboard.
+// Only the Linux backend builds one so far.
+#[cfg_attr(windows, allow(dead_code))]
+#[derive(Clone, Debug, PartialEq)]
+pub enum Clip {
+    Empty,
+    /// The text, cut to the limit asked for; `truncated` when it was.
+    Text {
+        text: String,
+        truncated: bool,
+    },
+    /// Marked as a password by the app that copied it; not read.
+    Secret,
+    /// Not text: the types offered (an image, copied files...).
+    Other(Vec<String>),
+}
+
 /// A top-level window and where it is, in logical screen px.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WindowGeo {
@@ -56,6 +76,17 @@ pub struct Terminal {
     pub tty: String,
     pub command: String,
     pub cwd: String,
+}
+
+/// An app `launch` started: the command, its pid, and the window it opened
+/// (None after the wait ran out, or when windows cannot be tracked).
+#[derive(Clone, Debug, Default)]
+pub struct Launched {
+    pub command: String,
+    pub pid: u32,
+    pub window: Option<WindowGeo>,
+    /// Why the window counts as the app's, or why none was waited for.
+    pub note: String,
 }
 
 /// What `move_window` changes; None keeps the current value.
@@ -94,6 +125,27 @@ pub struct Shot {
     pub area: Option<(f64, f64, f64, f64)>,
 }
 
+/// File dialogs the server can fill in (only KDE's so far).
+pub const NO_FILE_DIALOG: &str = "file dialogs are only supported on KDE Plasma";
+
+/// The active window when it is a file Open/Save dialog.
+#[derive(Clone, Debug)]
+pub struct FileDialog<Id> {
+    pub window: Id,
+    /// App name owning the dialog: the app itself (an in-process dialog)
+    /// or the desktop portal serving another app.
+    pub app: String,
+    /// Titles the dialog shows (compositor caption, accessible name).
+    pub titles: Vec<String>,
+    /// App the compositor says the dialog belongs to (its transient
+    /// parent), None when it does not say.
+    pub parent: Option<String>,
+    /// The file name / location field.
+    pub field: Id,
+    /// The dialog's default button (Open/Save), when found.
+    pub accept: Option<Id>,
+}
+
 pub struct WindowEntry {
     pub kind: String,
     pub title: String,
@@ -128,6 +180,12 @@ pub trait Backend {
     async fn active_app(&self) -> String;
 
     async fn info(&self, id: &Self::Id, text_limit: usize) -> Info<Self::Id>;
+    /// Role and name only, as cheaply as the platform allows (one round
+    /// trip); role "" when the element is gone. Checks an id before use.
+    async fn identity(&self, id: &Self::Id) -> (String, String) {
+        let info = self.info(id, 0).await;
+        (info.role, info.name)
+    }
     /// Fetch `roots` and their descendants into `cache`, as fast as the
     /// platform allows. Children of hidden nodes may be skipped when
     /// `only_showing`; stop after roughly `limit` new nodes.
@@ -160,7 +218,9 @@ pub trait Backend {
     /// Check a chord such as "ctrl+s" without pressing it.
     fn check_combo(&self, combo: &str) -> R<()>;
     async fn press_combo(&self, combo: &str) -> R<()>;
-    async fn type_text(&self, text: &str) -> R<()>;
+    /// Type `text`; Ok holds a note for the reply ("" when none), e.g. that
+    /// the clipboard could not be put back after a paste.
+    async fn type_text(&self, text: &str) -> R<String>;
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()>;
     /// Move the cursor to screen coordinates without clicking.
     async fn move_pointer(&self, x: i64, y: i64) -> R<()>;
@@ -183,12 +243,34 @@ pub trait Backend {
     ) -> R<WindowGeo> {
         Err(NO_WINDOW_CONTROL.into())
     }
+    /// Read the clipboard as text, at most `limit` characters.
+    async fn clipboard_get(&self, _limit: usize) -> R<Clip> {
+        Err(NO_CLIPBOARD.into())
+    }
+    async fn clipboard_set(&self, _text: &str) -> R<()> {
+        Err(NO_CLIPBOARD.into())
+    }
+    /// Start `app` (an allowed name) with `args`, without a shell, and wait
+    /// up to `wait` for its window; `allowed` limits which windows are seen.
+    async fn launch(
+        &self,
+        _app: &str,
+        _args: &[String],
+        _allowed: &[String],
+        _wait: std::time::Duration,
+    ) -> R<Launched> {
+        Err("launch is not supported on this platform yet".into())
+    }
     async fn screens(&self) -> Vec<Screen> {
         Vec::new()
     }
     /// Show what the agent is doing on screen, when the desktop has an
     /// indicator.
     async fn indicate(&self, _label: &str) {}
+    /// The active window as a file dialog; Err when it is none.
+    async fn active_file_dialog(&self) -> R<FileDialog<Self::Id>> {
+        Err(NO_FILE_DIALOG.into())
+    }
     /// Platform checks for `doctor`.
     async fn doctor(&self) -> Vec<Check> {
         Vec::new()

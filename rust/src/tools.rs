@@ -26,7 +26,7 @@ fn schema(params: &[(&str, &str, Option<Json>)]) -> Json {
 }
 
 /// Tools that only read, marked `readOnlyHint` so clients may run them in parallel.
-const READ_ONLY: [&str; 9] = [
+const READ_ONLY: [&str; 10] = [
     "apps",
     "windows",
     "doctor",
@@ -36,6 +36,7 @@ const READ_ONLY: [&str; 9] = [
     "wait_for",
     "screenshot",
     "pause",
+    "clipboard_get",
 ];
 
 /// How act/click/focus/get_text/set_text pick their element.
@@ -174,7 +175,17 @@ pub fn tools() -> Json {
         ),
         t(
             "type_text",
-            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. On Linux this goes through the clipboard and\noverwrites it. The reply names the focused element and warns when it is not\nan editable field.",
+            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. On Linux this may paste through the clipboard;\nthe text it held is put back afterwards (images and files are not; the reply\nsays so). The reply names the focused element and warns when it is not an\neditable field.",
+            schema(&[("text", "string", None)])
+        ),
+        t(
+            "clipboard_get",
+            "Read the clipboard as text, at most `limit` characters (the reply says\nwhen it was cut). Only works while an allowed app's window is active, since\nthe clipboard may hold anything the user copied. Says so instead when it\nholds no text (an image, files) or a password marked by a password manager.\nLinux only.",
+            schema(&[("limit", "integer", Some(json!(20000)))])
+        ),
+        t(
+            "clipboard_set",
+            "Put `text` on the clipboard, e.g. to paste it later with key ctrl+v or to\nhand it to the user. Only while an allowed app's window is active. Linux\nonly.",
             schema(&[("text", "string", None)])
         ),
         t(
@@ -216,6 +227,24 @@ pub fn tools() -> Json {
             ])
         ),
         t(
+            "launch",
+            "Start an allowed app (`app` as named by apps, e.g. \"kate\") with optional\n`args` (a list, no shell), resolved through its .desktop file or PATH, and\nwait up to `wait_ms` (at most 60000) until its window appears. Replies with\nthe window as windows prints it; finds windows a running instance opens\n(single-instance apps such as firefox or kate) too. 0 = do not wait.\nWindow tracking is KDE Plasma only; Linux only.",
+            schema(&[
+                ("app", "string", None),
+                ("args", "array", Some(Json::Null)),
+                ("wait_ms", "integer", Some(json!(15000))),
+            ])
+        ),
+        t(
+            "file_dialog",
+            "Fill in the file Open/Save dialog in front: write `path` (absolute or\n~/…) into its file name field, press its default button and wait up to\n`timeout_ms` for it to close. Works on an allowed app's own KDE dialog and\non the desktop portal's dialog (a browser's upload or download) when it\nbelongs to an allowed app's window; nothing else in the portal is reachable.\nFor `action`=\"open\" the path must exist; for \"save\" its folder must.\nOpen the dialog first (e.g. the page's upload button), then call this.\nKDE Plasma only.",
+            schema(&[
+                ("path", "string", None),
+                ("action", "string", Some(json!("open"))),
+                ("timeout_ms", "integer", Some(json!(5000))),
+            ])
+        ),
+        t(
             "doctor",
             "Check the setup in one report: version, allowlist, which running apps\nare allowed or blocked, the session, AT-SPI, the virtual keyboard and\npointer, KWin scripting, screens and the screenshot path. Run it first\nwhen tools fail in ways that look like a broken installation.",
             schema(&[])
@@ -235,6 +264,9 @@ pub fn tools() -> Json {
         ),
     ]);
     for tool in list.as_array_mut().unwrap() {
+        if tool["name"] == "launch" {
+            tool["inputSchema"]["properties"]["args"]["items"] = json!({ "type": "string" });
+        }
         if READ_ONLY.contains(&tool["name"].as_str().unwrap()) {
             tool["annotations"] = json!({ "readOnlyHint": true });
         }

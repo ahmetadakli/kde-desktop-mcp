@@ -2,12 +2,14 @@
 //! buttons, and the compositor (KWin or Hyprland) for windows and the cursor.
 
 mod atspi;
+mod clipboard;
 mod hyprland;
 mod image;
 pub mod indicator;
 mod indicator_draw;
 mod input;
 mod kwin;
+mod launch;
 mod roles;
 mod terminals;
 
@@ -22,8 +24,8 @@ use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
-    AppEntry, Backend, Cache, Check, Info, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange,
-    WindowEntry, WindowGeo,
+    AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_FILE_DIALOG,
+    NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -61,10 +63,37 @@ const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
 const INSERT_ACTIVE_AGE: Duration = Duration::from_secs(1);
 /// How long the in-process clipboard may take to become the selection.
 const CLIPBOARD_WAIT: Duration = Duration::from_millis(250);
+/// How long the app in front may take to read a paste after ctrl+v before
+/// the clipboard is left holding the pasted text instead of being put back.
+/// Apps read it while handling the key, within a few ms when idle; one that
+/// reads later would get the restored clipboard and paste the user's text.
+const PASTE_READ_WAIT: Duration = Duration::from_secs(1);
 /// How long a focus request may take to show in the element's state.
 /// Qt reports focus about 3 ms after a GrabFocus that works.
 const FOCUS_POLL: Duration = Duration::from_millis(20);
 const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
+const NOT_A_FILE_DIALOG: &str = "the active window is not a KDE file dialog";
+/// Roles holding rows of data (files, places) or tool buttons, never the
+/// dialog's form fields: not walked when looking for them.
+const DIALOG_SKIP: [&str; 6] = ["list", "tree", "table", "tree table", "tool bar", "menu"];
+/// Nodes looked at when searching a dialog for its fields (KFileWidget's
+/// form has about 60 outside the skipped lists).
+const DIALOG_MAX_NODES: usize = 400;
+
+/// KFileWidget's file name field: the line edit of its location combo box
+/// (the "Name:" row at the bottom), not the one of the URL navigator at the
+/// top. Qt builds accessible ids from object and class names, so this does
+/// not depend on the language.
+fn is_file_name_field(id: &str) -> bool {
+    id.contains("KFileWidget")
+        && id.ends_with("KUrlComboBox.KLineEdit")
+        && !id.contains("KUrlNavigator")
+}
+
+/// One of KFileWidget's dialog buttons (Open/Save, Cancel).
+fn is_file_dialog_button(id: &str) -> bool {
+    id.contains("KFileWidget") && id.ends_with(".QPushButton")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum FocusMethod {
@@ -214,6 +243,13 @@ async fn with_terminals(list: &mut [WindowGeo]) {
     }
 }
 
+/// How often `launch` looks for the new window.
+const LAUNCH_POLL: Duration = Duration::from_millis(150);
+/// How long `launch` waits for a new window before taking the app's changed
+/// active window, or after the started process ended its active one
+/// (handed to a running instance).
+const HANDOFF_GRACE: Duration = Duration::from_millis(1500);
+
 fn which(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
@@ -239,15 +275,15 @@ where
 /// Own the clipboard in-process through the Wayland data-control protocol;
 /// a background thread serves pastes until another client takes it over.
 /// Returns once the compositor has the new selection, so a paste sent
-/// afterwards cannot get the previous one.
-fn own_clipboard(text: &str) -> R<()> {
+/// afterwards cannot get the previous one. `secret` adds KDE's password
+/// hint (kept when putting back a password the user had copied).
+fn own_clipboard(text: &[u8], secret: bool) -> R<()> {
     use std::io::Read;
     use wl_clipboard_rs::{copy, paste};
-    copy::Options::new()
-        .copy(
-            copy::Source::Bytes(text.as_bytes().into()),
-            copy::MimeType::Text,
-        )
+    let mut options = copy::Options::new();
+    options.sensitive(secret);
+    options
+        .copy(copy::Source::Bytes(text.into()), copy::MimeType::Text)
         .map_err(|e| format!("clipboard: {e}"))?;
     // The selection request is flushed by the serving thread; read the
     // clipboard back until it is ours (if it held the same text already,
@@ -262,7 +298,7 @@ fn own_clipboard(text: &str) -> R<()> {
         let mut buf = Vec::new();
         if let Ok((mut pipe, _)) = got
             && pipe.read_to_end(&mut buf).is_ok()
-            && buf == text.as_bytes()
+            && buf == text
         {
             return Ok(());
         }
@@ -273,11 +309,20 @@ fn own_clipboard(text: &str) -> R<()> {
     }
 }
 
+/// Make `text` the clipboard again after a paste; a note when that failed.
+async fn put_back(text: Vec<u8>, secret: bool) -> String {
+    match tokio::task::spawn_blocking(move || own_clipboard(&text, secret)).await {
+        Ok(Ok(())) => String::new(),
+        Ok(Err(e)) => format!("; the clipboard could not be put back ({e})"),
+        Err(e) => format!("; the clipboard could not be put back ({e})"),
+    }
+}
+
 /// Paste instead of typing key by key: works with any layout and Unicode.
 /// In-process when the compositor offers data-control, else through wl-copy.
 async fn set_clipboard(text: &str) -> R<()> {
-    let owned = text.to_string();
-    let done = tokio::task::spawn_blocking(move || own_clipboard(&owned)).await;
+    let owned = text.as_bytes().to_vec();
+    let done = tokio::task::spawn_blocking(move || own_clipboard(&owned, false)).await;
     if matches!(done, Ok(Ok(()))) {
         return Ok(());
     }
@@ -390,6 +435,18 @@ impl LinuxBackend {
         p
     }
 
+    /// The allowlist plus pids of AT-SPI apps sorted against it, for the
+    /// KWin window scripts.
+    async fn kwin_allow(&self, allowed: &[String]) -> kwin::Allow {
+        let mut apps = Vec::new();
+        for (app, name, _) in self.a11y.apps_with_windows().await {
+            if let Some(pid) = self.pid(&app.bus).await {
+                apps.push((pid, name));
+            }
+        }
+        kwin::Allow::new(allowed, &apps)
+    }
+
     // ------------------------------------------------------------ Hyprland
 
     /// AT-SPI app name per process id, from one registry scan; the first
@@ -462,6 +519,39 @@ impl LinuxBackend {
             .unwrap()
             .insert(bus.to_string(), t.clone());
         t
+    }
+
+    /// Paste `text` with ctrl+v through the clipboard, then put back the
+    /// text the clipboard held, once the app in front has read the paste
+    /// (restoring earlier would let it paste the old text). Images, files
+    /// and other non-text contents are not put back; the note says so.
+    async fn paste(&self, text: &str) -> R<String> {
+        let saved = clipboard::save().await;
+        let Ok(mut source) = clipboard::PasteSource::start(text).await else {
+            // No data-control: wl-copy, and no way to see the paste read.
+            set_clipboard(text).await?;
+            self.input.press_combo("ctrl+v").await?;
+            return Ok("; the clipboard now holds the typed text".into());
+        };
+        let since = std::time::Instant::now();
+        if let Err(e) = self.input.press_combo("ctrl+v").await {
+            // Nothing was pasted: safe to put the clipboard back now.
+            if let clipboard::Saved::Text { bytes, secret } = saved {
+                put_back(bytes, secret).await;
+            }
+            return Err(e);
+        }
+        let read = source.wait_read(since, PASTE_READ_WAIT).await;
+        Ok(match saved {
+            clipboard::Saved::Empty => String::new(),
+            clipboard::Saved::Nothing(why) => {
+                format!("; the clipboard now holds the typed text (not put back: {why})")
+            }
+            clipboard::Saved::Text { .. } if !read => "; the paste was not read within 1 s, so \
+                 the clipboard was not put back"
+                .into(),
+            clipboard::Saved::Text { bytes, secret } => put_back(bytes, secret).await,
+        })
     }
 
     /// Type by inserting at the caret of the focused element through
@@ -542,6 +632,48 @@ impl LinuxBackend {
             a11y.set_caret(&target, at + grown).await?;
         }
         Ok(true)
+    }
+
+    /// The file name field and default button of a KDE file dialog window,
+    /// read level by level below `window` (showing nodes only).
+    async fn file_dialog_parts(&self, window: &Obj) -> (Option<Obj>, Option<Obj>) {
+        let a11y = &self.a11y;
+        let (mut field, mut accept) = (None, None);
+        let mut level = vec![window.clone()];
+        let mut seen = 0;
+        while !level.is_empty() && seen < DIALOG_MAX_NODES && (field.is_none() || accept.is_none())
+        {
+            seen += level.len();
+            let nodes = futures_util::future::join_all(level.iter().map(|o| async move {
+                let (role, states, id, kids) = tokio::join!(
+                    a11y.role(o),
+                    a11y.states(o),
+                    a11y.accessible_id(o),
+                    a11y.children(o)
+                );
+                (o.clone(), role, states.unwrap_or(0), id, kids)
+            }))
+            .await;
+            level = Vec::new();
+            for (o, role, st, id, kids) in nodes {
+                if !atspi::has(st, atspi::SHOWING) {
+                    continue;
+                }
+                if field.is_none() && atspi::has(st, atspi::EDITABLE) && is_file_name_field(&id) {
+                    field = Some(o.clone());
+                }
+                if accept.is_none()
+                    && atspi::has(st, atspi::IS_DEFAULT)
+                    && is_file_dialog_button(&id)
+                {
+                    accept = Some(o.clone());
+                }
+                if !DIALOG_SKIP.contains(&role.as_str()) {
+                    level.extend(kids);
+                }
+            }
+        }
+        (field, accept)
     }
 
     async fn kde_frame_active(&self, caption: &str) -> bool {
@@ -650,6 +782,10 @@ impl Backend for LinuxBackend {
 
     async fn info(&self, id: &Obj, text_limit: usize) -> Info<Obj> {
         self.a11y.info(id, text_limit).await
+    }
+
+    async fn identity(&self, id: &Obj) -> (String, String) {
+        self.a11y.identity(id).await
     }
 
     async fn prefetch(
@@ -824,9 +960,9 @@ impl Backend for LinuxBackend {
         self.input.press_combo(combo).await
     }
 
-    async fn type_text(&self, text: &str) -> R<()> {
+    async fn type_text(&self, text: &str) -> R<String> {
         if text.is_empty() {
-            return Ok(());
+            return Ok(String::new());
         }
         if matches!(self.comp, Compositor::Hyprland(_)) && which("wtype") {
             // wtype uses the virtual-keyboard protocol: Unicode-safe and
@@ -843,13 +979,34 @@ impl Backend for LinuxBackend {
                     return Err(format!("wtype failed: {status}"));
                 }
             }
-            return Ok(());
+            return Ok(String::new());
         }
         if matches!(self.comp, Compositor::Kde(_)) && self.insert_at_caret(text).await? {
-            return Ok(());
+            return Ok(String::new());
         }
-        set_clipboard(text).await?;
-        self.input.press_combo("ctrl+v").await
+        self.paste(text).await
+    }
+
+    async fn clipboard_get(&self, limit: usize) -> R<Clip> {
+        let mimes = clipboard::mime_types().await?;
+        Ok(match clipboard::classify(&mimes) {
+            clipboard::Kind::Empty => Clip::Empty,
+            clipboard::Kind::Text { secret: true } => Clip::Secret,
+            clipboard::Kind::Text { secret: false } => {
+                // A character is at most 4 bytes in UTF-8.
+                let (bytes, more) = clipboard::read_text(limit.saturating_mul(4)).await?;
+                let (text, cut) = clipboard::cap_chars(&bytes, limit);
+                Clip::Text {
+                    text,
+                    truncated: cut || more,
+                }
+            }
+            clipboard::Kind::Files | clipboard::Kind::Other(_) => Clip::Other(mimes),
+        })
+    }
+
+    async fn clipboard_set(&self, text: &str) -> R<()> {
+        set_clipboard(text).await
     }
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {
@@ -896,11 +1053,13 @@ impl Backend for LinuxBackend {
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()> {
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let caption = kwin.activate(query, allowed).await?;
-                if !caption.is_empty() {
-                    // KWin switches at once; the toolkit reports ACTIVE a moment later.
-                    poll(ACTIVATE_WAIT, || self.kde_frame_active(&caption)).await;
+                let allow = self.kwin_allow(allowed).await;
+                let caption = kwin.activate(query, &allow).await?;
+                if caption.is_empty() {
+                    return Err(format!("no window of an allowed app matches '{query}'"));
                 }
+                // KWin switches at once; the toolkit reports ACTIVE a moment later.
+                poll(ACTIVATE_WAIT, || self.kde_frame_active(&caption)).await;
             }
             Compositor::Hyprland(h) => {
                 let q = query.to_lowercase();
@@ -940,7 +1099,7 @@ impl Backend for LinuxBackend {
     async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let mut list = kwin.windows(query, allowed).await?;
+                let mut list = kwin.windows(query, &self.kwin_allow(allowed).await).await?;
                 with_terminals(&mut list).await;
                 Ok(list)
             }
@@ -956,10 +1115,100 @@ impl Backend for LinuxBackend {
     ) -> R<WindowGeo> {
         match &self.comp {
             Compositor::Kde(kwin) => kwin
-                .set_window(query, allowed, change)
+                .set_window(query, &self.kwin_allow(allowed).await, change)
                 .await?
                 .ok_or_else(|| format!("no window of an allowed app matches '{query}'")),
             Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+        }
+    }
+
+    async fn launch(
+        &self,
+        app: &str,
+        args: &[String],
+        allowed: &[String],
+        wait: Duration,
+    ) -> R<Launched> {
+        let (name, argv) = (app.to_string(), args.to_vec());
+        let r = tokio::task::spawn_blocking(move || launch::resolve(&name, &argv))
+            .await
+            .map_err(|e| e.to_string())??;
+        let kwin = match &self.comp {
+            Compositor::Kde(k) => Some(k),
+            Compositor::Hyprland(_) => None,
+        };
+        // Windows already open, to tell a new one of a running instance.
+        let before = match kwin {
+            Some(k) => k
+                .windows("", &self.kwin_allow(allowed).await)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let (pid, exit) = launch::spawn(&r)?;
+        let mut out = Launched {
+            command: launch::describe(&r),
+            pid,
+            ..Launched::default()
+        };
+        let Some(kwin) = kwin else {
+            out.note = format!("not waiting for its window: {NO_WINDOW_CONTROL}");
+            return Ok(out);
+        };
+        if wait.is_zero() {
+            out.note = "not waiting for its window (wait_ms=0)".into();
+            return Ok(out);
+        }
+        let start = std::time::Instant::now();
+        let mut tree = std::collections::HashSet::from([pid]);
+        let mut ended: Option<std::time::Instant> = None;
+        loop {
+            // Children seen once stay in the tree, so apps that fork and
+            // let the parent exit are still matched by pid.
+            let roots = tree.clone();
+            tree = tokio::task::spawn_blocking(move || {
+                let stats = terminals::read_stats();
+                launch::descendants(&roots, stats.iter().map(|(p, s)| (*p, s.ppid)))
+            })
+            .await
+            .unwrap_or_else(|_| std::collections::HashSet::from([pid]));
+            // Rebuilt each round: the new app joins AT-SPI after it starts.
+            let allow = self.kwin_allow(allowed).await;
+            let now = kwin.windows("", &allow).await?;
+            let status = *exit.lock().unwrap();
+            if status.is_some() && ended.is_none() {
+                ended = Some(std::time::Instant::now());
+            }
+            let settled = ended.is_some_and(|t| t.elapsed() >= HANDOFF_GRACE);
+            let stage = if settled && status.is_some_and(|s| s.success()) {
+                launch::Stage::Ended
+            } else if start.elapsed() >= HANDOFF_GRACE {
+                launch::Stage::Settled
+            } else {
+                launch::Stage::Starting
+            };
+            if let Some((w, how)) = launch::pick_window(app, &before, &now, &tree, stage) {
+                let mut found = vec![w.clone()];
+                with_terminals(&mut found).await;
+                out.window = found.pop();
+                out.note = match how {
+                    launch::Found::Own => "",
+                    launch::Found::New => "opened by the running instance",
+                    launch::Found::Existing => "handed to the running instance",
+                }
+                .into();
+                return Ok(out);
+            }
+            if let Some(s) = status.filter(|s| !s.success() && settled) {
+                return Err(format!(
+                    "{} (pid {pid}) exited with {s} without opening a window",
+                    out.command
+                ));
+            }
+            if start.elapsed() >= wait {
+                return Ok(out);
+            }
+            tokio::time::sleep(LAUNCH_POLL).await;
         }
     }
 
@@ -968,6 +1217,54 @@ impl Backend for LinuxBackend {
             Compositor::Kde(kwin) => kwin.screens().await.unwrap_or_default(),
             Compositor::Hyprland(_) => Vec::new(),
         }
+    }
+
+    async fn active_file_dialog(&self) -> R<FileDialog<Obj>> {
+        let Compositor::Kde(kwin) = &self.comp else {
+            return Err(NO_FILE_DIALOG.into());
+        };
+        let a11y = &self.a11y;
+        let (active, apps) = tokio::join!(kwin.active_parent(), a11y.apps_with_windows());
+        let active = active?.ok_or("no active window")?;
+        // The accessible window KWin has in front: the ACTIVE one of the
+        // process KWin names, so the parent it reports is this window's.
+        let pid = active["pid"].as_i64();
+        let mut found = None;
+        'apps: for (app, name, windows) in apps {
+            if self.pid(&app.bus).await.map(i64::from) != pid {
+                continue;
+            }
+            for w in windows {
+                if a11y.has_state(&w, atspi::ACTIVE).await {
+                    found = Some((name, w));
+                    break 'apps;
+                }
+            }
+        }
+        let (app, window) = found.ok_or(NOT_A_FILE_DIALOG)?;
+        if a11y.role(&window).await != "dialog" {
+            return Err(NOT_A_FILE_DIALOG.into());
+        }
+        let (field, accept) = self.file_dialog_parts(&window).await;
+        let field = field.ok_or(NOT_A_FILE_DIALOG)?;
+        let parent = if active["parent"].is_object() {
+            let names = self.app_names_by_pid().await;
+            Some(Self::client_app_name(&names, &active["parent"]))
+        } else {
+            None
+        };
+        let titles = vec![
+            active["caption"].as_str().unwrap_or("").trim().to_string(),
+            a11y.name(&window).await.trim().to_string(),
+        ];
+        Ok(FileDialog {
+            window,
+            app: app.to_lowercase(),
+            titles,
+            parent,
+            field,
+            accept,
+        })
     }
 
     async fn doctor(&self) -> Vec<Check> {
@@ -1134,6 +1431,31 @@ impl Backend for LinuxBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn file_dialog_parts_are_matched_by_qt_ids() {
+        // As seen in xdg-desktop-portal-kde and kdialog (KF6).
+        let base = "QApplication.FileDialog.KFileWidget.QSplitter.QWidget";
+        assert!(is_file_name_field(&format!(
+            "{base}.KUrlComboBox.KLineEdit"
+        )));
+        assert!(is_file_name_field(
+            "QApplication.KDEPlatformFileDialog.KFileWidget.QSplitter.QWidget.KUrlComboBox.KLineEdit"
+        ));
+        // The URL navigator's edit, the filter combo, a search field.
+        assert!(!is_file_name_field(&format!(
+            "{base}.QWidget.KUrlNavigator.KUrlComboBox.KLineEdit"
+        )));
+        assert!(!is_file_name_field(&format!(
+            "{base}.KFileFilterCombo.KLineEdit"
+        )));
+        assert!(!is_file_name_field(&format!("{base}.QWidget.QLineEdit")));
+        assert!(!is_file_name_field(
+            "QApplication.MainWindow.KUrlComboBox.KLineEdit"
+        ));
+        assert!(is_file_dialog_button(&format!("{base}.QPushButton")));
+        assert!(!is_file_dialog_button("QApplication.Settings.QPushButton"));
+    }
 
     #[test]
     fn client_app_name_prefers_atspi_name_by_pid() {
