@@ -371,6 +371,14 @@ impl<B: Backend> Server<B> {
             let kids = info.children.clone();
             cache.insert(id, info);
             (header, kids, app)
+        } else if arg_b(a, "document", false) {
+            let app = arg_s(a, "app", "");
+            let windows = self.app_windows(&app).await?;
+            let doc = self.active_document(&app, windows, &mut cache).await?;
+            let rid = self.add_ref(&doc, &app.to_lowercase()).await;
+            let header = render::describe(&cache[&doc], rid);
+            let kids = cache[&doc].children.clone();
+            (header, kids, app.to_lowercase())
         } else {
             let app = arg_s(a, "app", "");
             let windows = self.app_windows(&app).await?;
@@ -404,6 +412,51 @@ impl<B: Backend> Server<B> {
             }
         };
         Ok(self.print(lines, &cache, &app).await)
+    }
+
+    /// The page or document of `app`'s active window (else its first visible
+    /// window): in a browser, the current tab's web page without the tabs and
+    /// toolbars around it. Fills `cache` on the way, which the tree reuses.
+    async fn active_document(
+        &self,
+        app: &str,
+        windows: Vec<B::Id>,
+        cache: &mut Cache<B::Id>,
+    ) -> R<B::Id> {
+        self.b
+            .prefetch(
+                cache,
+                windows.clone(),
+                true,
+                TREE_TEXT_LIMIT,
+                render::FIND_MAX_SEEN,
+            )
+            .await;
+        let window = windows
+            .iter()
+            .filter(|w| cache.get(*w).is_some_and(|i| i.showing))
+            .max_by_key(|w| cache[*w].states.contains(&"active"))
+            .cloned()
+            .ok_or_else(|| format!("'{app}' has no visible window"))?;
+        loop {
+            match render::first_with_role(
+                cache,
+                std::slice::from_ref(&window),
+                &render::DOCUMENT_ROLES,
+            ) {
+                Ok(Some(doc)) => return Ok(doc),
+                Ok(None) => {
+                    return Err(format!(
+                        "no document in the active window of '{app}'; call tree without `document`"
+                    ));
+                }
+                Err(missing) => {
+                    self.b
+                        .prefetch(cache, missing, true, TREE_TEXT_LIMIT, PREFETCH_MORE)
+                        .await;
+                }
+            }
+        }
     }
 
     async fn find(&self, a: &Json) -> R<String> {

@@ -66,6 +66,11 @@ Neden hızlı:
   (`list item ×3: [8] "a" [9] "b" [10] "c"`), Qt'nin hemen her öğeye verdiği
   "Set Focus" eylemi listelenmez. Dolphin + Kate `tree` çıktısı 15.182'den
   7.092 karaktere indi.
+- Tarayıcılarda da: Firefox'un her öğeye verdiği "clickAncestor" eylemi ve
+  web sayfalarının gömülü öğe yer tutucusu (U+FFFC) listelenmez; Firefox'un
+  bozuk toplu eylem adları (`;;`) yerine gerçek adlar okunur.
+  `tree(document=true)` yalnızca etkin sekmenin sayfasını gösterir. Aynı
+  Firefox sayfası 5.943 karakterden 1.421'e indi.
 - Bir AT-SPI çağrısı en fazla 2 sn bekler; yanıt vermeyen bir uygulama
   sunucuyu kilitlemez. Menü açan eylemler (Qt'de menü kapanana kadar yanıt
   gelmez) 400 ms sonra gönderilmiş sayılır.
@@ -76,7 +81,9 @@ Neden hızlı:
 
 ## Araçlar
 
-- `apps`, `tree`, `find`, `get_text`: okuma ve arama
+- `apps`, `tree`, `find`, `get_text`: okuma ve arama. `tree`'ye
+  `document: true` verilirse yalnızca etkin penceredeki belge listelenir
+  (tarayıcıda o sekmenin sayfası, sekmeler ve araç çubukları olmadan)
 - `act`, `set_text`, `focus`, `click`: öğeye işlem. Öğe, `tree`/`find`
   numarasıyla (`id`) ya da tek çağrıda `app` + `query` (+ `role`) ile seçilir:
   adı `query` ile birebir aynı olan ilk görünür öğe, yoksa adında, metninde ya
