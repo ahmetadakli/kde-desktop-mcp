@@ -65,6 +65,15 @@ impl Hypr {
         }
     }
 
+    /// The cursor position in layout coordinates (`hyprctl cursorpos`).
+    pub async fn cursor_pos(&self) -> R<(i64, i64)> {
+        let p = self.json("cursorpos").await?;
+        match (p["x"].as_i64(), p["y"].as_i64()) {
+            (Some(x), Some(y)) => Ok((x, y)),
+            _ => Err(format!("hyprctl cursorpos: unexpected reply {p}")),
+        }
+    }
+
     /// The focused client, or None.
     pub async fn active_window(&self) -> R<Option<Json>> {
         let aw = self.json("activewindow").await?;
@@ -143,7 +152,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             let mut got = Vec::new();
-            for _ in 0..3 {
+            for _ in 0..4 {
                 let (mut s, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 256];
                 let n = s.read(&mut buf).await.unwrap();
@@ -151,6 +160,7 @@ mod tests {
                 let reply = match req.as_str() {
                     "j/activewindow" => r#"{"address":"0x1","pid":42,"title":"t"}"#,
                     "dispatch movecursor 10 20" => "ok",
+                    "j/cursorpos" => r#"{"x": 10, "y": 20}"#,
                     _ => "Invalid dispatcher",
                 };
                 s.write_all(reply.as_bytes()).await.unwrap();
@@ -161,12 +171,14 @@ mod tests {
         let h = Hypr { socket: path };
         assert_eq!(h.active_window().await.unwrap().unwrap()["pid"], 42);
         h.dispatch("movecursor 10 20").await.unwrap();
+        assert_eq!(h.cursor_pos().await.unwrap(), (10, 20));
         assert!(h.dispatch("nope").await.is_err());
         assert_eq!(
             server.await.unwrap(),
             vec![
                 "j/activewindow",
                 "dispatch movecursor 10 20",
+                "j/cursorpos",
                 "dispatch nope"
             ]
         );
