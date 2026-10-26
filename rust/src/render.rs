@@ -78,6 +78,17 @@ fn short_name<Id>(info: &Info<Id>) -> String {
     first_chars(&info.name.replace('\n', " "), 80)
 }
 
+/// `role "name"` as `describe` shows it, for messages about an element.
+pub fn role_and_name(role: &str, name: &str) -> String {
+    let role = if role.is_empty() { "?" } else { role };
+    let name = first_chars(&name.replace('\n', " "), 80);
+    if name.is_empty() {
+        role.to_string()
+    } else {
+        format!("{role} {}", json_str(&name))
+    }
+}
+
 pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
     let name = short_name(info);
     let role = if info.role.is_empty() {

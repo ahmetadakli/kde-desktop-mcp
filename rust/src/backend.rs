@@ -128,6 +128,12 @@ pub trait Backend {
     async fn active_app(&self) -> String;
 
     async fn info(&self, id: &Self::Id, text_limit: usize) -> Info<Self::Id>;
+    /// Role and name only, as cheaply as the platform allows (one round
+    /// trip); role "" when the element is gone. Checks an id before use.
+    async fn identity(&self, id: &Self::Id) -> (String, String) {
+        let info = self.info(id, 0).await;
+        (info.role, info.name)
+    }
     /// Fetch `roots` and their descendants into `cache`, as fast as the
     /// platform allows. Children of hidden nodes may be skipped when
     /// `only_showing`; stop after roughly `limit` new nodes.

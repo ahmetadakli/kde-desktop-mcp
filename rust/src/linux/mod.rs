@@ -652,6 +652,10 @@ impl Backend for LinuxBackend {
         self.a11y.info(id, text_limit).await
     }
 
+    async fn identity(&self, id: &Obj) -> (String, String) {
+        self.a11y.identity(id).await
+    }
+
     async fn prefetch(
         &self,
         cache: &mut Cache<Obj>,

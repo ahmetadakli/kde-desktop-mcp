@@ -117,6 +117,13 @@ değişkenini verin.
   adı `query` ile birebir aynı olan ilk görünür öğe, yoksa adında, metninde ya
   da rolünde geçen ilk öğe. `act`, etkin pencere değiştiyse (ör. bir iletişim
   kutusu açıldıysa) bunu bildirir.
+- Eskimiş numaralar: her `id` kullanımında öğenin rolü ve adı yeniden okunur
+  (tek gidiş-dönüş). Öğe kaybolduysa ya da rolü veya adı değiştiyse (sayfa
+  yeniden çizildi, nesne yolu başka öğeye geçti) hiçbir şey yapılmaz ve
+  `stale id N (was <rol> "<ad>", now ...); call tree/find again` hatası
+  döner. Adı içeriğiyle ya da başlığıyla değişen öğelerde (pencere, sekme,
+  belge, etiket, durum çubuğu, metin alanı, açılır kutu, düzenlenebilir
+  öğeler) ve adsız öğelerde yalnızca rol karşılaştırılır.
 - `wait_for`: bir öğe görünene ya da kaybolana kadar bekler (her 50 ms'de bir
   bakar, en fazla 10 dakika); tuş veya tıklamadan sonra açılan iletişim
   kutularını, uzun bir yüklemeyi ya da derlemeyi beklemek için. Daha uzun bir
