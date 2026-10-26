@@ -78,6 +78,9 @@ Neden hızlı:
   uygulama `ping`'i ve diğer çağrıları bekletmez. Claude bir çağrıyı iptal
   ederse (`notifications/cancelled`) çağrı durdurulur. Klavye ve fare girdisi
   gönderen araçlar yine sırayla çalışır, tuşlar birbirine karışmaz.
+- Okuma araçları (`apps`, `tree`, `find`, `get_text`, `wait_for`,
+  `screenshot`, `pause`) MCP'de `readOnlyHint` ile işaretlidir; Claude Code
+  bunları tek mesajda birden fazla istendiğinde paralel çalıştırır.
 
 ## Araçlar
 
@@ -90,7 +93,11 @@ Neden hızlı:
   da rolünde geçen ilk öğe. `act`, etkin pencere değiştiyse (ör. bir iletişim
   kutusu açıldıysa) bunu bildirir.
 - `wait_for`: bir öğe görünene ya da kaybolana kadar bekler (her 50 ms'de bir
-  bakar); tuş veya tıklamadan sonra açılan iletişim kutularını beklemek için
+  bakar, en fazla 10 dakika); tuş veya tıklamadan sonra açılan iletişim
+  kutularını, uzun bir yüklemeyi ya da derlemeyi beklemek için. Daha uzun bir
+  süre istenirse 10 dakikaya indirilir ve yanıtta bu belirtilir.
+- `pause`: belirli bir süre bekler (`ms`, en fazla 10 dakika); görünür bir
+  değişikliği değil, yalnızca zamanı beklemek için
 - `key`, `type_text`: klavye
 - `activate_window`: pencereyi öne getirme
 - `mouse`, `screenshot`: yalnızca yedek
@@ -167,6 +174,17 @@ claude mcp add --scope user desktop -- "$PWD\target\release\desktop-mcp.exe"
 Linux'ta Windows için derlemek de mümkündür (`mingw-w64-gcc` ve
 `rustup target add x86_64-pc-windows-gnu`, sonra
 `cargo build --release --target x86_64-pc-windows-gnu`).
+
+### Hız: izin sorusunu atlamak
+
+Claude Code, izin listesinde olmayan her MCP çağrısını onaya ya da auto
+mode'da güvenlik sınıflandırıcısına gönderir; bu çağrı başına yaklaşık
+0,7–2,5 sn ekler. Sunucunun bütün araçlarına güveniyorsanız
+`~/.claude/settings.json` dosyasına tek kural ekleyin:
+
+```json
+{ "permissions": { "allow": ["mcp__desktop"] } }
+```
 
 ## Test
 
