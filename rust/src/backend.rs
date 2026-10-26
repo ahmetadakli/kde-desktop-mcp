@@ -45,6 +45,17 @@ pub struct WindowGeo {
     pub minimized: bool,
     pub maximized: bool,
     pub output: String,
+    pub pid: u32,
+    /// Pseudo-terminals the window's processes hold (terminal emulators).
+    pub terminals: Vec<Terminal>,
+}
+
+/// A terminal in a window: device, foreground command and its directory.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Terminal {
+    pub tty: String,
+    pub command: String,
+    pub cwd: String,
 }
 
 /// What `move_window` changes; None keeps the current value.

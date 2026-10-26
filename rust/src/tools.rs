@@ -192,12 +192,15 @@ pub fn tools() -> Json {
         ),
         t(
             "activate_window",
-            "Bring an allowed app's window to the front by title or app-name substring.",
-            schema(&[("query", "string", None)])
+            "Bring an allowed app's window to the front by title or app-name substring\n(`query`), or with `terminal` the window whose terminal runs a command or\nis in a directory containing it (as listed by windows; KDE). A terminal\nwith several tabs comes to the front on whichever tab was shown.",
+            schema(&[
+                ("query", "string", Some(Json::Null)),
+                ("terminal", "string", Some(Json::Null)),
+            ])
         ),
         t(
             "windows",
-            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state and output, after the\nscreens (name, geometry, scale). `query` filters by title or app name.\nKDE Plasma only.",
+            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state and output, after the\nscreens (name, geometry, scale). Terminal windows also list each tab's\npseudo-terminal with its foreground command and directory. `query` filters\nby title or app name. KDE Plasma only.",
             schema(&[("query", "string", Some(json!("")))])
         ),
         t(

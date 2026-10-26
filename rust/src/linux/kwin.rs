@@ -110,7 +110,7 @@ function geo(w) {
   const m = workspace.clientArea(KWin.MaximizeArea, w);
   return {title: w.caption, app: w.resourceClass || "", x: g.x, y: g.y,
     width: g.width, height: g.height, active: w === workspace.activeWindow,
-    minimized: w.minimized, output: w.output ? w.output.name : "",
+    minimized: w.minimized, output: w.output ? w.output.name : "", pid: w.pid,
     maximized: g.x === m.x && g.y === m.y && g.width === m.width && g.height === m.height};
 }
 "#;
@@ -470,6 +470,11 @@ fn window_geo(g: &Json) -> WindowGeo {
         minimized: g["minimized"].as_bool().unwrap_or(false),
         maximized: g["maximized"].as_bool().unwrap_or(false),
         output: text("output"),
+        pid: g["pid"]
+            .as_u64()
+            .and_then(|p| u32::try_from(p).ok())
+            .unwrap_or(0),
+        terminals: Vec::new(),
     }
 }
 

@@ -7,6 +7,7 @@ mod image;
 mod input;
 mod kwin;
 mod roles;
+mod terminals;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -101,6 +102,22 @@ pub struct LinuxBackend {
     focus_record: Mutex<HashMap<(String, FocusMethod), Tried>>,
     /// KWin refused ScreenShot2; use spectacle from now on.
     shot_unauthorized: AtomicBool,
+}
+
+/// Fill in the terminals of each window from /proc (off the event loop).
+async fn with_terminals(list: &mut [WindowGeo]) {
+    let pids: Vec<u32> = list.iter().map(|w| w.pid).collect();
+    let found = tokio::task::spawn_blocking(move || {
+        let stats = terminals::read_stats();
+        pids.into_iter()
+            .map(|pid| terminals::terminals_of(pid, &stats, terminals::describe))
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap_or_default();
+    for (w, t) in list.iter_mut().zip(found) {
+        w.terminals = t;
+    }
 }
 
 fn which(cmd: &str) -> bool {
@@ -813,7 +830,11 @@ impl Backend for LinuxBackend {
 
     async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
         match &self.comp {
-            Compositor::Kde(kwin) => kwin.windows(query, allowed).await,
+            Compositor::Kde(kwin) => {
+                let mut list = kwin.windows(query, allowed).await?;
+                with_terminals(&mut list).await;
+                Ok(list)
+            }
             Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
         }
     }

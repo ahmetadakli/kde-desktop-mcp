@@ -184,6 +184,14 @@ fn describe_window(w: &WindowGeo) -> String {
     if !w.output.is_empty() {
         line.push_str(&format!(" on {}", w.output));
     }
+    for t in &w.terminals {
+        line.push_str(&format!(
+            "\n  {}: {} (in {})",
+            t.tty,
+            render::py_repr(&t.command),
+            t.cwd
+        ));
+    }
     line
 }
 
@@ -1064,7 +1072,10 @@ impl<B: Backend> Server<B> {
     }
 
     async fn activate_window(&self, a: &Json) -> R<String> {
-        let query = req_s(a, "query")?;
+        let query = match a.get("terminal").and_then(Json::as_str) {
+            Some(t) => self.terminal_window(t).await?,
+            None => req_s(a, "query")?,
+        };
         self.b.activate_window(&query, &self.allowed()).await?;
         *self.last_active.lock().await = self.active_title().await;
         let app = self.b.active_app().await;
@@ -1072,6 +1083,23 @@ impl<B: Backend> Server<B> {
             "active app now: {}",
             if app.is_empty() { "unknown" } else { &app }
         ))
+    }
+
+    /// Title of the allowed window whose terminal runs a command, or is in a
+    /// directory, containing `what` (case-insensitive).
+    async fn terminal_window(&self, what: &str) -> R<String> {
+        let q = what.to_lowercase();
+        let list = self.b.windows("", &self.allowed()).await?;
+        list.into_iter()
+            .find(|w| {
+                w.terminals.iter().any(|t| {
+                    t.command.to_lowercase().contains(&q) || t.cwd.to_lowercase().contains(&q)
+                })
+            })
+            .map(|w| w.title)
+            .ok_or_else(|| {
+                format!("no terminal of an allowed app runs or is in '{what}' (see windows)")
+            })
     }
 
     async fn screenshot(&self, a: &Json) -> R<Out> {
