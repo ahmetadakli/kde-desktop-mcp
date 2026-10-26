@@ -141,7 +141,7 @@ pub fn tools() -> Json {
         ),
         t(
             "key",
-            "Press a key or chord in the active window, e.g. \"ctrl+s\", \"alt+tab\", \"enter\",\n\"f5\", \"left\". Only sent when the active window belongs to an allowed app.\nTo wait for what a key opens or closes (a dialog), use wait_for.",
+            "Press a key or chord in the active window, e.g. \"ctrl+s\", \"alt+tab\", \"enter\",\n\"f5\", \"left\". Only sent when the active window belongs to an allowed app.\nThe reply names the element that has focus afterwards. To wait for what a\nkey opens or closes (a dialog), use wait_for.",
             schema(&[
                 ("combo", "string", None),
                 ("repeat", "integer", Some(json!(1)))
@@ -149,7 +149,7 @@ pub fn tools() -> Json {
         ),
         t(
             "type_text",
-            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. On Linux this goes through the clipboard and\noverwrites it.",
+            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. On Linux this goes through the clipboard and\noverwrites it. The reply names the focused element and warns when it is not\nan editable field.",
             schema(&[("text", "string", None)])
         ),
         t(
@@ -172,8 +172,11 @@ pub fn tools() -> Json {
         ),
         t(
             "screenshot",
-            "Last resort only: capture the active window to a PNG and return its path\n(read it with the Read tool) and the screen area it shows. Prefer tree/find;\nthey also list web page popups and menus. To click something seen only in\nthe image, pass its pixel position to mouse as image_x/image_y.",
-            schema(&[])
+            "Last resort only: capture the active window. The image comes back in the\nreply (no need to Read the file), shrunk so its longer side is at most\n`max_size` px; `inline`=false returns only the file path. Also says which\nscreen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y.",
+            schema(&[
+                ("max_size", "integer", Some(json!(1280))),
+                ("inline", "boolean", Some(json!(true))),
+            ])
         ),
         t(
             "batch",

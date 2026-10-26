@@ -10,6 +10,7 @@ mod backend;
 #[cfg(target_os = "linux")]
 mod linux;
 mod render;
+mod shot;
 mod tools;
 #[cfg(windows)]
 mod windows;
@@ -108,17 +109,26 @@ impl ShotMap {
     }
 }
 
-/// Width and height from a PNG file's header.
-fn png_size(path: &str) -> Option<(u32, u32)> {
-    use std::io::Read;
-    let mut head = [0u8; 24];
-    std::fs::File::open(path).ok()?.read_exact(&mut head).ok()?;
-    if &head[..8] != b"\x89PNG\r\n\x1a\n" || &head[12..16] != b"IHDR" {
-        return None;
-    }
-    let num = |i: usize| u32::from_be_bytes([head[i], head[i + 1], head[i + 2], head[i + 3]]);
-    Some((num(16), num(20)))
+/// A tool's reply: text, plus base64 PNGs sent as MCP image blocks.
+struct Out {
+    text: String,
+    images: Vec<String>,
 }
+
+impl From<String> for Out {
+    fn from(text: String) -> Self {
+        Out {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+/// Longest side of a screenshot sent back, unless `max_size` says otherwise.
+const SHOT_MAX_SIZE: i64 = 1280;
+
+/// Roles that take typed text without the editable state.
+const TEXT_SINKS: [&str; 2] = ["terminal", "console"];
 
 /// An element picked by `id`, or found by `app` + `query`.
 struct Target<Id> {
@@ -696,14 +706,36 @@ impl<B: Backend> Server<B> {
         for _ in 0..repeat.clamp(1, 100) {
             self.b.press_combo(&combo).await?;
         }
-        Ok(format!("sent {combo} x{repeat} to {app}"))
+        let focus = self.focus_note(&app, false).await;
+        Ok(format!("sent {combo} x{repeat} to {app}{focus}"))
     }
 
     async fn type_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
         let app = self.require_active_allowed().await?;
         self.b.type_text(&text).await?;
-        Ok(format!("typed {} chars into {app}", text.chars().count()))
+        let focus = self.focus_note(&app, true).await;
+        Ok(format!(
+            "typed {} chars into {app}{focus}",
+            text.chars().count()
+        ))
+    }
+
+    /// "; focus: [id] role "name"" for the element now holding focus, so a
+    /// key or typed text that went somewhere unexpected shows at once. With
+    /// `typing`, warns when that element does not take text.
+    async fn focus_note(&self, app: &str, typing: bool) -> String {
+        let Some(id) = self.b.focused().await else {
+            return String::new();
+        };
+        let info = self.b.info(&id, 0).await;
+        let rid = self.add_ref(&id, &app.to_lowercase()).await;
+        let mut note = format!("; focus: {}", render::describe(&info, rid));
+        if typing && !info.states.contains(&"editable") && !TEXT_SINKS.contains(&info.role.as_str())
+        {
+            note.push_str(" (not an editable field: check where the text went)");
+        }
+        note
     }
 
     async fn mouse(&self, a: &Json) -> R<String> {
@@ -739,30 +771,53 @@ impl<B: Backend> Server<B> {
         ))
     }
 
-    async fn screenshot(&self) -> R<String> {
+    async fn screenshot(&self, a: &Json) -> R<Out> {
         self.require_active_allowed().await?;
-        let Some(Shot { path, area }) = self.b.screenshot().await else {
-            *self.last_shot.lock().await = None;
-            return Err("screenshot failed".into());
-        };
-        let size = png_size(&path);
-        let map = size.zip(area).and_then(|(s, a)| ShotMap::new(s, a));
+        *self.last_shot.lock().await = None;
+        let Shot { path, area } = self.b.screenshot().await.ok_or("screenshot failed")?;
+        let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, 8192) as u32;
+        let inline = arg_b(a, "inline", true);
+        // Decoding and shrinking take tens of ms: keep other calls moving.
+        let file = path.clone();
+        let (size, png) = tokio::task::spawn_blocking(move || -> R<((u32, u32), Vec<u8>)> {
+            let img = shot::read_png(&file)?;
+            let (w, h) = shot::fit((img.width, img.height), max, max);
+            if (w, h) == (img.width, img.height) {
+                return Ok(((w, h), std::fs::read(&file).map_err(|e| e.to_string())?));
+            }
+            let png = shot::write_png(&shot::shrink(&img, w, h))?;
+            std::fs::write(&file, &png).map_err(|e| e.to_string())?;
+            Ok(((w, h), png))
+        })
+        .await
+        .map_err(|e| e.to_string())??;
+        let map = area.and_then(|a| ShotMap::new(size, a));
         *self.last_shot.lock().await = map;
-        Ok(match (size, area, map) {
-            (Some((iw, ih)), Some((x, y, w, h)), Some(_)) => format!(
-                "{path}\n{iw}x{ih} px image of screen area at ({x},{y}), {w}x{h}. To click a \
-                 point seen in it, pass its pixel position as image_x/image_y to mouse."
-            ),
-            _ => path,
+        let (iw, ih) = size;
+        let mut text = format!("{path}\n{iw}x{ih} px");
+        if let (Some((x, y, w, h)), Some(_)) = (area, map) {
+            text.push_str(&format!(
+                " image of screen area at ({x},{y}), {w}x{h}. To click a point seen in it, \
+                 pass its pixel position as image_x/image_y to mouse."
+            ));
+        }
+        Ok(Out {
+            text,
+            images: if inline {
+                vec![shot::base64(&png)]
+            } else {
+                Vec::new()
+            },
         })
     }
 
-    async fn batch(&self, a: &Json) -> R<String> {
+    async fn batch(&self, a: &Json) -> R<Out> {
         let steps = a
             .get("steps")
             .and_then(Json::as_array)
             .ok_or("missing array argument 'steps'")?;
         let mut out = Vec::new();
+        let mut images = Vec::new();
         for (i, step) in steps.iter().enumerate() {
             let tool = step.get("tool").and_then(Json::as_str).unwrap_or("");
             let args = step.get("args").cloned().unwrap_or_else(|| json!({}));
@@ -770,7 +825,10 @@ impl<B: Backend> Server<B> {
                 return Err("batch cannot contain batch".into());
             }
             match self.call(tool, &args).await {
-                Ok(text) => out.push(format!("[{}] {tool}: {text}", i + 1)),
+                Ok(o) => {
+                    out.push(format!("[{}] {tool}: {}", i + 1, o.text));
+                    images.extend(o.images);
+                }
                 Err(e) => {
                     out.push(format!("[{}] {tool} failed: {e}", i + 1));
                     if i + 1 < steps.len() {
@@ -780,14 +838,17 @@ impl<B: Backend> Server<B> {
                 }
             }
         }
-        Ok(out.join("\n"))
+        Ok(Out {
+            text: out.join("\n"),
+            images,
+        })
     }
 
     fn call<'a>(
         &'a self,
         name: &'a str,
         a: &'a Json,
-    ) -> Pin<Box<dyn Future<Output = R<String>> + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         Box::pin(async move {
             let _input = if INPUT_TOOLS.contains(&name) {
                 Some(self.input.lock().await)
@@ -795,21 +856,21 @@ impl<B: Backend> Server<B> {
                 None
             };
             match name {
-                "apps" => self.apps().await,
-                "tree" => self.tree(a).await,
-                "find" => self.find(a).await,
-                "act" => self.act(a).await,
-                "set_text" => self.set_text(a).await,
-                "get_text" => self.get_text(a).await,
-                "wait_for" => self.wait_for(a).await,
-                "pause" => self.pause(a).await,
-                "focus" => self.focus(a).await,
-                "click" => self.click(a).await,
-                "key" => self.key(a).await,
-                "type_text" => self.type_text(a).await,
-                "mouse" => self.mouse(a).await,
-                "activate_window" => self.activate_window(a).await,
-                "screenshot" => self.screenshot().await,
+                "apps" => self.apps().await.map(Out::from),
+                "tree" => self.tree(a).await.map(Out::from),
+                "find" => self.find(a).await.map(Out::from),
+                "act" => self.act(a).await.map(Out::from),
+                "set_text" => self.set_text(a).await.map(Out::from),
+                "get_text" => self.get_text(a).await.map(Out::from),
+                "wait_for" => self.wait_for(a).await.map(Out::from),
+                "pause" => self.pause(a).await.map(Out::from),
+                "focus" => self.focus(a).await.map(Out::from),
+                "click" => self.click(a).await.map(Out::from),
+                "key" => self.key(a).await.map(Out::from),
+                "type_text" => self.type_text(a).await.map(Out::from),
+                "mouse" => self.mouse(a).await.map(Out::from),
+                "activate_window" => self.activate_window(a).await.map(Out::from),
+                "screenshot" => self.screenshot(a).await,
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
             }
@@ -847,11 +908,17 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let (text, is_error) = match server.call(name, &args).await {
-                Ok(t) => (t, false),
-                Err(e) => (format!("Error executing tool {name}: {e}"), true),
+            let (out, is_error) = match server.call(name, &args).await {
+                Ok(o) => (o, false),
+                Err(e) => (Out::from(format!("Error executing tool {name}: {e}")), true),
             };
-            json!({ "content": [{ "type": "text", "text": text }], "isError": is_error })
+            let mut content = vec![json!({ "type": "text", "text": out.text })];
+            content.extend(
+                out.images
+                    .into_iter()
+                    .map(|data| json!({ "type": "image", "data": data, "mimeType": "image/png" })),
+            );
+            json!({ "content": content, "isError": is_error })
         }
         _ => {
             return Some(json!({ "jsonrpc": "2.0", "id": id,
@@ -1076,8 +1143,19 @@ mod tests {
         async fn active_app(&self) -> String {
             "fake".into()
         }
-        async fn info(&self, _: &u32, _: usize) -> Info<u32> {
-            Info::default()
+        async fn info(&self, id: &u32, _: usize) -> Info<u32> {
+            match *id {
+                FAKE_FOCUS => Info {
+                    role: "push button".into(),
+                    name: "OK".into(),
+                    showing: true,
+                    ..Info::default()
+                },
+                _ => Info::default(),
+            }
+        }
+        async fn focused(&self) -> Option<u32> {
+            Some(FAKE_FOCUS)
         }
         async fn prefetch(&self, _: &mut Cache<u32>, _: Vec<u32>, _: bool, _: usize, _: usize) {}
         async fn actions(&self, _: &u32) -> Vec<String> {
@@ -1120,9 +1198,23 @@ mod tests {
             Ok(())
         }
         async fn screenshot(&self) -> Option<Shot> {
-            None
+            // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.
+            let path = self.allow_file.with_extension("png");
+            let img = shot::Pixels {
+                width: 200,
+                height: 100,
+                channels: 3,
+                data: vec![128; 200 * 100 * 3],
+            };
+            std::fs::write(&path, shot::write_png(&img).ok()?).ok()?;
+            Some(Shot {
+                path: path.display().to_string(),
+                area: Some((10.0, 20.0, 400.0, 200.0)),
+            })
         }
     }
+
+    const FAKE_FOCUS: u32 = 7;
 
     struct Session {
         stdin: DuplexStream,
@@ -1300,20 +1392,79 @@ mod tests {
         assert_eq!(ShotMap::new((0, 600), (0.0, 0.0, 800.0, 600.0)), None);
     }
 
-    #[test]
-    fn png_size_reads_the_header() {
-        let dir = std::env::temp_dir().join(format!("desktop-mcp-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("a.png");
-        let mut enc = png::Encoder::new(std::fs::File::create(&path).unwrap(), 3, 2);
-        enc.set_color(png::ColorType::Rgb);
-        enc.write_header()
+    async fn call_tool(s: &mut Session, id: u64, name: &str, args: Json) -> Json {
+        send(
+            s,
+            json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": {"name": name, "arguments": args}}),
+        )
+        .await;
+        let line = tokio::time::timeout(Duration::from_secs(5), s.stdout.next_line())
+            .await
             .unwrap()
-            .write_image_data(&[0; 18])
+            .unwrap()
             .unwrap();
-        assert_eq!(png_size(path.to_str().unwrap()), Some((3, 2)));
-        std::fs::write(&path, b"not a png at all, just text").unwrap();
-        assert_eq!(png_size(path.to_str().unwrap()), None);
-        std::fs::remove_dir_all(&dir).unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn screenshot_comes_back_inline_shrunk_and_clickable() {
+        local(async {
+            let mut s = session("shot");
+            let r = call_tool(&mut s, 2, "screenshot", json!({"max_size": 100})).await;
+            let content = &r["result"]["content"];
+            let text = content[0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("100x50 px image of screen area at (10,20), 400x200"),
+                "{text}"
+            );
+            assert_eq!(content[1]["type"], "image", "{r}");
+            assert_eq!(content[1]["mimeType"], "image/png");
+            assert!(
+                content[1]["data"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("iVBORw0KGgo")
+            );
+            // The file on disk is the shrunk image the coordinates refer to.
+            let path = text.lines().next().unwrap();
+            let img = shot::read_png(path).unwrap();
+            assert_eq!((img.width, img.height), (100, 50));
+            std::fs::remove_file(path).unwrap();
+            // Pixel (50, 25) of a 4x-scaled image of an area at (10, 20).
+            let r = call_tool(&mut s, 3, "mouse", json!({"image_x": 50, "image_y": 25})).await;
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert_eq!(text, "pointer at (212,122) in fake");
+            let r = call_tool(&mut s, 4, "screenshot", json!({"inline": false})).await;
+            assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1, "{r}");
+            let path = r["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap();
+            std::fs::remove_file(path).unwrap();
+        });
+    }
+
+    #[test]
+    fn typing_reports_focus_and_warns_off_a_text_field() {
+        local(async {
+            let mut s = session("focusnote");
+            let r = call_tool(&mut s, 2, "type_text", json!({"text": "hi"})).await;
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with("typed 2 chars into fake; focus: [1] push button \"OK\""),
+                "{text}"
+            );
+            assert!(
+                text.ends_with("(not an editable field: check where the text went)"),
+                "{text}"
+            );
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "a"})).await;
+            let text = r["result"]["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("; focus: [2] push button \"OK\""), "{text}");
+            assert!(!text.contains("not an editable"), "{text}");
+        });
     }
 }

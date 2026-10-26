@@ -89,6 +89,10 @@ pub trait Backend {
     /// Replace the contents; Err when the element is not editable.
     async fn set_text(&self, id: &Self::Id, text: &str) -> R<bool>;
     async fn is_focused(&self, id: &Self::Id) -> bool;
+    /// The element holding keyboard focus now, when the backend tracks it.
+    async fn focused(&self) -> Option<Self::Id> {
+        None
+    }
     /// Focus without synthesising pointer input. Ok(Some(method)) when it
     /// worked, Ok(None) so the caller can fall back to a click.
     async fn try_focus(&self, id: &Self::Id) -> R<Option<String>>;
