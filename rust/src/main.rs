@@ -291,28 +291,12 @@ const PORTAL_APPS: [&str; 1] = ["xdg-desktop-portal-kde"];
 /// after the path was written.
 const ACCEPT_ENABLE_WAIT: Duration = Duration::from_millis(1000);
 
-/// Whether a dialog title names `window` as its parent: the portal titles
-/// its dialog "<dialog title> - <parent window title>".
-fn title_names_parent(dialog: &str, window: &str) -> bool {
-    let window = window.trim();
-    !window.is_empty()
-        && dialog
-            .trim()
-            .strip_suffix(window)
-            .and_then(|rest| rest.strip_suffix(" - "))
-            .is_some_and(|title| !title.trim().is_empty())
-}
-
 /// The allowed app a file dialog belongs to, or why it may not be filled
 /// in. An allowed app's own (in-process) dialog is that app's. A portal
-/// dialog belongs to its transient parent when the compositor reports one,
-/// else to the allowed window its title names; `windows` are (app, title)
-/// of allowed apps' windows.
-fn file_dialog_owner<Id>(
-    d: &FileDialog<Id>,
-    allowed: &[String],
-    windows: &[(String, String)],
-) -> R<String> {
+/// dialog belongs to the transient parent KWin reports for it (the window
+/// the requesting app exported); without one it is refused, as its title
+/// alone could be made to name any window.
+fn file_dialog_owner<Id>(d: &FileDialog<Id>, allowed: &[String]) -> R<String> {
     let app = d.app.to_lowercase();
     if allowed.contains(&app) {
         return Ok(app);
@@ -338,16 +322,10 @@ fn file_dialog_owner<Id>(
             ))
         };
     }
-    windows
-        .iter()
-        .find(|(_, w)| d.titles.iter().any(|t| title_names_parent(t, w)))
-        .map(|(a, _)| a.clone())
-        .ok_or_else(|| {
-            format!(
-                "the active file dialog ({}) does not belong to a window of an allowed app",
-                render::py_repr(d.titles.first().map(String::as_str).unwrap_or(""))
-            )
-        })
+    Err(format!(
+        "the active file dialog ({}) names no parent window, so it cannot be tied to an allowed app",
+        render::py_repr(d.titles.first().map(String::as_str).unwrap_or(""))
+    ))
 }
 
 /// `raw` with a leading `~` expanded to `home`; Err unless the result is an
@@ -1403,20 +1381,7 @@ impl<B: Backend> Server<B> {
         self.b.enable().await;
         let d = self.b.active_file_dialog().await?;
         let allowed = self.allowed();
-        let windows: Vec<(String, String)> = self
-            .b
-            .list_apps()
-            .await
-            .into_iter()
-            .filter(|app| allowed.contains(&app.name.to_lowercase()))
-            .flat_map(|app| {
-                let name = app.name.to_lowercase();
-                app.windows
-                    .into_iter()
-                    .map(move |w| (name.clone(), w.title))
-            })
-            .collect();
-        let owner = file_dialog_owner(&d, &allowed, &windows)
+        let owner = file_dialog_owner(&d, &allowed)
             .map_err(|e| format!("{e} (allowlist: {})", self.allow_file.display()))?;
         let text = path.display().to_string();
         if !self.b.set_text(&d.field, &text).await? {
@@ -2343,24 +2308,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn dialog_titles_name_their_parent_window() {
-        let gemini = "Google Gemini — Mozilla Firefox";
-        assert!(title_names_parent(
-            "Dosya gönder - Google Gemini — Mozilla Firefox",
-            gemini
-        ));
-        // A dialog title that itself has " - " in it.
-        assert!(title_names_parent("Yükle - Dosya - x — Kate", "x — Kate"));
-        assert!(!title_names_parent(gemini, gemini));
-        assert!(!title_names_parent(
-            " - Google Gemini — Mozilla Firefox",
-            gemini
-        ));
-        assert!(!title_names_parent("Aç - Başka — Mozilla Firefox", gemini));
-        assert!(!title_names_parent("Aç - ", ""));
-    }
-
     fn dialog(app: &str, title: &str, parent: Option<&str>) -> FileDialog<u32> {
         FileDialog {
             window: 1,
@@ -2375,11 +2322,7 @@ mod tests {
     #[test]
     fn file_dialogs_are_filled_only_for_allowed_apps() {
         let allowed = vec!["firefox".to_string(), "kate".to_string()];
-        let windows = vec![(
-            "firefox".to_string(),
-            "Google Gemini — Mozilla Firefox".to_string(),
-        )];
-        let owner = |d: &FileDialog<u32>| file_dialog_owner(d, &allowed, &windows);
+        let owner = |d: &FileDialog<u32>| file_dialog_owner(d, &allowed);
         let portal = "xdg-desktop-portal-kde";
         let title = "Dosya gönder - Google Gemini — Mozilla Firefox";
         // The compositor's transient parent decides when it is known.
@@ -2389,9 +2332,9 @@ mod tests {
         );
         assert!(owner(&dialog(portal, title, Some("telegram-desktop"))).is_err());
         assert!(owner(&dialog(portal, title, Some(""))).is_err());
-        // Else the window its title names.
-        assert_eq!(owner(&dialog(portal, title, None)).unwrap(), "firefox");
-        assert!(owner(&dialog(portal, "Dosya gönder - Telegram", None)).is_err());
+        // Without a parent the title is not trusted, even when it names an
+        // allowed window.
+        assert!(owner(&dialog(portal, title, None)).is_err());
         // An allowed app's own dialog; any other app's is refused.
         assert_eq!(owner(&dialog("Kate", "Aç", None)).unwrap(), "kate");
         assert!(owner(&dialog("telegram-desktop", title, Some("firefox"))).is_err());

@@ -152,8 +152,8 @@ değişkenini verin.
   Kaydet) basılır ve kutunun kapanması beklenir. İzinli bir uygulamanın
   kendi KDE iletişim kutusunda ve tarayıcının yükleme/indirme için açtığı
   portal kutusunda (`xdg-desktop-portal-kde`) çalışır; portal kutusu
-  yalnızca izinli bir uygulamanın penceresine aitse doldurulur (KWin'in
-  bildirdiği üst pencere, yoksa başlıktaki "… - <pencere başlığı>"). Portal
+  yalnızca KWin'in bildirdiği üst pencere izinli bir uygulamanınsa
+  doldurulur; üst penceresi bildirilmeyen kutu reddedilir. Portal
   izin listesine eklenmez; kutunun başka hiçbir öğesine erişilemez.
   `action: "open"` için dosya var olmalı, `"save"` için klasörü (yalnızca
   KDE)

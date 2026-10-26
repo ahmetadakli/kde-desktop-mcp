@@ -1055,10 +1055,11 @@ impl Backend for LinuxBackend {
             Compositor::Kde(kwin) => {
                 let allow = self.kwin_allow(allowed).await;
                 let caption = kwin.activate(query, &allow).await?;
-                if !caption.is_empty() {
-                    // KWin switches at once; the toolkit reports ACTIVE a moment later.
-                    poll(ACTIVATE_WAIT, || self.kde_frame_active(&caption)).await;
+                if caption.is_empty() {
+                    return Err(format!("no window of an allowed app matches '{query}'"));
                 }
+                // KWin switches at once; the toolkit reports ACTIVE a moment later.
+                poll(ACTIVATE_WAIT, || self.kde_frame_active(&caption)).await;
             }
             Compositor::Hyprland(h) => {
                 let q = query.to_lowercase();
