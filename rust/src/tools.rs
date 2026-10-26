@@ -154,10 +154,12 @@ pub fn tools() -> Json {
         ),
         t(
             "mouse",
-            "Fallback pointer input in screen coordinates: move, then click\n(`clicks`=0 to only move) and/or scroll (positive = down).",
+            "Fallback pointer input: move, then click (`clicks`=0 to only move) and/or\nscroll (positive = down). Give either screen coordinates `x`/`y`, or\n`image_x`/`image_y`: a pixel position in the last screenshot, converted to\nthe screen for you (window position and display scaling included).",
             schema(&[
-                ("x", "integer", None),
-                ("y", "integer", None),
+                ("x", "integer", Some(Json::Null)),
+                ("y", "integer", Some(Json::Null)),
+                ("image_x", "integer", Some(Json::Null)),
+                ("image_y", "integer", Some(Json::Null)),
                 ("button", "string", Some(json!("left"))),
                 ("clicks", "integer", Some(json!(1))),
                 ("scroll", "integer", Some(json!(0)))
@@ -170,7 +172,7 @@ pub fn tools() -> Json {
         ),
         t(
             "screenshot",
-            "Last resort only: capture the active window to a PNG and return its path\n(read it with the Read tool). Prefer tree/find.",
+            "Last resort only: capture the active window to a PNG and return its path\n(read it with the Read tool) and the screen area it shows. Prefer tree/find;\nthey also list web page popups and menus. To click something seen only in\nthe image, pass its pixel position to mouse as image_x/image_y.",
             schema(&[])
         ),
         t(

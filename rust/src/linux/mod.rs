@@ -18,7 +18,7 @@ use serde_json::Value as Json;
 use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
-use crate::backend::{AppEntry, Backend, Cache, Info, R, WindowEntry};
+use crate::backend::{AppEntry, Backend, Cache, Info, R, Shot, WindowEntry};
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
 use input::Input;
@@ -786,9 +786,11 @@ impl Backend for LinuxBackend {
         Ok(())
     }
 
-    async fn screenshot(&self) -> Option<String> {
+    async fn screenshot(&self) -> Option<Shot> {
+        let area;
         let mut cmd = match &self.comp {
             Compositor::Kde(kwin) => {
+                area = kwin.active_frame().await;
                 if !self.shot_unauthorized.load(Ordering::Relaxed) {
                     match kwin.capture_active_window().await {
                         Ok(raw) => {
@@ -798,7 +800,7 @@ impl Backend for LinuxBackend {
                                 std::io::Write::flush(&mut out).map_err(|e| e.to_string())
                             });
                             if written.is_ok() {
-                                return keep_if_written(path);
+                                return keep_if_written(path).map(|path| Shot { path, area });
                             }
                             let _ = std::fs::remove_file(&path);
                         }
@@ -816,6 +818,14 @@ impl Backend for LinuxBackend {
             }
             Compositor::Hyprland(h) => {
                 let aw = h.active_window().await.ok().flatten()?;
+                area = (|| {
+                    Some((
+                        aw["at"][0].as_f64()?,
+                        aw["at"][1].as_f64()?,
+                        aw["size"][0].as_f64()?,
+                        aw["size"][1].as_f64()?,
+                    ))
+                })();
                 if !which("grim") {
                     return None;
                 }
@@ -831,7 +841,7 @@ impl Backend for LinuxBackend {
         let (path, file) = temp_png()?;
         drop(file);
         let _ = cmd.arg(&path).output().await;
-        keep_if_written(path)
+        keep_if_written(path).map(|path| Shot { path, area })
     }
 }
 

@@ -193,7 +193,7 @@ fn image_stem(pid: u32) -> String {
 }
 
 /// Grab the screen rectangle of the foreground window as 24-bit RGB rows.
-fn grab_foreground() -> Option<(u32, u32, Vec<u8>)> {
+fn grab_foreground() -> Option<(u32, u32, Vec<u8>, RECT)> {
     let h = foreground();
     if h.is_invalid() {
         return None;
@@ -250,13 +250,13 @@ fn grab_foreground() -> Option<(u32, u32, Vec<u8>)> {
         let _ = DeleteObject(bmp.into());
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
-        (lines == ht).then(|| (w as u32, ht as u32, logic::bgra_to_rgb(&bgra)))
+        (lines == ht).then(|| (w as u32, ht as u32, logic::bgra_to_rgb(&bgra), r))
     }
 }
 
 /// Capture the foreground window to a new private PNG in %TEMP%.
-pub fn screenshot() -> Option<String> {
-    let (w, h, rgb) = grab_foreground()?;
+pub fn screenshot() -> Option<(String, RECT)> {
+    let (w, h, rgb, rect) = grab_foreground()?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -279,5 +279,5 @@ pub fn screenshot() -> Option<String> {
         let _ = std::fs::remove_file(&path);
         return None;
     }
-    Some(path.display().to_string())
+    Some((path.display().to_string(), rect))
 }

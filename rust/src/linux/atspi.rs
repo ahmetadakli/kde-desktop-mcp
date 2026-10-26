@@ -41,6 +41,7 @@ pub const FOCUSED: u32 = 12;
 pub const MULTI_LINE: u32 = 17;
 pub const SELECTED: u32 = 23;
 pub const SHOWING: u32 = 25;
+pub const VISIBLE: u32 = 30;
 
 // AtspiCoordType.
 pub const COORD_SCREEN: u32 = 0;
@@ -431,6 +432,13 @@ impl A11y {
 
     /// All attributes of one node, requested together.
     pub async fn info(&self, o: &Obj, text_limit: usize) -> Info {
+        self.info_flagged(o, text_limit).await.0
+    }
+
+    /// `info`, and whether the node is visible but not showing: an overlay
+    /// container that toolkits (Firefox's popover layer) never mark showing,
+    /// or content scrolled out of view.
+    async fn info_flagged(&self, o: &Obj, text_limit: usize) -> (Info, bool) {
         let (role, name, states, ifaces, children) = tokio::join!(
             self.role(o),
             self.name(o),
@@ -464,15 +472,41 @@ impl A11y {
                 }
             }
         );
-        Info {
+        let raw = states.unwrap_or(0);
+        // Background browser tabs are visible-not-showing documents too;
+        // only containers inside a page qualify.
+        let hidden_visible = !has(raw, SHOWING)
+            && has(raw, VISIBLE)
+            && !OVERLAY_EXCLUDED_ROLES.contains(&role.as_str())
+            && has_iface("org.a11y.atspi.Component");
+        let info = Info {
             role,
             name,
-            showing: has(states.unwrap_or(0), SHOWING),
+            showing: has(raw, SHOWING),
             states: state_labels(states),
             actions,
             text,
             children,
+        };
+        (info, hidden_visible)
+    }
+
+    /// Size of the largest window among the frames of `roots`, in window
+    /// coordinates; None when no frame answers.
+    async fn viewport(&self, roots: &[Obj]) -> Option<(i32, i32)> {
+        let mut best: Option<(i32, i32)> = None;
+        for r in roots.iter().take(8) {
+            let Some(f) = self.frame_of(r).await else {
+                continue;
+            };
+            if let Ok((_, _, w, h)) = self.extents(&f, COORD_WINDOW).await
+                && w > 0
+                && h > 0
+            {
+                best = Some(best.map_or((w, h), |(bw, bh)| (bw.max(w), bh.max(h))));
+            }
         }
+        best
     }
 
     /// Breadth-first fetch below `roots` into `cache`, all of a level at once.
@@ -491,12 +525,29 @@ impl A11y {
             .filter(|o| !cache.contains_key(o))
             .collect();
         let mut fetched = 0;
+        let view = tokio::sync::OnceCell::new();
+        let first: Vec<Obj> = level.clone();
+        let view = LazyView {
+            cell: view,
+            a11y: self,
+            roots: first,
+        };
         while !level.is_empty() && fetched < limit {
             level.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
             level.dedup();
+            let view = &view;
             let infos: Vec<(Obj, Info)> = stream::iter(level)
                 .map(|o| async move {
-                    let info = self.info(&o, text_limit).await;
+                    let (mut info, hidden_visible) = self.info_flagged(&o, text_limit).await;
+                    // A visible node that is not showing yet lies inside the
+                    // window holds an overlay (a web page's popup menu): treat
+                    // it as showing so its showing children are reached.
+                    if hidden_visible
+                        && let Some((vw, vh)) = view.get().await
+                        && let Ok((x, y, w, h)) = self.extents(&o, COORD_WINDOW).await
+                    {
+                        info.showing = overlaps((x, y, w, h), (*vw, *vh));
+                    }
                     (o, info)
                 })
                 .buffered(IN_FLIGHT)
@@ -589,6 +640,40 @@ impl A11y {
     }
 }
 
+/// Roles never treated as an overlay: whole documents (background tabs),
+/// windows, and Firefox's auto-hidden menu bar.
+const OVERLAY_EXCLUDED_ROLES: [&str; 9] = [
+    "menu bar",
+    "document web",
+    "document frame",
+    "internal frame",
+    "embedded",
+    "frame",
+    "window",
+    "dialog",
+    "application",
+];
+
+/// The viewport size, looked up only when a node needs it.
+struct LazyView<'a> {
+    cell: tokio::sync::OnceCell<Option<(i32, i32)>>,
+    a11y: &'a A11y,
+    roots: Vec<Obj>,
+}
+
+impl LazyView<'_> {
+    async fn get(&self) -> &Option<(i32, i32)> {
+        self.cell
+            .get_or_init(|| self.a11y.viewport(&self.roots))
+            .await
+    }
+}
+
+/// Whether a box in window coordinates has area inside a `w`×`h` window.
+fn overlaps((x, y, bw, bh): (i32, i32, i32, i32), (w, h): (i32, i32)) -> bool {
+    bw > 0 && bh > 0 && x < w && y < h && x + bw > 0 && y + bh > 0
+}
+
 /// Ask the session to turn the accessibility layer on (idempotent).
 pub async fn enable(session: &Connection) {
     let _ = session
@@ -609,6 +694,18 @@ pub async fn enable(session: &Connection) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn overlay_boxes_must_have_area_inside_the_window() {
+        let window = (1536, 779);
+        assert!(overlaps((0, 84, 1536, 779), window));
+        assert!(overlaps((-10, -10, 20, 20), window));
+        // Scrolled out of view, collapsed, or unknown (-1 extents).
+        assert!(!overlaps((0, 2000, 300, 40), window));
+        assert!(!overlaps((0, -200, 300, 40), window));
+        assert!(!overlaps((10, 10, 0, 40), window));
+        assert!(!overlaps((-1, -1, -1, -1), window));
+    }
 
     #[test]
     fn firefox_key_bindings_are_not_action_names() {

@@ -94,6 +94,9 @@ const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow
      const g = w.clientGeometry; return {x: g.x, y: g.y, width: g.width, \
      height: g.height, caption: w.caption, cls: w.resourceClass}; })())";
 
+const FRAME: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
+     const g = w.frameGeometry; return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
+
 const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtualScreenGeometry; \
      return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
 
@@ -231,6 +234,19 @@ impl KWin {
             (Some(x), Some(y)) => Ok((x, y)),
             _ => Err("could not read the active window geometry from KWin".into()),
         }
+    }
+
+    /// Frame (with title bar) of KWin's active window in logical px:
+    /// (x, y, width, height).
+    pub async fn active_frame(&self) -> Option<(f64, f64, f64, f64)> {
+        let raw = self.query(FRAME).await.ok()??;
+        let g: Json = serde_json::from_str(&raw).ok()?;
+        Some((
+            g["x"].as_f64()?,
+            g["y"].as_f64()?,
+            g["width"].as_f64()?,
+            g["height"].as_f64()?,
+        ))
     }
 
     /// Capture the active window (with its title bar, without the shadow)
