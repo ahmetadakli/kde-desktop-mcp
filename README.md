@@ -171,7 +171,16 @@ it exits with the server. To turn it off, set the environment variable
   `mouse` converts a pixel of the image to a screen coordinate (window position
   and display scaling, e.g. 125 %, included).
 - `batch`: runs several tools in order in one call and stops at the first
-  error; reduces Claude's number of turns.
+  error; reduces Claude's number of turns. A step with `"optional": true`
+  (typically a `wait_for`) may fail without stopping the batch: it is reported
+  as `[n] tool failed (optional): …` and the remaining steps still run, so a
+  final observation step (`find`, `screenshot`) is not lost.
+
+The `initialize` reply carries `instructions` (about 1.8 KB): the workflow,
+the targeting rules shared by the tools above, the allowlist and which tools
+to load together. Clients that load tool schemas on demand, such as Claude
+Code, show it at session start before any schema is loaded; the per-tool
+descriptions only point to it.
 
 ## Allowlist
 

@@ -1501,10 +1501,16 @@ impl<B: Backend> Server<B> {
             if tool == "batch" {
                 return Err("batch cannot contain batch".into());
             }
+            // An optional step (typically a wait) may fail without costing
+            // the steps after it, e.g. the final observation.
+            let optional = step.get("optional").and_then(Json::as_bool) == Some(true);
             match self.call(tool, &args).await {
                 Ok(o) => {
                     out.push(format!("[{}] {tool}: {}", i + 1, o.text));
                     images.extend(o.images);
+                }
+                Err(e) if optional => {
+                    out.push(format!("[{}] {tool} failed (optional): {e}", i + 1));
                 }
                 Err(e) => {
                     out.push(format!("[{}] {tool} failed: {e}", i + 1));
@@ -1587,6 +1593,7 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
                 "protocolVersion": version,
                 "capabilities": { "tools": { "listChanged": false } },
                 "serverInfo": { "name": "desktop", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": tools::INSTRUCTIONS,
             })
         }
         "ping" => json!({}),
@@ -2164,6 +2171,79 @@ mod tests {
             indicator_label("launch", &json!({"app": "kate"})).as_deref(),
             Some("launching kate")
         );
+    }
+
+    fn batch_steps(wait_optional: bool) -> Json {
+        json!({"steps": [
+            {"tool": "key", "args": {"combo": "a"}},
+            {"tool": "wait_for", "args": {"app": "fake", "query": "never there", "timeout_ms": 60},
+             "optional": wait_optional},
+            {"tool": "key", "args": {"combo": "b"}},
+        ]})
+    }
+
+    #[test]
+    fn an_optional_batch_step_fails_and_the_batch_goes_on() {
+        local(async {
+            let mut s = session("batch-optional");
+            let r = call_tool(&mut s, 2, "batch", batch_steps(true)).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            let lines: Vec<&str> = reply_text(&r).lines().collect();
+            assert_eq!(lines.len(), 3, "{r}");
+            assert!(lines[0].starts_with("[1] key: "), "{r}");
+            assert!(
+                lines[1].starts_with("[2] wait_for failed (optional): "),
+                "{r}"
+            );
+            assert!(lines[2].starts_with("[3] key: "), "{r}");
+            assert_eq!(*s.keys.borrow(), ["down a", "up a", "down b", "up b"]);
+        });
+    }
+
+    #[test]
+    fn a_required_batch_step_failing_stops_the_batch() {
+        local(async {
+            let mut s = session("batch-required");
+            let r = call_tool(&mut s, 2, "batch", batch_steps(false)).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let lines: Vec<&str> = reply_text(&r).lines().collect();
+            assert_eq!(lines.len(), 3, "{r}");
+            assert!(
+                lines[0].starts_with("Error executing tool batch: [1] key: "),
+                "{r}"
+            );
+            assert!(lines[1].starts_with("[2] wait_for failed: "), "{r}");
+            assert_eq!(lines[2], "stopped; 1 step(s) not run");
+            assert_eq!(*s.keys.borrow(), ["down a", "up a"]);
+        });
+    }
+
+    #[test]
+    fn initialize_carries_short_instructions() {
+        local(async {
+            let mut s = session("init");
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": {"protocolVersion": "2025-06-18"}}),
+            )
+            .await;
+            let line = s.stdout.next_line().await.unwrap().unwrap();
+            let r: Json = serde_json::from_str(&line).unwrap();
+            let text = r["result"]["instructions"].as_str().unwrap();
+            // Claude Code shows at most 4096 characters of it.
+            assert!(text.chars().count() < 3000, "{}", text.len());
+            let names: Vec<Json> = tools::tools()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].clone())
+                .collect();
+            let common = text.rsplit("one search: ").next().unwrap();
+            for name in common.trim_end_matches('.').split(", ") {
+                assert!(names.contains(&json!(name)), "{name}");
+            }
+        });
     }
 
     #[test]
