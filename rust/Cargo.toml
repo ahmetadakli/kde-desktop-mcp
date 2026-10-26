@@ -16,7 +16,6 @@ fontdue = "=0.9.5"
 png = "=0.18.0"
 serde = "1"
 smithay-client-toolkit = { version = "=0.21.1", default-features = false }
-wl-clipboard-rs = "=0.9.4"
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [target.'cfg(windows)'.dependencies]

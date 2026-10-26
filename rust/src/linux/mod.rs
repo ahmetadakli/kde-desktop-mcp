@@ -62,8 +62,6 @@ const NOT_ACTIVE: &str = "element's window is not active; call activate_window f
 /// How old the active-app check before `type_text` may be for the
 /// accessibility insert to trust it.
 const INSERT_ACTIVE_AGE: Duration = Duration::from_secs(1);
-/// How long the in-process clipboard may take to become the selection.
-const CLIPBOARD_WAIT: Duration = Duration::from_millis(250);
 /// How long the app in front may take to read a paste after ctrl+v before
 /// the clipboard is left holding the pasted text instead of being put back.
 /// Apps read it while handling the key, within a few ms when idle; one that
@@ -360,48 +358,10 @@ where
     }
 }
 
-/// Own the clipboard in-process through the Wayland data-control protocol;
-/// a background thread serves pastes until another client takes it over.
-/// Returns once the compositor has the new selection, so a paste sent
-/// afterwards cannot get the previous one. `secret` adds KDE's password
-/// hint (kept when putting back a password the user had copied).
-fn own_clipboard(text: &[u8], secret: bool) -> R<()> {
-    use std::io::Read;
-    use wl_clipboard_rs::{copy, paste};
-    let mut options = copy::Options::new();
-    options.sensitive(secret);
-    options
-        .copy(copy::Source::Bytes(text.into()), copy::MimeType::Text)
-        .map_err(|e| format!("clipboard: {e}"))?;
-    // The selection request is flushed by the serving thread; read the
-    // clipboard back until it is ours (if it held the same text already,
-    // a paste gives the right text either way).
-    let start = std::time::Instant::now();
-    loop {
-        let got = paste::get_contents(
-            paste::ClipboardType::Regular,
-            paste::Seat::Unspecified,
-            paste::MimeType::Text,
-        );
-        let mut buf = Vec::new();
-        if let Ok((mut pipe, _)) = got
-            && pipe.read_to_end(&mut buf).is_ok()
-            && buf == text
-        {
-            return Ok(());
-        }
-        if start.elapsed() >= CLIPBOARD_WAIT {
-            return Err("clipboard: selection did not take".into());
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-}
-
 /// Make `text` the clipboard again after a paste; a note when that failed.
 async fn put_back(text: Vec<u8>, secret: bool) -> String {
-    match tokio::task::spawn_blocking(move || own_clipboard(&text, secret)).await {
-        Ok(Ok(())) => String::new(),
-        Ok(Err(e)) => format!("; the clipboard could not be put back ({e})"),
+    match clipboard::own(&text, secret).await {
+        Ok(()) => String::new(),
         Err(e) => format!("; the clipboard could not be put back ({e})"),
     }
 }
@@ -409,9 +369,7 @@ async fn put_back(text: Vec<u8>, secret: bool) -> String {
 /// Paste instead of typing key by key: works with any layout and Unicode.
 /// In-process when the compositor offers data-control, else through wl-copy.
 async fn set_clipboard(text: &str) -> R<()> {
-    let owned = text.as_bytes().to_vec();
-    let done = tokio::task::spawn_blocking(move || own_clipboard(&owned, false)).await;
-    if matches!(done, Ok(Ok(()))) {
+    if clipboard::own(text.as_bytes(), false).await.is_ok() {
         return Ok(());
     }
     wl_copy(text).await
