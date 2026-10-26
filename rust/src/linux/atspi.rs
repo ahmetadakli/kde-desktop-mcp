@@ -430,6 +430,11 @@ impl A11y {
             .await
     }
 
+    /// Role and name, requested together.
+    pub async fn identity(&self, o: &Obj) -> (String, String) {
+        tokio::join!(self.role(o), self.name(o))
+    }
+
     /// All attributes of one node, requested together.
     pub async fn info(&self, o: &Obj, text_limit: usize) -> Info {
         self.info_flagged(o, text_limit).await.0

@@ -30,7 +30,7 @@ use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use backend::{Backend, Cache, R, Shot, WindowChange, WindowGeo};
+use backend::{Backend, Cache, Info, R, Shot, WindowChange, WindowGeo};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
@@ -39,8 +39,69 @@ const TREE_TEXT_LIMIT: usize = 80;
 const PREFETCH_MORE: usize = 500;
 
 struct Refs<Id> {
-    map: HashMap<u64, (Id, String)>,
+    map: HashMap<u64, Ref<Id>>,
     next: u64,
+}
+
+/// An issued id: the element, its app, and its role and name at the time,
+/// so a re-rendered page that dropped or reused the object is noticed.
+#[derive(Clone)]
+struct Ref<Id> {
+    id: Id,
+    app: String,
+    role: String,
+    name: String,
+    /// Whether `name` must still match on resolve (see `name_is_stable`).
+    check_name: bool,
+}
+
+/// Roles whose accessible name follows their content or a title that
+/// changes while the element stays the same: window, dialog and tab titles,
+/// documents (the page title), labels and status text, progress, and fields
+/// or pickers some toolkits name after their value. Ids of these are
+/// checked by role only.
+const VOLATILE_NAME_ROLES: [&str; 31] = [
+    // AT-SPI
+    "frame",
+    "window",
+    "dialog",
+    "alert",
+    "page tab",
+    "document web",
+    "document frame",
+    "document text",
+    "document email",
+    "document spreadsheet",
+    "document presentation",
+    "label",
+    "static",
+    "status bar",
+    "progress bar",
+    "level bar",
+    "tool tip",
+    "notification",
+    "terminal",
+    "text",
+    "entry",
+    "password text",
+    "combo box",
+    "spin button",
+    "slider",
+    // UI Automation
+    "document",
+    "tabitem",
+    "statusbar",
+    "progressbar",
+    "combobox",
+    "spinner",
+];
+
+/// Whether an element's name identifies it well enough to compare on
+/// resolve: it has one, it is not editable, and its role does not rename it.
+fn name_is_stable<Id>(info: &Info<Id>) -> bool {
+    !info.name.is_empty()
+        && !info.states.contains(&"editable")
+        && !VOLATILE_NAME_ROLES.contains(&info.role.as_str())
 }
 
 struct Server<B: Backend> {
@@ -341,24 +402,48 @@ impl<B: Backend> Server<B> {
 
     // ------------------------------------------------------------ ids
 
-    async fn add_ref(&self, id: &B::Id, app: &str) -> u64 {
+    /// Issue an id for `id`, remembering the role and name in `info`.
+    async fn add_ref(&self, id: &B::Id, info: &Info<B::Id>, app: &str) -> u64 {
         let mut refs = self.refs.lock().await;
         if refs.map.len() > MAX_REFS {
             refs.map.clear();
         }
         let rid = refs.next;
         refs.next += 1;
-        refs.map.insert(rid, (id.clone(), app.to_string()));
+        let r = Ref {
+            id: id.clone(),
+            app: app.to_string(),
+            role: info.role.clone(),
+            name: info.name.clone(),
+            check_name: name_is_stable(info),
+        };
+        refs.map.insert(rid, r);
         rid
     }
 
+    /// The element and app behind an id, after checking the allowlist and
+    /// that the element still has the role (and stable name) it was issued
+    /// with. Every use of an id goes through here, reads included, so a
+    /// stale id never acts on, or reads, another element.
     async fn resolve_with_app(&self, rid: i64) -> R<(B::Id, String)> {
         let found = self.refs.lock().await.map.get(&(rid as u64)).cloned();
-        let (id, app) = found.ok_or_else(|| format!("unknown id {rid}; call tree/find again"))?;
-        if !self.is_allowed(&app) {
-            return Err(self.not_allowed(&app));
+        let r = found.ok_or_else(|| format!("unknown id {rid}; call tree/find again"))?;
+        if !self.is_allowed(&r.app) {
+            return Err(self.not_allowed(&r.app));
         }
-        Ok((id, app))
+        let (role, name) = self.b.identity(&r.id).await;
+        if role != r.role || (r.check_name && name != r.name) {
+            let now = if role.is_empty() {
+                "now gone or not answering".to_string()
+            } else {
+                format!("now {}", render::role_and_name(&role, &name))
+            };
+            return Err(format!(
+                "stale id {rid} (was {}, {now}); call tree/find again",
+                render::role_and_name(&r.role, &r.name)
+            ));
+        }
+        Ok((r.id, r.app))
     }
 
     async fn resolve(&self, rid: i64) -> R<B::Id> {
@@ -430,7 +515,7 @@ impl<B: Backend> Server<B> {
             };
             format!("no visible element in '{app}' matches '{query}'{role}")
         })?;
-        let rid = self.add_ref(&id, &app.to_lowercase()).await;
+        let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
         let found = Some(render::describe(&cache[&id], rid));
         Ok(Target { id, found })
     }
@@ -468,7 +553,7 @@ impl<B: Backend> Server<B> {
             out.push(match line {
                 Line::Raw(s) => Printed::Raw(s),
                 Line::Node { depth, id } => {
-                    let rid = self.add_ref(&id, app).await;
+                    let rid = self.add_ref(&id, &cache[&id], app).await;
                     Printed::Node {
                         depth,
                         rid,
@@ -657,7 +742,7 @@ impl<B: Backend> Server<B> {
         let (header, roots, app) = if root_id != 0 {
             let (id, app) = self.resolve_with_app(root_id).await?;
             let info = self.b.info(&id, TREE_TEXT_LIMIT).await;
-            let rid = self.add_ref(&id, &app).await;
+            let rid = self.add_ref(&id, &info, &app).await;
             let header = render::describe(&info, rid);
             let kids = info.children.clone();
             cache.insert(id, info);
@@ -666,7 +751,7 @@ impl<B: Backend> Server<B> {
             let app = arg_s(a, "app", "");
             let windows = self.app_windows(&app).await?;
             let doc = self.active_document(&app, windows, &mut cache).await?;
-            let rid = self.add_ref(&doc, &app.to_lowercase()).await;
+            let rid = self.add_ref(&doc, &cache[&doc], &app.to_lowercase()).await;
             let header = render::describe(&cache[&doc], rid);
             let kids = cache[&doc].children.clone();
             (header, kids, app.to_lowercase())
@@ -915,7 +1000,7 @@ impl<B: Backend> Server<B> {
             let ms = start.elapsed().as_millis();
             match found {
                 Some((id, cache)) if !gone => {
-                    let rid = self.add_ref(&id, &app.to_lowercase()).await;
+                    let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
                     return Ok(format!(
                         "found after {ms} ms{note}: {}",
                         render::describe(&cache[&id], rid)
@@ -1057,7 +1142,7 @@ impl<B: Backend> Server<B> {
             return String::new();
         };
         let info = self.b.info(&id, 0).await;
-        let rid = self.add_ref(&id, &app.to_lowercase()).await;
+        let rid = self.add_ref(&id, &info, &app.to_lowercase()).await;
         let mut note = format!("; focus: {}", render::describe(&info, rid));
         if typing && !info.states.contains(&"editable") && !TEXT_SINKS.contains(&info.role.as_str())
         {
@@ -1477,10 +1562,13 @@ mod tests {
     use tokio::io::DuplexStream;
 
     /// An app "fake" that is running but never shows the element asked for,
-    /// so `wait_for` keeps polling until its timeout; key presses are logged.
+    /// so `wait_for` keeps polling until its timeout; key presses and
+    /// actions are logged. The focused element is `focus`, which a test may
+    /// change between calls.
     struct FakeBackend {
         allow_file: PathBuf,
         keys: Rc<RefCell<Vec<String>>>,
+        focus: Rc<RefCell<Info<u32>>>,
     }
 
     impl Backend for FakeBackend {
@@ -1509,12 +1597,7 @@ mod tests {
         }
         async fn info(&self, id: &u32, _: usize) -> Info<u32> {
             match *id {
-                FAKE_FOCUS => Info {
-                    role: "push button".into(),
-                    name: "OK".into(),
-                    showing: true,
-                    ..Info::default()
-                },
+                FAKE_FOCUS => self.focus.borrow().clone(),
                 _ => Info::default(),
             }
         }
@@ -1522,10 +1605,13 @@ mod tests {
             Some(FAKE_FOCUS)
         }
         async fn prefetch(&self, _: &mut Cache<u32>, _: Vec<u32>, _: bool, _: usize, _: usize) {}
-        async fn actions(&self, _: &u32) -> Vec<String> {
-            Vec::new()
+        async fn actions(&self, id: &u32) -> Vec<String> {
+            self.info(id, 0).await.actions
         }
-        async fn do_action(&self, _: &u32, _: usize) -> R<bool> {
+        async fn do_action(&self, id: &u32, index: usize) -> R<bool> {
+            self.keys
+                .borrow_mut()
+                .push(format!("action {index} on {id}"));
             Ok(true)
         }
         async fn full_text(&self, _: &u32, _: usize) -> R<String> {
@@ -1593,6 +1679,7 @@ mod tests {
         stdin: DuplexStream,
         stdout: tokio::io::Lines<BufReader<DuplexStream>>,
         keys: Rc<RefCell<Vec<String>>>,
+        focus: Rc<RefCell<Info<u32>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -1603,9 +1690,17 @@ mod tests {
         ));
         std::fs::write(&allow_file, "fake\n").unwrap();
         let keys = Rc::new(RefCell::new(Vec::new()));
+        let focus = Rc::new(RefCell::new(Info {
+            role: "push button".into(),
+            name: "OK".into(),
+            showing: true,
+            actions: vec!["Press".into()],
+            ..Info::default()
+        }));
         let server = Rc::new(Server::new(FakeBackend {
             allow_file,
             keys: keys.clone(),
+            focus: focus.clone(),
         }));
         let (stdin, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, client_out) = tokio::io::duplex(64 * 1024);
@@ -1614,6 +1709,7 @@ mod tests {
             stdin,
             stdout: BufReader::new(client_out).lines(),
             keys,
+            focus,
         }
     }
 
@@ -1909,5 +2005,115 @@ mod tests {
         };
         assert!(window_reached(&max, &ask(None, None, Some("maximize"))));
         assert!(!window_reached(&max, &ask(None, None, Some("restore"))));
+    }
+
+    fn reply_text(r: &Json) -> &str {
+        r["result"]["content"][0]["text"].as_str().unwrap()
+    }
+
+    /// Issue an id for the fake's focused element (through the focus note of
+    /// `key`) and return it.
+    async fn focus_id(s: &mut Session, call: u64) -> i64 {
+        let r = call_tool(s, call, "key", json!({"combo": "a"})).await;
+        let text = reply_text(&r);
+        let at = text.find("focus: [").expect(text) + "focus: [".len();
+        text[at..].split(']').next().unwrap().parse().unwrap()
+    }
+
+    fn actions_run(s: &Session) -> usize {
+        s.keys
+            .borrow()
+            .iter()
+            .filter(|k| k.starts_with("action"))
+            .count()
+    }
+
+    #[test]
+    fn an_unchanged_id_acts() {
+        local(async {
+            let mut s = session("fresh");
+            let id = focus_id(&mut s, 2).await;
+            let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
+            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(actions_run(&s), 1);
+        });
+    }
+
+    #[test]
+    fn a_renamed_or_changed_element_is_stale_and_not_acted_on() {
+        local(async {
+            let mut s = session("stale");
+            let id = focus_id(&mut s, 2).await;
+            s.focus.borrow_mut().name = "Cancel".into();
+            let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert_eq!(
+                reply_text(&r),
+                format!(
+                    "Error executing tool act: stale id {id} (was push button \"OK\", \
+                     now push button \"Cancel\"); call tree/find again"
+                )
+            );
+            // Reads and pointer tools check too.
+            for (n, tool) in [(4, "get_text"), (5, "click"), (6, "focus")] {
+                let r = call_tool(&mut s, n, tool, json!({"id": id})).await;
+                assert!(reply_text(&r).contains(": stale id"), "{tool}: {r}");
+            }
+            // Same name, other role: a reused object path.
+            s.focus.borrow_mut().name = "OK".into();
+            s.focus.borrow_mut().role = "check box".into();
+            let r = call_tool(&mut s, 7, "act", json!({"id": id})).await;
+            assert!(reply_text(&r).contains("now check box \"OK\""), "{r}");
+            // Gone: the backend no longer knows the object.
+            *s.focus.borrow_mut() = Info::default();
+            let r = call_tool(&mut s, 8, "act", json!({"id": id})).await;
+            assert!(reply_text(&r).contains("now gone"), "{r}");
+            assert_eq!(actions_run(&s), 0);
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("move")));
+        });
+    }
+
+    #[test]
+    fn names_that_follow_content_are_not_compared() {
+        local(async {
+            let mut s = session("volatile");
+            *s.focus.borrow_mut() = Info {
+                role: "entry".into(),
+                name: "Search".into(),
+                actions: vec!["Activate".into()],
+                ..Info::default()
+            };
+            let entry = focus_id(&mut s, 2).await;
+            s.focus.borrow_mut().name = "Search: rust".into();
+            let r = call_tool(&mut s, 3, "act", json!({"id": entry})).await;
+            assert_eq!(reply_text(&r), "Activate -> ok", "{r}");
+            // An unnamed element may gain a name; its role still counts.
+            *s.focus.borrow_mut() = Info {
+                role: "push button".into(),
+                actions: vec!["Press".into()],
+                ..Info::default()
+            };
+            let unnamed = focus_id(&mut s, 4).await;
+            s.focus.borrow_mut().name = "Play".into();
+            let r = call_tool(&mut s, 5, "act", json!({"id": unnamed})).await;
+            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(actions_run(&s), 2);
+        });
+    }
+
+    #[test]
+    fn stable_names_exclude_editable_and_titled_roles() {
+        let info = |role: &str, name: &str, states: Vec<&'static str>| Info::<u32> {
+            role: role.into(),
+            name: name.into(),
+            states,
+            ..Info::default()
+        };
+        assert!(name_is_stable(&info("push button", "OK", vec![])));
+        assert!(name_is_stable(&info("list item", "a.txt", vec![])));
+        assert!(!name_is_stable(&info("push button", "", vec![])));
+        assert!(!name_is_stable(&info("frame", "Untitled - Kate", vec![])));
+        assert!(!name_is_stable(&info("page tab", "Loading…", vec![])));
+        assert!(!name_is_stable(&info("section", "x", vec!["editable"])));
     }
 }
