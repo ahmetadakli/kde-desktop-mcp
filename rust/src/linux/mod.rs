@@ -2,6 +2,7 @@
 //! buttons, and the compositor (KWin or Hyprland) for windows and the cursor.
 
 mod atspi;
+mod clipboard;
 mod hyprland;
 mod image;
 pub mod indicator;
@@ -22,7 +23,7 @@ use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
-    AppEntry, Backend, Cache, Check, Info, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange,
+    AppEntry, Backend, Cache, Check, Clip, Info, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange,
     WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
@@ -61,6 +62,11 @@ const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
 const INSERT_ACTIVE_AGE: Duration = Duration::from_secs(1);
 /// How long the in-process clipboard may take to become the selection.
 const CLIPBOARD_WAIT: Duration = Duration::from_millis(250);
+/// How long the app in front may take to read a paste after ctrl+v before
+/// the clipboard is left holding the pasted text instead of being put back.
+/// Apps read it while handling the key, within a few ms when idle; one that
+/// reads later would get the restored clipboard and paste the user's text.
+const PASTE_READ_WAIT: Duration = Duration::from_secs(1);
 /// How long a focus request may take to show in the element's state.
 /// Qt reports focus about 3 ms after a GrabFocus that works.
 const FOCUS_POLL: Duration = Duration::from_millis(20);
@@ -239,15 +245,15 @@ where
 /// Own the clipboard in-process through the Wayland data-control protocol;
 /// a background thread serves pastes until another client takes it over.
 /// Returns once the compositor has the new selection, so a paste sent
-/// afterwards cannot get the previous one.
-fn own_clipboard(text: &str) -> R<()> {
+/// afterwards cannot get the previous one. `secret` adds KDE's password
+/// hint (kept when putting back a password the user had copied).
+fn own_clipboard(text: &[u8], secret: bool) -> R<()> {
     use std::io::Read;
     use wl_clipboard_rs::{copy, paste};
-    copy::Options::new()
-        .copy(
-            copy::Source::Bytes(text.as_bytes().into()),
-            copy::MimeType::Text,
-        )
+    let mut options = copy::Options::new();
+    options.sensitive(secret);
+    options
+        .copy(copy::Source::Bytes(text.into()), copy::MimeType::Text)
         .map_err(|e| format!("clipboard: {e}"))?;
     // The selection request is flushed by the serving thread; read the
     // clipboard back until it is ours (if it held the same text already,
@@ -262,7 +268,7 @@ fn own_clipboard(text: &str) -> R<()> {
         let mut buf = Vec::new();
         if let Ok((mut pipe, _)) = got
             && pipe.read_to_end(&mut buf).is_ok()
-            && buf == text.as_bytes()
+            && buf == text
         {
             return Ok(());
         }
@@ -273,11 +279,20 @@ fn own_clipboard(text: &str) -> R<()> {
     }
 }
 
+/// Make `text` the clipboard again after a paste; a note when that failed.
+async fn put_back(text: Vec<u8>, secret: bool) -> String {
+    match tokio::task::spawn_blocking(move || own_clipboard(&text, secret)).await {
+        Ok(Ok(())) => String::new(),
+        Ok(Err(e)) => format!("; the clipboard could not be put back ({e})"),
+        Err(e) => format!("; the clipboard could not be put back ({e})"),
+    }
+}
+
 /// Paste instead of typing key by key: works with any layout and Unicode.
 /// In-process when the compositor offers data-control, else through wl-copy.
 async fn set_clipboard(text: &str) -> R<()> {
-    let owned = text.to_string();
-    let done = tokio::task::spawn_blocking(move || own_clipboard(&owned)).await;
+    let owned = text.as_bytes().to_vec();
+    let done = tokio::task::spawn_blocking(move || own_clipboard(&owned, false)).await;
     if matches!(done, Ok(Ok(()))) {
         return Ok(());
     }
@@ -462,6 +477,39 @@ impl LinuxBackend {
             .unwrap()
             .insert(bus.to_string(), t.clone());
         t
+    }
+
+    /// Paste `text` with ctrl+v through the clipboard, then put back the
+    /// text the clipboard held, once the app in front has read the paste
+    /// (restoring earlier would let it paste the old text). Images, files
+    /// and other non-text contents are not put back; the note says so.
+    async fn paste(&self, text: &str) -> R<String> {
+        let saved = clipboard::save().await;
+        let Ok(mut source) = clipboard::PasteSource::start(text).await else {
+            // No data-control: wl-copy, and no way to see the paste read.
+            set_clipboard(text).await?;
+            self.input.press_combo("ctrl+v").await?;
+            return Ok("; the clipboard now holds the typed text".into());
+        };
+        let since = std::time::Instant::now();
+        if let Err(e) = self.input.press_combo("ctrl+v").await {
+            // Nothing was pasted: safe to put the clipboard back now.
+            if let clipboard::Saved::Text { bytes, secret } = saved {
+                put_back(bytes, secret).await;
+            }
+            return Err(e);
+        }
+        let read = source.wait_read(since, PASTE_READ_WAIT).await;
+        Ok(match saved {
+            clipboard::Saved::Empty => String::new(),
+            clipboard::Saved::Nothing(why) => {
+                format!("; the clipboard now holds the typed text (not put back: {why})")
+            }
+            clipboard::Saved::Text { .. } if !read => "; the paste was not read within 1 s, so \
+                 the clipboard was not put back"
+                .into(),
+            clipboard::Saved::Text { bytes, secret } => put_back(bytes, secret).await,
+        })
     }
 
     /// Type by inserting at the caret of the focused element through
@@ -824,9 +872,9 @@ impl Backend for LinuxBackend {
         self.input.press_combo(combo).await
     }
 
-    async fn type_text(&self, text: &str) -> R<()> {
+    async fn type_text(&self, text: &str) -> R<String> {
         if text.is_empty() {
-            return Ok(());
+            return Ok(String::new());
         }
         if matches!(self.comp, Compositor::Hyprland(_)) && which("wtype") {
             // wtype uses the virtual-keyboard protocol: Unicode-safe and
@@ -843,13 +891,34 @@ impl Backend for LinuxBackend {
                     return Err(format!("wtype failed: {status}"));
                 }
             }
-            return Ok(());
+            return Ok(String::new());
         }
         if matches!(self.comp, Compositor::Kde(_)) && self.insert_at_caret(text).await? {
-            return Ok(());
+            return Ok(String::new());
         }
-        set_clipboard(text).await?;
-        self.input.press_combo("ctrl+v").await
+        self.paste(text).await
+    }
+
+    async fn clipboard_get(&self, limit: usize) -> R<Clip> {
+        let mimes = clipboard::mime_types().await?;
+        Ok(match clipboard::classify(&mimes) {
+            clipboard::Kind::Empty => Clip::Empty,
+            clipboard::Kind::Text { secret: true } => Clip::Secret,
+            clipboard::Kind::Text { secret: false } => {
+                // A character is at most 4 bytes in UTF-8.
+                let (bytes, more) = clipboard::read_text(limit.saturating_mul(4)).await?;
+                let (text, cut) = clipboard::cap_chars(&bytes, limit);
+                Clip::Text {
+                    text,
+                    truncated: cut || more,
+                }
+            }
+            clipboard::Kind::Files | clipboard::Kind::Other(_) => Clip::Other(mimes),
+        })
+    }
+
+    async fn clipboard_set(&self, text: &str) -> R<()> {
+        set_clipboard(text).await
     }
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {

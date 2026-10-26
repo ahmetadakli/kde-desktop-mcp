@@ -324,13 +324,13 @@ impl Backend for WindowsBackend {
         Ok(())
     }
 
-    async fn type_text(&self, text: &str) -> R<()> {
+    async fn type_text(&self, text: &str) -> R<String> {
         // KEYEVENTF_UNICODE sends characters independent of the keyboard
         // layout and leaves the clipboard alone.
         for batch in logic::unicode_batches(text) {
             input::send_keys(&batch)?;
         }
-        Ok(())
+        Ok(String::new())
     }
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {

@@ -30,7 +30,7 @@ use serde_json::{Value as Json, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
-use backend::{Backend, Cache, R, Shot, WindowChange, WindowGeo};
+use backend::{Backend, Cache, Clip, R, Shot, WindowChange, WindowGeo};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
@@ -56,8 +56,9 @@ struct Server<B: Backend> {
     input: Mutex<()>,
 }
 
-/// Tools that send keyboard or pointer input.
-const INPUT_TOOLS: [&str; 8] = [
+/// Tools that send keyboard or pointer input, or use the clipboard that
+/// type_text pastes through; they run one at a time.
+const INPUT_TOOLS: [&str; 10] = [
     "focus",
     "click",
     "drag",
@@ -66,6 +67,8 @@ const INPUT_TOOLS: [&str; 8] = [
     "type_text",
     "mouse",
     "activate_window",
+    "clipboard_get",
+    "clipboard_set",
 ];
 
 /// Longest `wait_for` / `pause`, in ms (10 minutes).
@@ -155,6 +158,7 @@ fn indicator_label(tool: &str, a: &Json) -> Option<String> {
         "scroll" => "scrolling".into(),
         "activate_window" => "switching windows".into(),
         "move_window" => "arranging windows".into(),
+        "clipboard_set" => "copying".into(),
         _ => return None,
     })
 }
@@ -1041,12 +1045,41 @@ impl<B: Backend> Server<B> {
     async fn type_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
         let app = self.require_active_allowed().await?;
-        self.b.type_text(&text).await?;
+        let note = self.b.type_text(&text).await?;
         let focus = self.focus_note(&app, true).await;
         Ok(format!(
-            "typed {} chars into {app}{focus}",
+            "typed {} chars into {app}{focus}{note}",
             text.chars().count()
         ))
+    }
+
+    /// The clipboard's text. Only with an allowed app in front: the
+    /// clipboard may hold anything the user copied anywhere.
+    async fn clipboard_get(&self, a: &Json) -> R<String> {
+        let limit = arg_i(a, "limit", 20000).max(0) as usize;
+        self.require_active_allowed().await?;
+        Ok(match self.b.clipboard_get(limit).await? {
+            Clip::Empty => "(the clipboard is empty)".into(),
+            Clip::Secret => {
+                "(the clipboard holds a password, marked so by the app that copied it; not read)"
+                    .into()
+            }
+            Clip::Other(types) => format!(
+                "(the clipboard holds no text; types: {})",
+                types.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+            ),
+            Clip::Text { text, truncated } if truncated => {
+                format!("{text}\n(cut at {limit} chars)")
+            }
+            Clip::Text { text, .. } => text,
+        })
+    }
+
+    async fn clipboard_set(&self, a: &Json) -> R<String> {
+        let text = req_s(a, "text")?;
+        self.require_active_allowed().await?;
+        self.b.clipboard_set(&text).await?;
+        Ok(format!("clipboard set to {} chars", text.chars().count()))
     }
 
     /// "; focus: [id] role "name"" for the element now holding focus, so a
@@ -1224,6 +1257,8 @@ impl<B: Backend> Server<B> {
                 "scroll" => self.scroll(a).await.map(Out::from),
                 "key" => self.key(a).await.map(Out::from),
                 "type_text" => self.type_text(a).await.map(Out::from),
+                "clipboard_get" => self.clipboard_get(a).await.map(Out::from),
+                "clipboard_set" => self.clipboard_set(a).await.map(Out::from),
                 "mouse" => self.mouse(a).await.map(Out::from),
                 "activate_window" => self.activate_window(a).await.map(Out::from),
                 "screenshot" => self.screenshot(a).await,
@@ -1481,6 +1516,7 @@ mod tests {
     struct FakeBackend {
         allow_file: PathBuf,
         keys: Rc<RefCell<Vec<String>>>,
+        clipboard: RefCell<String>,
     }
 
     impl Backend for FakeBackend {
@@ -1552,7 +1588,22 @@ mod tests {
             self.keys.borrow_mut().push(format!("up {combo}"));
             Ok(())
         }
-        async fn type_text(&self, _: &str) -> R<()> {
+        async fn type_text(&self, _: &str) -> R<String> {
+            Ok(String::new())
+        }
+        async fn clipboard_get(&self, limit: usize) -> R<Clip> {
+            let text = self.clipboard.borrow().clone();
+            let cut: String = text.chars().take(limit).collect();
+            Ok(match text.is_empty() {
+                true => Clip::Empty,
+                false => Clip::Text {
+                    truncated: cut.len() < text.len(),
+                    text: cut,
+                },
+            })
+        }
+        async fn clipboard_set(&self, text: &str) -> R<()> {
+            *self.clipboard.borrow_mut() = text.to_string();
             Ok(())
         }
         async fn pointer(&self, _: i64, _: i64, _: &str, _: i64, _: i64) -> R<()> {
@@ -1606,6 +1657,7 @@ mod tests {
         let server = Rc::new(Server::new(FakeBackend {
             allow_file,
             keys: keys.clone(),
+            clipboard: RefCell::new(String::new()),
         }));
         let (stdin, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, client_out) = tokio::io::duplex(64 * 1024);
@@ -1817,6 +1869,44 @@ mod tests {
                 .next()
                 .unwrap();
             std::fs::remove_file(path).unwrap();
+        });
+    }
+
+    #[test]
+    fn clipboard_round_trips_and_needs_an_allowed_window() {
+        local(async {
+            let mut s = session("clipboard");
+            let text = |r: &Json| {
+                r["result"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            };
+            let r = call_tool(&mut s, 2, "clipboard_get", json!({})).await;
+            assert_eq!(text(&r), "(the clipboard is empty)");
+            let r = call_tool(&mut s, 3, "clipboard_set", json!({"text": "çağ €\n😀"})).await;
+            assert_eq!(text(&r), "clipboard set to 7 chars");
+            let r = call_tool(&mut s, 4, "clipboard_get", json!({})).await;
+            assert_eq!(text(&r), "çağ €\n😀");
+            let r = call_tool(&mut s, 5, "clipboard_get", json!({"limit": 2})).await;
+            assert_eq!(text(&r), "ça\n(cut at 2 chars)");
+            // Nothing is read or written while the app in front is not allowed.
+            let allow = std::env::temp_dir().join(format!(
+                "desktop-mcp-test-{}-clipboard.txt",
+                std::process::id()
+            ));
+            std::fs::write(&allow, "other\n").unwrap();
+            for (id, tool, args) in [
+                (6, "clipboard_get", json!({})),
+                (7, "clipboard_set", json!({"text": "x"})),
+            ] {
+                let r = call_tool(&mut s, id, tool, args).await;
+                assert_eq!(r["result"]["isError"], true, "{r}");
+                assert!(text(&r).contains("not in"), "{r}");
+            }
+            std::fs::write(&allow, "fake\n").unwrap();
+            let r = call_tool(&mut s, 8, "clipboard_get", json!({})).await;
+            assert_eq!(text(&r), "çağ €\n😀");
         });
     }
 

@@ -26,7 +26,7 @@ fn schema(params: &[(&str, &str, Option<Json>)]) -> Json {
 }
 
 /// Tools that only read, marked `readOnlyHint` so clients may run them in parallel.
-const READ_ONLY: [&str; 9] = [
+const READ_ONLY: [&str; 10] = [
     "apps",
     "windows",
     "doctor",
@@ -36,6 +36,7 @@ const READ_ONLY: [&str; 9] = [
     "wait_for",
     "screenshot",
     "pause",
+    "clipboard_get",
 ];
 
 /// How act/click/focus/get_text/set_text pick their element.
@@ -174,7 +175,17 @@ pub fn tools() -> Json {
         ),
         t(
             "type_text",
-            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. On Linux this goes through the clipboard and\noverwrites it. The reply names the focused element and warns when it is not\nan editable field.",
+            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. On Linux this may paste through the clipboard;\nthe text it held is put back afterwards (images and files are not; the reply\nsays so). The reply names the focused element and warns when it is not an\neditable field.",
+            schema(&[("text", "string", None)])
+        ),
+        t(
+            "clipboard_get",
+            "Read the clipboard as text, at most `limit` characters (the reply says\nwhen it was cut). Only works while an allowed app's window is active, since\nthe clipboard may hold anything the user copied. Says so instead when it\nholds no text (an image, files) or a password marked by a password manager.\nLinux only.",
+            schema(&[("limit", "integer", Some(json!(20000)))])
+        ),
+        t(
+            "clipboard_set",
+            "Put `text` on the clipboard, e.g. to paste it later with key ctrl+v or to\nhand it to the user. Only while an allowed app's window is active. Linux\nonly.",
             schema(&[("text", "string", None)])
         ),
         t(
