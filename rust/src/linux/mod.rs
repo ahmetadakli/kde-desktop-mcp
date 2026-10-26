@@ -18,7 +18,10 @@ use serde_json::Value as Json;
 use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
-use crate::backend::{AppEntry, Backend, Cache, Info, R, Shot, WindowEntry};
+use crate::backend::{
+    AppEntry, Backend, Cache, Check, Info, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange,
+    WindowEntry, WindowGeo,
+};
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
 use input::Input;
@@ -806,6 +809,135 @@ impl Backend for LinuxBackend {
             }
         }
         Ok(())
+    }
+
+    async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
+        match &self.comp {
+            Compositor::Kde(kwin) => kwin.windows(query, allowed).await,
+            Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+        }
+    }
+
+    async fn set_window(
+        &self,
+        query: &str,
+        allowed: &[String],
+        change: &WindowChange,
+    ) -> R<WindowGeo> {
+        match &self.comp {
+            Compositor::Kde(kwin) => kwin
+                .set_window(query, allowed, change)
+                .await?
+                .ok_or_else(|| format!("no window of an allowed app matches '{query}'")),
+            Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+        }
+    }
+
+    async fn screens(&self) -> Vec<Screen> {
+        match &self.comp {
+            Compositor::Kde(kwin) => kwin.screens().await.unwrap_or_default(),
+            Compositor::Hyprland(_) => Vec::new(),
+        }
+    }
+
+    async fn doctor(&self) -> Vec<Check> {
+        let mut out = Vec::new();
+        let env = |k: &str| std::env::var(k).unwrap_or_default();
+        let wayland = env("WAYLAND_DISPLAY");
+        out.push(Check {
+            name: "session",
+            ok: !wayland.is_empty(),
+            detail: format!(
+                "{} on {} (WAYLAND_DISPLAY={}, XDG_SESSION_TYPE={})",
+                match &self.comp {
+                    Compositor::Kde(_) => "KDE Plasma",
+                    Compositor::Hyprland(_) => "Hyprland",
+                },
+                if wayland.is_empty() {
+                    "no Wayland display"
+                } else {
+                    "Wayland"
+                },
+                if wayland.is_empty() {
+                    "unset"
+                } else {
+                    &wayland
+                },
+                env("XDG_SESSION_TYPE"),
+            ),
+        });
+        let apps = self.a11y.applications().await;
+        out.push(Check {
+            name: "accessibility (AT-SPI)",
+            ok: !apps.is_empty(),
+            detail: if apps.is_empty() {
+                "no applications registered on the AT-SPI bus; is at-spi2-core running?".into()
+            } else {
+                format!("{} applications registered", apps.len())
+            },
+        });
+        let input = self.input.clone();
+        let (kbd, ptr) = tokio::task::spawn_blocking(move || input.check())
+            .await
+            .unwrap_or_else(|e| (Err(e.to_string()), Err(e.to_string())));
+        for (name, r) in [
+            ("virtual keyboard (uinput)", kbd),
+            ("virtual pointer (uinput)", ptr),
+        ] {
+            out.push(Check {
+                name,
+                ok: r.is_ok(),
+                detail: r.err().unwrap_or_else(|| "ready".into()),
+            });
+        }
+        match &self.comp {
+            Compositor::Kde(kwin) => {
+                let script = kwin.query("1").await;
+                out.push(Check {
+                    name: "KWin scripting",
+                    ok: matches!(&script, Ok(Some(v)) if v == "1"),
+                    detail: match script {
+                        Ok(Some(_)) => "window queries and activation work".into(),
+                        Ok(None) => "script ran but did not answer".into(),
+                        Err(e) => e,
+                    },
+                });
+                let screens = kwin.screens().await.unwrap_or_default();
+                out.push(Check {
+                    name: "screens",
+                    ok: !screens.is_empty(),
+                    detail: screens
+                        .iter()
+                        .map(|s| {
+                            format!(
+                                "{} at ({},{}) {}x{} scale {}",
+                                s.name, s.x, s.y, s.width, s.height, s.scale
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                });
+                let fallback = self.shot_unauthorized.load(Ordering::Relaxed);
+                out.push(Check {
+                    name: "screenshot",
+                    ok: !fallback || which("spectacle"),
+                    detail: if fallback {
+                        "KWin refused ScreenShot2; using spectacle (slower)".into()
+                    } else {
+                        "KWin ScreenShot2 (spectacle as fallback)".into()
+                    },
+                });
+            }
+            Compositor::Hyprland(h) => {
+                let ok = h.json("version").await;
+                out.push(Check {
+                    name: "hyprctl",
+                    ok: ok.is_ok(),
+                    detail: ok.err().unwrap_or_else(|| "reachable".into()),
+                });
+            }
+        }
+        out
     }
 
     async fn screenshot(&self) -> Option<Shot> {

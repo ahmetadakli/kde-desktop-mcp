@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, mpsc};
 use zbus::Connection;
 use zbus::zvariant::{Fd, OwnedValue, Value};
 
-use crate::backend::R;
+use crate::backend::{R, Screen, WindowChange, WindowGeo};
 
 const SINK_PATH: &str = "/org/desktopmcp/sink";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -89,6 +89,55 @@ for (const w of workspace.windowList()) {
 }
 return "";
 })()"#;
+
+/// Shared by WINDOWS and SET_WINDOW: windows of allowed apps (matched like
+/// ACTIVATE) whose caption or class contains the query, and their geometry.
+const WINDOW_JS: &str = r#"
+const allow = %ALLOW%;
+const q = %QUERY%.toLowerCase();
+function okApp(w) {
+  const cls = (w.resourceClass || "").toLowerCase();
+  const name = (w.resourceName || "").toLowerCase();
+  return allow.some(a => cls.includes(a) || name.includes(a));
+}
+function matching() {
+  return workspace.windowList().filter(w => (w.normalWindow || w.dialog) && okApp(w)
+    && (!q || w.caption.toLowerCase().includes(q)
+        || (w.resourceClass || "").toLowerCase().includes(q)));
+}
+function geo(w) {
+  const g = w.frameGeometry;
+  const m = workspace.clientArea(KWin.MaximizeArea, w);
+  return {title: w.caption, app: w.resourceClass || "", x: g.x, y: g.y,
+    width: g.width, height: g.height, active: w === workspace.activeWindow,
+    minimized: w.minimized, output: w.output ? w.output.name : "",
+    maximized: g.x === m.x && g.y === m.y && g.width === m.width && g.height === m.height};
+}
+"#;
+
+const WINDOWS: &str = "(() => { %JS% return JSON.stringify(matching().map(geo)); })()";
+
+/// Applies %CHANGE% ({x, y, width, height, state}; null fields kept) to the
+/// first matching window; evaluates to its new geometry, "" when none.
+const SET_WINDOW: &str = r#"(() => { %JS%
+const c = %CHANGE%;
+const w = matching()[0];
+if (!w) return "";
+if (c.state === "minimize") w.minimized = true;
+if (c.state === "maximize") { w.minimized = false; w.setMaximize(true, true); }
+if (c.state === "restore") { w.minimized = false; w.setMaximize(false, false); }
+if (c.x !== null || c.y !== null || c.width !== null || c.height !== null) {
+  w.setMaximize(false, false);
+  const g = w.frameGeometry;
+  w.frameGeometry = {x: c.x ?? g.x, y: c.y ?? g.y,
+    width: c.width ?? g.width, height: c.height ?? g.height};
+}
+return JSON.stringify(geo(w));
+})()"#;
+
+const SCREENS: &str = "JSON.stringify(workspace.screens.map(o => ({name: o.name, \
+     x: o.geometry.x, y: o.geometry.y, width: o.geometry.width, \
+     height: o.geometry.height, scale: o.devicePixelRatio})))";
 
 const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
      const g = w.clientGeometry; return {x: g.x, y: g.y, width: g.width, \
@@ -236,6 +285,55 @@ impl KWin {
         }
     }
 
+    pub async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
+        let script = WINDOWS.replace("%JS%", &window_js(query, allowed));
+        let raw = self.query(&script).await?.unwrap_or_default();
+        let list: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
+        Ok(list
+            .as_array()
+            .map(|a| a.iter().map(window_geo).collect())
+            .unwrap_or_default())
+    }
+
+    pub async fn set_window(
+        &self,
+        query: &str,
+        allowed: &[String],
+        change: &WindowChange,
+    ) -> R<Option<WindowGeo>> {
+        let change = serde_json::json!({
+            "x": change.x, "y": change.y, "width": change.width,
+            "height": change.height, "state": change.state,
+        });
+        let script = SET_WINDOW
+            .replace("%JS%", &window_js(query, allowed))
+            .replace("%CHANGE%", &change.to_string());
+        let raw = self.query(&script).await?.unwrap_or_default();
+        if raw.is_empty() {
+            return Ok(None);
+        }
+        let g: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
+        Ok(Some(window_geo(&g)))
+    }
+
+    pub async fn screens(&self) -> R<Vec<Screen>> {
+        let raw = self.query(SCREENS).await?.unwrap_or_default();
+        let list: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
+        Ok(list
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|o| Screen {
+                name: o["name"].as_str().unwrap_or("").to_string(),
+                x: o["x"].as_f64().unwrap_or(0.0),
+                y: o["y"].as_f64().unwrap_or(0.0),
+                width: o["width"].as_f64().unwrap_or(0.0),
+                height: o["height"].as_f64().unwrap_or(0.0),
+                scale: o["scale"].as_f64().unwrap_or(1.0),
+            })
+            .collect())
+    }
+
     /// Frame (with title bar) of KWin's active window in logical px:
     /// (x, y, width, height).
     pub async fn active_frame(&self) -> Option<(f64, f64, f64, f64)> {
@@ -349,6 +447,29 @@ impl KWin {
         let (x, y) = (g["x"].as_f64()?, g["y"].as_f64()?);
         let (w, h) = (g["width"].as_f64()?, g["height"].as_f64()?);
         (w > 0.0 && h > 0.0).then_some((x as i32, y as i32, (x + w) as i32, (y + h) as i32))
+    }
+}
+
+fn window_js(query: &str, allowed: &[String]) -> String {
+    WINDOW_JS
+        .replace("%ALLOW%", &Json::from(allowed.to_vec()).to_string())
+        .replace("%QUERY%", &Json::from(query).to_string())
+}
+
+fn window_geo(g: &Json) -> WindowGeo {
+    let num = |k: &str| g[k].as_f64().unwrap_or(0.0);
+    let text = |k: &str| g[k].as_str().unwrap_or("").to_string();
+    WindowGeo {
+        title: text("title"),
+        app: text("app"),
+        x: num("x"),
+        y: num("y"),
+        width: num("width"),
+        height: num("height"),
+        active: g["active"].as_bool().unwrap_or(false),
+        minimized: g["minimized"].as_bool().unwrap_or(false),
+        maximized: g["maximized"].as_bool().unwrap_or(false),
+        output: text("output"),
     }
 }
 

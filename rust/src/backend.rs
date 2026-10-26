@@ -29,6 +29,53 @@ pub struct Info<Id> {
 
 pub type Cache<Id> = HashMap<Id, Info<Id>>;
 
+/// Window management the desktop does not offer (only KDE does so far).
+pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma";
+
+/// A top-level window and where it is, in logical screen px.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WindowGeo {
+    pub title: String,
+    pub app: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub active: bool,
+    pub minimized: bool,
+    pub maximized: bool,
+    pub output: String,
+}
+
+/// What `move_window` changes; None keeps the current value.
+#[derive(Clone, Debug, Default)]
+pub struct WindowChange {
+    pub x: Option<f64>,
+    pub y: Option<f64>,
+    pub width: Option<f64>,
+    pub height: Option<f64>,
+    /// "maximize", "minimize" or "restore".
+    pub state: Option<String>,
+}
+
+/// A display output: name, logical geometry and scale factor.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Screen {
+    pub name: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub scale: f64,
+}
+
+/// One line of the `doctor` report.
+pub struct Check {
+    pub name: &'static str,
+    pub ok: bool,
+    pub detail: String,
+}
+
 /// A screenshot file and the screen area it shows, in the coordinates
 /// `pointer` takes: (x, y, width, height). None when unknown.
 pub struct Shot {
@@ -111,6 +158,27 @@ pub trait Backend {
     /// Raise the first window of an allowed app whose title or app name
     /// contains `query`, and wait until it is in front.
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()>;
+    /// Windows of allowed apps whose title or app contains `query` (all when
+    /// empty).
+    async fn windows(&self, _query: &str, _allowed: &[String]) -> R<Vec<WindowGeo>> {
+        Err(NO_WINDOW_CONTROL.into())
+    }
+    /// Move, resize, maximize, minimize or restore the first such window.
+    async fn set_window(
+        &self,
+        _query: &str,
+        _allowed: &[String],
+        _change: &WindowChange,
+    ) -> R<WindowGeo> {
+        Err(NO_WINDOW_CONTROL.into())
+    }
+    async fn screens(&self) -> Vec<Screen> {
+        Vec::new()
+    }
+    /// Platform checks for `doctor`.
+    async fn doctor(&self) -> Vec<Check> {
+        Vec::new()
+    }
     /// Capture the active window to a private file and return its path.
     async fn screenshot(&self) -> Option<Shot>;
 }

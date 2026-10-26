@@ -112,6 +112,15 @@ Neden hızlı:
   süre istenirse 10 dakikaya indirilir ve yanıtta bu belirtilir.
 - `pause`: belirli bir süre bekler (`ms`, en fazla 10 dakika); görünür bir
   değişikliği değil, yalnızca zamanı beklemek için
+- `windows`: izin verilen uygulamaların pencerelerini ekran koordinatlarında
+  konum, boyut, durum (etkin, büyütülmüş, simge durumunda) ve ekranla, önce
+  ekran düzeniyle (ad, alan, ölçek) listeler (yalnızca KDE)
+- `move_window`: pencereyi taşır, boyutlandırır ya da büyütür, simge durumuna
+  küçültür, eski haline getirir; pencere yeni boyutu alana kadar (en fazla
+  1 sn) bekleyip gerçek sonucu bildirir (yalnızca KDE)
+- `doctor`: kurulumu tek raporda denetler: sürüm, izin listesi, çalışan
+  uygulamalardan hangilerinin izinli olduğu, oturum, AT-SPI, sanal klavye ve
+  fare, KWin betikleri, ekranlar ve ekran görüntüsü yolu
 - `key`, `type_text`: klavye. Yanıt, ardından odakta olan öğeyi adlandırır;
   `type_text` odak düzenlenebilir bir alanda değilse uyarır (KDE)
 - `activate_window`: pencereyi öne getirme
