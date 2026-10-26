@@ -78,6 +78,17 @@ pub struct Terminal {
     pub cwd: String,
 }
 
+/// An app `launch` started: the command, its pid, and the window it opened
+/// (None after the wait ran out, or when windows cannot be tracked).
+#[derive(Clone, Debug, Default)]
+pub struct Launched {
+    pub command: String,
+    pub pid: u32,
+    pub window: Option<WindowGeo>,
+    /// Why the window counts as the app's, or why none was waited for.
+    pub note: String,
+}
+
 /// What `move_window` changes; None keeps the current value.
 #[derive(Clone, Debug, Default)]
 pub struct WindowChange {
@@ -217,6 +228,17 @@ pub trait Backend {
     }
     async fn clipboard_set(&self, _text: &str) -> R<()> {
         Err(NO_CLIPBOARD.into())
+    }
+    /// Start `app` (an allowed name) with `args`, without a shell, and wait
+    /// up to `wait` for its window; `allowed` limits which windows are seen.
+    async fn launch(
+        &self,
+        _app: &str,
+        _args: &[String],
+        _allowed: &[String],
+        _wait: std::time::Duration,
+    ) -> R<Launched> {
+        Err("launch is not supported on this platform yet".into())
     }
     async fn screens(&self) -> Vec<Screen> {
         Vec::new()

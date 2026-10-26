@@ -9,6 +9,7 @@ pub mod indicator;
 mod indicator_draw;
 mod input;
 mod kwin;
+mod launch;
 mod roles;
 mod terminals;
 
@@ -23,8 +24,8 @@ use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
-    AppEntry, Backend, Cache, Check, Clip, Info, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange,
-    WindowEntry, WindowGeo,
+    AppEntry, Backend, Cache, Check, Clip, Info, Launched, NO_WINDOW_CONTROL, R, Screen, Shot,
+    WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -219,6 +220,13 @@ async fn with_terminals(list: &mut [WindowGeo]) {
         w.terminals = t;
     }
 }
+
+/// How often `launch` looks for the new window.
+const LAUNCH_POLL: Duration = Duration::from_millis(150);
+/// How long `launch` waits for a new window before taking the app's changed
+/// active window, or after the started process ended its active one
+/// (handed to a running instance).
+const HANDOFF_GRACE: Duration = Duration::from_millis(1500);
 
 fn which(cmd: &str) -> bool {
     std::env::var_os("PATH")
@@ -1046,6 +1054,96 @@ impl Backend for LinuxBackend {
                 .await?
                 .ok_or_else(|| format!("no window of an allowed app matches '{query}'")),
             Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+        }
+    }
+
+    async fn launch(
+        &self,
+        app: &str,
+        args: &[String],
+        allowed: &[String],
+        wait: Duration,
+    ) -> R<Launched> {
+        let (name, argv) = (app.to_string(), args.to_vec());
+        let r = tokio::task::spawn_blocking(move || launch::resolve(&name, &argv))
+            .await
+            .map_err(|e| e.to_string())??;
+        let kwin = match &self.comp {
+            Compositor::Kde(k) => Some(k),
+            Compositor::Hyprland(_) => None,
+        };
+        // Windows already open, to tell a new one of a running instance.
+        let before = match kwin {
+            Some(k) => k
+                .windows("", &self.kwin_allow(allowed).await)
+                .await
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
+        let (pid, exit) = launch::spawn(&r)?;
+        let mut out = Launched {
+            command: launch::describe(&r),
+            pid,
+            ..Launched::default()
+        };
+        let Some(kwin) = kwin else {
+            out.note = format!("not waiting for its window: {NO_WINDOW_CONTROL}");
+            return Ok(out);
+        };
+        if wait.is_zero() {
+            out.note = "not waiting for its window (wait_ms=0)".into();
+            return Ok(out);
+        }
+        let start = std::time::Instant::now();
+        let mut tree = std::collections::HashSet::from([pid]);
+        let mut ended: Option<std::time::Instant> = None;
+        loop {
+            // Children seen once stay in the tree, so apps that fork and
+            // let the parent exit are still matched by pid.
+            let roots = tree.clone();
+            tree = tokio::task::spawn_blocking(move || {
+                let stats = terminals::read_stats();
+                launch::descendants(&roots, stats.iter().map(|(p, s)| (*p, s.ppid)))
+            })
+            .await
+            .unwrap_or_else(|_| std::collections::HashSet::from([pid]));
+            // Rebuilt each round: the new app joins AT-SPI after it starts.
+            let allow = self.kwin_allow(allowed).await;
+            let now = kwin.windows("", &allow).await?;
+            let status = *exit.lock().unwrap();
+            if status.is_some() && ended.is_none() {
+                ended = Some(std::time::Instant::now());
+            }
+            let settled = ended.is_some_and(|t| t.elapsed() >= HANDOFF_GRACE);
+            let stage = if settled && status.is_some_and(|s| s.success()) {
+                launch::Stage::Ended
+            } else if start.elapsed() >= HANDOFF_GRACE {
+                launch::Stage::Settled
+            } else {
+                launch::Stage::Starting
+            };
+            if let Some((w, how)) = launch::pick_window(app, &before, &now, &tree, stage) {
+                let mut found = vec![w.clone()];
+                with_terminals(&mut found).await;
+                out.window = found.pop();
+                out.note = match how {
+                    launch::Found::Own => "",
+                    launch::Found::New => "opened by the running instance",
+                    launch::Found::Existing => "handed to the running instance",
+                }
+                .into();
+                return Ok(out);
+            }
+            if let Some(s) = status.filter(|s| !s.success() && settled) {
+                return Err(format!(
+                    "{} (pid {pid}) exited with {s} without opening a window",
+                    out.command
+                ));
+            }
+            if start.elapsed() >= wait {
+                return Ok(out);
+            }
+            tokio::time::sleep(LAUNCH_POLL).await;
         }
     }
 

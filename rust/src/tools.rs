@@ -227,6 +227,15 @@ pub fn tools() -> Json {
             ])
         ),
         t(
+            "launch",
+            "Start an allowed app (`app` as named by apps, e.g. \"kate\") with optional\n`args` (a list, no shell), resolved through its .desktop file or PATH, and\nwait up to `wait_ms` (at most 60000) until its window appears. Replies with\nthe window as windows prints it; finds windows a running instance opens\n(single-instance apps such as firefox or kate) too. 0 = do not wait.\nWindow tracking is KDE Plasma only; Linux only.",
+            schema(&[
+                ("app", "string", None),
+                ("args", "array", Some(Json::Null)),
+                ("wait_ms", "integer", Some(json!(15000))),
+            ])
+        ),
+        t(
             "doctor",
             "Check the setup in one report: version, allowlist, which running apps\nare allowed or blocked, the session, AT-SPI, the virtual keyboard and\npointer, KWin scripting, screens and the screenshot path. Run it first\nwhen tools fail in ways that look like a broken installation.",
             schema(&[])
@@ -246,6 +255,9 @@ pub fn tools() -> Json {
         ),
     ]);
     for tool in list.as_array_mut().unwrap() {
+        if tool["name"] == "launch" {
+            tool["inputSchema"]["properties"]["args"]["items"] = json!({ "type": "string" });
+        }
         if READ_ONLY.contains(&tool["name"].as_str().unwrap()) {
             tool["annotations"] = json!({ "readOnlyHint": true });
         }
