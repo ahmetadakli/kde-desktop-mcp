@@ -14,10 +14,10 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use windows::Win32::UI::Accessibility::IUIAutomationElement;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, SetProcessDpiAwarenessContext,
 };
-use windows::Win32::UI::Accessibility::IUIAutomationElement;
 
 use crate::backend::{AppEntry, Backend, Cache, Info, R, WindowEntry};
 use logic::Props;
@@ -65,8 +65,15 @@ async fn poll(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
 
 /// What Python renders for an element that is gone: no role, not showing.
 fn dead() -> Info<Elem> {
-    Info { role: String::new(), name: String::new(), states: Vec::new(), showing: false,
-           actions: Vec::new(), text: None, children: Vec::new() }
+    Info {
+        role: String::new(),
+        name: String::new(),
+        states: Vec::new(),
+        showing: false,
+        actions: Vec::new(),
+        text: None,
+        children: Vec::new(),
+    }
 }
 
 impl WindowsBackend {
@@ -80,11 +87,19 @@ impl WindowsBackend {
 
     /// Info of an element whose properties (and, from a subtree request,
     /// children) are in its UIA cache. Only TextPattern text is read live.
-    fn info_of(&self, el: &IUIAutomationElement, p: &Props, fg: i32, text_limit: usize,
-               children: Vec<Elem>) -> Info<Elem> {
+    fn info_of(
+        &self,
+        el: &IUIAutomationElement,
+        p: &Props,
+        fg: i32,
+        text_limit: usize,
+        children: Vec<Elem>,
+    ) -> Info<Elem> {
         let text = match p.value_preview(text_limit) {
             Some(t) => Some(t),
-            None if p.wants_document_text() => self.uia.document_text(el, text_limit)
+            None if p.wants_document_text() => self
+                .uia
+                .document_text(el, text_limit)
                 .map(|t| logic::one_line(&t, text_limit)),
             None => None,
         };
@@ -108,7 +123,9 @@ impl Backend for WindowsBackend {
     type Id = Elem;
 
     fn allow_file(&self) -> PathBuf {
-        let base = std::env::var_os("APPDATA").filter(|v| !v.is_empty()).map(PathBuf::from)
+        let base = std::env::var_os("APPDATA")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
             .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
             .unwrap_or_default();
         base.join("desktop-mcp").join("allow.txt")
@@ -144,12 +161,17 @@ impl Backend for WindowsBackend {
                 active: p.hwnd != 0 && p.hwnd == fg,
             });
         }
-        apps.into_iter().map(|(name, windows)| AppEntry { name, windows }).collect()
+        apps.into_iter()
+            .map(|(name, windows)| AppEntry { name, windows })
+            .collect()
     }
 
     async fn app_windows(&self, app: &str) -> Option<Vec<Elem>> {
         // UIA has no application object: group top-level windows by executable.
-        let windows: Vec<Elem> = self.uia.top_level().into_iter()
+        let windows: Vec<Elem> = self
+            .uia
+            .top_level()
+            .into_iter()
             .filter(|(_, p)| input::proc_name(p.pid) == app)
             .map(|(e, _)| e)
             .collect();
@@ -161,14 +183,22 @@ impl Backend for WindowsBackend {
     }
 
     async fn info(&self, id: &Elem, text_limit: usize) -> Info<Elem> {
-        let Some(el) = self.uia.fetch_subtree(&id.el) else { return dead() };
+        let Some(el) = self.uia.fetch_subtree(&id.el) else {
+            return dead();
+        };
         let p = uia::props(&el);
         let kids = Uia::cached_children(&el);
         self.info_of(&el, &p, Self::foreground_i32(), text_limit, kids)
     }
 
-    async fn prefetch(&self, cache: &mut Cache<Elem>, roots: Vec<Elem>, only_showing: bool,
-                      text_limit: usize, limit: usize) {
+    async fn prefetch(
+        &self,
+        cache: &mut Cache<Elem>,
+        roots: Vec<Elem>,
+        only_showing: bool,
+        text_limit: usize,
+        limit: usize,
+    ) {
         let fg = Self::foreground_i32();
         // (cache key, element whose UIA cache holds its properties and children)
         let mut queue = std::collections::VecDeque::new();
@@ -215,29 +245,43 @@ impl Backend for WindowsBackend {
     }
 
     async fn actions(&self, id: &Elem) -> Vec<String> {
-        self.uia.fetch(&id.el).map(|p| p.actions().into_iter().map(String::from).collect())
+        self.uia
+            .fetch(&id.el)
+            .map(|p| p.actions().into_iter().map(String::from).collect())
             .unwrap_or_default()
     }
 
     async fn do_action(&self, id: &Elem, index: usize) -> R<bool> {
-        let names = self.uia.fetch(&id.el).map(|p| p.actions()).unwrap_or_default();
+        let names = self
+            .uia
+            .fetch(&id.el)
+            .map(|p| p.actions())
+            .unwrap_or_default();
         let name = names.get(index).ok_or("action index out of range")?;
         Ok(self.uia.perform(&id.el, name))
     }
 
     async fn full_text(&self, id: &Elem, limit: usize) -> R<String> {
-        let Some(p) = self.uia.fetch(&id.el) else { return Ok(String::new()) };
-        if p.text && let Some(t) = self.uia.document_text(&id.el, limit) {
+        let Some(p) = self.uia.fetch(&id.el) else {
+            return Ok(String::new());
+        };
+        if p.text
+            && let Some(t) = self.uia.document_text(&id.el, limit)
+        {
             return Ok(logic::unix_newlines(&t));
         }
-        if p.value && let Some(v) = self.uia.value(&id.el) {
+        if p.value
+            && let Some(v) = self.uia.value(&id.el)
+        {
             return Ok(v.chars().take(limit).collect());
         }
         Ok(p.name)
     }
 
     async fn set_text(&self, id: &Elem, text: &str) -> R<bool> {
-        let vp = self.uia.writable_value(&id.el)
+        let vp = self
+            .uia
+            .writable_value(&id.el)
             .ok_or("element has no writable value; use focus + type_text")?;
         Ok(Uia::set_value(&vp, text))
     }
@@ -261,7 +305,8 @@ impl Backend for WindowsBackend {
         {
             return Err("element's window is not active; call activate_window first".into());
         }
-        self.uia.bounds(&id.el)
+        self.uia
+            .bounds(&id.el)
             .and_then(|(l, t, r, b)| logic::center(l, t, r, b))
             .ok_or_else(|| "element has no on-screen area".into())
     }

@@ -54,7 +54,14 @@ struct Server<B: Backend> {
 }
 
 /// Tools that send keyboard or pointer input.
-const INPUT_TOOLS: [&str; 6] = ["focus", "click", "key", "type_text", "mouse", "activate_window"];
+const INPUT_TOOLS: [&str; 6] = [
+    "focus",
+    "click",
+    "key",
+    "type_text",
+    "mouse",
+    "activate_window",
+];
 
 /// An element picked by `id`, or found by `app` + `query`.
 struct Target<Id> {
@@ -78,7 +85,9 @@ fn arg_s(a: &Json, k: &str, d: &str) -> String {
 }
 
 fn arg_i(a: &Json, k: &str, d: i64) -> i64 {
-    a.get(k).and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64))).unwrap_or(d)
+    a.get(k)
+        .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)))
+        .unwrap_or(d)
 }
 
 fn arg_b(a: &Json, k: &str, d: bool) -> bool {
@@ -86,12 +95,16 @@ fn arg_b(a: &Json, k: &str, d: bool) -> bool {
 }
 
 fn req_s(a: &Json, k: &str) -> R<String> {
-    a.get(k).and_then(Json::as_str).map(str::to_string)
+    a.get(k)
+        .and_then(Json::as_str)
+        .map(str::to_string)
         .ok_or_else(|| format!("missing string argument '{k}'"))
 }
 
 fn req_i(a: &Json, k: &str) -> R<i64> {
-    a.get(k).and_then(Json::as_i64).ok_or_else(|| format!("missing integer argument '{k}'"))
+    a.get(k)
+        .and_then(Json::as_i64)
+        .ok_or_else(|| format!("missing integer argument '{k}'"))
 }
 
 /// Poll `check` every few ms until it is true or `limit` passes.
@@ -115,8 +128,16 @@ where
 impl<B: Backend> Server<B> {
     fn new(b: B) -> Self {
         let allow_file = b.allow_file();
-        Server { b, refs: Mutex::new(Refs { map: HashMap::new(), next: 1 }), allow_file,
-                 last_active: Mutex::new(None), input: Mutex::new(()) }
+        Server {
+            b,
+            refs: Mutex::new(Refs {
+                map: HashMap::new(),
+                next: 1,
+            }),
+            allow_file,
+            last_active: Mutex::new(None),
+            input: Mutex::new(()),
+        }
     }
 
     // ------------------------------------------------------------ allowlist
@@ -152,7 +173,9 @@ impl<B: Backend> Server<B> {
         if !self.is_allowed(&name) {
             return Err(format!(
                 "active window app '{}' is not in {}; activate an allowed window first",
-                if name.is_empty() { "unknown" } else { &name }, self.allow_file.display()));
+                if name.is_empty() { "unknown" } else { &name },
+                self.allow_file.display()
+            ));
         }
         Ok(name)
     }
@@ -187,7 +210,9 @@ impl<B: Backend> Server<B> {
         if !self.is_allowed(name) {
             return Err(self.not_allowed(name));
         }
-        self.b.app_windows(&name.to_lowercase()).await
+        self.b
+            .app_windows(&name.to_lowercase())
+            .await
             .ok_or_else(|| format!("app '{name}' not found in the accessibility tree"))
     }
 
@@ -195,14 +220,28 @@ impl<B: Backend> Server<B> {
     async fn locate(&self, app: &str, query: &str, role: &str) -> R<Option<(B::Id, Cache<B::Id>)>> {
         let windows = self.app_windows(app).await?;
         let mut cache = Cache::new();
-        self.b.prefetch(&mut cache, windows.clone(), true, render::FIND_TEXT_LIMIT,
-                        render::FIND_MAX_SEEN).await;
+        self.b
+            .prefetch(
+                &mut cache,
+                windows.clone(),
+                true,
+                render::FIND_TEXT_LIMIT,
+                render::FIND_MAX_SEEN,
+            )
+            .await;
         loop {
             match render::locate(&cache, &windows, query, role) {
                 Ok(found) => return Ok(found.map(|id| (id, cache))),
                 Err(missing) => {
-                    self.b.prefetch(&mut cache, missing, true, render::FIND_TEXT_LIMIT,
-                                    PREFETCH_MORE).await;
+                    self.b
+                        .prefetch(
+                            &mut cache,
+                            missing,
+                            true,
+                            render::FIND_TEXT_LIMIT,
+                            PREFETCH_MORE,
+                        )
+                        .await;
                 }
             }
         }
@@ -211,16 +250,25 @@ impl<B: Backend> Server<B> {
     /// The element a tool call names: `id`, or `app` + `query` (+ `role`).
     async fn target(&self, a: &Json) -> R<Target<B::Id>> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
-            return Ok(Target { id: self.resolve(rid).await?, found: None });
+            return Ok(Target {
+                id: self.resolve(rid).await?,
+                found: None,
+            });
         }
-        let (Some(app), Some(query)) = (a.get("app").and_then(Json::as_str),
-                                        a.get("query").and_then(Json::as_str)) else {
+        let (Some(app), Some(query)) = (
+            a.get("app").and_then(Json::as_str),
+            a.get("query").and_then(Json::as_str),
+        ) else {
             return Err("pass `id` (from tree/find), or `app` and `query`".into());
         };
         self.b.enable().await;
         let role = arg_s(a, "role", "");
         let (id, cache) = self.locate(app, query, &role).await?.ok_or_else(|| {
-            let role = if role.is_empty() { String::new() } else { format!(" with role '{role}'") };
+            let role = if role.is_empty() {
+                String::new()
+            } else {
+                format!(" with role '{role}'")
+            };
             format!("no visible element in '{app}' matches '{query}'{role}")
         })?;
         let rid = self.add_ref(&id, &app.to_lowercase()).await;
@@ -230,7 +278,10 @@ impl<B: Backend> Server<B> {
 
     /// Title of the active window, if any.
     async fn active_title(&self) -> Option<String> {
-        self.b.list_apps().await.into_iter()
+        self.b
+            .list_apps()
+            .await
+            .into_iter()
             .flat_map(|a| a.windows)
             .find(|w| w.active)
             .map(|w| w.title)
@@ -259,7 +310,11 @@ impl<B: Backend> Server<B> {
                 Line::Raw(s) => Printed::Raw(s),
                 Line::Node { depth, id } => {
                     let rid = self.add_ref(&id, app).await;
-                    Printed::Node { depth, rid, info: &cache[&id] }
+                    Printed::Node {
+                        depth,
+                        rid,
+                        info: &cache[&id],
+                    }
                 }
             });
         }
@@ -276,11 +331,19 @@ impl<B: Backend> Server<B> {
             if app.windows.is_empty() {
                 continue;
             }
-            let flag = if allow.contains(&app.name.to_lowercase()) { "allowed" } else { "blocked" };
+            let flag = if allow.contains(&app.name.to_lowercase()) {
+                "allowed"
+            } else {
+                "blocked"
+            };
             lines.push(format!("{} ({flag})", app.name));
             for w in app.windows {
                 let act = if w.active { " [active]" } else { "" };
-                lines.push(format!("  - {}: {}{act}", w.kind, render::py_repr(&w.title)));
+                lines.push(format!(
+                    "  - {}: {}{act}",
+                    w.kind,
+                    render::py_repr(&w.title)
+                ));
             }
         }
         lines.push(format!("allowlist file: {}", self.allow_file.display()));
@@ -314,14 +377,29 @@ impl<B: Backend> Server<B> {
             (app.clone(), windows, app.to_lowercase())
         };
         let first = (opts.budget * 4).max(1000);
-        self.b.prefetch(&mut cache, roots.clone(), opts.only_showing, TREE_TEXT_LIMIT, first).await;
+        self.b
+            .prefetch(
+                &mut cache,
+                roots.clone(),
+                opts.only_showing,
+                TREE_TEXT_LIMIT,
+                first,
+            )
+            .await;
         let lines = loop {
             let mut lines = vec![Line::Raw(header.clone())];
             match render::walk(&cache, &roots, 1, &opts, &mut lines) {
                 Ok(()) => break lines,
                 Err(missing) => {
-                    self.b.prefetch(&mut cache, missing, opts.only_showing, TREE_TEXT_LIMIT,
-                                    PREFETCH_MORE).await;
+                    self.b
+                        .prefetch(
+                            &mut cache,
+                            missing,
+                            opts.only_showing,
+                            TREE_TEXT_LIMIT,
+                            PREFETCH_MORE,
+                        )
+                        .await;
                 }
             }
         };
@@ -336,21 +414,38 @@ impl<B: Backend> Server<B> {
         let max_results = arg_i(a, "max_results", 30).max(0) as usize;
         let windows = self.app_windows(&app).await?;
         let mut cache = Cache::new();
-        self.b.prefetch(&mut cache, windows.clone(), true, render::FIND_TEXT_LIMIT,
-                        render::FIND_MAX_SEEN).await;
+        self.b
+            .prefetch(
+                &mut cache,
+                windows.clone(),
+                true,
+                render::FIND_TEXT_LIMIT,
+                render::FIND_MAX_SEEN,
+            )
+            .await;
         let hits = loop {
             match render::find(&cache, &windows, &query, &role, max_results) {
                 Ok(h) => break h,
                 Err(missing) => {
-                    self.b.prefetch(&mut cache, missing, true, render::FIND_TEXT_LIMIT,
-                                    PREFETCH_MORE).await;
+                    self.b
+                        .prefetch(
+                            &mut cache,
+                            missing,
+                            true,
+                            render::FIND_TEXT_LIMIT,
+                            PREFETCH_MORE,
+                        )
+                        .await;
                 }
             }
         };
         if hits.is_empty() {
             return Ok("no matches".into());
         }
-        let lines = hits.into_iter().map(|id| Line::Node { depth: 0, id }).collect();
+        let lines = hits
+            .into_iter()
+            .map(|id| Line::Node { depth: 0, id })
+            .collect();
         Ok(self.print(lines, &cache, &app.to_lowercase()).await)
     }
 
@@ -365,25 +460,39 @@ impl<B: Backend> Server<B> {
         let mut idx = 0;
         if !action.is_empty() {
             let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
-            idx = lowered.iter().position(|n| *n == action.to_lowercase()).ok_or_else(|| {
-                let list: Vec<String> = names.iter().map(|n| render::py_repr(n)).collect();
-                format!("action '{action}' not in [{}]", list.join(", "))
-            })?;
+            idx = lowered
+                .iter()
+                .position(|n| *n == action.to_lowercase())
+                .ok_or_else(|| {
+                    let list: Vec<String> = names.iter().map(|n| render::py_repr(n)).collect();
+                    format!("action '{action}' not in [{}]", list.join(", "))
+                })?;
         }
         let ok = self.b.do_action(id, idx).await?;
-        let reply = t.reply(&format!("{} -> {}", names[idx], if ok { "ok" } else { "failed" }));
+        let reply = t.reply(&format!(
+            "{} -> {}",
+            names[idx],
+            if ok { "ok" } else { "failed" }
+        ));
         Ok(self.note_active_change(reply).await)
     }
 
     async fn set_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
         let t = self.target(a).await?;
-        Ok(t.reply(if self.b.set_text(&t.id, &text).await? { "ok" } else { "failed" }))
+        Ok(t.reply(if self.b.set_text(&t.id, &text).await? {
+            "ok"
+        } else {
+            "failed"
+        }))
     }
 
     async fn get_text(&self, a: &Json) -> R<String> {
         let t = self.target(a).await?;
-        let text = self.b.full_text(&t.id, arg_i(a, "limit", 20000).max(0) as usize).await?;
+        let text = self
+            .b
+            .full_text(&t.id, arg_i(a, "limit", 20000).max(0) as usize)
+            .await?;
         Ok(match t.found {
             Some(d) => format!("{d}:\n{text}"),
             None => text,
@@ -408,14 +517,19 @@ impl<B: Backend> Server<B> {
             match found {
                 Some((id, cache)) if !gone => {
                     let rid = self.add_ref(&id, &app.to_lowercase()).await;
-                    return Ok(format!("found after {ms} ms: {}", render::describe(&cache[&id], rid)));
+                    return Ok(format!(
+                        "found after {ms} ms: {}",
+                        render::describe(&cache[&id], rid)
+                    ));
                 }
                 None if gone => return Ok(format!("gone after {ms} ms")),
                 _ => {}
             }
             if start.elapsed() >= limit {
                 let what = if gone { "to disappear" } else { "to appear" };
-                return Err(format!("timed out after {ms} ms waiting for '{query}' in '{app}' {what}"));
+                return Err(format!(
+                    "timed out after {ms} ms waiting for '{query}' in '{app}' {what}"
+                ));
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -433,7 +547,9 @@ impl<B: Backend> Server<B> {
         if wait_for(Duration::from_millis(150), || self.b.is_focused(id)).await {
             return Ok(t.reply(&format!("ok (clicked at {x},{y})")));
         }
-        Ok(t.reply(&format!("clicked at {x},{y} but element did not report focus")))
+        Ok(t.reply(&format!(
+            "clicked at {x},{y} but element did not report focus"
+        )))
     }
 
     async fn click(&self, a: &Json) -> R<String> {
@@ -442,7 +558,9 @@ impl<B: Backend> Server<B> {
         let t = self.target(a).await?;
         self.require_active_allowed().await?;
         let (x, y) = self.b.element_center(&t.id).await?;
-        self.b.pointer(x as i64, y as i64, &button, clicks, 0).await?;
+        self.b
+            .pointer(x as i64, y as i64, &button, clicks, 0)
+            .await?;
         Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}")))
     }
 
@@ -467,8 +585,15 @@ impl<B: Backend> Server<B> {
     async fn mouse(&self, a: &Json) -> R<String> {
         let (x, y) = (req_i(a, "x")?, req_i(a, "y")?);
         let app = self.require_active_allowed().await?;
-        self.b.pointer(x, y, &arg_s(a, "button", "left"), arg_i(a, "clicks", 1),
-                       arg_i(a, "scroll", 0)).await?;
+        self.b
+            .pointer(
+                x,
+                y,
+                &arg_s(a, "button", "left"),
+                arg_i(a, "clicks", 1),
+                arg_i(a, "scroll", 0),
+            )
+            .await?;
         Ok(format!("pointer at ({x},{y}) in {app}"))
     }
 
@@ -477,16 +602,25 @@ impl<B: Backend> Server<B> {
         self.b.activate_window(&query, &self.allowed()).await?;
         *self.last_active.lock().await = self.active_title().await;
         let app = self.b.active_app().await;
-        Ok(format!("active app now: {}", if app.is_empty() { "unknown" } else { &app }))
+        Ok(format!(
+            "active app now: {}",
+            if app.is_empty() { "unknown" } else { &app }
+        ))
     }
 
     async fn screenshot(&self) -> R<String> {
         self.require_active_allowed().await?;
-        Ok(self.b.screenshot().await.unwrap_or_else(|| "screenshot failed".into()))
+        Ok(self
+            .b
+            .screenshot()
+            .await
+            .unwrap_or_else(|| "screenshot failed".into()))
     }
 
     async fn batch(&self, a: &Json) -> R<String> {
-        let steps = a.get("steps").and_then(Json::as_array)
+        let steps = a
+            .get("steps")
+            .and_then(Json::as_array)
             .ok_or("missing array argument 'steps'")?;
         let mut out = Vec::new();
         for (i, step) in steps.iter().enumerate() {
@@ -509,10 +643,17 @@ impl<B: Backend> Server<B> {
         Ok(out.join("\n"))
     }
 
-    fn call<'a>(&'a self, name: &'a str, a: &'a Json)
-        -> Pin<Box<dyn Future<Output = R<String>> + 'a>> {
+    fn call<'a>(
+        &'a self,
+        name: &'a str,
+        a: &'a Json,
+    ) -> Pin<Box<dyn Future<Output = R<String>> + 'a>> {
         Box::pin(async move {
-            let _input = if INPUT_TOOLS.contains(&name) { Some(self.input.lock().await) } else { None };
+            let _input = if INPUT_TOOLS.contains(&name) {
+                Some(self.input.lock().await)
+            } else {
+                None
+            };
             match name {
                 "apps" => self.apps().await,
                 "tree" => self.tree(a).await,
@@ -546,7 +687,11 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
     let result = match method {
         "initialize" => {
             let asked = params["protocolVersion"].as_str().unwrap_or("");
-            let version = if PROTOCOL_VERSIONS.contains(&asked) { asked } else { PROTOCOL_VERSIONS[0] };
+            let version = if PROTOCOL_VERSIONS.contains(&asked) {
+                asked
+            } else {
+                PROTOCOL_VERSIONS[0]
+            };
             json!({
                 "protocolVersion": version,
                 "capabilities": { "tools": { "listChanged": false } },
@@ -557,7 +702,10 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
         "tools/list" => json!({ "tools": tools::tools() }),
         "tools/call" => {
             let name = params["name"].as_str().unwrap_or("");
-            let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+            let args = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             let (text, is_error) = match server.call(name, &args).await {
                 Ok(t) => (t, false),
                 Err(e) => (format!("Error executing tool {name}: {e}"), true),
@@ -579,7 +727,12 @@ async fn serve<B: Backend + 'static>(backend: B) -> R<()> {
     let server = Server::new(backend);
     server.b.enable().await;
     server.allowed();
-    run_loop(std::rc::Rc::new(server), BufReader::new(tokio::io::stdin()), tokio::io::stdout()).await
+    run_loop(
+        std::rc::Rc::new(server),
+        BufReader::new(tokio::io::stdin()),
+        tokio::io::stdout(),
+    )
+    .await
 }
 
 /// The JSON-RPC loop over newline-delimited messages, apart from the
@@ -607,7 +760,10 @@ where
         while let Some(reply) = rx.recv().await {
             let mut out = reply.to_string();
             out.push('\n');
-            stdout.write_all(out.as_bytes()).await.map_err(|e| e.to_string())?;
+            stdout
+                .write_all(out.as_bytes())
+                .await
+                .map_err(|e| e.to_string())?;
             stdout.flush().await.map_err(|e| e.to_string())?;
         }
         Ok::<(), String>(())

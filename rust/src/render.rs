@@ -22,9 +22,15 @@ pub enum Line<Id> {
     Raw(String),
 }
 
-fn get<'a, Id: Clone + Eq + Hash>(cache: &'a Cache<Id>, ids: &[Id])
-                                  -> Result<Vec<&'a Info<Id>>, Vec<Id>> {
-    let missing: Vec<Id> = ids.iter().filter(|o| !cache.contains_key(o)).cloned().collect();
+fn get<'a, Id: Clone + Eq + Hash>(
+    cache: &'a Cache<Id>,
+    ids: &[Id],
+) -> Result<Vec<&'a Info<Id>>, Vec<Id>> {
+    let missing: Vec<Id> = ids
+        .iter()
+        .filter(|o| !cache.contains_key(o))
+        .cloned()
+        .collect();
     if missing.is_empty() {
         Ok(ids.iter().map(|o| &cache[o]).collect())
     } else {
@@ -42,13 +48,18 @@ pub fn json_str(s: &str) -> String {
 }
 
 pub fn text_preview<Id>(info: &Info<Id>, limit: usize) -> String {
-    info.text.as_deref().map(|t| first_chars(t, limit)).unwrap_or_default()
+    info.text
+        .as_deref()
+        .map(|t| first_chars(t, limit))
+        .unwrap_or_default()
 }
 
 /// Actions worth listing. Qt gives nearly every widget "Set Focus"; the
 /// `focus` tool uses it on its own, so listing it only costs tokens.
 pub fn shown_actions<Id>(info: &Info<Id>) -> Vec<&str> {
-    info.actions.iter().map(String::as_str)
+    info.actions
+        .iter()
+        .map(String::as_str)
         .filter(|a| !a.is_empty() && !a.eq_ignore_ascii_case("set focus"))
         .collect()
 }
@@ -59,7 +70,11 @@ fn short_name<Id>(info: &Info<Id>) -> String {
 
 pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
     let name = short_name(info);
-    let role = if info.role.is_empty() { "?" } else { &info.role };
+    let role = if info.role.is_empty() {
+        "?"
+    } else {
+        &info.role
+    };
     let mut out = format!("[{id}] {role}");
     if !name.is_empty() {
         out.push(' ');
@@ -90,7 +105,11 @@ fn plain<Id>(info: &Info<Id>) -> bool {
 /// One line of tree/find output, with its id assigned.
 pub enum Printed<'a, Id> {
     Raw(String),
-    Node { depth: usize, rid: u64, info: &'a Info<Id> },
+    Node {
+        depth: usize,
+        rid: u64,
+        info: &'a Info<Id>,
+    },
 }
 
 /// Shortest run of plain sibling leaves printed on one line.
@@ -119,8 +138,16 @@ pub fn format<Id>(items: &[Printed<Id>]) -> String {
             Printed::Node { depth, rid, info } => (*depth, *rid, *info),
         };
         let mut j = i;
-        while let Some(Printed::Node { depth: d, info: next, .. }) = items.get(j) {
-            if *d != depth || next.role != info.role || !plain(next) || !leaf(j, depth)
+        while let Some(Printed::Node {
+            depth: d,
+            info: next,
+            ..
+        }) = items.get(j)
+        {
+            if *d != depth
+                || next.role != info.role
+                || !plain(next)
+                || !leaf(j, depth)
                 || shown_actions(next) != shown_actions(info)
             {
                 break;
@@ -129,17 +156,32 @@ pub fn format<Id>(items: &[Printed<Id>]) -> String {
         }
         let indent = " ".repeat(depth);
         if j - i >= MIN_RUN {
-            let role = if info.role.is_empty() { "?" } else { &info.role };
+            let role = if info.role.is_empty() {
+                "?"
+            } else {
+                &info.role
+            };
             let actions = shown_actions(info);
-            let actions = if actions.is_empty() { String::new() } else { format!(" actions={}", actions.join(",")) };
-            let members: Vec<String> = items[i..j].iter().map(|it| match it {
-                Printed::Node { rid, info, .. } => match short_name(info) {
-                    n if n.is_empty() => format!("[{rid}]"),
-                    n => format!("[{rid}] {}", json_str(&n)),
-                },
-                Printed::Raw(_) => unreachable!(),
-            }).collect();
-            out.push(format!("{indent}{role} ×{}{actions}: {}", j - i, members.join(" ")));
+            let actions = if actions.is_empty() {
+                String::new()
+            } else {
+                format!(" actions={}", actions.join(","))
+            };
+            let members: Vec<String> = items[i..j]
+                .iter()
+                .map(|it| match it {
+                    Printed::Node { rid, info, .. } => match short_name(info) {
+                        n if n.is_empty() => format!("[{rid}]"),
+                        n => format!("[{rid}] {}", json_str(&n)),
+                    },
+                    Printed::Raw(_) => unreachable!(),
+                })
+                .collect();
+            out.push(format!(
+                "{indent}{role} ×{}{actions}: {}",
+                j - i,
+                members.join(" ")
+            ));
             i = j;
         } else {
             out.push(format!("{indent}{}", describe(info, rid)));
@@ -158,9 +200,13 @@ pub struct WalkOpts {
 
 /// Python `walk`: unnamed, actionless nodes of boring roles are skipped and
 /// their children lifted to the same depth.
-pub fn walk<Id: Clone + Eq + Hash>(cache: &Cache<Id>, children: &[Id], depth: usize,
-                                   opts: &WalkOpts, lines: &mut Vec<Line<Id>>)
-                                   -> Result<(), Vec<Id>> {
+pub fn walk<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    children: &[Id],
+    depth: usize,
+    opts: &WalkOpts,
+    lines: &mut Vec<Line<Id>>,
+) -> Result<(), Vec<Id>> {
     if lines.len() >= opts.budget || depth > opts.max_depth {
         return Ok(());
     }
@@ -180,7 +226,10 @@ pub fn walk<Id: Clone + Eq + Hash>(cache: &Cache<Id>, children: &[Id], depth: us
             || !info.name.is_empty()
             || !shown_actions(info).is_empty();
         if interesting {
-            lines.push(Line::Node { depth, id: c.clone() });
+            lines.push(Line::Node {
+                depth,
+                id: c.clone(),
+            });
             walk(cache, &info.children, depth + 1, opts, lines)?;
         } else {
             walk(cache, &info.children, depth, opts, lines)?;
@@ -191,8 +240,13 @@ pub fn walk<Id: Clone + Eq + Hash>(cache: &Cache<Id>, children: &[Id], depth: us
 
 /// Python `find`: depth-first, hidden subtrees skipped, case-insensitive
 /// substring match over name, text and role.
-pub fn find<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id], query: &str, role: &str,
-                                   max_results: usize) -> Result<Vec<Id>, Vec<Id>> {
+pub fn find<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+    query: &str,
+    role: &str,
+    max_results: usize,
+) -> Result<Vec<Id>, Vec<Id>> {
     let q = query.to_lowercase();
     let mut hits = Vec::new();
     // None is the synthetic root whose children are `roots`.
@@ -216,8 +270,13 @@ pub fn find<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id], query: &str,
             if !role.is_empty() && info.role != role {
                 continue;
             }
-            let hay = format!("{} {} {}", info.name, text_preview(info, FIND_TEXT_LIMIT),
-                              info.role).to_lowercase();
+            let hay = format!(
+                "{} {} {}",
+                info.name,
+                text_preview(info, FIND_TEXT_LIMIT),
+                info.role
+            )
+            .to_lowercase();
             if hay.contains(&q) {
                 hits.push(c.clone());
             }
@@ -230,13 +289,24 @@ pub fn find<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id], query: &str,
 /// elements, the first whose name equals `query` (case-insensitive) wins,
 /// else the first whose name, text or role contains it. Ok(None) when
 /// nothing matches.
-pub fn locate<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id], query: &str,
-                                     role: &str) -> Result<Option<Id>, Vec<Id>> {
+pub fn locate<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+    query: &str,
+    role: &str,
+) -> Result<Option<Id>, Vec<Id>> {
     let q = query.trim().to_lowercase();
     let mut first_partial = None;
     let mut stack: Vec<&Id> = Vec::new();
     let infos = get(cache, roots)?;
-    stack.extend(roots.iter().zip(infos).filter(|(_, i)| i.showing).map(|(r, _)| r).rev());
+    stack.extend(
+        roots
+            .iter()
+            .zip(infos)
+            .filter(|(_, i)| i.showing)
+            .map(|(r, _)| r)
+            .rev(),
+    );
     let mut seen = 0;
     while let Some(id) = stack.pop() {
         seen += 1;
@@ -249,22 +319,38 @@ pub fn locate<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id], query: &st
                 return Ok(Some(id.clone()));
             }
             if first_partial.is_none() {
-                let hay = format!("{} {} {}", info.name, text_preview(info, FIND_TEXT_LIMIT),
-                                  info.role).to_lowercase();
+                let hay = format!(
+                    "{} {} {}",
+                    info.name,
+                    text_preview(info, FIND_TEXT_LIMIT),
+                    info.role
+                )
+                .to_lowercase();
                 if hay.contains(&q) {
                     first_partial = Some(id.clone());
                 }
             }
         }
         let kids = get(cache, &info.children)?;
-        stack.extend(info.children.iter().zip(kids).filter(|(_, k)| k.showing).map(|(c, _)| c).rev());
+        stack.extend(
+            info.children
+                .iter()
+                .zip(kids)
+                .filter(|(_, k)| k.showing)
+                .map(|(c, _)| c)
+                .rev(),
+        );
     }
     Ok(first_partial)
 }
 
 /// Python `repr()` of a str, for window titles in `apps`.
 pub fn py_repr(s: &str) -> String {
-    let quote = if s.contains('\'') && !s.contains('"') { '"' } else { '\'' };
+    let quote = if s.contains('\'') && !s.contains('"') {
+        '"'
+    } else {
+        '\''
+    };
     let mut out = String::from(quote);
     for ch in s.chars() {
         match ch {
@@ -292,8 +378,13 @@ mod tests {
 
     const BORING: &[&str] = &["filler", "panel"];
 
-    fn node(role: &str, name: &str, showing: bool, states: &[&'static str], kids: &[&'static str])
-            -> Info<&'static str> {
+    fn node(
+        role: &str,
+        name: &str,
+        showing: bool,
+        states: &[&'static str],
+        kids: &[&'static str],
+    ) -> Info<&'static str> {
         Info {
             role: role.into(),
             name: name.into(),
@@ -319,7 +410,12 @@ mod tests {
     }
 
     fn opts(budget: usize) -> WalkOpts {
-        WalkOpts { max_depth: 12, budget, only_showing: true, boring_roles: BORING }
+        WalkOpts {
+            max_depth: 12,
+            budget,
+            only_showing: true,
+            boring_roles: BORING,
+        }
     }
 
     #[test]
@@ -327,10 +423,13 @@ mod tests {
         let cache = sample();
         let mut lines = Vec::new();
         walk(&cache, &["/w"], 1, &opts(300), &mut lines).unwrap();
-        let got: Vec<(usize, &str)> = lines.iter().map(|l| match l {
-            Line::Node { depth, id } => (*depth, *id),
-            Line::Raw(_) => (0, "raw"),
-        }).collect();
+        let got: Vec<(usize, &str)> = lines
+            .iter()
+            .map(|l| match l {
+                Line::Node { depth, id } => (*depth, *id),
+                Line::Raw(_) => (0, "raw"),
+            })
+            .collect();
         assert_eq!(got, vec![(1, "/w"), (2, "/b1"), (2, "/b2")]);
     }
 
@@ -345,15 +444,23 @@ mod tests {
         let mut lines = Vec::new();
         walk(&cache, &["/w"], 1, &opts(2), &mut lines).unwrap();
         assert_eq!(lines.last(), Some(&Line::Raw(TRUNCATED.into())));
-        assert_eq!(lines.iter().filter(|l| matches!(l, Line::Raw(_))).count(), 1);
+        assert_eq!(
+            lines.iter().filter(|l| matches!(l, Line::Raw(_))).count(),
+            1
+        );
     }
 
     #[test]
     fn describe_matches_python_format() {
         let cache = sample();
-        assert_eq!(describe(&cache["/b1"], 7), "[7] push button \"Kaydet\" actions=Press");
-        assert_eq!(describe(&cache["/b2"], 8),
-                   "[8] text \"line break\" text=\"içerik \\\"x\\\"\" {focused,disabled}");
+        assert_eq!(
+            describe(&cache["/b1"], 7),
+            "[7] push button \"Kaydet\" actions=Press"
+        );
+        assert_eq!(
+            describe(&cache["/b2"], 8),
+            "[8] text \"line break\" text=\"içerik \\\"x\\\"\" {focused,disabled}"
+        );
         assert_eq!(describe(&cache["/w"], 1), "[1] frame \"Win\" {active}");
         let mut f = node("filler", "", true, &[], &[]);
         f.actions = vec!["Set Focus".into()];
@@ -371,39 +478,99 @@ mod tests {
 
     #[test]
     fn format_folds_runs_of_plain_sibling_leaves() {
-        let items: Vec<Info<&str>> = ["a", "b", "c", "d"].iter()
-            .map(|n| node("list item", n, true, &[], &[])).collect();
+        let items: Vec<Info<&str>> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| node("list item", n, true, &[], &[]))
+            .collect();
         let focused = node("list item", "e", true, &["focused"], &[]);
         let list = node("list", "files", true, &[], &[]);
         let printed = vec![
             Printed::Raw("dolphin".into()),
-            Printed::Node { depth: 1, rid: 1, info: &list },
-            Printed::Node { depth: 2, rid: 2, info: &focused },
-            Printed::Node { depth: 2, rid: 3, info: &items[0] },
-            Printed::Node { depth: 2, rid: 4, info: &items[1] },
-            Printed::Node { depth: 2, rid: 5, info: &items[2] },
-            Printed::Node { depth: 1, rid: 6, info: &items[3] },
+            Printed::Node {
+                depth: 1,
+                rid: 1,
+                info: &list,
+            },
+            Printed::Node {
+                depth: 2,
+                rid: 2,
+                info: &focused,
+            },
+            Printed::Node {
+                depth: 2,
+                rid: 3,
+                info: &items[0],
+            },
+            Printed::Node {
+                depth: 2,
+                rid: 4,
+                info: &items[1],
+            },
+            Printed::Node {
+                depth: 2,
+                rid: 5,
+                info: &items[2],
+            },
+            Printed::Node {
+                depth: 1,
+                rid: 6,
+                info: &items[3],
+            },
         ];
-        assert_eq!(format(&printed), "dolphin\n [1] list \"files\"\n  [2] list item \"e\" {focused}\n  \
-             list item ×3: [3] \"a\" [4] \"b\" [5] \"c\"\n [6] list item \"d\"");
+        assert_eq!(
+            format(&printed),
+            "dolphin\n [1] list \"files\"\n  [2] list item \"e\" {focused}\n  \
+             list item ×3: [3] \"a\" [4] \"b\" [5] \"c\"\n [6] list item \"d\""
+        );
         // Same role and actions fold too, unnamed members as bare ids.
-        let boxes: Vec<Info<&str>> = ["Bold", "", "Italic"].iter().map(|n| {
-            let mut b = node("check box", n, true, &[], &[]);
-            b.actions = vec!["Toggle".into(), "Set Focus".into()];
-            b
-        }).collect();
-        let printed: Vec<Printed<&str>> = boxes.iter().enumerate()
-            .map(|(k, info)| Printed::Node { depth: 0, rid: k as u64 + 1, info }).collect();
-        assert_eq!(format(&printed), "check box ×3 actions=Toggle: [1] \"Bold\" [2] [3] \"Italic\"");
+        let boxes: Vec<Info<&str>> = ["Bold", "", "Italic"]
+            .iter()
+            .map(|n| {
+                let mut b = node("check box", n, true, &[], &[]);
+                b.actions = vec!["Toggle".into(), "Set Focus".into()];
+                b
+            })
+            .collect();
+        let printed: Vec<Printed<&str>> = boxes
+            .iter()
+            .enumerate()
+            .map(|(k, info)| Printed::Node {
+                depth: 0,
+                rid: k as u64 + 1,
+                info,
+            })
+            .collect();
+        assert_eq!(
+            format(&printed),
+            "check box ×3 actions=Toggle: [1] \"Bold\" [2] [3] \"Italic\""
+        );
         // Two in a row stay separate lines; a node with children is no leaf.
         let printed = vec![
-            Printed::Node { depth: 0, rid: 1, info: &items[0] },
-            Printed::Node { depth: 0, rid: 2, info: &items[1] },
-            Printed::Node { depth: 0, rid: 3, info: &items[2] },
-            Printed::Node { depth: 1, rid: 4, info: &list },
+            Printed::Node {
+                depth: 0,
+                rid: 1,
+                info: &items[0],
+            },
+            Printed::Node {
+                depth: 0,
+                rid: 2,
+                info: &items[1],
+            },
+            Printed::Node {
+                depth: 0,
+                rid: 3,
+                info: &items[2],
+            },
+            Printed::Node {
+                depth: 1,
+                rid: 4,
+                info: &list,
+            },
         ];
-        assert_eq!(format(&printed),
-                   "[1] list item \"a\"\n[2] list item \"b\"\n[3] list item \"c\"\n [4] list \"files\"");
+        assert_eq!(
+            format(&printed),
+            "[1] list item \"a\"\n[2] list item \"b\"\n[3] list item \"c\"\n [4] list \"files\""
+        );
     }
 
     #[test]

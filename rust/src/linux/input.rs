@@ -5,8 +5,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use evdev::uinput::VirtualDevice;
-use evdev::{AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode,
-            RelativeAxisCode, UinputAbsSetup};
+use evdev::{
+    AbsInfo, AbsoluteAxisCode, AttributeSet, EventType, InputEvent, KeyCode, RelativeAxisCode,
+    UinputAbsSetup,
+};
 
 use crate::backend::R;
 
@@ -29,16 +31,32 @@ const BUTTON_HOLD: Duration = Duration::from_millis(3);
 const BUTTON_GAP: Duration = Duration::from_millis(30);
 
 const ALIASES: &[(&str, &str)] = &[
-    ("ctrl", "LEFTCTRL"), ("control", "LEFTCTRL"), ("shift", "LEFTSHIFT"),
-    ("alt", "LEFTALT"), ("altgr", "RIGHTALT"), ("super", "LEFTMETA"), ("meta", "LEFTMETA"),
-    ("win", "LEFTMETA"), ("enter", "ENTER"), ("return", "ENTER"), ("esc", "ESC"),
-    ("escape", "ESC"), ("del", "DELETE"), ("pgup", "PAGEUP"), ("pgdn", "PAGEDOWN"),
-    ("space", "SPACE"), ("tab", "TAB"), ("backspace", "BACKSPACE"),
+    ("ctrl", "LEFTCTRL"),
+    ("control", "LEFTCTRL"),
+    ("shift", "LEFTSHIFT"),
+    ("alt", "LEFTALT"),
+    ("altgr", "RIGHTALT"),
+    ("super", "LEFTMETA"),
+    ("meta", "LEFTMETA"),
+    ("win", "LEFTMETA"),
+    ("enter", "ENTER"),
+    ("return", "ENTER"),
+    ("esc", "ESC"),
+    ("escape", "ESC"),
+    ("del", "DELETE"),
+    ("pgup", "PAGEUP"),
+    ("pgdn", "PAGEDOWN"),
+    ("space", "SPACE"),
+    ("tab", "TAB"),
+    ("backspace", "BACKSPACE"),
 ];
 
 pub fn keycode(name: &str) -> R<KeyCode> {
     let lower = name.to_lowercase();
-    let n = ALIASES.iter().find(|(a, _)| *a == lower).map(|(_, k)| k.to_string())
+    let n = ALIASES
+        .iter()
+        .find(|(a, _)| *a == lower)
+        .map(|(_, k)| k.to_string())
         .unwrap_or_else(|| name.to_uppercase());
     KeyCode::from_str(&format!("KEY_{n}")).map_err(|_| format!("unknown key '{name}'"))
 }
@@ -53,7 +71,12 @@ pub fn button_code(button: &str) -> R<KeyCode> {
 }
 
 pub fn parse_combo(combo: &str) -> R<Vec<KeyCode>> {
-    combo.replace(' ', "").split('+').filter(|k| !k.is_empty()).map(keycode).collect()
+    combo
+        .replace(' ', "")
+        .split('+')
+        .filter(|k| !k.is_empty())
+        .map(keycode)
+        .collect()
 }
 
 fn ev(kind: EventType, code: u16, value: i32) -> InputEvent {
@@ -74,7 +97,11 @@ fn io(e: std::io::Error) -> String {
 
 impl Input {
     pub fn new(absolute: bool) -> Self {
-        Input { kbd: Mutex::new(None), ptr: Mutex::new(None), absolute }
+        Input {
+            kbd: Mutex::new(None),
+            ptr: Mutex::new(None),
+            absolute,
+        }
     }
 
     fn with_kbd<T>(&self, f: impl FnOnce(&mut VirtualDevice) -> R<T>) -> R<T> {
@@ -85,10 +112,13 @@ impl Input {
             for code in (1u16..0x100).chain(0x160..0x200) {
                 keys.insert(KeyCode::new(code));
             }
-            let dev = VirtualDevice::builder().map_err(io)?
+            let dev = VirtualDevice::builder()
+                .map_err(io)?
                 .name("desktop-mcp-keyboard")
-                .with_keys(&keys).map_err(io)?
-                .build().map_err(io)?;
+                .with_keys(&keys)
+                .map_err(io)?
+                .build()
+                .map_err(io)?;
             std::thread::sleep(DEVICE_SETTLE);
             *slot = Some(dev);
         }
@@ -104,20 +134,28 @@ impl Input {
             }
             let mut rel = AttributeSet::<RelativeAxisCode>::new();
             rel.insert(RelativeAxisCode::REL_WHEEL);
-            let mut builder = VirtualDevice::builder().map_err(io)?
+            let mut builder = VirtualDevice::builder()
+                .map_err(io)?
                 .name("desktop-mcp-pointer")
-                .with_keys(&buttons).map_err(io)?;
+                .with_keys(&buttons)
+                .map_err(io)?;
             if self.absolute {
                 let axis = |code| UinputAbsSetup::new(code, AbsInfo::new(0, 0, ABS_MAX, 0, 0, 0));
                 builder = builder
-                    .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X)).map_err(io)?
-                    .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y)).map_err(io)?;
+                    .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_X))
+                    .map_err(io)?
+                    .with_absolute_axis(&axis(AbsoluteAxisCode::ABS_Y))
+                    .map_err(io)?;
             } else {
                 // A pointer device needs motion axes to be classified as one.
                 rel.insert(RelativeAxisCode::REL_X);
                 rel.insert(RelativeAxisCode::REL_Y);
             }
-            let dev = builder.with_relative_axes(&rel).map_err(io)?.build().map_err(io)?;
+            let dev = builder
+                .with_relative_axes(&rel)
+                .map_err(io)?
+                .build()
+                .map_err(io)?;
             std::thread::sleep(DEVICE_SETTLE);
             *slot = Some(dev);
         }
@@ -137,7 +175,11 @@ impl Input {
     pub async fn press_combo(&self, combo: &str) -> R<()> {
         let codes = parse_combo(combo)?;
         let down: Vec<InputEvent> = codes.iter().map(|c| ev(EventType::KEY, c.0, 1)).collect();
-        let up: Vec<InputEvent> = codes.iter().rev().map(|c| ev(EventType::KEY, c.0, 0)).collect();
+        let up: Vec<InputEvent> = codes
+            .iter()
+            .rev()
+            .map(|c| ev(EventType::KEY, c.0, 0))
+            .collect();
         self.with_kbd(|d| d.emit(&down).map_err(io))?;
         tokio::time::sleep(KEY_HOLD).await;
         self.with_kbd(|d| d.emit(&up).map_err(io))?;
@@ -148,10 +190,13 @@ impl Input {
     /// Move to absolute device coordinates (0..=ABS_MAX) and let the
     /// compositor catch up.
     pub async fn move_abs(&self, ax: i32, ay: i32) -> R<()> {
-        self.with_ptr(|d| d.emit(&[
-            ev(EventType::ABSOLUTE, AbsoluteAxisCode::ABS_X.0, ax),
-            ev(EventType::ABSOLUTE, AbsoluteAxisCode::ABS_Y.0, ay),
-        ]).map_err(io))?;
+        self.with_ptr(|d| {
+            d.emit(&[
+                ev(EventType::ABSOLUTE, AbsoluteAxisCode::ABS_X.0, ax),
+                ev(EventType::ABSOLUTE, AbsoluteAxisCode::ABS_Y.0, ay),
+            ])
+            .map_err(io)
+        })?;
         tokio::time::sleep(POINTER_SETTLE).await;
         Ok(())
     }
@@ -176,8 +221,10 @@ impl Input {
         }
         if scroll != 0 {
             let v = (-scroll).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
-            self.with_ptr(|d| d.emit(&[
-                ev(EventType::RELATIVE, RelativeAxisCode::REL_WHEEL.0, v)]).map_err(io))?;
+            self.with_ptr(|d| {
+                d.emit(&[ev(EventType::RELATIVE, RelativeAxisCode::REL_WHEEL.0, v)])
+                    .map_err(io)
+            })?;
         }
         Ok(())
     }
@@ -189,9 +236,18 @@ mod tests {
 
     #[test]
     fn parses_aliases_and_names() {
-        assert_eq!(parse_combo("ctrl+s").unwrap(), vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_S]);
-        assert_eq!(parse_combo("Ctrl + Shift + F5").unwrap(),
-                   vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_LEFTSHIFT, KeyCode::KEY_F5]);
+        assert_eq!(
+            parse_combo("ctrl+s").unwrap(),
+            vec![KeyCode::KEY_LEFTCTRL, KeyCode::KEY_S]
+        );
+        assert_eq!(
+            parse_combo("Ctrl + Shift + F5").unwrap(),
+            vec![
+                KeyCode::KEY_LEFTCTRL,
+                KeyCode::KEY_LEFTSHIFT,
+                KeyCode::KEY_F5
+            ]
+        );
         assert_eq!(parse_combo("enter").unwrap(), vec![KeyCode::KEY_ENTER]);
         assert_eq!(parse_combo("pgdn").unwrap(), vec![KeyCode::KEY_PAGEDOWN]);
         assert!(parse_combo("ctrl+nosuchkey").is_err());

@@ -19,8 +19,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId,
-    IsIconic, SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
+    GA_ROOT, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
+    SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
 };
 use windows::core::PWSTR;
 
@@ -52,8 +52,14 @@ fn mouse(flags: MOUSE_EVENT_FLAGS, data: i32) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
         Anonymous: INPUT_0 {
-            mi: MOUSEINPUT { dx: 0, dy: 0, mouseData: data as u32, dwFlags: flags, time: 0,
-                             dwExtraInfo: 0 },
+            mi: MOUSEINPUT {
+                dx: 0,
+                dy: 0,
+                mouseData: data as u32,
+                dwFlags: flags,
+                time: 0,
+                dwExtraInfo: 0,
+            },
         },
     }
 }
@@ -64,8 +70,11 @@ fn send(inputs: &[INPUT]) -> R<()> {
     }
     let sent = unsafe { SendInput(inputs, size_of::<INPUT>() as i32) };
     if sent as usize != inputs.len() {
-        return Err(format!("[Errno {}] SendInput was blocked (a higher-integrity window may be \
-                            in front)", last_error()));
+        return Err(format!(
+            "[Errno {}] SendInput was blocked (a higher-integrity window may be \
+                            in front)",
+            last_error()
+        ));
     }
     Ok(())
 }
@@ -89,7 +98,9 @@ pub fn button(flags: MOUSE_EVENT_FLAGS) -> R<()> {
 }
 
 pub fn wheel(scroll: i64) -> R<()> {
-    let data = (-scroll).saturating_mul(WHEEL_DELTA).clamp(i32::MIN as i64, i32::MAX as i64);
+    let data = (-scroll)
+        .saturating_mul(WHEEL_DELTA)
+        .clamp(i32::MIN as i64, i32::MAX as i64);
     send(&[mouse(MOUSEEVENTF_WHEEL, data as i32)])
 }
 
@@ -132,8 +143,18 @@ pub fn set_foreground(h: HWND) {
 /// after input.
 pub fn alt_tap() -> R<()> {
     let alt = logic::VK_MENU;
-    send_keys(&[KeyEv { vk: alt, scan: 0, flags: 0 },
-                KeyEv { vk: alt, scan: 0, flags: logic::KEYEVENTF_KEYUP }])
+    send_keys(&[
+        KeyEv {
+            vk: alt,
+            scan: 0,
+            flags: 0,
+        },
+        KeyEv {
+            vk: alt,
+            scan: 0,
+            flags: logic::KEYEVENTF_KEYUP,
+        },
+    ])
 }
 
 /// Executable stem of a process. Not cached: process ids are reused, and a
@@ -161,7 +182,8 @@ fn image_stem(pid: u32) -> String {
         };
         let mut buf = [0u16; 1024];
         let mut size = buf.len() as u32;
-        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut size);
+        let ok =
+            QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, PWSTR(buf.as_mut_ptr()), &mut size);
         let _ = CloseHandle(h);
         if ok.is_err() {
             return String::new();
@@ -187,7 +209,17 @@ fn grab_foreground() -> Option<(u32, u32, Vec<u8>)> {
         let mem = CreateCompatibleDC(Some(screen));
         let bmp = CreateCompatibleBitmap(screen, w, ht);
         let old = SelectObject(mem, bmp.into());
-        let copied = BitBlt(mem, 0, 0, w, ht, Some(screen), r.left, r.top, SRCCOPY | CAPTUREBLT);
+        let copied = BitBlt(
+            mem,
+            0,
+            0,
+            w,
+            ht,
+            Some(screen),
+            r.left,
+            r.top,
+            SRCCOPY | CAPTUREBLT,
+        );
         let mut info = BITMAPINFO {
             bmiHeader: BITMAPINFOHEADER {
                 biSize: size_of::<BITMAPINFOHEADER>() as u32,
@@ -202,8 +234,15 @@ fn grab_foreground() -> Option<(u32, u32, Vec<u8>)> {
         };
         let mut bgra = vec![0u8; w as usize * ht as usize * 4];
         let lines = if copied.is_ok() {
-            GetDIBits(mem, bmp, 0, ht as u32, Some(bgra.as_mut_ptr().cast()), &mut info,
-                      DIB_RGB_COLORS)
+            GetDIBits(
+                mem,
+                bmp,
+                0,
+                ht as u32,
+                Some(bgra.as_mut_ptr().cast()),
+                &mut info,
+                DIB_RGB_COLORS,
+            )
         } else {
             0
         };
@@ -219,14 +258,23 @@ fn grab_foreground() -> Option<(u32, u32, Vec<u8>)> {
 pub fn screenshot() -> Option<String> {
     let (w, h, rgb) = grab_foreground()?;
     let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
     let path: PathBuf = std::env::temp_dir().join(format!("desktop-mcp-{nanos}.png"));
-    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(&path).ok()?;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .ok()?;
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), w, h);
     enc.set_color(png::ColorType::Rgb);
     enc.set_depth(png::BitDepth::Eight);
     enc.set_compression(png::Compression::Fast);
-    let ok = enc.write_header().and_then(|mut wr| wr.write_image_data(&rgb)).is_ok();
+    let ok = enc
+        .write_header()
+        .and_then(|mut wr| wr.write_image_data(&rgb))
+        .is_ok();
     if !ok {
         let _ = std::fs::remove_file(&path);
         return None;

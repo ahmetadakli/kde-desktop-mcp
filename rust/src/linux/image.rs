@@ -44,8 +44,12 @@ pub fn to_rgba(img: &RawImage) -> R<Vec<u8>> {
             let a = if alpha { px[layout[3]] } else { 255 };
             let (r, g, b) = (px[layout[0]], px[layout[1]], px[layout[2]]);
             if premul {
-                out.extend_from_slice(&[unpremultiply(r, a), unpremultiply(g, a),
-                                        unpremultiply(b, a), a]);
+                out.extend_from_slice(&[
+                    unpremultiply(r, a),
+                    unpremultiply(g, a),
+                    unpremultiply(b, a),
+                    a,
+                ]);
             } else {
                 out.extend_from_slice(&[r, g, b, a]);
             }
@@ -70,16 +74,36 @@ mod tests {
     use super::*;
 
     fn img(format: u32, stride: u32, data: Vec<u8>) -> RawImage {
-        RawImage { width: 2, height: 1, stride, format, data }
+        RawImage {
+            width: 2,
+            height: 1,
+            stride,
+            format,
+            data,
+        }
     }
 
     #[test]
     fn converts_native_argb_and_rgba_layouts() {
         // Pixels: opaque red, then half-transparent premultiplied green.
-        let argb = img(ARGB32_PREMULTIPLIED, 8, vec![0, 0, 255, 255, 0, 128, 0, 128]);
-        assert_eq!(to_rgba(&argb).unwrap(), vec![255, 0, 0, 255, 0, 255, 0, 128]);
-        let rgba = img(RGBA8888_PREMULTIPLIED, 8, vec![255, 0, 0, 255, 0, 128, 0, 128]);
-        assert_eq!(to_rgba(&rgba).unwrap(), vec![255, 0, 0, 255, 0, 255, 0, 128]);
+        let argb = img(
+            ARGB32_PREMULTIPLIED,
+            8,
+            vec![0, 0, 255, 255, 0, 128, 0, 128],
+        );
+        assert_eq!(
+            to_rgba(&argb).unwrap(),
+            vec![255, 0, 0, 255, 0, 255, 0, 128]
+        );
+        let rgba = img(
+            RGBA8888_PREMULTIPLIED,
+            8,
+            vec![255, 0, 0, 255, 0, 128, 0, 128],
+        );
+        assert_eq!(
+            to_rgba(&rgba).unwrap(),
+            vec![255, 0, 0, 255, 0, 255, 0, 128]
+        );
         let straight = img(RGBA8888, 8, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(to_rgba(&straight).unwrap(), vec![1, 2, 3, 4, 5, 6, 7, 8]);
     }
