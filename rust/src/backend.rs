@@ -125,6 +125,27 @@ pub struct Shot {
     pub area: Option<(f64, f64, f64, f64)>,
 }
 
+/// File dialogs the server can fill in (only KDE's so far).
+pub const NO_FILE_DIALOG: &str = "file dialogs are only supported on KDE Plasma";
+
+/// The active window when it is a file Open/Save dialog.
+#[derive(Clone, Debug)]
+pub struct FileDialog<Id> {
+    pub window: Id,
+    /// App name owning the dialog: the app itself (an in-process dialog)
+    /// or the desktop portal serving another app.
+    pub app: String,
+    /// Titles the dialog shows (compositor caption, accessible name).
+    pub titles: Vec<String>,
+    /// App the compositor says the dialog belongs to (its transient
+    /// parent), None when it does not say.
+    pub parent: Option<String>,
+    /// The file name / location field.
+    pub field: Id,
+    /// The dialog's default button (Open/Save), when found.
+    pub accept: Option<Id>,
+}
+
 pub struct WindowEntry {
     pub kind: String,
     pub title: String,
@@ -246,6 +267,10 @@ pub trait Backend {
     /// Show what the agent is doing on screen, when the desktop has an
     /// indicator.
     async fn indicate(&self, _label: &str) {}
+    /// The active window as a file dialog; Err when it is none.
+    async fn active_file_dialog(&self) -> R<FileDialog<Self::Id>> {
+        Err(NO_FILE_DIALOG.into())
+    }
     /// Platform checks for `doctor`.
     async fn doctor(&self) -> Vec<Check> {
         Vec::new()

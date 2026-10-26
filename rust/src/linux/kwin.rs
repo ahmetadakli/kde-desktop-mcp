@@ -206,6 +206,13 @@ const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow
 const FRAME: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
      const g = w.frameGeometry; return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
 
+/// The active window's caption and process, and the window it is a
+/// transient (dialog) for. A portal dialog gets its parent from the window
+/// handle the requesting app exported (xdg-foreign), not from its title.
+const ACTIVE_PARENT: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
+     const p = w.transientFor; return {caption: w.caption, pid: w.pid, \
+     parent: p ? {pid: p.pid, class: p.resourceClass || '', caption: p.caption} : null}; })())";
+
 const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtualScreenGeometry; \
      return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
 
@@ -392,6 +399,14 @@ impl KWin {
                 scale: o["scale"].as_f64().unwrap_or(1.0),
             })
             .collect())
+    }
+
+    /// KWin's active window with its transient parent, see ACTIVE_PARENT;
+    /// None without an active window.
+    pub async fn active_parent(&self) -> R<Option<Json>> {
+        let raw = self.query(ACTIVE_PARENT).await?.unwrap_or_default();
+        let v: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
+        Ok((!v.is_null()).then_some(v))
     }
 
     /// Frame (with title bar) of KWin's active window in logical px:

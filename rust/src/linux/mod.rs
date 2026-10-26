@@ -24,8 +24,8 @@ use tokio::io::AsyncWriteExt;
 use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
-    AppEntry, Backend, Cache, Check, Clip, Info, Launched, NO_WINDOW_CONTROL, R, Screen, Shot,
-    WindowChange, WindowEntry, WindowGeo,
+    AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_FILE_DIALOG,
+    NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -72,6 +72,28 @@ const PASTE_READ_WAIT: Duration = Duration::from_secs(1);
 /// Qt reports focus about 3 ms after a GrabFocus that works.
 const FOCUS_POLL: Duration = Duration::from_millis(20);
 const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
+const NOT_A_FILE_DIALOG: &str = "the active window is not a KDE file dialog";
+/// Roles holding rows of data (files, places) or tool buttons, never the
+/// dialog's form fields: not walked when looking for them.
+const DIALOG_SKIP: [&str; 6] = ["list", "tree", "table", "tree table", "tool bar", "menu"];
+/// Nodes looked at when searching a dialog for its fields (KFileWidget's
+/// form has about 60 outside the skipped lists).
+const DIALOG_MAX_NODES: usize = 400;
+
+/// KFileWidget's file name field: the line edit of its location combo box
+/// (the "Name:" row at the bottom), not the one of the URL navigator at the
+/// top. Qt builds accessible ids from object and class names, so this does
+/// not depend on the language.
+fn is_file_name_field(id: &str) -> bool {
+    id.contains("KFileWidget")
+        && id.ends_with("KUrlComboBox.KLineEdit")
+        && !id.contains("KUrlNavigator")
+}
+
+/// One of KFileWidget's dialog buttons (Open/Save, Cancel).
+fn is_file_dialog_button(id: &str) -> bool {
+    id.contains("KFileWidget") && id.ends_with(".QPushButton")
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum FocusMethod {
@@ -610,6 +632,48 @@ impl LinuxBackend {
             a11y.set_caret(&target, at + grown).await?;
         }
         Ok(true)
+    }
+
+    /// The file name field and default button of a KDE file dialog window,
+    /// read level by level below `window` (showing nodes only).
+    async fn file_dialog_parts(&self, window: &Obj) -> (Option<Obj>, Option<Obj>) {
+        let a11y = &self.a11y;
+        let (mut field, mut accept) = (None, None);
+        let mut level = vec![window.clone()];
+        let mut seen = 0;
+        while !level.is_empty() && seen < DIALOG_MAX_NODES && (field.is_none() || accept.is_none())
+        {
+            seen += level.len();
+            let nodes = futures_util::future::join_all(level.iter().map(|o| async move {
+                let (role, states, id, kids) = tokio::join!(
+                    a11y.role(o),
+                    a11y.states(o),
+                    a11y.accessible_id(o),
+                    a11y.children(o)
+                );
+                (o.clone(), role, states.unwrap_or(0), id, kids)
+            }))
+            .await;
+            level = Vec::new();
+            for (o, role, st, id, kids) in nodes {
+                if !atspi::has(st, atspi::SHOWING) {
+                    continue;
+                }
+                if field.is_none() && atspi::has(st, atspi::EDITABLE) && is_file_name_field(&id) {
+                    field = Some(o.clone());
+                }
+                if accept.is_none()
+                    && atspi::has(st, atspi::IS_DEFAULT)
+                    && is_file_dialog_button(&id)
+                {
+                    accept = Some(o.clone());
+                }
+                if !DIALOG_SKIP.contains(&role.as_str()) {
+                    level.extend(kids);
+                }
+            }
+        }
+        (field, accept)
     }
 
     async fn kde_frame_active(&self, caption: &str) -> bool {
@@ -1154,6 +1218,54 @@ impl Backend for LinuxBackend {
         }
     }
 
+    async fn active_file_dialog(&self) -> R<FileDialog<Obj>> {
+        let Compositor::Kde(kwin) = &self.comp else {
+            return Err(NO_FILE_DIALOG.into());
+        };
+        let a11y = &self.a11y;
+        let (active, apps) = tokio::join!(kwin.active_parent(), a11y.apps_with_windows());
+        let active = active?.ok_or("no active window")?;
+        // The accessible window KWin has in front: the ACTIVE one of the
+        // process KWin names, so the parent it reports is this window's.
+        let pid = active["pid"].as_i64();
+        let mut found = None;
+        'apps: for (app, name, windows) in apps {
+            if self.pid(&app.bus).await.map(i64::from) != pid {
+                continue;
+            }
+            for w in windows {
+                if a11y.has_state(&w, atspi::ACTIVE).await {
+                    found = Some((name, w));
+                    break 'apps;
+                }
+            }
+        }
+        let (app, window) = found.ok_or(NOT_A_FILE_DIALOG)?;
+        if a11y.role(&window).await != "dialog" {
+            return Err(NOT_A_FILE_DIALOG.into());
+        }
+        let (field, accept) = self.file_dialog_parts(&window).await;
+        let field = field.ok_or(NOT_A_FILE_DIALOG)?;
+        let parent = if active["parent"].is_object() {
+            let names = self.app_names_by_pid().await;
+            Some(Self::client_app_name(&names, &active["parent"]))
+        } else {
+            None
+        };
+        let titles = vec![
+            active["caption"].as_str().unwrap_or("").trim().to_string(),
+            a11y.name(&window).await.trim().to_string(),
+        ];
+        Ok(FileDialog {
+            window,
+            app: app.to_lowercase(),
+            titles,
+            parent,
+            field,
+            accept,
+        })
+    }
+
     async fn doctor(&self) -> Vec<Check> {
         let mut out = Vec::new();
         let env = |k: &str| std::env::var(k).unwrap_or_default();
@@ -1318,6 +1430,31 @@ impl Backend for LinuxBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn file_dialog_parts_are_matched_by_qt_ids() {
+        // As seen in xdg-desktop-portal-kde and kdialog (KF6).
+        let base = "QApplication.FileDialog.KFileWidget.QSplitter.QWidget";
+        assert!(is_file_name_field(&format!(
+            "{base}.KUrlComboBox.KLineEdit"
+        )));
+        assert!(is_file_name_field(
+            "QApplication.KDEPlatformFileDialog.KFileWidget.QSplitter.QWidget.KUrlComboBox.KLineEdit"
+        ));
+        // The URL navigator's edit, the filter combo, a search field.
+        assert!(!is_file_name_field(&format!(
+            "{base}.QWidget.KUrlNavigator.KUrlComboBox.KLineEdit"
+        )));
+        assert!(!is_file_name_field(&format!(
+            "{base}.KFileFilterCombo.KLineEdit"
+        )));
+        assert!(!is_file_name_field(&format!("{base}.QWidget.QLineEdit")));
+        assert!(!is_file_name_field(
+            "QApplication.MainWindow.KUrlComboBox.KLineEdit"
+        ));
+        assert!(is_file_dialog_button(&format!("{base}.QPushButton")));
+        assert!(!is_file_dialog_button("QApplication.Settings.QPushButton"));
+    }
 
     #[test]
     fn client_app_name_prefers_atspi_name_by_pid() {
