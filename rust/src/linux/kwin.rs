@@ -107,6 +107,21 @@ impl Allow {
         }
     }
 
+    /// OK_APP's test outside KWin (Hyprland): by pid first, else by a
+    /// class containing an allowlist entry.
+    pub fn permits(&self, pid: u32, classes: &[&str]) -> bool {
+        if self.blocked_pids.contains(&pid) {
+            return false;
+        }
+        if self.pids.contains(&pid) {
+            return true;
+        }
+        classes.iter().any(|c| {
+            let c = c.to_lowercase();
+            self.names.iter().any(|a| c.contains(a.as_str()))
+        })
+    }
+
     /// OK_APP with this allowlist filled in.
     fn ok_app_js(&self) -> String {
         OK_APP
@@ -752,6 +767,18 @@ mod tests {
         let allow = Allow::new(&names(&["electron"]), &apps);
         assert!(allow.pids.is_empty());
         assert_eq!(allow.blocked_pids, vec![10]);
+    }
+
+    #[test]
+    fn permits_by_pid_then_class() {
+        let allow = Allow::new(
+            &names(&["electron", "alacritty"]),
+            &[(10, "electron".into()), (30, "konsole".into())],
+        );
+        assert!(allow.permits(10, &["Ferdium"]));
+        assert!(!allow.permits(30, &["Alacritty"]));
+        assert!(allow.permits(99, &["", "Alacritty"]));
+        assert!(!allow.permits(99, &["org.kde.kcalc"]));
     }
 
     #[test]
