@@ -1,6 +1,6 @@
 [package]
 name = "desktop-mcp"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2024"
 description = "Screenshot-free desktop control MCP server for KDE Plasma (Wayland), Hyprland and Windows"
 license = "MIT"
