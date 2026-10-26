@@ -390,6 +390,18 @@ impl LinuxBackend {
         p
     }
 
+    /// The allowlist plus pids of AT-SPI apps sorted against it, for the
+    /// KWin window scripts.
+    async fn kwin_allow(&self, allowed: &[String]) -> kwin::Allow {
+        let mut apps = Vec::new();
+        for (app, name, _) in self.a11y.apps_with_windows().await {
+            if let Some(pid) = self.pid(&app.bus).await {
+                apps.push((pid, name));
+            }
+        }
+        kwin::Allow::new(allowed, &apps)
+    }
+
     // ------------------------------------------------------------ Hyprland
 
     /// AT-SPI app name per process id, from one registry scan; the first
@@ -896,7 +908,8 @@ impl Backend for LinuxBackend {
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<()> {
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let caption = kwin.activate(query, allowed).await?;
+                let allow = self.kwin_allow(allowed).await;
+                let caption = kwin.activate(query, &allow).await?;
                 if !caption.is_empty() {
                     // KWin switches at once; the toolkit reports ACTIVE a moment later.
                     poll(ACTIVATE_WAIT, || self.kde_frame_active(&caption)).await;
@@ -940,7 +953,7 @@ impl Backend for LinuxBackend {
     async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let mut list = kwin.windows(query, allowed).await?;
+                let mut list = kwin.windows(query, &self.kwin_allow(allowed).await).await?;
                 with_terminals(&mut list).await;
                 Ok(list)
             }
@@ -956,7 +969,7 @@ impl Backend for LinuxBackend {
     ) -> R<WindowGeo> {
         match &self.comp {
             Compositor::Kde(kwin) => kwin
-                .set_window(query, allowed, change)
+                .set_window(query, &self.kwin_allow(allowed).await, change)
                 .await?
                 .ok_or_else(|| format!("no window of an allowed app matches '{query}'")),
             Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),

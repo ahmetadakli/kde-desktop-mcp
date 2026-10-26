@@ -154,8 +154,11 @@ değişkenini verin.
 Her çağrıda yeniden okunur; ilk çalıştırmada varsayılan liste oluşturulur.
 
 - KDE ve Hyprland: `~/.config/desktop-mcp/allow.txt`, satır başına AT-SPI
-  uygulama adı (`kate`, `firefox`…). Hyprland'de erişilebilirliği olmayan
-  uygulamalar pencere sınıfıyla (`xterm` gibi) eşleşir.
+  uygulama adı (`kate`, `firefox`…). Pencere araçları (`windows`,
+  `move_window`, `activate_window`) pencereyi, sürecinin (pid) AT-SPI
+  uygulama adıyla eşleştirir; böylece pencere sınıfı farklı olan uygulamalar
+  da (Ferdium: `electron`) bulunur. Erişilebilirliği olmayan uygulamalar
+  pencere sınıfıyla (`xterm` gibi) eşleşir.
 - Windows: `%APPDATA%\desktop-mcp\allow.txt`, satır başına `.exe` olmadan
   program adı (`notepad`, `firefox`, `chrome`…)
 
