@@ -52,6 +52,13 @@ pub struct RawImage {
     pub data: Vec<u8>,
 }
 
+/// A window's frame in logical px, (x, y, width, height), and its
+/// ScreenShot2 handle when KWin gave one.
+pub struct Frame {
+    pub area: (f64, f64, f64, f64),
+    pub handle: Option<String>,
+}
+
 /// (x0, y0, x1, y1) in logical px.
 type ScreenBox = (i32, i32, i32, i32);
 
@@ -203,8 +210,11 @@ const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow
      const g = w.clientGeometry; return {x: g.x, y: g.y, width: g.width, \
      height: g.height, caption: w.caption, cls: w.resourceClass}; })())";
 
+/// The active window's frame and its internal id, the handle ScreenShot2's
+/// CaptureWindow takes ("{uuid}").
 const FRAME: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
-     const g = w.frameGeometry; return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
+     const g = w.frameGeometry; return {x: g.x, y: g.y, width: g.width, height: g.height, \
+     id: String(w.internalId)}; })())";
 
 /// The active window's caption and process, and the window it is a
 /// transient (dialog) for. A portal dialog gets its parent from the window
@@ -268,10 +278,7 @@ impl KWin {
             Json::from(SINK_PATH),
             Json::from(id.as_str())
         );
-        let file = std::env::temp_dir().join(format!("desktop-mcp-{id}.js"));
-        tokio::fs::write(&file, script)
-            .await
-            .map_err(|e| e.to_string())?;
+        let file = write_script(&id, &script).await?;
         let plugin = format!("desktop-mcp-{id}");
         let result = self.run_script(&file, &plugin, &id).await;
         let _ = tokio::fs::remove_file(&file).await;
@@ -409,23 +416,31 @@ impl KWin {
         Ok((!v.is_null()).then_some(v))
     }
 
-    /// Frame (with title bar) of KWin's active window in logical px:
-    /// (x, y, width, height).
-    pub async fn active_frame(&self) -> Option<(f64, f64, f64, f64)> {
+    /// Frame (with title bar) of KWin's active window in logical px, and
+    /// the window's handle for `capture_window`.
+    pub async fn active_frame(&self) -> Option<Frame> {
         let raw = self.query(FRAME).await.ok()??;
         let g: Json = serde_json::from_str(&raw).ok()?;
-        Some((
-            g["x"].as_f64()?,
-            g["y"].as_f64()?,
-            g["width"].as_f64()?,
-            g["height"].as_f64()?,
-        ))
+        Some(Frame {
+            area: (
+                g["x"].as_f64()?,
+                g["y"].as_f64()?,
+                g["width"].as_f64()?,
+                g["height"].as_f64()?,
+            ),
+            handle: g["id"]
+                .as_str()
+                .filter(|id| id.starts_with('{'))
+                .map(str::to_string),
+        })
     }
 
-    /// Capture the active window (with its title bar, without the shadow)
-    /// through ScreenShot2: KWin writes the raw pixels into a pipe after
+    /// Capture a window (with its title bar, without the shadow) through
+    /// ScreenShot2: the one with this `active_frame` handle, so the image
+    /// matches the frame read with it even if focus moved since, or else
+    /// whichever is active. KWin writes the raw pixels into a pipe after
     /// replying with their layout.
-    pub async fn capture_active_window(&self) -> R<RawImage> {
+    pub async fn capture_window(&self, handle: Option<&str>) -> R<RawImage> {
         let (mut reader, writer) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
         // Read concurrently: KWin blocks on a full pipe until it is drained.
         let pixels = tokio::task::spawn_blocking(move || {
@@ -438,16 +453,30 @@ impl KWin {
             ("include-cursor", Value::from(false)),
             ("native-resolution", Value::from(true)),
         ]);
-        let reply = self
-            .session
-            .call_method(
-                Some("org.kde.KWin"),
-                SHOT_PATH,
-                Some(SHOT_IFACE),
-                "CaptureActiveWindow",
-                &(options, Fd::from(&writer)),
-            )
-            .await;
+        let fd = Fd::from(&writer);
+        let bus = Some("org.kde.KWin");
+        let (method, reply) = match handle {
+            Some(h) => {
+                let body = (h, options, fd);
+                let m = "CaptureWindow";
+                (
+                    m,
+                    self.session
+                        .call_method(bus, SHOT_PATH, Some(SHOT_IFACE), m, &body)
+                        .await,
+                )
+            }
+            None => {
+                let body = (options, fd);
+                let m = "CaptureActiveWindow";
+                (
+                    m,
+                    self.session
+                        .call_method(bus, SHOT_PATH, Some(SHOT_IFACE), m, &body)
+                        .await,
+                )
+            }
+        };
         // KWin holds its own duplicate; ours must go for the read to end.
         drop(writer);
         let reply = match reply {
@@ -455,7 +484,7 @@ impl KWin {
             Err(zbus::Error::MethodError(name, msg, _)) => {
                 return Err(format!("{}: {}", name.as_str(), msg.unwrap_or_default()));
             }
-            Err(e) => return Err(format!("KWin CaptureActiveWindow: {e}")),
+            Err(e) => return Err(format!("KWin {method}: {e}")),
         };
         let meta: HashMap<String, OwnedValue> =
             reply.body().deserialize().map_err(|e| e.to_string())?;
@@ -525,6 +554,43 @@ impl KWin {
     }
 }
 
+/// Where KWin reads a script from: the private runtime directory when
+/// there is one, else the temp directory.
+fn script_dir() -> std::path::PathBuf {
+    std::env::var_os("XDG_RUNTIME_DIR")
+        .map(std::path::PathBuf::from)
+        .filter(|d| d.is_absolute() && d.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
+/// Write a script to a new file only this user can read: never through a
+/// file or symlink planted at that name.
+async fn write_script(id: &str, script: &str) -> R<std::path::PathBuf> {
+    use tokio::io::AsyncWriteExt;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let path = script_dir().join(format!("desktop-mcp-{id}-{nanos}.js"));
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .await
+        .map_err(|e| format!("{}: {e}", path.display()))?;
+    let written = async {
+        file.write_all(script.as_bytes()).await?;
+        file.flush().await
+    }
+    .await;
+    if let Err(e) = written {
+        let _ = tokio::fs::remove_file(&path).await;
+        return Err(format!("{}: {e}", path.display()));
+    }
+    Ok(path)
+}
+
 fn window_js(query: &str, allow: &Allow) -> String {
     WINDOW_JS
         .replace("%OK_APP%", &allow.ok_app_js())
@@ -586,6 +652,18 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn scripts_are_written_to_new_private_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let path = write_script("test", "1 + 1").await.unwrap();
+        assert!(path.starts_with(script_dir()));
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        assert!(meta.is_file());
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "1 + 1");
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

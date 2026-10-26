@@ -187,22 +187,46 @@ impl IndicatorProc {
         true
     }
 
-    /// Send one command line; a child that cannot take it is dropped and
-    /// the indicator stays off.
-    async fn send(&mut self, line: &str) -> bool {
+    async fn write(&mut self, line: &str) -> bool {
         let Some((_, stdin, _)) = self.child.as_mut() else {
             return false;
         };
-        let sent = stdin
+        stdin
             .write_all(format!("{line}\n").as_bytes())
             .await
             .is_ok()
-            && stdin.flush().await.is_ok();
-        if !sent {
-            self.child = None;
-            self.off = true;
+            && stdin.flush().await.is_ok()
+    }
+
+    /// Drop a child that stopped answering. It may come back only when it
+    /// ended cleanly, i.e. on its idle exit; whether it did.
+    fn drop_child(&mut self) -> bool {
+        let idle_exit = match self.child.as_mut() {
+            Some((child, _, _)) => matches!(child.try_wait(), Ok(Some(s)) if s.success()),
+            None => false,
+        };
+        self.child = None;
+        self.off |= !idle_exit;
+        idle_exit
+    }
+
+    /// Send one command line. A child that cannot take it is dropped; after
+    /// its idle exit, with `restart`, a fresh one gets the line. The
+    /// indicator stays off after a child failed, or when a fresh one cannot
+    /// take the line either.
+    async fn send(&mut self, line: &str, restart: bool) -> bool {
+        if self.write(line).await {
+            return true;
         }
-        sent
+        if !self.drop_child() || !restart {
+            return false;
+        }
+        if self.spawn() && self.write(line).await {
+            return true;
+        }
+        self.child = None;
+        self.off = true;
+        false
     }
 }
 
@@ -211,7 +235,8 @@ impl LinuxBackend {
     /// to confirm (briefly; a stuck indicator is dropped).
     async fn hide_indicator(&self) {
         let mut ind = self.indicator.lock().await;
-        if ind.child.is_none() || !ind.send("hide").await {
+        // A child that exited shows nothing: no need for a new one.
+        if ind.child.is_none() || !ind.send("hide", false).await {
             return;
         }
         let answered = match ind.child.as_mut() {
@@ -220,9 +245,16 @@ impl LinuxBackend {
             }
             None => return,
         };
-        if !matches!(answered, Ok(Ok(Some(ref l))) if l == "hidden") {
-            ind.child = None;
-            ind.off = true;
+        match answered {
+            Ok(Ok(Some(l))) if l == "hidden" => {}
+            // Closed: it may just have reached its idle exit.
+            Ok(Ok(None)) => {
+                ind.drop_child();
+            }
+            _ => {
+                ind.child = None;
+                ind.off = true;
+            }
         }
     }
 }
@@ -1016,19 +1048,22 @@ impl Backend for LinuxBackend {
     }
 
     async fn indicate(&self, label: &str) {
-        let mut ind = self.indicator.lock().await;
+        // Busy (a screenshot waits for it to hide): skip rather than delay
+        // the action.
+        let Ok(mut ind) = self.indicator.try_lock() else {
+            return;
+        };
         if ind.spawn() {
-            ind.send(&format!("show {}", label.replace('\n', " ")))
+            ind.send(&format!("show {}", label.replace('\n', " ")), true)
                 .await;
         }
     }
 
     async fn move_pointer(&self, x: i64, y: i64) -> R<()> {
+        if let Ok(mut ind) = self.indicator.try_lock()
+            && ind.child.is_some()
         {
-            let mut ind = self.indicator.lock().await;
-            if ind.child.is_some() {
-                ind.send(&format!("point {x} {y}")).await;
-            }
+            ind.send(&format!("point {x} {y}"), true).await;
         }
         match &self.comp {
             Compositor::Kde(kwin) => {
@@ -1372,19 +1407,31 @@ impl Backend for LinuxBackend {
         let area;
         let mut cmd = match &self.comp {
             Compositor::Kde(kwin) => {
-                area = kwin.active_frame().await;
+                // One script run gives the frame and the window's handle, so
+                // the capture is of the window the area belongs to.
+                let frame = kwin.active_frame().await;
+                area = frame.as_ref().map(|f| f.area);
                 if !self.shot_unauthorized.load(Ordering::Relaxed) {
-                    match kwin.capture_active_window().await {
+                    let handle = frame.as_ref().and_then(|f| f.handle.as_deref());
+                    let mut captured = kwin.capture_window(handle).await;
+                    // The window closed meanwhile, or the handle was refused:
+                    // the active window still beats spectacle.
+                    if handle.is_some()
+                        && captured
+                            .as_ref()
+                            .is_err_and(|e| !e.starts_with(kwin::SHOT_NOT_AUTHORIZED))
+                    {
+                        captured = kwin.capture_window(None).await;
+                    }
+                    match captured {
                         Ok(raw) => {
                             let (path, file) = temp_png()?;
-                            let mut out = std::io::BufWriter::new(file);
-                            let written = image::write_png(&raw, &mut out).and_then(|()| {
-                                std::io::Write::flush(&mut out).map_err(|e| e.to_string())
+                            drop(file);
+                            return Some(Shot {
+                                path: path.display().to_string(),
+                                pixels: Some(Box::new(move || image::to_pixels(&raw))),
+                                area,
                             });
-                            if written.is_ok() {
-                                return keep_if_written(path).map(|path| Shot { path, area });
-                            }
-                            let _ = std::fs::remove_file(&path);
                         }
                         // Older KWin without the desktop-file grant: stop asking.
                         Err(e) if e.starts_with(kwin::SHOT_NOT_AUTHORIZED) => {
@@ -1423,7 +1470,11 @@ impl Backend for LinuxBackend {
         let (path, file) = temp_png()?;
         drop(file);
         let _ = cmd.arg(&path).output().await;
-        keep_if_written(path).map(|path| Shot { path, area })
+        keep_if_written(path).map(|path| Shot {
+            path,
+            pixels: None,
+            area,
+        })
     }
 }
 
@@ -1455,6 +1506,43 @@ mod tests {
         ));
         assert!(is_file_dialog_button(&format!("{base}.QPushButton")));
         assert!(!is_file_dialog_button("QApplication.Settings.QPushButton"));
+    }
+
+    /// An indicator whose child is `program` (with nothing to read), already
+    /// exited.
+    async fn exited_indicator(program: &str) -> IndicatorProc {
+        use tokio::io::AsyncBufReadExt;
+        let mut child = tokio::process::Command::new(program)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let (stdin, stdout) = (child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        assert!(lines.next_line().await.unwrap().is_none());
+        // Wait for the exit without reaping it, as after an idle exit.
+        while std::fs::read_to_string(format!("/proc/{}/stat", child.id().unwrap()))
+            .is_ok_and(|st| !st.contains(") Z "))
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        IndicatorProc {
+            child: Some((child, stdin, lines)),
+            off: false,
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn indicator_may_come_back_after_its_idle_exit_only() {
+        // Exit code 0 (idle exit): dropped, but not turned off for good.
+        let mut ind = exited_indicator("true").await;
+        assert!(!ind.send("hide", false).await);
+        assert!(ind.child.is_none() && !ind.off);
+        // A child that failed keeps the indicator off.
+        let mut ind = exited_indicator("false").await;
+        assert!(!ind.send("show x", true).await);
+        assert!(ind.child.is_none() && ind.off);
+        assert!(!ind.spawn());
     }
 
     #[test]

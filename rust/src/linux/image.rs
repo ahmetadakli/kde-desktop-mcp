@@ -1,9 +1,8 @@
-//! Raw QImage pixels from KWin's ScreenShot2 to PNG.
-
-use std::io::Write;
+//! Raw QImage pixels from KWin's ScreenShot2 to straight-alpha RGBA.
 
 use super::kwin::RawImage;
 use crate::backend::R;
+use crate::shot::Pixels;
 
 // QImage::Format values KWin hands out for window captures.
 const RGB32: u32 = 4;
@@ -58,15 +57,14 @@ pub fn to_rgba(img: &RawImage) -> R<Vec<u8>> {
     Ok(out)
 }
 
-pub fn write_png(img: &RawImage, out: impl Write) -> R<()> {
-    let rgba = to_rgba(img)?;
-    let mut enc = png::Encoder::new(out, img.width, img.height);
-    enc.set_color(png::ColorType::Rgba);
-    enc.set_depth(png::BitDepth::Eight);
-    enc.set_compression(png::Compression::Fast);
-    let mut w = enc.write_header().map_err(|e| format!("png: {e}"))?;
-    w.write_image_data(&rgba).map_err(|e| format!("png: {e}"))?;
-    w.finish().map_err(|e| format!("png: {e}"))
+/// The capture as RGBA pixels, sized as KWin sent it.
+pub fn to_pixels(img: &RawImage) -> R<Pixels> {
+    Ok(Pixels {
+        width: img.width,
+        height: img.height,
+        channels: 4,
+        data: to_rgba(img)?,
+    })
 }
 
 #[cfg(test)]
@@ -125,9 +123,11 @@ mod tests {
     }
 
     #[test]
-    fn writes_a_png_signature() {
-        let mut out = Vec::new();
-        write_png(&img(RGBA8888, 8, vec![255; 8]), &mut out).unwrap();
-        assert_eq!(&out[..8], b"\x89PNG\r\n\x1a\n");
+    fn pixels_keep_the_capture_size() {
+        let px = to_pixels(&img(RGBA8888, 8, vec![255; 8])).unwrap();
+        assert_eq!(
+            (px.width, px.height, px.channels, px.data.len()),
+            (2, 1, 4, 8)
+        );
     }
 }

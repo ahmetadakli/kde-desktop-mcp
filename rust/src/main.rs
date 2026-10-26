@@ -1451,23 +1451,15 @@ impl<B: Backend> Server<B> {
     async fn screenshot(&self, a: &Json) -> R<Out> {
         self.require_active_allowed().await?;
         *self.last_shot.lock().await = None;
-        let Shot { path, area } = self.b.screenshot().await.ok_or("screenshot failed")?;
+        let Shot { path, pixels, area } = self.b.screenshot().await.ok_or("screenshot failed")?;
         let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, 8192) as u32;
         let inline = arg_b(a, "inline", true);
-        // Decoding and shrinking take tens of ms: keep other calls moving.
+        // Converting, shrinking and encoding take milliseconds: keep other
+        // calls moving.
         let file = path.clone();
-        let (size, png) = tokio::task::spawn_blocking(move || -> R<((u32, u32), Vec<u8>)> {
-            let img = shot::read_png(&file)?;
-            let (w, h) = shot::fit((img.width, img.height), max, max);
-            if (w, h) == (img.width, img.height) {
-                return Ok(((w, h), std::fs::read(&file).map_err(|e| e.to_string())?));
-            }
-            let png = shot::write_png(&shot::shrink(&img, w, h))?;
-            std::fs::write(&file, &png).map_err(|e| e.to_string())?;
-            Ok(((w, h), png))
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+        let (size, png) = tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max))
+            .await
+            .map_err(|e| e.to_string())??;
         let map = area.and_then(|a| ShotMap::new(size, a));
         *self.last_shot.lock().await = map;
         let (iw, ih) = size;
@@ -1923,15 +1915,17 @@ mod tests {
         async fn screenshot(&self) -> Option<Shot> {
             // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.
             let path = self.allow_file.with_extension("png");
-            let img = shot::Pixels {
-                width: 200,
-                height: 100,
-                channels: 3,
-                data: vec![128; 200 * 100 * 3],
-            };
-            std::fs::write(&path, shot::write_png(&img).ok()?).ok()?;
+            std::fs::write(&path, b"").ok()?;
             Some(Shot {
                 path: path.display().to_string(),
+                pixels: Some(Box::new(|| {
+                    Ok(shot::Pixels {
+                        width: 200,
+                        height: 100,
+                        channels: 3,
+                        data: vec![128; 200 * 100 * 3],
+                    })
+                })),
                 area: Some((10.0, 20.0, 400.0, 200.0)),
             })
         }
