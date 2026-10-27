@@ -25,8 +25,9 @@ const KEY_HOLD: Duration = Duration::from_millis(2);
 const KEY_GAP: Duration = Duration::from_millis(1);
 /// After an absolute move on the pointer device, before its button events.
 const POINTER_SETTLE: Duration = Duration::from_millis(2);
-/// After the cursor was moved outside uinput (Hyprland IPC), which is not
-/// ordered with the button events.
+/// After the cursor was moved outside uinput (Hyprland IPC) and the move
+/// could not be confirmed, so it is not known to be ordered before the
+/// button events that follow. A confirmed move needs no wait.
 const EXTERNAL_MOVE_SETTLE: Duration = Duration::from_millis(25);
 /// After a button press, before its release or a drag's first move.
 const BUTTON_HOLD: Duration = Duration::from_millis(3);
@@ -216,7 +217,8 @@ impl Input {
         Ok(())
     }
 
-    /// Wait after a cursor move done outside uinput.
+    /// Wait after a cursor move done outside uinput that could not be
+    /// confirmed.
     pub async fn settle(&self) {
         tokio::time::sleep(EXTERNAL_MOVE_SETTLE).await;
     }

@@ -59,8 +59,8 @@ pub struct Fetch {
     pub stop_roles: &'static [&'static str],
 }
 
-/// Window management the desktop does not offer (only KDE does so far).
-pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma";
+/// Window management the desktop does not offer (KDE and Hyprland do).
+pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma and Hyprland";
 
 /// Clipboard access the desktop does not offer (only Linux so far).
 pub const NO_CLIPBOARD: &str = "the clipboard tools are only available on Linux (Wayland)";

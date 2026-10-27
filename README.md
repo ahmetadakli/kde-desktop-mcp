@@ -23,7 +23,7 @@ list like `[55] button "Save"` and acts on an element by its number.
 | Keyboard | `/dev/uinput` | `/dev/uinput` | Win32 `SendInput` |
 | Mouse | Absolute uinput pointer | Hyprland `movecursor` + uinput buttons | `SetCursorPos` + `SendInput` |
 | Typing text | Direct insertion via AT-SPI into Qt multi-line fields (clipboard untouched); elsewhere in-process clipboard + Ctrl+V, after which the previous clipboard text is put back | `wtype` (clipboard untouched); otherwise clipboard + Ctrl+V as on KDE | `KEYEVENTF_UNICODE` (clipboard untouched) |
-| Windows | KWin scripting (D-Bus) | Hyprland socket: `clients`, `focuswindow` | `SetForegroundWindow` |
+| Windows | KWin scripting (D-Bus) | Hyprland socket: `clients`, `monitors`, dispatchers, batched in one request | `SetForegroundWindow` |
 | Screenshot (fallback) | KWin `ScreenShot2` (D-Bus); else `spectacle` | `grim` | GDI |
 
 The code lives in `rust/src/`: `main.rs` holds the MCP protocol, the
@@ -139,15 +139,16 @@ it exits with the server. To turn it off, set the environment variable
   only, not on a visible change.
 - `windows`: lists windows of allowed apps with position, size, state (active,
   maximized, minimized) and output in screen coordinates, after the screen
-  layout (name, area, scale) (KDE only).
+  layout (name, area, scale) (KDE and Hyprland).
 - `move_window`: moves, resizes, maximizes, minimizes or restores a window;
   waits (at most 1 s) until the window has its new geometry and reports the
-  real result (KDE only).
+  real result (KDE and Hyprland; see the Hyprland limitations).
 - `launch`: starts an allowed app (`app`, e.g. `kate`) with an optional `args`
   list (no shell; its `.desktop` file first, else the program on `PATH`) and
   waits until its window opens (`wait_ms`, default 15 s, at most 60 s; 0 does
   not wait). Prints the window as `windows` does; also finds launches handed
-  to an already running instance (firefox, kate). Window tracking is KDE only.
+  to an already running instance (firefox, kate). Window tracking works on
+  KDE and Hyprland.
 - Terminal windows: `windows` also lists each terminal tab's pts device,
   foreground command and directory; `activate_window` with
   `terminal: "pytest"` brings forward the terminal running that command (or in
@@ -440,6 +441,17 @@ Hyprland:
 - Two windows of the same process with the same title cannot be told apart.
 - Without `wtype`, `type_text` pastes through the clipboard as on KDE and puts
   the clipboard text back afterwards.
+- Hyprland has no minimize: `move_window` with `state: "minimize"` moves the
+  window to the special workspace `special:minimized`, and `windows` reports
+  windows on a special workspace no monitor shows as minimized. `restore`
+  brings it back to the workspace its monitor shows (not necessarily the one
+  it came from).
+- Maximize is Hyprland's maximized fullscreen mode (`fullscreenstate 1 1`);
+  `windows` reports any fullscreen mode as maximized. Hyprland applies
+  fullscreen states only to the focused window, so `maximize` and `restore`
+  of a maximized window also focus it.
+- Moving or resizing a tiled window makes it floating first (`setfloating`);
+  it stays floating afterwards.
 
 Windows:
 - Input cannot be sent to windows running as administrator from a server that

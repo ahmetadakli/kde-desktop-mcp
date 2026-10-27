@@ -25,7 +25,7 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    NO_FILE_DIALOG, NO_WINDOW_CONTROL, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -336,6 +336,20 @@ fn active_index(caption: &str, seen: &[(String, bool)]) -> Option<usize> {
         .or_else(|| (seen.len() == 1 && seen[0].1).then_some(0))
 }
 
+/// The doctor's line about the outputs.
+fn screens_line(screens: &[Screen]) -> String {
+    screens
+        .iter()
+        .map(|s| {
+            format!(
+                "{} at ({},{}) {}x{} scale {}",
+                s.name, s.x, s.y, s.width, s.height, s.scale
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 fn which(cmd: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|d| d.join(cmd).is_file()))
@@ -451,15 +465,15 @@ impl LinuxBackend {
             None => Compositor::Kde(KWin::new(session.clone()).await?),
         };
         let absolute = matches!(comp, Compositor::Kde(_));
-        let focus = async {
-            if absolute {
-                // Without it `type_text` falls back to pasting more often.
-                let _ = a11y.track_focus().await;
-            }
-        };
-        // Lets `act` return as soon as a menu or dialog opened, and
-        // `wait_for` wait for the app to change rather than poll it.
-        let _ = tokio::join!(focus, a11y.track_actions(), a11y.track_changes());
+        // Focus events keep the hint `focused` reports current (on KDE,
+        // without it `type_text` also falls back to pasting more often).
+        // The others let `act` return as soon as a menu or dialog opened,
+        // and `wait_for` wait for the app to change rather than poll it.
+        let _ = tokio::join!(
+            a11y.track_focus(),
+            a11y.track_actions(),
+            a11y.track_changes()
+        );
         Ok(LinuxBackend {
             session,
             a11y,
@@ -517,13 +531,97 @@ impl LinuxBackend {
     /// AT-SPI app name per process id, from one registry scan; the first
     /// app wins when a process registered several.
     async fn app_names_by_pid(&self) -> HashMap<i64, String> {
+        Self::names_by_pid(&self.apps_with_pids().await)
+    }
+
+    fn names_by_pid(apps: &[(Option<u32>, Obj, String, Vec<Obj>)]) -> HashMap<i64, String> {
         let mut out = HashMap::new();
-        for (app, name, _) in self.a11y.apps_with_windows().await {
-            if let Some(pid) = self.pid(&app.bus).await {
-                out.entry(i64::from(pid)).or_insert(name);
+        for (pid, _, name, _) in apps {
+            if let Some(pid) = pid {
+                out.entry(i64::from(*pid)).or_insert_with(|| name.clone());
             }
         }
         out
+    }
+
+    /// What `activate_window` reports for the Hyprland client it focused:
+    /// the AT-SPI app of its process and the title of its AT-SPI window, as
+    /// `list_apps` matches them (the only window, else by title), so the
+    /// title compares equal to `list_apps`' later; the client's own class
+    /// and title when no AT-SPI app or window matches.
+    async fn hypr_activated(
+        &self,
+        apps: &[(Option<u32>, Obj, String, Vec<Obj>)],
+        names: &HashMap<i64, String>,
+        client: &Json,
+    ) -> Activated {
+        let pid = client["pid"].as_i64();
+        let title = client["title"].as_str().unwrap_or("");
+        let want = hyprland::norm(title);
+        for (p, _, name, windows) in apps {
+            if p.map(i64::from) != pid || windows.is_empty() {
+                continue;
+            }
+            let titles =
+                futures_util::future::join_all(windows.iter().map(|w| self.a11y.name(w))).await;
+            let found = if titles.len() == 1 {
+                titles.into_iter().next()
+            } else {
+                titles.into_iter().find(|t| hyprland::norm(t) == want)
+            };
+            if let Some(t) = found {
+                return Activated {
+                    app: name.clone(),
+                    title: t.trim().to_string(),
+                };
+            }
+        }
+        Activated {
+            app: Self::client_app_name(names, client),
+            title: title.trim().to_string(),
+        }
+    }
+
+    /// Screen centre of `id` when its window is `active` (Hyprland's
+    /// `activewindow`). Wayland clients report extents relative to their
+    /// window, which Hyprland places at `at`: the client area, without
+    /// borders. Toolkits that draw their own shadow and count it in the
+    /// window extents (GTK3) come out off by the shadow's width.
+    async fn hypr_center(&self, active: Option<&Json>, id: &Obj) -> R<(i32, i32)> {
+        let a11y = &self.a11y;
+        let no_area = || "element has no on-screen area".to_string();
+        let Some(aw) = active else {
+            return Err(NOT_ACTIVE.into());
+        };
+        let Some(frame) = a11y.frame_of(id).await else {
+            return Err(NOT_ACTIVE.into());
+        };
+        if !self.same_window(&frame, aw).await {
+            return Err(NOT_ACTIVE.into());
+        }
+        let xwayland = aw["xwayland"].as_bool().unwrap_or(false);
+        // X11 clients report real screen coordinates.
+        let coords = if xwayland {
+            atspi::COORD_SCREEN
+        } else {
+            atspi::COORD_WINDOW
+        };
+        let (x, y, w, h) = a11y.extents(id, coords).await?;
+        if w <= 0 || h <= 0 {
+            return Err(no_area());
+        }
+        let (ox, oy) = if xwayland {
+            (0.0, 0.0)
+        } else {
+            (
+                aw["at"][0].as_f64().unwrap_or(0.0),
+                aw["at"][1].as_f64().unwrap_or(0.0),
+            )
+        };
+        Ok((
+            (ox + x as f64 + w as f64 / 2.0) as i32,
+            (oy + y as f64 + h as f64 / 2.0) as i32,
+        ))
     }
 
     /// Prefer the AT-SPI name so one allowlist works for every Linux
@@ -549,6 +647,40 @@ impl LinuxBackend {
         }
         hyprland::norm(&self.a11y.name(frame).await)
             == hyprland::norm(client["title"].as_str().unwrap_or(""))
+    }
+
+    /// Hyprland's monitors, and the clients of allowed apps whose title or
+    /// class contains `query`, from one batched request. Like KWin's
+    /// windows: a client's pid sorted by its AT-SPI app name decides, else
+    /// its class.
+    async fn hypr_clients(
+        &self,
+        h: &Hypr,
+        query: &str,
+        allowed: &[String],
+    ) -> R<(hyprland::Snapshot, Vec<hyprland::Client>)> {
+        let (snap, allow) = tokio::join!(h.snapshot(), self.kwin_allow(allowed));
+        let snap = snap?;
+        let q = query.to_lowercase();
+        let list = hyprland::clients_of(&snap)
+            .into_iter()
+            .filter(|c| allow.permits(c.geo.pid, &[&c.geo.app, &c.initial_class]) && c.matches(&q))
+            .collect();
+        Ok((snap, list))
+    }
+
+    /// Every window of an allowed app, without terminals (launch's poll).
+    async fn all_windows(&self, allowed: &[String]) -> R<Vec<WindowGeo>> {
+        match &self.comp {
+            Compositor::Kde(kwin) => kwin.windows("", &self.kwin_allow(allowed).await).await,
+            Compositor::Hyprland(h) => Ok(self
+                .hypr_clients(h, "", allowed)
+                .await?
+                .1
+                .into_iter()
+                .map(|c| c.geo)
+                .collect()),
+        }
     }
 
     // ------------------------------------------------------------ focus
@@ -995,15 +1127,25 @@ impl Backend for LinuxBackend {
         // when the input moved focus to another app. All of it in one go:
         // two round trips, instead of a registry scan and then a fetch of
         // children and text the note never shows.
-        if !matches!(self.comp, Compositor::Kde(_)) {
-            // Hyprland's active window is not an AT-SPI state.
-            return None;
-        }
         let a11y = &self.a11y;
         let hint = a11y.focus_hint()?;
         let app = Self::app_of(&hint);
+        let in_front = async {
+            match &self.comp {
+                Compositor::Kde(_) => self.app_active(&app).await,
+                // Hyprland's active window is not an AT-SPI state: the
+                // hint's process (cached per bus) must own the client in front.
+                Compositor::Hyprland(h) => {
+                    let (pid, aw) = tokio::join!(self.pid(&hint.bus), h.active_window());
+                    match (pid, aw) {
+                        (Some(pid), Ok(Some(aw))) => aw["pid"].as_i64() == Some(i64::from(pid)),
+                        _ => false,
+                    }
+                }
+            }
+        };
         let (name, active, (role, label, states, actions)) =
-            tokio::join!(a11y.name(&app), self.app_active(&app), async {
+            tokio::join!(a11y.name(&app), in_front, async {
                 tokio::join!(
                     a11y.role(&hint),
                     a11y.name(&hint),
@@ -1073,52 +1215,26 @@ impl Backend for LinuxBackend {
     }
 
     async fn element_center(&self, id: &Obj) -> R<(i32, i32)> {
-        let a11y = &self.a11y;
-        let no_area = || "element has no on-screen area".to_string();
-        match &self.comp {
-            Compositor::Kde(_) => self
-                .element_centers(std::slice::from_ref(id))
-                .await
-                .pop()
-                .unwrap_or_else(|| Err(no_area())),
-            Compositor::Hyprland(h) => {
-                let (aw, frame) = tokio::join!(h.active_window(), a11y.frame_of(id));
-                let (Some(aw), Some(frame)) = (aw?, frame) else {
-                    return Err(NOT_ACTIVE.into());
-                };
-                if !self.same_window(&frame, &aw).await {
-                    return Err(NOT_ACTIVE.into());
-                }
-                if aw["xwayland"].as_bool().unwrap_or(false) {
-                    // X11 clients report real screen coordinates.
-                    let (x, y, w, hh) = a11y.extents(id, atspi::COORD_SCREEN).await?;
-                    if w <= 0 || hh <= 0 {
-                        return Err(no_area());
-                    }
-                    return Ok((
-                        (x as f64 + w as f64 / 2.0) as i32,
-                        (y as f64 + hh as f64 / 2.0) as i32,
-                    ));
-                }
-                // Wayland clients report surface-relative extents; add the window origin.
-                let (x, y, w, hh) = a11y.extents(id, atspi::COORD_WINDOW).await?;
-                if w <= 0 || hh <= 0 {
-                    return Err(no_area());
-                }
-                let ox = aw["at"][0].as_f64().unwrap_or(0.0);
-                let oy = aw["at"][1].as_f64().unwrap_or(0.0);
-                Ok((
-                    (ox + x as f64 + w as f64 / 2.0) as i32,
-                    (oy + y as f64 + hh as f64 / 2.0) as i32,
-                ))
-            }
-        }
+        self.element_centers(std::slice::from_ref(id))
+            .await
+            .pop()
+            .unwrap_or_else(|| Err("element has no on-screen area".into()))
     }
 
     async fn element_centers(&self, ids: &[Obj]) -> Vec<R<(i32, i32)>> {
-        let Compositor::Kde(kwin) = &self.comp else {
-            return futures_util::future::join_all(ids.iter().map(|id| self.element_center(id)))
+        let kwin = match &self.comp {
+            Compositor::Kde(kwin) => kwin,
+            Compositor::Hyprland(h) => {
+                // One look at the window in front for all the elements.
+                let aw = match h.active_window().await {
+                    Ok(aw) => aw,
+                    Err(e) => return ids.iter().map(|_| Err(e.clone())).collect(),
+                };
+                return futures_util::future::join_all(
+                    ids.iter().map(|id| self.hypr_center(aw.as_ref(), id)),
+                )
                 .await;
+            }
         };
         let a11y = &self.a11y;
         // AT-SPI extents are relative to the toplevel surface on Wayland,
@@ -1238,9 +1354,22 @@ impl Backend for LinuxBackend {
                 self.input.move_abs(ax, ay).await?;
             }
             Compositor::Hyprland(h) => {
-                // Hyprland places the cursor exactly; uinput only supplies buttons.
+                // Hyprland places the cursor exactly; uinput only supplies
+                // buttons. Its main loop handles the request in full (moves
+                // the cursor, sends the motion to the surface under it)
+                // before it replies, and the same loop reads the uinput
+                // buttons through libinput: a button emitted after the reply
+                // is handled after the move. The position read back confirms
+                // the move took (it is clamped outside every monitor); only
+                // an unconfirmed move gets the old fixed wait.
                 h.dispatch(&format!("movecursor {x} {y}")).await?;
-                self.input.settle().await;
+                if !h
+                    .cursor_pos()
+                    .await
+                    .is_ok_and(|(cx, cy)| (cx - x).abs() <= 1 && (cy - y).abs() <= 1)
+                {
+                    self.input.settle().await;
+                }
             }
         }
         Ok(())
@@ -1267,33 +1396,43 @@ impl Backend for LinuxBackend {
             }
             Compositor::Hyprland(h) => {
                 let q = query.to_lowercase();
-                let (clients, names) = tokio::join!(h.json("clients"), self.app_names_by_pid());
+                let (clients, apps) = tokio::join!(h.json("clients"), self.apps_with_pids());
                 let clients = clients?;
-                for c in clients.as_array().into_iter().flatten() {
+                let names = Self::names_by_pid(&apps);
+                let found = clients.as_array().into_iter().flatten().find(|c| {
                     if !c["mapped"].as_bool().unwrap_or(true)
                         || c["hidden"].as_bool().unwrap_or(false)
                     {
-                        continue;
+                        return false;
                     }
                     let app = Self::client_app_name(&names, c);
                     if !allowed.contains(&app) {
-                        continue;
+                        return false;
                     }
                     let title = c["title"].as_str().unwrap_or("").to_lowercase();
                     let class = c["class"].as_str().unwrap_or("").to_lowercase();
-                    if title.contains(&q) || app.contains(&q) || class.contains(&q) {
-                        let addr = c["address"].as_str().unwrap_or("").to_string();
-                        h.dispatch(&format!("focuswindow address:{addr}")).await?;
-                        poll(ACTIVATE_WAIT, || async {
-                            h.active_window()
-                                .await
-                                .ok()
-                                .flatten()
-                                .is_some_and(|aw| aw["address"].as_str() == Some(addr.as_str()))
-                        })
-                        .await;
-                        return Ok(None);
-                    }
+                    title.contains(&q) || app.contains(&q) || class.contains(&q)
+                });
+                let Some(c) = found else {
+                    return Err(format!("no window of an allowed app matches '{query}'"));
+                };
+                let addr = c["address"].as_str().unwrap_or("");
+                h.dispatch(&format!("focuswindow address:{addr}")).await?;
+                // Hyprland switches focus while it handles the request, so
+                // the first look finds the client in front (measured: every
+                // time, 0.05 ms for both requests); the poll only covers a
+                // compositor that switches later. The toolkit's own ACTIVE
+                // state may lag, but input goes where Hyprland says.
+                let in_front = poll(ACTIVATE_WAIT, || async {
+                    h.active_window()
+                        .await
+                        .ok()
+                        .flatten()
+                        .is_some_and(|aw| aw["address"].as_str() == Some(addr))
+                })
+                .await;
+                if in_front {
+                    return Ok(Some(self.hypr_activated(&apps, &names, c).await));
                 }
             }
         }
@@ -1307,7 +1446,12 @@ impl Backend for LinuxBackend {
                 with_terminals(&mut list).await;
                 Ok(list)
             }
-            Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+            Compositor::Hyprland(h) => {
+                let (_, clients) = self.hypr_clients(h, query, allowed).await?;
+                let mut list: Vec<WindowGeo> = clients.into_iter().map(|c| c.geo).collect();
+                with_terminals(&mut list).await;
+                Ok(list)
+            }
         }
     }
 
@@ -1327,7 +1471,14 @@ impl Backend for LinuxBackend {
                     Err(e) => (Vec::new(), Err(e)),
                 }
             }
-            Compositor::Hyprland(_) => (Vec::new(), Err(NO_WINDOW_CONTROL.into())),
+            Compositor::Hyprland(h) => match self.hypr_clients(h, query, allowed).await {
+                Ok((snap, clients)) => {
+                    let mut list: Vec<WindowGeo> = clients.into_iter().map(|c| c.geo).collect();
+                    with_terminals(&mut list).await;
+                    (hyprland::screens_of(&snap.monitors), Ok(list))
+                }
+                Err(e) => (Vec::new(), Err(e)),
+            },
         }
     }
 
@@ -1342,7 +1493,26 @@ impl Backend for LinuxBackend {
                 .set_window(query, &self.kwin_allow(allowed).await, change)
                 .await?
                 .ok_or_else(|| format!("no window of an allowed app matches '{query}'")),
-            Compositor::Hyprland(_) => Err(NO_WINDOW_CONTROL.into()),
+            Compositor::Hyprland(h) => {
+                let (snap, clients) = self.hypr_clients(h, query, allowed).await?;
+                // The active window when it matches, else the first.
+                let c = clients
+                    .iter()
+                    .find(|c| c.geo.active)
+                    .or(clients.first())
+                    .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
+                let back = hyprland::monitor_workspace(&snap.monitors, c.monitor);
+                h.dispatch_all(&hyprland::change_commands(c, change, back)?)
+                    .await?;
+                // Hyprland applies geometry at once; the caller waits for the
+                // app (and the state) by re-reading `windows`.
+                let snap = h.snapshot().await?;
+                hyprland::clients_of(&snap)
+                    .into_iter()
+                    .find(|n| n.address == c.address)
+                    .map(|n| n.geo)
+                    .ok_or_else(|| format!("the window '{}' closed", c.geo.title))
+            }
         }
     }
 
@@ -1357,27 +1527,13 @@ impl Backend for LinuxBackend {
         let r = tokio::task::spawn_blocking(move || launch::resolve(&name, &argv))
             .await
             .map_err(|e| e.to_string())??;
-        let kwin = match &self.comp {
-            Compositor::Kde(k) => Some(k),
-            Compositor::Hyprland(_) => None,
-        };
         // Windows already open, to tell a new one of a running instance.
-        let before = match kwin {
-            Some(k) => k
-                .windows("", &self.kwin_allow(allowed).await)
-                .await
-                .unwrap_or_default(),
-            None => Vec::new(),
-        };
+        let before = self.all_windows(allowed).await.unwrap_or_default();
         let (pid, exit) = launch::spawn(&r)?;
         let mut out = Launched {
             command: launch::describe(&r),
             pid,
             ..Launched::default()
-        };
-        let Some(kwin) = kwin else {
-            out.note = format!("not waiting for its window: {NO_WINDOW_CONTROL}");
-            return Ok(out);
         };
         if wait.is_zero() {
             out.note = "not waiting for its window (wait_ms=0)".into();
@@ -1402,9 +1558,9 @@ impl Backend for LinuxBackend {
             } else {
                 stable += 1;
             }
-            // Rebuilt each round: the new app joins AT-SPI after it starts.
-            let allow = self.kwin_allow(allowed).await;
-            let now = kwin.windows("", &allow).await?;
+            // The allowlist's pids are rebuilt each round: the new app
+            // joins AT-SPI after it starts.
+            let now = self.all_windows(allowed).await?;
             let status = *exit.lock().unwrap();
             if status.is_some() && ended.is_none() {
                 ended = Some(std::time::Instant::now());
@@ -1453,7 +1609,11 @@ impl Backend for LinuxBackend {
     async fn screens(&self) -> Vec<Screen> {
         match &self.comp {
             Compositor::Kde(kwin) => kwin.screens().await.unwrap_or_default(),
-            Compositor::Hyprland(_) => Vec::new(),
+            Compositor::Hyprland(h) => h
+                .json("monitors")
+                .await
+                .map(|m| hyprland::screens_of(&m))
+                .unwrap_or_default(),
         }
     }
 
@@ -1571,16 +1731,7 @@ impl Backend for LinuxBackend {
                 out.push(Check {
                     name: "screens",
                     ok: !screens.is_empty(),
-                    detail: screens
-                        .iter()
-                        .map(|s| {
-                            format!(
-                                "{} at ({},{}) {}x{} scale {}",
-                                s.name, s.x, s.y, s.width, s.height, s.scale
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; "),
+                    detail: screens_line(&screens),
                 });
                 let fallback = self.shot_unauthorized.load(Ordering::Relaxed);
                 out.push(Check {
@@ -1599,6 +1750,12 @@ impl Backend for LinuxBackend {
                     name: "hyprctl",
                     ok: ok.is_ok(),
                     detail: ok.err().unwrap_or_else(|| "reachable".into()),
+                });
+                let screens = self.screens().await;
+                out.push(Check {
+                    name: "screens",
+                    ok: !screens.is_empty(),
+                    detail: screens_line(&screens),
                 });
             }
         }
@@ -1815,5 +1972,17 @@ mod tests {
         assert_eq!(LinuxBackend::client_app_name(&names, &firefox), "firefox");
         assert_eq!(LinuxBackend::client_app_name(&names, &xterm), "xterm");
         assert_eq!(LinuxBackend::client_app_name(&names, &json!({})), "");
+    }
+
+    #[test]
+    fn names_by_pid_keeps_the_first_app_of_a_process() {
+        let app = |bus: &str| Obj::new(bus, OwnedObjectPath::try_from(APP_ROOT).unwrap());
+        let apps = vec![
+            (Some(7), app(":1.1"), "kate".to_string(), Vec::new()),
+            (Some(7), app(":1.2"), "other".to_string(), Vec::new()),
+            (None, app(":1.3"), "sandboxed".to_string(), Vec::new()),
+        ];
+        let names = LinuxBackend::names_by_pid(&apps);
+        assert_eq!(names, HashMap::from([(7, "kate".to_string())]));
     }
 }
