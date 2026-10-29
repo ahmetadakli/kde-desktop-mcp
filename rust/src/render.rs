@@ -1059,6 +1059,230 @@ pub fn py_repr(s: &str) -> String {
     out
 }
 
+// ---------------------------------------------------------------- menus
+
+/// Roles of a menu entry. A named "menu" is a submenu entry (GTK, Firefox);
+/// an unnamed one only holds entries.
+pub const MENU_ITEM_ROLES: [&str; 5] = [
+    "menu item",
+    "menu",
+    "check menu item",
+    "radio menu item",
+    "tearoff menu item",
+];
+
+/// Roles that only hold menu entries: the popup under a Qt or Firefox
+/// entry, and unnamed menus or fillers.
+const MENU_HOLDER_ROLES: [&str; 4] = ["popup menu", "menu", "filler", "panel"];
+
+/// Where `menu_bars` does not look (nor fetch below): menus, documents and
+/// big views, none of which holds an app's menu bar.
+pub const MENU_BAR_STOP: [&str; 12] = [
+    "menu bar",
+    "menu",
+    "popup menu",
+    "document web",
+    "document frame",
+    "document",
+    "list",
+    "table",
+    "tree table",
+    "tree",
+    "terminal",
+    "text",
+];
+
+/// The menu bars below `roots` (hidden ones too: Dolphin and Kate keep
+/// theirs in the tree when the hamburger menu replaces it), in document
+/// order, the showing ones first. Children of MENU_BAR_STOP roles are not
+/// visited.
+pub fn menu_bars<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+) -> Result<Vec<Id>, Vec<Id>> {
+    let mut missing = Vec::new();
+    let mut stack: Vec<&Id> = get(cache, roots, &mut missing)
+        .into_iter()
+        .map(|(c, _)| c)
+        .rev()
+        .collect();
+    let mut found = Vec::new();
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        let info = &cache[id];
+        if info.role == "menu bar" {
+            found.push(id.clone());
+        }
+        if MENU_BAR_STOP.contains(&info.role.as_str()) {
+            continue;
+        }
+        stack.extend(
+            get(cache, &info.children, &mut missing)
+                .into_iter()
+                .map(|(c, _)| c)
+                .rev(),
+        );
+    }
+    found.sort_by_key(|id| !cache[id].showing);
+    done(found, missing)
+}
+
+/// The entries of a menu bar or submenu entry `node`: its children of the
+/// MENU_ITEM_ROLES with a name, looking through holders (a Qt entry's popup
+/// menu); separators and the like are left out.
+pub fn menu_items<Id: Clone + Eq + Hash>(cache: &Cache<Id>, node: &Id) -> Result<Vec<Id>, Vec<Id>> {
+    let mut missing = Vec::new();
+    let mut items = Vec::new();
+    let Some(info) = cache.get(node) else {
+        return Err(vec![node.clone()]);
+    };
+    let mut stack: Vec<&Id> = get(cache, &info.children, &mut missing)
+        .into_iter()
+        .map(|(c, _)| c)
+        .rev()
+        .collect();
+    while let Some(id) = stack.pop() {
+        let info = &cache[id];
+        let role = info.role.as_str();
+        if MENU_ITEM_ROLES.contains(&role) && !info.name.trim().is_empty() {
+            items.push(id.clone());
+        } else if MENU_HOLDER_ROLES.contains(&role) {
+            stack.extend(
+                get(cache, &info.children, &mut missing)
+                    .into_iter()
+                    .map(|(c, _)| c)
+                    .rev(),
+            );
+        }
+    }
+    done(items, missing)
+}
+
+/// Whether a menu entry opens a submenu rather than doing something: a
+/// named "menu" (GTK, Firefox), an entry with a popup below it or Qt's
+/// "Show Menu" action.
+pub fn is_submenu<Id: Clone + Eq + Hash>(cache: &Cache<Id>, info: &Info<Id>) -> bool {
+    info.role == "menu"
+        || info
+            .actions
+            .iter()
+            .any(|a| a.eq_ignore_ascii_case("show menu"))
+        || info
+            .children
+            .iter()
+            .filter_map(|c| cache.get(c))
+            .any(|c| c.role == "popup menu" || c.role == "menu")
+}
+
+/// A menu label as compared: without accelerator markers (`&`, `_`; doubled
+/// ones stand for the character), a shortcut after a tab, or trailing
+/// ellipses; case and Turkish dotted/dotless i folded, spaces collapsed.
+pub fn menu_norm(label: &str) -> String {
+    let label = label.split('\t').next().unwrap_or("");
+    let mut out = String::new();
+    let mut chars = label.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '&' || c == '_' {
+            if chars.peek() == Some(&c) {
+                out.push(c);
+                chars.next();
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    let mut s = out.trim().to_string();
+    loop {
+        let t = s
+            .trim_end_matches('…')
+            .trim_end_matches("...")
+            .trim_end()
+            .to_string();
+        if t == s {
+            break;
+        }
+        s = t;
+    }
+    let folded: String = s
+        .chars()
+        .flat_map(char::to_lowercase)
+        .filter(|c| *c != '\u{307}')
+        .map(|c| if c == 'ı' { 'i' } else { c })
+        .collect();
+    folded.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// The entry of `items` that `want` names: the first whose label equals it
+/// (see `menu_norm`), else the only one containing it. Err lists the labels
+/// to choose from.
+pub fn pick_menu_item<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    items: &[Id],
+    want: &str,
+) -> Result<Id, String> {
+    let w = menu_norm(want);
+    let label = |id: &Id| menu_norm(&cache[id].name);
+    if let Some(id) = items.iter().find(|id| label(id) == w) {
+        return Ok(id.clone());
+    }
+    let partial: Vec<&Id> = items
+        .iter()
+        .filter(|id| !w.is_empty() && label(id).contains(&w))
+        .collect();
+    if let [one] = partial.as_slice() {
+        return Ok((*one).clone());
+    }
+    let names = |ids: &mut dyn Iterator<Item = &Id>| {
+        ids.map(|id| json_str(cache[id].name.trim()))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if partial.is_empty() {
+        Err(format!(
+            "no entry {} here; there are: {}",
+            json_str(want),
+            names(&mut items.iter())
+        ))
+    } else {
+        Err(format!(
+            "{} matches several entries: {}",
+            json_str(want),
+            names(&mut partial.into_iter())
+        ))
+    }
+}
+
+/// A menu `path`: a list of labels, or one string split at `>`; empty for
+/// none.
+pub fn menu_path(path: Option<&Json>) -> Result<Vec<String>, String> {
+    let bad =
+        || "path must be a list of menu labels or one string like \"File > Save As\"".to_string();
+    match path {
+        None | Some(Json::Null) => Ok(Vec::new()),
+        Some(Json::String(s)) => Ok(s
+            .split('>')
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect()),
+        Some(Json::Array(list)) => list
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .ok_or_else(bad)
+            })
+            .collect(),
+        Some(_) => Err(bad()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1080,6 +1304,144 @@ mod tests {
             children: kids.to_vec(),
             ..Default::default()
         }
+    }
+
+    fn menu_cache() -> Cache<&'static str> {
+        let mut c = Cache::new();
+        c.insert(
+            "/w",
+            node(
+                "frame",
+                "notes.txt — Kate",
+                true,
+                &["active"],
+                &["/doc", "/tb", "/mb"],
+            ),
+        );
+        c.insert("/doc", node("text", "notes", true, &[], &["/ignored"]));
+        c.insert("/tb", node("tool bar", "", true, &[], &["/hb"]));
+        c.insert("/hb", node("push button", "Menüyü Aç", true, &[], &[]));
+        // Hidden, as with the hamburger menu: still found.
+        c.insert(
+            "/mb",
+            node("menu bar", "", false, &[], &["/file", "/sep", "/edit"]),
+        );
+        let mut file = node("menu item", "&Dosya", false, &[], &["/pop"]);
+        file.actions = vec!["Show Menu".into()];
+        c.insert("/file", file);
+        c.insert("/sep", node("separator", "", false, &["disabled"], &[]));
+        c.insert("/edit", node("menu", "Düzen", false, &[], &[]));
+        c.insert(
+            "/pop",
+            node(
+                "popup menu",
+                "",
+                false,
+                &[],
+                &["/new", "/s1", "/saveas", "/savecopy", "/quit"],
+            ),
+        );
+        c.insert("/new", node("menu item", "Yeni", false, &[], &[]));
+        c.insert("/s1", node("separator", "", false, &[], &[]));
+        c.insert(
+            "/saveas",
+            node("menu item", "Farklı Kaydet…", false, &[], &[]),
+        );
+        c.insert(
+            "/savecopy",
+            node(
+                "menu item",
+                "Kopyayı Farklı Kaydet…\tCtrl+Shift+S",
+                false,
+                &[],
+                &[],
+            ),
+        );
+        c.insert("/quit", node("menu item", "Çık", false, &["disabled"], &[]));
+        c
+    }
+
+    #[test]
+    fn menu_labels_compare_without_markers_case_or_ellipses() {
+        assert_eq!(menu_norm("&Dosya"), "dosya");
+        assert_eq!(menu_norm("Save _As..."), "save as");
+        assert_eq!(menu_norm("Farklı Kaydet…"), menu_norm("farkli kaydet"));
+        assert_eq!(menu_norm("İPTAL"), menu_norm("iptal"));
+        assert_eq!(menu_norm("Rock && Roll"), "rock & roll");
+        assert_eq!(menu_norm("Print\tCtrl+P"), "print");
+        assert_eq!(menu_norm("  Open   Recent … "), "open recent");
+    }
+
+    #[test]
+    fn menu_bars_include_hidden_ones_and_skip_documents() {
+        let c = menu_cache();
+        assert_eq!(menu_bars(&c, &["/w"]).unwrap(), vec!["/mb"]);
+        let mut shown = c.clone();
+        shown.insert("/mb2", node("menu bar", "", true, &[], &[]));
+        shown.get_mut("/tb").unwrap().children.push("/mb2");
+        assert_eq!(menu_bars(&shown, &["/w"]).unwrap(), vec!["/mb2", "/mb"]);
+        // "/ignored" below the text is never asked for.
+        let mut gap = c.clone();
+        gap.remove("/hb");
+        assert_eq!(menu_bars(&gap, &["/w"]), Err(vec!["/hb"]));
+    }
+
+    #[test]
+    fn menu_items_look_through_popups_and_skip_separators() {
+        let c = menu_cache();
+        assert_eq!(menu_items(&c, &"/mb").unwrap(), vec!["/file", "/edit"]);
+        assert_eq!(
+            menu_items(&c, &"/file").unwrap(),
+            vec!["/new", "/saveas", "/savecopy", "/quit"]
+        );
+        assert!(menu_items(&c, &"/edit").unwrap().is_empty());
+        assert!(is_submenu(&c, &c["/file"]) && is_submenu(&c, &c["/edit"]));
+        assert!(!is_submenu(&c, &c["/saveas"]));
+        let mut gap = c.clone();
+        gap.remove("/pop");
+        assert_eq!(menu_items(&gap, &"/file"), Err(vec!["/pop"]));
+    }
+
+    #[test]
+    fn menu_entries_are_picked_exactly_then_by_a_unique_part() {
+        let c = menu_cache();
+        let items = menu_items(&c, &"/file").unwrap();
+        assert_eq!(pick_menu_item(&c, &items, "farklı kaydet"), Ok("/saveas"));
+        assert_eq!(
+            pick_menu_item(&c, &items, "FARKLI KAYDET..."),
+            Ok("/saveas")
+        );
+        assert_eq!(pick_menu_item(&c, &items, "kopya"), Ok("/savecopy"));
+        let err = pick_menu_item(&c, &items, "kaydet").unwrap_err();
+        assert!(
+            err.contains("several") && err.contains("\"Farklı Kaydet…\""),
+            "{err}"
+        );
+        let err = pick_menu_item(&c, &items, "Save As").unwrap_err();
+        assert!(
+            err.contains("there are: \"Yeni\", \"Farklı Kaydet…\""),
+            "{err}"
+        );
+        let top = menu_items(&c, &"/mb").unwrap();
+        assert_eq!(pick_menu_item(&c, &top, "dosya"), Ok("/file"));
+    }
+
+    #[test]
+    fn menu_paths_are_lists_or_split_at_arrows() {
+        let p = |v: Json| menu_path(Some(&v));
+        assert_eq!(
+            p(Json::from("Dosya > Farklı Kaydet…")).unwrap(),
+            vec!["Dosya", "Farklı Kaydet…"]
+        );
+        assert_eq!(
+            p(serde_json::json!(["A > B", " C "])).unwrap(),
+            vec!["A > B", "C"]
+        );
+        assert!(p(Json::from("")).unwrap().is_empty());
+        assert!(menu_path(None).unwrap().is_empty());
+        assert!(p(serde_json::json!(["A", 3])).is_err());
+        assert!(p(serde_json::json!(["A", " "])).is_err());
+        assert!(p(serde_json::json!(5)).is_err());
     }
 
     fn sample() -> Cache<&'static str> {

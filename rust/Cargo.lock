@@ -132,7 +132,7 @@ checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
 name = "desktop-mcp"
-version = "0.11.0"
+version = "0.12.0"
 dependencies = [
  "evdev",
  "fontdue",

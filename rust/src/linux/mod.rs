@@ -26,7 +26,7 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    Layout, NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -1101,6 +1101,13 @@ impl Backend for LinuxBackend {
         busy.into_iter().any(|b| b)
     }
 
+    /// Not in Firefox: opening a menu of its (hidden) menu bar through
+    /// DoAction hung or crashed a freshly started Firefox in tests (an
+    /// abort on invalid UTF-8 in a D-Bus message), most times.
+    async fn may_open_menu(&self, id: &Obj) -> bool {
+        !self.toolkit(&id.bus).await.eq_ignore_ascii_case("gecko")
+    }
+
     async fn actions(&self, id: &Obj) -> Vec<String> {
         self.a11y.actions(id).await
     }
@@ -1504,29 +1511,38 @@ impl Backend for LinuxBackend {
         }
     }
 
-    async fn screens_and_windows(
-        &self,
-        query: &str,
-        allowed: &[String],
-    ) -> (Vec<Screen>, R<Vec<WindowGeo>>) {
+    async fn layout(&self, query: &str, allowed: &[String]) -> Layout {
+        let failed = |e| Layout {
+            screens: Vec::new(),
+            desktops: Vec::new(),
+            windows: Err(e),
+        };
         match &self.comp {
             Compositor::Kde(kwin) => {
                 let allow = self.kwin_allow(allowed).await;
-                match kwin.screens_and_windows(query, &allow).await {
-                    Ok((screens, mut list)) => {
+                match kwin.layout(query, &allow).await {
+                    Ok((screens, desktops, mut list)) => {
                         with_terminals(&mut list).await;
-                        (screens, Ok(list))
+                        Layout {
+                            screens,
+                            desktops,
+                            windows: Ok(list),
+                        }
                     }
-                    Err(e) => (Vec::new(), Err(e)),
+                    Err(e) => failed(e),
                 }
             }
             Compositor::Hyprland(h) => match self.hypr_clients(h, query, allowed).await {
                 Ok((snap, clients)) => {
                     let mut list: Vec<WindowGeo> = clients.into_iter().map(|c| c.geo).collect();
                     with_terminals(&mut list).await;
-                    (hyprland::screens_of(&snap.monitors), Ok(list))
+                    Layout {
+                        screens: hyprland::screens_of(&snap.monitors),
+                        desktops: hyprland::workspaces_of(&snap),
+                        windows: Ok(list),
+                    }
                 }
-                Err(e) => (Vec::new(), Err(e)),
+                Err(e) => failed(e),
             },
         }
     }
@@ -1551,8 +1567,17 @@ impl Backend for LinuxBackend {
                     .or(clients.first())
                     .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
                 let back = hyprland::monitor_workspace(&snap.monitors, c.monitor);
-                h.dispatch_all(&hyprland::change_commands(c, change, back)?)
-                    .await?;
+                let desk = match &change.desktop {
+                    Some(d) => Some(hyprland::workspace_target(&snap, d)?),
+                    None => None,
+                };
+                h.dispatch_all(&hyprland::change_commands(
+                    c,
+                    change,
+                    back,
+                    desk.as_deref(),
+                )?)
+                .await?;
                 // Hyprland applies geometry at once; the caller waits for the
                 // app (and the state) by re-reading `windows`.
                 let snap = h.snapshot().await?;
@@ -1561,6 +1586,24 @@ impl Backend for LinuxBackend {
                     .find(|n| n.address == c.address)
                     .map(|n| n.geo)
                     .ok_or_else(|| format!("the window '{}' closed", c.geo.title))
+            }
+        }
+    }
+
+    async fn close_window(&self, query: &str, allowed: &[String]) -> R<WindowGeo> {
+        match &self.comp {
+            Compositor::Kde(kwin) => {
+                kwin.close_window(query, &self.kwin_allow(allowed).await)
+                    .await
+            }
+            Compositor::Hyprland(h) => {
+                let (_, clients) = self.hypr_clients(h, query, allowed).await?;
+                let [c] = clients.as_slice() else {
+                    let list: Vec<WindowGeo> = clients.into_iter().map(|c| c.geo).collect();
+                    return Err(crate::backend::not_one_window(query, &list));
+                };
+                h.dispatch(&hyprland::close_command(c)).await?;
+                Ok(c.geo.clone())
             }
         }
     }

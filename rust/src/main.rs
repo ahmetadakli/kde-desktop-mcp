@@ -355,8 +355,9 @@ fn describe_call(tool: &str, app: Option<&str>, a: &Json) -> String {
 /// presses buttons and opens menus; `set_text` may retype through the
 /// keyboard), or use the clipboard that type_text pastes through; they run
 /// one at a time.
-const INPUT_TOOLS: [&str; 14] = [
+const INPUT_TOOLS: [&str; 15] = [
     "act",
+    "menu",
     "set_text",
     "focus",
     "click",
@@ -375,8 +376,11 @@ const INPUT_TOOLS: [&str; 14] = [
 /// Tools that act on the seat or what the user sees: they pause while the
 /// user uses the keyboard or mouse, and stop after the stop shortcut. The
 /// clipboard tools send no input and are not held up.
-const GATED_TOOLS: [&str; 13] = [
+const GATED_TOOLS: [&str; 16] = [
     "act",
+    "menu",
+    "close_window",
+    "hold",
     "set_text",
     "focus",
     "click",
@@ -633,10 +637,10 @@ fn observe_arg(tool: &str, a: &Json) -> R<Option<Observe>> {
         return Ok(None);
     }
     // Without `observe` nothing is measured, so plain input stays as fast
-    // as before; `act` keeps its effect line (it replaced act's note that
-    // the active window changed).
+    // as before; act, menu and close_window keep their effect line (it
+    // replaced their note that the active window changed).
     let default = match tool {
-        "act" => Some(Observe::Nothing),
+        "act" | "menu" | "close_window" => Some(Observe::Nothing),
         _ => None,
     };
     Ok(match a.get("observe") {
@@ -768,11 +772,77 @@ fn indicator_label(tool: &str, a: &Json) -> Option<String> {
         "scroll" => "scrolling".into(),
         "activate_window" => "switching windows".into(),
         "move_window" => "arranging windows".into(),
+        "close_window" => "closing a window".into(),
+        "menu" => "using a menu".into(),
         "clipboard_set" => "copying".into(),
         "launch" => format!("launching {}", arg_s(a, "app", "an app")),
         "file_dialog" => "choosing a file".into(),
         _ => return None,
     })
+}
+
+/// Rounds of fetching what a menu walk misses before giving up on a part
+/// of the tree that does not answer.
+const MENU_FETCH_ROUNDS: usize = 50;
+/// How long `menu` waits for a submenu it opened to list its entries.
+const MENU_OPEN_WAIT: Duration = Duration::from_millis(2000);
+
+/// The action that runs a menu entry: press, click and the like, else its
+/// only (or first) action; None without any.
+fn menu_action(actions: &[String]) -> Option<usize> {
+    const RUN: [&str; 7] = [
+        "press", "click", "activate", "trigger", "toggle", "select", "check",
+    ];
+    actions
+        .iter()
+        .position(|a| RUN.contains(&a.to_lowercase().as_str()))
+        .or((!actions.is_empty()).then_some(0))
+}
+
+/// How long close_window waits for the window to go before saying it is
+/// still open (an app asking to save changes keeps it).
+const CLOSE_SETTLE: Duration = Duration::from_millis(1500);
+
+/// `desktops: 1 "Main" (current), 2 "Web"`; Hyprland: `workspaces: …`
+/// with the monitor each is on.
+fn desktops_line(list: &[backend::Desktop]) -> String {
+    let hypr = list.iter().any(|d| !d.output.is_empty());
+    let items: Vec<String> = list
+        .iter()
+        .map(|d| {
+            // Hyprland's named workspaces have no number (0).
+            let mut s = if d.number == 0 {
+                render::py_repr(&d.name)
+            } else {
+                d.number.to_string()
+            };
+            if d.number != 0 && d.name != s {
+                s.push_str(&format!(" {}", render::py_repr(&d.name)));
+            }
+            match (d.current, d.output.is_empty()) {
+                (true, true) => s.push_str(" (current)"),
+                (true, false) => s.push_str(&format!(" (shown on {})", d.output)),
+                (false, false) => s.push_str(&format!(" (on {})", d.output)),
+                (false, true) => {}
+            }
+            s
+        })
+        .collect();
+    format!(
+        "{}: {}",
+        if hypr { "workspaces" } else { "desktops" },
+        items.join(", ")
+    )
+}
+
+/// move_window's `desktop`: a number or a name; None when absent.
+fn desktop_arg(a: &Json) -> R<Option<String>> {
+    match a.get("desktop") {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Number(n)) => Ok(Some(n.to_string())),
+        Some(Json::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+        Some(_) => Err("desktop must be a desktop number or name".into()),
+    }
 }
 
 /// How long move_window waits for a window to take its new geometry.
@@ -791,7 +861,7 @@ fn window_reached(w: &WindowGeo, c: &WindowChange) -> bool {
     state && near(c.x, w.x) && near(c.y, w.y) && near(c.width, w.width) && near(c.height, w.height)
 }
 
-/// `"title" [app] at (x,y) WxH {active,maximized} on OUTPUT`.
+/// `"title" [app] at (x,y) WxH {active,maximized} on OUTPUT, desktop 2`.
 fn describe_window(w: &WindowGeo) -> String {
     let states: Vec<&str> = [
         (w.active, "active"),
@@ -816,6 +886,12 @@ fn describe_window(w: &WindowGeo) -> String {
     }
     if !w.output.is_empty() {
         line.push_str(&format!(" on {}", w.output));
+    }
+    match w.desktops.as_slice() {
+        [] => {}
+        [all] if all == "all" => line.push_str(", all desktops"),
+        [one] => line.push_str(&format!(", desktop {one}")),
+        many => line.push_str(&format!(", desktops {}", many.join(","))),
     }
     for t in &w.terminals {
         line.push_str(&format!(
@@ -1301,17 +1377,17 @@ impl<B: Backend> Server<B> {
                     Some("accept" | "decline") => "declined",
                     _ => "dismissed",
                 };
-                return Err(format!(
-                    "the user {how} {what}; nothing was done (the allowlist's confirm list \
-                     asks for it)"
-                ));
+                return Err(format!("the user {how} {what}; nothing was done"));
             }
         } else if !arg_b(a, "confirm", false) {
+            let why = match self.policy().needs_confirm(tool, app) {
+                true => format!("confirm list in {}", self.allow_file.display()),
+                false => "it may lose unsaved work".into(),
+            };
             return Err(format!(
-                "{tool} needs the user's confirmation here (confirm list in {}), and this \
-                 client cannot ask (no elicitation): ask the user, and only if they agree \
-                 call again with confirm: true",
-                self.allow_file.display()
+                "{what} needs the user's confirmation ({why}), and this client cannot ask \
+                 (no elicitation): ask the user, and only if they agree call again with \
+                 confirm: true"
             ));
         }
         let _ = GATE.try_with(|g| g.borrow_mut().confirmed = true);
@@ -1748,8 +1824,9 @@ impl<B: Backend> Server<B> {
     async fn windows(&self, a: &Json) -> R<String> {
         let query = arg_s(a, "query", "");
         let allowed = self.allowed();
-        let (screens, list) = self.b.screens_and_windows(&query, &allowed).await;
-        let mut lines: Vec<String> = screens
+        let layout = self.b.layout(&query, &allowed).await;
+        let mut lines: Vec<String> = layout
+            .screens
             .iter()
             .map(|s| {
                 format!(
@@ -1758,7 +1835,10 @@ impl<B: Backend> Server<B> {
                 )
             })
             .collect();
-        let list = list?;
+        if !layout.desktops.is_empty() {
+            lines.push(desktops_line(&layout.desktops));
+        }
+        let list = layout.windows?;
         if list.is_empty() {
             lines.push(if query.is_empty() {
                 "no windows of allowed apps".into()
@@ -1779,6 +1859,7 @@ impl<B: Backend> Server<B> {
             width: num("width").map(|w| w.max(1.0)),
             height: num("height").map(|h| h.max(1.0)),
             state: a.get("state").and_then(Json::as_str).map(str::to_string),
+            desktop: desktop_arg(a)?,
         };
         if let Some(st) = &change.state
             && !["maximize", "minimize", "restore"].contains(&st.as_str())
@@ -1788,11 +1869,12 @@ impl<B: Backend> Server<B> {
             ));
         }
         if change.state.is_none()
+            && change.desktop.is_none()
             && [change.x, change.y, change.width, change.height]
                 .iter()
                 .all(Option::is_none)
         {
-            return Err("pass x/y, width/height or state".into());
+            return Err("pass x/y, width/height, state or desktop".into());
         }
         // The window it will move, for the tier check (and confirmation);
         // only apps with that tier are passed on, so it stays the same one.
@@ -1822,6 +1904,50 @@ impl<B: Backend> Server<B> {
             " (not what was asked: the app may limit its size or position)"
         };
         Ok(format!("now: {}{note}", describe_window(&w)))
+    }
+
+    async fn close_window(&self, a: &Json) -> R<String> {
+        let query = req_s(a, "query")?;
+        if query.trim().is_empty() {
+            return Err("pass the title (or app name) of the window to close as `query`".into());
+        }
+        let allowed = self.allowed();
+        // Exactly one window, named in the confirmation and the reply.
+        let list = self.b.windows(&query, &allowed).await?;
+        let [w] = list.as_slice() else {
+            return Err(backend::not_one_window(&query, &list));
+        };
+        // Always confirmed, not only on the allowlist's confirm list:
+        // unsaved work may go with it.
+        self.permit(&w.app).await?;
+        if !GATE.try_with(|g| g.borrow().confirmed).unwrap_or(false) {
+            self.confirm("close_window", Some(&w.app), a).await?;
+        }
+        let closed = self.b.close_window(&query, &allowed).await?;
+        let start = Instant::now();
+        let gone = loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let open = self
+                .b
+                .windows(&closed.title, &allowed)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|n| n.app == closed.app && n.pid == closed.pid && n.title == closed.title);
+            if !open || start.elapsed() >= CLOSE_SETTLE {
+                break !open;
+            }
+        };
+        let what = format!("{} [{}]", render::py_repr(&closed.title), closed.app);
+        let reply = if gone {
+            format!("closed {what}")
+        } else {
+            format!(
+                "asked {what} to close; it is still open, probably asking whether to save \
+                 changes (see apps, then find/act on its dialog)"
+            )
+        };
+        Ok(reply)
     }
 
     async fn launch(&self, a: &Json) -> R<String> {
@@ -2232,6 +2358,228 @@ impl<B: Backend> Server<B> {
             names[idx],
             if ok { "ok" } else { "failed" }
         )))
+    }
+
+    async fn menu(&self, a: &Json) -> R<String> {
+        let app = req_s(a, "app")?;
+        let path = render::menu_path(a.get("path"))?;
+        self.b.enable().await;
+        let windows = self.app_windows(&app).await?;
+        self.permit(&app).await?;
+        let app_key = app.to_lowercase();
+        let mut cache = Cache::new();
+        let bar = self.menu_bar(&app, &windows, &mut cache).await?;
+        let hidden = !cache[&bar].showing;
+        let mut node = bar;
+        let mut trail: Vec<String> = Vec::new();
+        let mut opened: Vec<String> = Vec::new();
+        let where_ = |trail: &[String]| {
+            if trail.is_empty() {
+                format!("{app}'s menu bar")
+            } else {
+                render::json_str(&trail.join(" > "))
+            }
+        };
+        let open_note = |opened: &[String]| {
+            if opened.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (opened {} to read it; it may still be open: key escape closes it)",
+                    opened.join(", ")
+                )
+            }
+        };
+        for seg in &path {
+            let mut items = self.menu_entries(&mut cache, &node).await;
+            if items.is_empty() && !trail.is_empty() {
+                items = self
+                    .open_submenu(&mut cache, &node, &windows)
+                    .await
+                    .map_err(|e| format!("{}: {e}{}", where_(&trail), open_note(&opened)))?;
+                opened.push(render::json_str(trail.last().unwrap()));
+            }
+            let item = render::pick_menu_item(&cache, &items, seg)
+                .map_err(|e| format!("in {}: {e}{}", where_(&trail), open_note(&opened)))?;
+            trail.push(cache[&item].name.trim().to_string());
+            node = item;
+        }
+        self.b
+            .fill_actions(&mut cache, std::slice::from_ref(&node))
+            .await;
+        let list = trail.is_empty() || render::is_submenu(&cache, &cache[&node]);
+        if list {
+            let mut items = self.menu_entries(&mut cache, &node).await;
+            if items.is_empty() && !trail.is_empty() {
+                items = self
+                    .open_submenu(&mut cache, &node, &windows)
+                    .await
+                    .map_err(|e| format!("{}: {e}{}", where_(&trail), open_note(&opened)))?;
+                opened.push(render::json_str(trail.last().unwrap()));
+            }
+            self.b.fill_actions(&mut cache, &items).await;
+            let mut lines = vec![format!(
+                "{}{}:",
+                where_(&trail),
+                if hidden && trail.is_empty() {
+                    " (hidden: its entries still work through `menu`)"
+                } else {
+                    ""
+                }
+            )];
+            for id in &items {
+                let rid = self.add_ref(id, &cache[id], &app_key).await;
+                // A submenu's action only opens it: "(submenu)" says that
+                // ("click" is implied for menu roles, so nothing is listed).
+                let line = if render::is_submenu(&cache, &cache[id]) {
+                    let info = Info {
+                        actions: vec!["click".into()],
+                        ..cache[id].clone()
+                    };
+                    format!("{} (submenu)", render::describe(&info, rid))
+                } else {
+                    render::describe(&cache[id], rid)
+                };
+                lines.push(line);
+            }
+            if items.is_empty() {
+                lines.push("(no entries)".into());
+            }
+            let note = open_note(&opened);
+            if !note.is_empty() {
+                lines.push(note.trim().to_string());
+            }
+            return Ok(lines.join("\n"));
+        }
+        let info = &cache[&node];
+        let what = render::json_str(&trail.join(" > "));
+        if info.states.contains(&"disabled") {
+            return Err(format!("{what} is disabled{}", open_note(&opened)));
+        }
+        let idx = menu_action(&info.actions)
+            .ok_or_else(|| format!("{what} has no action{}", open_note(&opened)))?;
+        let ok = self.b.do_action(&node, idx).await?;
+        let reply = format!("{what} -> {}", if ok { "ok" } else { "failed" });
+        Ok(reply)
+    }
+
+    /// The menu bar of `app`'s active window, else of its other windows (a
+    /// dialog in front has none). Hidden menu bars count: KDE apps keep
+    /// theirs in the tree when the hamburger menu replaces it, and their
+    /// entries still work.
+    async fn menu_bar(&self, app: &str, windows: &[B::Id], cache: &mut Cache<B::Id>) -> R<B::Id> {
+        let fetch = |limit| Fetch {
+            only_showing: false,
+            text_limit: 0,
+            limit,
+            actions: false,
+            stop_roles: &render::MENU_BAR_STOP,
+        };
+        self.b
+            .prefetch_with(cache, windows.to_vec(), &fetch(1))
+            .await;
+        let mut order: Vec<&B::Id> = windows.iter().filter(|w| cache.contains_key(*w)).collect();
+        order.sort_by_key(|w| {
+            let i = &cache[*w];
+            (!i.states.contains(&"active"), !i.showing)
+        });
+        for w in order {
+            let kids = cache[w].children.clone();
+            self.b
+                .prefetch_with(cache, kids, &fetch(render::FIND_MAX_SEEN))
+                .await;
+            for _ in 0..MENU_FETCH_ROUNDS {
+                match render::menu_bars(cache, std::slice::from_ref(w)) {
+                    Ok(bars) => {
+                        if let Some(bar) = bars.into_iter().next() {
+                            return Ok(bar);
+                        }
+                        break;
+                    }
+                    Err(missing) => {
+                        self.b
+                            .prefetch_with(cache, missing, &fetch(PREFETCH_MORE))
+                            .await
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "no menu bar in '{app}'s windows; the app may have only a hamburger or \
+             context menu: find its button and act on it, or use key"
+        ))
+    }
+
+    /// The entries of `node` (a menu bar or submenu entry), fetching what is
+    /// missing.
+    async fn menu_entries(&self, cache: &mut Cache<B::Id>, node: &B::Id) -> Vec<B::Id> {
+        let fetch = Fetch {
+            only_showing: false,
+            text_limit: 0,
+            limit: PREFETCH_MORE,
+            actions: false,
+            stop_roles: &[],
+        };
+        for _ in 0..MENU_FETCH_ROUNDS {
+            match render::menu_items(cache, node) {
+                Ok(items) => return items,
+                Err(missing) => self.b.prefetch_with(cache, missing, &fetch).await,
+            }
+        }
+        Vec::new()
+    }
+
+    /// Open a submenu whose entries are not in the tree until it is shown
+    /// (Firefox), and wait for them.
+    async fn open_submenu(
+        &self,
+        cache: &mut Cache<B::Id>,
+        node: &B::Id,
+        windows: &[B::Id],
+    ) -> R<Vec<B::Id>> {
+        if !self.b.may_open_menu(node).await {
+            return Err(
+                "this app lists a submenu's entries only while it is open, and opening \
+                 its menus through accessibility can hang or crash it (Firefox); open the \
+                 menu with key (alt + its underlined letter, or f10), then call menu again"
+                    .into(),
+            );
+        }
+        let actions = self.b.actions(node).await;
+        let idx = actions
+            .iter()
+            .position(|a| {
+                ["show menu", "open", "click", "press", "activate"]
+                    .contains(&a.to_lowercase().as_str())
+            })
+            .or((!actions.is_empty()).then_some(0))
+            .ok_or(
+                "its entries are not in the accessibility tree and it has no action to open it",
+            )?;
+        let mut mark = self.b.change_mark();
+        self.b.do_action(node, idx).await?;
+        let start = Instant::now();
+        loop {
+            // Read the entry afresh: what the cache holds predates the popup.
+            let mut fresh = Cache::new();
+            fresh.insert(node.clone(), self.b.info(node, 0).await);
+            let items = self.menu_entries(&mut fresh, node).await;
+            cache.extend(fresh);
+            if !items.is_empty() {
+                return Ok(items);
+            }
+            let left = MENU_OPEN_WAIT.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return Err(format!(
+                    "opened it, but no entries appeared within {} ms",
+                    MENU_OPEN_WAIT.as_millis()
+                ));
+            }
+            self.b
+                .wait_change(windows, mark, left.min(WAIT_FALLBACK))
+                .await;
+            mark = self.b.change_mark();
+        }
     }
 
     async fn set_text(&self, a: &Json) -> R<String> {
@@ -3345,6 +3693,8 @@ impl<B: Backend> Server<B> {
                 "drag" => self.drag(a).await.map(Out::from),
                 "windows" => self.windows(a).await.map(Out::from),
                 "move_window" => self.move_window(a).await.map(Out::from),
+                "close_window" => self.close_window(a).await.map(Out::from),
+                "menu" => self.menu(a).await.map(Out::from),
                 "launch" => self.launch(a).await.map(Out::from),
                 "doctor" => self.doctor().await.map(Out::from),
                 "scroll" => self.scroll(a).await.map(Out::from),
@@ -3407,13 +3757,15 @@ impl<B: Backend> Server<B> {
 /// Tools that never call `Server::permit` (they reach no app, or only read
 /// with a tier every allowed app has); `call_inner` handles their
 /// confirmation.
-const NO_PERMIT_TOOLS: [&str; 9] = [
+const NO_PERMIT_TOOLS: [&str; 11] = [
     "apps",
     "windows",
     "doctor",
     "tree",
     "find",
     "wait_for",
+    "wait_idle",
+    "cursor_position",
     "pause",
     "activate_window",
     "batch",
@@ -3747,6 +4099,10 @@ mod tests {
         active: Rc<RefCell<(String, String)>>,
         /// Fed by the tests: user input and the stop shortcut.
         takeover: std::sync::Arc<takeover::Takeover>,
+        /// Elements other than `focus`, by id. An action on an empty
+        /// "menu" fills it with entry 99 "Opened", as Firefox shows a
+        /// submenu's entries only once it is open.
+        nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
     }
 
     /// Windows on the fake desktop: (app, title).
@@ -3791,7 +4147,7 @@ mod tests {
         async fn info(&self, id: &u32, _: usize) -> Info<u32> {
             match *id {
                 FAKE_FOCUS => self.focus.borrow().clone(),
-                _ => Info::default(),
+                _ => self.nodes.borrow().get(id).cloned().unwrap_or_default(),
             }
         }
         async fn focused(&self) -> Option<Focused<u32>> {
@@ -3821,6 +4177,14 @@ mod tests {
             self.keys
                 .borrow_mut()
                 .push(format!("action {index} on {id}"));
+            let mut nodes = self.nodes.borrow_mut();
+            if let Some(n) = nodes.get_mut(id)
+                && n.role == "menu"
+                && n.children.is_empty()
+            {
+                n.children = vec![99];
+                nodes.insert(99, fake_node("menu item", "Opened", &[]));
+            }
             Ok(true)
         }
         async fn full_text(&self, _: &u32, _: usize) -> R<String> {
@@ -3973,6 +4337,17 @@ mod tests {
     /// `pointer` at this x takes 5 s.
     const SLOW_X: i64 = 777;
 
+    fn fake_node(role: &str, name: &str, kids: &[u32]) -> Info<u32> {
+        Info {
+            role: role.into(),
+            name: name.into(),
+            showing: true,
+            actions: vec!["Press".into()],
+            children: kids.to_vec(),
+            ..Info::default()
+        }
+    }
+
     struct Session {
         stdin: DuplexStream,
         stdout: tokio::io::Lines<BufReader<DuplexStream>>,
@@ -3982,6 +4357,7 @@ mod tests {
         field: Rc<RefCell<Option<String>>>,
         active: Rc<RefCell<(String, String)>>,
         takeover: std::sync::Arc<takeover::Takeover>,
+        nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -4009,6 +4385,7 @@ mod tests {
             Duration::from_millis(1500),
             Some("meta+alt+esc"),
         ));
+        let nodes = Rc::new(RefCell::new(HashMap::new()));
         let server = Rc::new(Server::new(FakeBackend {
             takeover: takeover.clone(),
             allow_file,
@@ -4018,6 +4395,7 @@ mod tests {
             clipboard: RefCell::new(String::new()),
             field: field.clone(),
             active: active.clone(),
+            nodes: nodes.clone(),
         }));
         let (stdin, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, client_out) = tokio::io::duplex(64 * 1024);
@@ -4031,6 +4409,7 @@ mod tests {
             field,
             active,
             takeover,
+            nodes,
         }
     }
 
@@ -4381,6 +4760,200 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    /// The fake window as a KDE app with its menu bar hidden behind a
+    /// hamburger button: File (Qt-style popup, entries in the tree while
+    /// closed) and Tools (Firefox-style, empty until opened).
+    fn fake_menus(s: &Session) {
+        *s.focus.borrow_mut() = Info {
+            role: "frame".into(),
+            name: "notes.txt — Fake".into(),
+            showing: true,
+            states: vec!["active"],
+            children: vec![20],
+            ..Info::default()
+        };
+        let mut n = s.nodes.borrow_mut();
+        let mut bar = fake_node("menu bar", "", &[21, 30]);
+        bar.showing = false;
+        bar.actions.clear();
+        n.insert(20, bar);
+        let mut file = fake_node("menu item", "&File", &[22]);
+        file.actions = vec!["Show Menu".into()];
+        n.insert(21, file);
+        n.insert(22, fake_node("popup menu", "", &[23, 28, 24, 25]));
+        n.insert(23, fake_node("menu item", "Save As…", &[]));
+        n.insert(28, fake_node("separator", "", &[]));
+        let mut quit = fake_node("menu item", "Quit", &[]);
+        quit.states = vec!["disabled"];
+        n.insert(24, quit);
+        let mut recent = fake_node("menu item", "Open Recent", &[26]);
+        recent.actions = vec!["Show Menu".into()];
+        n.insert(25, recent);
+        n.insert(26, fake_node("popup menu", "", &[27]));
+        n.insert(27, fake_node("menu item", "a.txt", &[]));
+        let mut tools = fake_node("menu", "Tools", &[]);
+        tools.actions = vec!["click".into()];
+        n.insert(30, tools);
+    }
+
+    #[test]
+    fn menu_lists_and_invokes_entries_by_path() {
+        local(async {
+            let mut s = session("menu");
+            fake_menus(&s);
+            let r = call_tool(&mut s, 2, "menu", json!({"app": "fake"})).await;
+            let text = reply_text(&r).to_string();
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(text.starts_with("fake's menu bar (hidden"), "{text}");
+            assert!(text.contains("[1] menu item \"&File\" (submenu)"), "{text}");
+            assert!(text.contains("[2] menu \"Tools\" (submenu)"), "{text}");
+            let r = call_tool(
+                &mut s,
+                3,
+                "menu",
+                json!({"app": "fake", "path": "file > SAVE AS"}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "\"&File > Save As…\" -> ok; effect: no visible change",
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 23");
+            let r = call_tool(
+                &mut s,
+                4,
+                "menu",
+                json!({"app": "fake", "path": ["File", "recent"]}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(text.starts_with("\"&File > Open Recent\":\n"), "{text}");
+            assert!(text.contains("menu item \"a.txt\""), "{text}");
+            let r = call_tool(
+                &mut s,
+                5,
+                "menu",
+                json!({"app": "fake", "path": "File > Quit"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("is disabled"), "{r}");
+            let r = call_tool(
+                &mut s,
+                6,
+                "menu",
+                json!({"app": "fake", "path": "File > Print"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("there are: \"Save As…\", \"Quit\", \"Open Recent\""),
+                "{r}"
+            );
+            let before = s.keys.borrow().len();
+            // Tools has no entries until opened: opened, then the entry runs.
+            let r = call_tool(
+                &mut s,
+                7,
+                "menu",
+                json!({"app": "fake", "path": "Tools > Opened"}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "\"Tools > Opened\" -> ok; effect: no visible change",
+                "{r}"
+            );
+            assert_eq!(
+                s.keys.borrow()[before..].to_vec(),
+                vec!["action 0 on 30".to_string(), "action 0 on 99".to_string()]
+            );
+            let r = call_tool(&mut s, 8, "menu", json!({"app": "evil"})).await;
+            assert!(reply_text(&r).contains("is not in"), "{r}");
+        });
+    }
+
+    #[test]
+    fn close_window_names_one_window_and_needs_confirmation() {
+        local(async {
+            let mut s = session("close");
+            let r = call_tool(&mut s, 2, "close_window", json!({"query": "fake"})).await;
+            assert!(reply_text(&r).contains("2 windows match 'fake'"), "{r}");
+            let r = call_tool(&mut s, 3, "close_window", json!({"query": "konsole"})).await;
+            assert!(
+                reply_text(&r).contains("no window of an allowed app"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 4, "close_window", json!({"query": "notes"})).await;
+            let text = reply_text(&r);
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                text.contains("close_window on fake {\"query\":\"notes\"}")
+                    && text.contains("unsaved work")
+                    && text.contains("confirm: true"),
+                "{text}"
+            );
+            // Confirmed: it reaches the backend, which has no window control.
+            let r = call_tool(
+                &mut s,
+                5,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            assert!(reply_text(&r).contains(backend::NO_WINDOW_CONTROL), "{r}");
+            assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn windows_lines_show_desktops() {
+        let mut w = WindowGeo {
+            title: "a".into(),
+            app: "kate".into(),
+            output: "eDP-1".into(),
+            desktops: vec!["2".into()],
+            ..WindowGeo::default()
+        };
+        assert!(describe_window(&w).ends_with(" on eDP-1, desktop 2"));
+        w.desktops = vec!["all".into()];
+        assert!(describe_window(&w).ends_with(", all desktops"));
+        w.desktops = vec!["1".into(), "3".into()];
+        assert!(describe_window(&w).ends_with(", desktops 1,3"));
+        let d = |number, name: &str, current, output: &str| backend::Desktop {
+            number,
+            name: name.into(),
+            current,
+            output: output.into(),
+        };
+        assert_eq!(
+            desktops_line(&[d(1, "Masaüstü 1", true, ""), d(2, "2", false, "")]),
+            "desktops: 1 'Masaüstü 1' (current), 2"
+        );
+        assert_eq!(
+            desktops_line(&[d(1, "1", true, "DP-1"), d(5, "mail", false, "DP-1")]),
+            "workspaces: 1 (shown on DP-1), 5 'mail' (on DP-1)"
+        );
+        assert_eq!(
+            desktops_line(&[d(0, "mail", true, "DP-1")]),
+            "workspaces: 'mail' (shown on DP-1)"
+        );
+        assert_eq!(
+            desktop_arg(&json!({"desktop": 2})).unwrap(),
+            Some("2".into())
+        );
+        assert_eq!(
+            desktop_arg(&json!({"desktop": " Web "})).unwrap(),
+            Some("Web".into())
+        );
+        assert_eq!(desktop_arg(&json!({})).unwrap(), None);
+        assert!(desktop_arg(&json!({"desktop": true})).is_err());
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(menu_action(&names(&["Show Menu", "Press"])), Some(1));
+        assert_eq!(menu_action(&names(&["<Alt>D;"])), Some(0));
+        assert_eq!(menu_action(&[]), None);
     }
 
     #[test]

@@ -41,6 +41,12 @@ const READ_ONLY: [&str; 12] = [
     "cursor_position",
 ];
 
+/// Tools that change something but destroy nothing: they raise, arrange or
+/// start windows. Every other tool that is not read-only gets
+/// `destructiveHint`: close_window, and the input tools, which can do
+/// anything the user could (focus may click; a wheel changes a slider).
+const NOT_DESTRUCTIVE: [&str; 3] = ["activate_window", "move_window", "launch"];
+
 /// Input tools that take an optional `window` (title or app-name
 /// substring): they activate the matching window first unless it is
 /// already in front.
@@ -59,8 +65,10 @@ pub const WINDOW_TOOLS: [&str; 10] = [
 
 /// Input tools that report an `effect` line and take `observe` and
 /// `settle_ms`: what to look at once the input settled.
-pub const OBSERVE_TOOLS: [&str; 8] = [
+pub const OBSERVE_TOOLS: [&str; 10] = [
     "act",
+    "menu",
+    "close_window",
     "set_text",
     "click",
     "drag",
@@ -79,22 +87,22 @@ pub const OBSERVE_KINDS: [&str; 5] = ["none", "effect", "focus", "tree", "screen
 /// costs context in every session: keep it short.
 pub const INSTRUCTIONS: &str = "\
 Controls GUI apps on the user's desktop (KDE Plasma; also Hyprland, Windows) through the \
-accessibility tree, with real keyboard and mouse input where needed.
+accessibility tree, with real keyboard and mouse input.
 
 Workflow:
 - apps lists running apps and marks the allowed ones. find (app + query) locates elements; \
 act, click, focus, get_text, set_text and scroll take the target themselves, so find-and-act \
-is one call. tree shows structure (document=true: a browser's page only); find is cheaper.
+is one call. tree shows structure; find is cheaper.
 - Target: `id` from tree/find, or `app` + `query` (+ `role`): the first visible element whose \
 name equals `query` (case-insensitive) wins, else the first whose name or text contains it. \
 Window and tab titles count only when nothing else matches or `role` names that role. The \
 reply starts with the element picked.
 - batch runs steps in one round trip when later steps don't depend on reading a result. \
-Mark waits \"optional\": true and end with an observation step (find, get_text). A later \
+Mark waits \"optional\": true and end with an observation step. A later \
 step's `id` (or root_id/from_id/to_id) may be \"$N\": the element step N found or acted on \
 (find: its first hit).
 - Input tools (key, type_text, click, mouse, scroll, focus, drag, set_text, act, screenshot) \
-take `window` (title or app-name substring): pass it instead of a separate activate_window \
+take `window` (title or app substring): pass it instead of a separate activate_window \
 step; it activates that window only when it isn't in front. Without it, input fails while \
 the user's terminal is in front.
 - click, mouse and scroll take `modifiers` (e.g. [\"ctrl\"]); hold keeps a key or button \
@@ -107,14 +115,16 @@ state (state=enabled…) or a window (window=…), never as a sleep; wait_idle u
 stops changing. tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
 view after the input settled: no separate call.
-- screenshot is a last resort; the image comes back inline (don't Read the file). To click \
+- menu (app + path, e.g. \"File > Save As\") runs a menu bar entry; without path it lists \
+the entries.
+- screenshot is a last resort (inline image: don't Read the file). To click \
 something seen only in it, pass its pixel position to mouse as image_x/image_y; \
 `region`=[x, y, w, h] zooms in.
 
-Allowlist: only apps listed in the user's allowlist file can be read, activated or sent input, \
-and input only goes to an allowed active window. An app may be limited to a tier: view \
+Allowlist: only apps in the user's allowlist file can be read, activated or sent input, and \
+input only goes to an allowed active window. An app may be limited to a tier: view \
 (read only) or click (no typing or keys). When a refusal says to, ask the user and retry with \
-confirm: true only if they agree. Password fields are never read, and only filled in if the \
+confirm: true only if they agree. Password fields are never read, and filled in only if the \
 user allowed it. Errors name the file; changing it is the user's decision. When tools fail as if the setup \
 were broken (AT-SPI, virtual input, KWin, screenshots), run doctor.
 
@@ -338,12 +348,12 @@ pub fn tools() -> Json {
         ),
         t(
             "windows",
-            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state and output, after the\nscreens (name, geometry, scale). Terminal windows also list each tab's\npseudo-terminal with its foreground command and directory. `query` filters\nby title or app name. KDE Plasma and Hyprland.",
+            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state, output and virtual desktop\n(Hyprland: workspace), after the screens (name, geometry, scale) and the\ndesktops (number, name, the current one). Terminal windows also list each\ntab's pseudo-terminal with its foreground command and directory. `query`\nfilters by title or app name. KDE Plasma and Hyprland.",
             schema(&[("query", "string", Some(json!("")))])
         ),
         t(
             "move_window",
-            "Move and/or resize the first window of an allowed app whose title or\napp name contains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), or set `state` to maximize, minimize or restore.\nReplies with the new geometry. KDE Plasma and Hyprland (there a tiled\nwindow is floated to move or resize it; minimize parks it on the special\nworkspace special:minimized).",
+            "Move and/or resize the first window of an allowed app whose title or\napp name contains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), set `state` to maximize, minimize or restore, and/or\nmove it to virtual desktop `desktop` (number or name as windows lists them;\nHyprland: a workspace, created when the number is new; the view stays).\nReplies with the new geometry. KDE Plasma and Hyprland (there a tiled\nwindow is floated to move or resize it; minimize parks it on the special\nworkspace special:minimized).",
             schema(&[
                 ("query", "string", None),
                 ("x", "integer", Some(Json::Null)),
@@ -351,7 +361,21 @@ pub fn tools() -> Json {
                 ("width", "integer", Some(Json::Null)),
                 ("height", "integer", Some(Json::Null)),
                 ("state", "string", Some(Json::Null)),
+                ("desktop", "string", Some(Json::Null)),
             ])
+        ),
+        t(
+            "close_window",
+            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes, which the reply then says. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma and\nHyprland.",
+            schema(&[
+                ("query", "string", None),
+                ("confirm", "boolean", Some(json!(false))),
+            ])
+        ),
+        t(
+            "menu",
+            "Use an app's menu bar by labels, in one call: `path` is a list\n([\"File\", \"Save As…\"]) or one string (\"File > Save As\"), in the app's\nlanguage. Labels match case-insensitively, without & or _ markers or a\ntrailing ellipsis; a unique part is enough. The last entry's action runs\n(the reply notes a dialog it opened). Without `path`, lists the top\nlevel; a path ending at a submenu lists its entries with ids instead.\nWorks on the active window's menu bar even when hidden behind a\nhamburger button (KDE apps). Firefox lists a menu's entries only while\nit is open: open it with key (e.g. alt+f) first.",
+            schema(&[("app", "string", None), ("path", "array", Some(Json::Null)),])
         ),
         t(
             "launch",
@@ -398,6 +422,15 @@ pub fn tools() -> Json {
         if let Some(m) = tool["inputSchema"]["properties"].get_mut("modifiers") {
             m["items"] = json!({ "type": "string", "enum": ["ctrl", "shift", "alt", "meta"] });
         }
+        if tool["name"] == "menu" {
+            tool["inputSchema"]["properties"]["path"] = json!({
+                "type": ["array", "string"],
+                "items": { "type": "string" },
+            });
+        }
+        if tool["name"] == "move_window" {
+            tool["inputSchema"]["properties"]["desktop"]["type"] = json!(["string", "integer"]);
+        }
         if WINDOW_TOOLS.contains(&tool["name"].as_str().unwrap()) {
             tool["inputSchema"]["properties"]["window"] = json!({
                 "type": "string",
@@ -416,7 +449,7 @@ pub fn tools() -> Json {
                 "type": "string",
                 "enum": OBSERVE_KINDS,
                 "default": "none",
-                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds nothing and costs nothing; act reports the effect line by default."
+                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds nothing and costs nothing; act, menu and close_window report the effect line by default."
             });
             props["settle_ms"] = json!({
                 "type": "integer",
@@ -424,9 +457,19 @@ pub fn tools() -> Json {
                 "description": "Longest wait for the app to react before the effect line and observation; ends early once it changed."
             });
         }
-        if READ_ONLY.contains(&tool["name"].as_str().unwrap()) {
+        let name = tool["name"].as_str().unwrap().to_string();
+        let name = name.as_str();
+        if READ_ONLY.contains(&name) {
             tool["annotations"] = json!({ "readOnlyHint": true });
-        } else if tool["name"] != "batch" {
+        } else {
+            // MCP assumes a tool that is not read-only may be destructive;
+            // say which ones only arrange or start things.
+            tool["annotations"] = json!({
+                "readOnlyHint": false,
+                "destructiveHint": !NOT_DESTRUCTIVE.contains(&name),
+            });
+        }
+        if !READ_ONLY.contains(&name) && name != "batch" {
             tool["inputSchema"]["properties"]["confirm"] = json!({
                 "type": "boolean",
                 "description": CONFIRM
@@ -449,6 +492,12 @@ mod tests {
             assert_eq!(ro, READ_ONLY.contains(&name), "{name}");
             let c = tool["inputSchema"]["properties"]["confirm"]["type"] == json!("boolean");
             assert_eq!(c, !ro && name != "batch", "{name} confirm");
+            let destructive = tool["annotations"]["destructiveHint"] == json!(true);
+            assert_eq!(
+                destructive,
+                !ro && !NOT_DESTRUCTIVE.contains(&name),
+                "{name} destructive"
+            );
             // wait_for's `window` is what it waits for, not one to activate.
             let w = tool["inputSchema"]["properties"]["window"]["description"].is_string();
             assert_eq!(w, WINDOW_TOOLS.contains(&name), "{name} window");
@@ -461,8 +510,15 @@ mod tests {
             .iter()
             .map(|t| t["name"].clone())
             .collect();
-        for name in READ_ONLY {
+        for name in READ_ONLY.iter().chain(&NOT_DESTRUCTIVE) {
             assert!(names.contains(&json!(name)), "{name} missing");
         }
+        let close = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "close_window")
+            .unwrap();
+        assert_eq!(close["annotations"]["destructiveHint"], json!(true));
     }
 }

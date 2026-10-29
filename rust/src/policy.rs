@@ -69,15 +69,17 @@ impl fmt::Display for Tier {
 /// later is never let through by mistake.
 pub fn needed_tier(tool: &str, args: &Json) -> Tier {
     match tool {
-        "apps" | "windows" | "doctor" | "tree" | "find" | "get_text" | "wait_for"
-        | "screenshot" | "pause" | "clipboard_get" | "activate_window" | "batch" => Tier::View,
+        "apps" | "windows" | "doctor" | "tree" | "find" | "get_text" | "wait_for" | "wait_idle"
+        | "screenshot" | "pause" | "clipboard_get" | "cursor_position" | "activate_window"
+        | "batch" => Tier::View,
         // Starting an app with arguments can run anything it can.
         "launch" => match args.get("args").and_then(Json::as_array) {
             Some(list) if !list.is_empty() => Tier::Full,
             _ => Tier::Click,
         },
-        "act" | "click" | "focus" | "scroll" | "drag" | "mouse" | "move_window"
+        "act" | "menu" | "click" | "focus" | "scroll" | "drag" | "mouse" | "move_window"
         | "close_window" => Tier::Click,
+        // hold presses keys as well as buttons.
         _ => Tier::Full,
     }
 }

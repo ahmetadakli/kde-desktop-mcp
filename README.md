@@ -91,6 +91,9 @@ Why it is fast:
   `screenshot`, `pause`, `clipboard_get`, `windows`, `doctor`) carry MCP's
   `readOnlyHint`;
   Claude Code runs several of them in parallel when asked for in one message.
+  The others carry `destructiveHint`: true for `close_window` and the input
+  tools (which can do whatever the user could), false for `activate_window`,
+  `move_window` and `launch`.
 
 ## On-screen indicator
 
@@ -222,11 +225,36 @@ tool; `off` turns it off). Not available on Windows yet.
 - `pause`: waits a fixed time (`ms`, at most 10 minutes); for waiting on time
   only, not on a visible change.
 - `windows`: lists windows of allowed apps with position, size, state (active,
-  maximized, minimized) and output in screen coordinates, after the screen
-  layout (name, area, scale) (KDE and Hyprland).
-- `move_window`: moves, resizes, maximizes, minimizes or restores a window;
-  waits (at most 1 s) until the window has its new geometry and reports the
-  real result (KDE and Hyprland; see the Hyprland limitations).
+  maximized, minimized), output and virtual desktop in screen coordinates,
+  after the screen layout (name, area, scale) and the virtual desktops
+  (KDE: number, name, the current one; Hyprland: the regular workspaces and
+  the monitor each is on) (KDE and Hyprland).
+- `move_window`: moves, resizes, maximizes, minimizes or restores a window,
+  and with `desktop` (a number or name as `windows` lists them) moves it to
+  that virtual desktop (KDE: the window is then on that one only) or
+  workspace (Hyprland: silently, the view stays; a new number makes the
+  workspace); waits (at most 1 s) until the window has its new geometry and
+  reports the real result (KDE and Hyprland; see the Hyprland limitations).
+- `close_window`: closes the one window whose title or app name contains
+  `query` (several matches: an error listing them) as its close button does
+  (KWin `closeWindow()`, Hyprland `closewindow`), so an app with unsaved
+  changes still asks; the reply then says the window is still open. Always
+  needs the user's consent, as tools on the `confirm:` list do (see
+  [Tiers, confirmation and password fields](#tiers-confirmation-and-password-fields)).
+- `menu`: runs a menu bar entry by its labels in one call: `path` is a list
+  (`["Dosya", "Farklı Kaydet…"]`) or one string (`"Dosya > Farklı Kaydet"`).
+  Labels are matched case-insensitively (Turkish dotted and dotless i
+  alike), without `&`/`_` accelerator markers, a shortcut after a tab or a
+  trailing ellipsis; an exact label wins, else a unique part of one. Without
+  `path` it lists the top level, and a path ending at a submenu lists that
+  submenu's entries with ids (read-only where the app keeps closed submenus
+  in the tree). Qt and GTK apps keep closed submenus' entries in the tree, so
+  nothing is opened. KDE apps that replace the menu bar with a hamburger
+  button ("Menüyü Aç", which has no accessibility action and no children)
+  keep the hidden menu bar in the tree, and its entries work: `menu` finds it
+  too (Kate, Dolphin). Firefox fills a menu only while it is open; `menu`
+  does not open Firefox menus itself (doing so through accessibility hung or
+  crashed a fresh Firefox in tests), so open the menu with `key` first.
 - `launch`: starts an allowed app (`app`, e.g. `kate`) with an optional `args`
   list (no shell; its `.desktop` file first, else the program on `PATH`) and
   waits until its window opens (`wait_ms`, default 15 s, at most 60 s; 0 does
@@ -327,9 +355,9 @@ passwords: keepassxc
 
 | tier | allows |
 | --- | --- |
-| `view` | `tree`, `find`, `get_text`, `wait_for`, `screenshot`, `clipboard_get` (and `activate_window`) |
-| `click` | plus `act`, `click`, `focus`, `scroll`, `drag`, `mouse`, `move_window`, `launch` without `args` |
-| `full` | plus `key`, `type_text`, `set_text`, `clipboard_set`, `file_dialog`, `launch` with `args` |
+| `view` | `tree`, `find`, `get_text`, `wait_for`, `wait_idle`, `screenshot`, `clipboard_get`, `cursor_position` (and `activate_window`) |
+| `click` | plus `act`, `menu`, `click`, `focus`, `scroll`, `drag`, `mouse`, `move_window`, `close_window`, `launch` without `args` |
+| `full` | plus `key`, `hold`, `type_text`, `set_text`, `clipboard_set`, `file_dialog`, `launch` with `args` |
 
 The tier is checked against the app a call reaches: the target element's app
 for element tools, the active window's app for keyboard and pointer input
@@ -575,6 +603,14 @@ Hyprland:
   of a maximized window also focus it.
 - Moving or resizing a tiled window makes it floating first (`setfloating`);
   it stays floating afterwards.
+- Hyprland 0.57 takes only Lua dispatchers over its socket (`hyprctl
+  dispatch X` became `hl.dispatch(X)`). The server notices the first Lua
+  error and then sends Lua forms (`hl.dsp.window.move`,
+  `hl.dsp.window.close`) for moving windows between workspaces (including
+  minimize) and closing them; its other dispatchers (focus, floating,
+  geometry, fullscreen, cursor) have no Lua form yet and fail there with a
+  message saying so. Named workspaces have no number there; `windows` lists
+  them by name.
 
 Windows:
 - Input cannot be sent to windows running as administrator from a server that

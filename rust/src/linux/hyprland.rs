@@ -1,12 +1,13 @@
 //! Hyprland's request socket, spoken directly instead of spawning `hyprctl`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value as Json;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
-use crate::backend::{R, Screen, WindowChange, WindowGeo};
+use crate::backend::{Desktop, R, Screen, WindowChange, WindowGeo};
 
 /// Where `move_window` state=minimize parks a window: Hyprland has no
 /// minimize, so a special workspace nothing shows unless toggled.
@@ -17,6 +18,9 @@ const BATCH_SEP: &str = "\n\n\n";
 
 pub struct Hypr {
     socket: PathBuf,
+    /// Set once Hyprland (0.57 and later) answered a dispatcher with a Lua
+    /// error: it then takes `hl.dsp.*` calls, see `lua_dispatch`.
+    lua: AtomicBool,
 }
 
 impl Hypr {
@@ -37,7 +41,14 @@ impl Hypr {
             .find(|p| p.exists())
             .unwrap_or(&candidates[0])
             .clone();
-        Some(Hypr { socket })
+        Some(Hypr::at(socket))
+    }
+
+    fn at(socket: PathBuf) -> Self {
+        Hypr {
+            socket,
+            lua: AtomicBool::new(false),
+        }
     }
 
     async fn request(&self, cmd: &str) -> R<String> {
@@ -63,13 +74,27 @@ impl Hypr {
         serde_json::from_str(&raw).map_err(|e| format!("hyprctl {args}: {e}: {raw}"))
     }
 
-    /// `hyprctl dispatch <args>`.
+    /// `hyprctl dispatch <args>`; see `dispatch_all`.
     pub async fn dispatch(&self, args: &str) -> R<()> {
-        let out = self.request(&format!("dispatch {args}")).await?;
-        match out.trim() {
-            "ok" | "" => Ok(()),
-            other => Err(format!("hyprctl dispatch {args}: {other}")),
+        self.dispatch_all(&[args.to_string()]).await
+    }
+
+    /// The dispatchers to send: as given (the classic syntax), or their
+    /// Lua forms once Hyprland asked for those; Err names one that has none.
+    fn for_syntax(&self, args: &[String]) -> R<Vec<String>> {
+        if !self.lua.load(Ordering::Relaxed) {
+            return Ok(args.to_vec());
         }
+        args.iter()
+            .map(|a| {
+                lua_dispatch(a).ok_or_else(|| {
+                    format!(
+                        "hyprctl dispatch {a}: this Hyprland takes Lua dispatchers \
+                         (hl.dsp.*), and this one has no Lua form here yet"
+                    )
+                })
+            })
+            .collect()
     }
 
     /// The cursor position in layout coordinates (`hyprctl cursorpos`).
@@ -94,16 +119,26 @@ impl Hypr {
     }
 
     /// `hyprctl --batch "dispatch a; dispatch b"`; Err names the first that
-    /// failed.
+    /// failed. Classic dispatchers (`movetoworkspacesilent 2,address:…`)
+    /// go as they are until Hyprland rejects one as not Lua (0.57 and
+    /// later); from then on their Lua forms are sent instead.
     pub async fn dispatch_all(&self, args: &[String]) -> R<()> {
         if args.is_empty() {
             return Ok(());
         }
-        let cmds: Vec<String> = args.iter().map(|a| format!("dispatch {a}")).collect();
+        let was_lua = self.lua.load(Ordering::Relaxed);
+        let sent = self.for_syntax(args)?;
+        let cmds: Vec<String> = sent.iter().map(|a| format!("dispatch {a}")).collect();
         let replies = self.batch(&cmds).await?;
-        for (i, a) in args.iter().enumerate() {
+        for (i, a) in sent.iter().enumerate() {
             match replies.get(i).map(|r| r.trim()) {
                 Some("ok" | "") => {}
+                // This one and those after it go again in Lua; the ones
+                // before it are done.
+                Some(other) if !was_lua && wants_lua(other) => {
+                    self.lua.store(true, Ordering::Relaxed);
+                    return Box::pin(self.dispatch_all(&args[i..])).await;
+                }
                 Some(other) => return Err(format!("hyprctl dispatch {a}: {other}")),
                 None => return Err(format!("hyprctl dispatch {a}: no reply")),
             }
@@ -111,9 +146,10 @@ impl Hypr {
         Ok(())
     }
 
-    /// Clients, monitors and the active window in one round trip.
+    /// Clients, monitors, the active window and the workspaces in one
+    /// round trip.
     pub async fn snapshot(&self) -> R<Snapshot> {
-        let cmds = ["j/clients", "j/monitors", "j/activewindow"].map(String::from);
+        let cmds = ["j/clients", "j/monitors", "j/activewindow", "j/workspaces"].map(String::from);
         let replies = self.batch(&cmds).await?;
         let parse = |i: usize| -> R<Json> {
             let raw = replies.get(i).map(|r| r.trim()).unwrap_or("");
@@ -126,6 +162,7 @@ impl Hypr {
         Ok(Snapshot {
             clients: parse(0)?,
             monitors: parse(1)?,
+            workspaces: parse(3)?,
             active: active["address"].as_str().unwrap_or("").to_string(),
         })
     }
@@ -141,12 +178,61 @@ impl Hypr {
     }
 }
 
-/// What `Hypr::snapshot` read: `clients -j`, `monitors -j` and the active
-/// window's address ("" when none).
+/// Whether a dispatch reply says Hyprland wanted Lua (0.57 made
+/// `hyprctl dispatch X` shorthand for `hl.dispatch(X)`).
+fn wants_lua(reply: &str) -> bool {
+    reply.contains("hl.dispatch")
+}
+
+/// A Lua string literal.
+fn lua_str(s: &str) -> String {
+    let mut out = String::from("\"");
+    for c in s.chars() {
+        match c {
+            '\\' | '"' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The Lua form (Hyprland 0.57+) of the classic dispatchers this server
+/// sends to move windows between workspaces and close them; None for the
+/// others.
+pub fn lua_dispatch(cmd: &str) -> Option<String> {
+    let (name, args) = cmd.split_once(' ').unwrap_or((cmd, ""));
+    match name {
+        "movetoworkspacesilent" => {
+            let (ws, window) = args.split_once(',')?;
+            let ws = match ws.parse::<i64>() {
+                Ok(n) => n.to_string(),
+                Err(_) => lua_str(ws),
+            };
+            Some(format!(
+                "hl.dsp.window.move({{workspace = {ws}, window = {}, follow = false}})",
+                lua_str(window)
+            ))
+        }
+        "closewindow" => Some(format!(
+            "hl.dsp.window.close({{window = {}}})",
+            lua_str(args)
+        )),
+        _ => None,
+    }
+}
+
+/// What `Hypr::snapshot` read: `clients -j`, `monitors -j`,
+/// `workspaces -j` and the active window's address ("" when none).
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub clients: Json,
     pub monitors: Json,
+    pub workspaces: Json,
     pub active: String,
 }
 
@@ -274,6 +360,7 @@ pub fn clients_of(snap: &Snapshot) -> Vec<Client> {
                         .and_then(|p| u32::try_from(p).ok())
                         .unwrap_or(0),
                     terminals: Vec::new(),
+                    desktops: workspace_label(&c["workspace"]).into_iter().collect(),
                 },
                 initial_class: text("initialClass"),
                 floating: c["floating"].as_bool().unwrap_or(false),
@@ -285,19 +372,106 @@ pub fn clients_of(snap: &Snapshot) -> Vec<Client> {
         .collect()
 }
 
+/// A workspace's name, else its id; None for neither.
+fn workspace_label(ws: &Json) -> Option<String> {
+    match ws["name"].as_str().filter(|n| !n.is_empty()) {
+        Some(n) => Some(n.to_string()),
+        None => ws["id"].as_i64().map(|id| id.to_string()),
+    }
+}
+
+fn is_special(ws: &Json) -> bool {
+    ws["id"].as_i64().is_some_and(|id| id < 0)
+        || ws["type"] == "special"
+        || ws["name"]
+            .as_str()
+            .is_some_and(|n| n.starts_with("special"))
+}
+
+/// The regular workspaces, numbered ones first; those a monitor shows are
+/// current. Hyprland 0.57 gives named workspaces no id (number 0 here).
+pub fn workspaces_of(snap: &Snapshot) -> Vec<Desktop> {
+    let shown: Vec<String> = snap
+        .monitors
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| workspace_label(&m["activeWorkspace"]))
+        .collect();
+    let mut list: Vec<Desktop> = snap
+        .workspaces
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|w| !is_special(w))
+        .filter_map(|w| {
+            let name = workspace_label(w)?;
+            Some(Desktop {
+                number: w["id"].as_i64().unwrap_or(0),
+                current: shown.contains(&name),
+                output: w["monitor"].as_str().unwrap_or("").to_string(),
+                name,
+            })
+        })
+        .collect();
+    list.sort_by(|a, b| {
+        (a.number == 0, a.number, &a.name).cmp(&(b.number == 0, b.number, &b.name))
+    });
+    list
+}
+
+/// The `movetoworkspacesilent` argument for `want`: a number as it is
+/// (Hyprland makes the workspace when needed), else an existing regular
+/// workspace's name (case-insensitive).
+pub fn workspace_target(snap: &Snapshot, want: &str) -> R<String> {
+    let want = want.trim();
+    if !want.is_empty() && want.parse::<i64>().is_ok_and(|n| n > 0) {
+        return Ok(want.to_string());
+    }
+    let list = workspaces_of(snap);
+    match list.iter().find(|d| d.name.eq_ignore_ascii_case(want)) {
+        Some(d) if d.number > 0 => Ok(d.number.to_string()),
+        Some(d) => Ok(format!("name:{}", d.name)),
+        None => Err(format!(
+            "no workspace '{want}'; give a number, or one of: {}",
+            list.iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+/// The dispatcher that asks `c` to close, as its close button does
+/// (`killwindow` would end it without asking).
+pub fn close_command(c: &Client) -> String {
+    format!("closewindow address:{}", c.address)
+}
+
 /// Dispatchers that apply `change` to `c`, for one batch. `back` is the
 /// workspace a minimized client returns to (its monitor's). Hyprland's
 /// fullscreenstate only acts on the focused window, so maximize and
 /// leaving it focus the client first. Geometry needs a floating window:
 /// a tiled one is floated, and then takes every field (the tiled size for
 /// those not given) since floating places it anew. A resize is followed
-/// by a move, as Hyprland keeps the centre and not the corner.
-pub fn change_commands(c: &Client, change: &WindowChange, back: Option<i64>) -> R<Vec<String>> {
+/// by a move, as Hyprland keeps the centre and not the corner. `desk`
+/// (from `workspace_target`) moves it to that workspace first, which also
+/// takes it out of the minimized one.
+pub fn change_commands(
+    c: &Client,
+    change: &WindowChange,
+    back: Option<i64>,
+    desk: Option<&str>,
+) -> R<Vec<String>> {
     let addr = format!("address:{}", c.address);
     let mut cmds = Vec::new();
     let mut fullscreen = c.fullscreen != 0;
+    if let Some(ws) = desk {
+        cmds.push(format!("movetoworkspacesilent {ws},{addr}"));
+    }
+    let minimized = c.geo.minimized && desk.is_none();
     let unminimize = |cmds: &mut Vec<String>| -> R<()> {
-        if c.geo.minimized {
+        if minimized {
             let ws = back.ok_or("cannot tell which workspace to restore the window to")?;
             cmds.push(format!("movetoworkspacesilent {ws},{addr}"));
         }
@@ -312,7 +486,7 @@ pub fn change_commands(c: &Client, change: &WindowChange, back: Option<i64>) -> 
     };
     match change.state.as_deref() {
         Some("minimize") => {
-            if !c.geo.minimized {
+            if !minimized {
                 cmds.push(format!(
                     "movetoworkspacesilent {MINIMIZED_WORKSPACE},{addr}"
                 ));
@@ -416,6 +590,8 @@ mod tests {
         Snapshot {
             clients: serde_json::from_str(include_str!("testdata/hypr_clients.json")).unwrap(),
             monitors: serde_json::from_str(include_str!("testdata/hypr_monitors.json")).unwrap(),
+            workspaces: serde_json::from_str(include_str!("testdata/hypr_workspaces.json"))
+                .unwrap(),
             active: "0x55f94a3aaeb0".into(),
         }
     }
@@ -475,6 +651,7 @@ mod tests {
                 output: "HEADLESS-1".into(),
                 pid: 526509,
                 terminals: Vec::new(),
+                desktops: vec!["2".into()],
             }
         );
         assert_eq!((k.fullscreen, k.floating, k.monitor), (1, false, 1));
@@ -525,7 +702,7 @@ mod tests {
         let ka = "address:0x55f94a3aaeb0";
         // Tiled: floated first, then every field so it keeps its size.
         assert_eq!(
-            change_commands(b, &ask(Some(10.0), None, None), Some(1)).unwrap(),
+            change_commands(b, &ask(Some(10.0), None, None), Some(1), None).unwrap(),
             vec![
                 "setfloating address:0x55f94a444680".to_string(),
                 "resizewindowpixel exact 1038 1878,address:0x55f94a444680".into(),
@@ -536,7 +713,7 @@ mod tests {
         let mut floating = k.clone();
         floating.floating = true;
         assert_eq!(
-            change_commands(&floating, &ask(None, Some(500.4), None), None).unwrap(),
+            change_commands(&floating, &ask(None, Some(500.4), None), None, None).unwrap(),
             vec![
                 format!("focuswindow {ka}"),
                 "fullscreenstate 0 0".into(),
@@ -545,38 +722,140 @@ mod tests {
             ]
         );
         assert_eq!(
-            change_commands(k, &ask(None, None, Some("minimize")), None).unwrap(),
+            change_commands(k, &ask(None, None, Some("minimize")), None, None).unwrap(),
             vec![format!("movetoworkspacesilent special:minimized,{ka}")]
         );
         assert_eq!(
-            change_commands(k, &ask(None, None, Some("restore")), None).unwrap(),
+            change_commands(k, &ask(None, None, Some("restore")), None, None).unwrap(),
             vec![format!("focuswindow {ka}"), "fullscreenstate 0 0".into()]
         );
         assert!(
-            change_commands(k, &ask(None, None, Some("maximize")), None)
+            change_commands(k, &ask(None, None, Some("maximize")), None, None)
                 .unwrap()
                 .ends_with(&["fullscreenstate 1 1".to_string()])
         );
         // Minimized: back to its monitor's workspace.
         let aa = "address:0x55f94a3a5470";
         assert_eq!(
-            change_commands(a, &ask(None, None, Some("restore")), Some(2)).unwrap(),
+            change_commands(a, &ask(None, None, Some("restore")), Some(2), None).unwrap(),
             vec![format!("movetoworkspacesilent 2,{aa}")]
         );
         assert_eq!(
-            change_commands(a, &ask(None, None, Some("maximize")), Some(2)).unwrap(),
+            change_commands(a, &ask(None, None, Some("maximize")), Some(2), None).unwrap(),
             vec![
                 format!("movetoworkspacesilent 2,{aa}"),
                 format!("focuswindow {aa}"),
                 "fullscreenstate 1 1".into(),
             ]
         );
-        assert!(change_commands(a, &ask(None, None, Some("restore")), None).is_err());
+        assert!(change_commands(a, &ask(None, None, Some("restore")), None, None).is_err());
         assert!(
-            change_commands(a, &ask(None, None, Some("minimize")), None)
+            change_commands(a, &ask(None, None, Some("minimize")), None, None)
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn workspaces_are_listed_and_named_targets_resolved() {
+        let snap = fixture();
+        let list = workspaces_of(&snap);
+        let got: Vec<(i64, &str, bool, &str)> = list
+            .iter()
+            .map(|d| (d.number, d.name.as_str(), d.current, d.output.as_str()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (1, "1", true, "HEADLESS-2"),
+                (2, "2", true, "HEADLESS-1"),
+                (5, "mail", false, "HEADLESS-1"),
+            ]
+        );
+        let clients = clients_of(&snap);
+        assert_eq!(
+            by_title(&clients, "alpha term").geo.desktops,
+            vec!["special:minimized"]
+        );
+        assert_eq!(by_title(&clients, "beta term").geo.desktops, vec!["1"]);
+        assert_eq!(workspace_target(&snap, "3").unwrap(), "3");
+        assert_eq!(workspace_target(&snap, " MAIL ").unwrap(), "5");
+        let err = workspace_target(&snap, "web").unwrap_err();
+        assert!(err.contains("1, 2, mail"), "{err}");
+        assert!(workspace_target(&snap, "-1").is_err());
+        assert!(workspace_target(&snap, "special:minimized").is_err());
+    }
+
+    /// Hyprland 0.57 (captured): named and special workspaces have no id,
+    /// and every workspace an "address" and "type".
+    #[test]
+    fn named_workspaces_without_ids_are_listed_and_targeted_by_name() {
+        let snap = Snapshot {
+            workspaces: serde_json::json!([
+                {"address": "2", "id": 2, "type": "normal", "name": "2", "monitor": "WAYLAND-1"},
+                {"address": "mail", "type": "normal", "name": "mail", "monitor": "WAYLAND-1"},
+                {"address": "special:minimized", "type": "special",
+                 "name": "special:minimized", "monitor": "WAYLAND-1"}
+            ]),
+            monitors: serde_json::json!([{"id": 0, "name": "WAYLAND-1",
+                "activeWorkspace": {"address": "mail", "type": "normal", "name": "mail"},
+                "specialWorkspace": {"address": "", "type": "", "name": ""}}]),
+            ..Snapshot::default()
+        };
+        let list = workspaces_of(&snap);
+        let got: Vec<(i64, &str, bool)> = list
+            .iter()
+            .map(|d| (d.number, d.name.as_str(), d.current))
+            .collect();
+        assert_eq!(got, vec![(2, "2", false), (0, "mail", true)]);
+        assert_eq!(workspace_target(&snap, "Mail").unwrap(), "name:mail");
+        assert_eq!(workspace_target(&snap, "2").unwrap(), "2");
+    }
+
+    #[test]
+    fn classic_dispatchers_get_lua_forms() {
+        assert_eq!(
+            lua_dispatch("movetoworkspacesilent 3,address:0x1").unwrap(),
+            "hl.dsp.window.move({workspace = 3, window = \"address:0x1\", follow = false})"
+        );
+        assert_eq!(
+            lua_dispatch("movetoworkspacesilent name:a\"b,address:0x1").unwrap(),
+            "hl.dsp.window.move({workspace = \"name:a\\\"b\", window = \"address:0x1\", \
+             follow = false})"
+        );
+        assert_eq!(
+            lua_dispatch("closewindow address:0x1").unwrap(),
+            "hl.dsp.window.close({window = \"address:0x1\"})"
+        );
+        assert_eq!(lua_dispatch("setfloating address:0x1"), None);
+        assert!(wants_lua(
+            "error: 3 [string \"return hl.dispatch(closewindow address:0x1)\"]:1: ')' expected"
+        ));
+        assert!(!wants_lua("Invalid dispatcher"));
+    }
+
+    #[test]
+    fn desktop_moves_and_closes_become_dispatchers() {
+        let list = clients_of(&fixture());
+        let (k, a) = (by_title(&list, "K Hesap"), by_title(&list, "alpha term"));
+        let desk = WindowChange {
+            desktop: Some("3".into()),
+            ..WindowChange::default()
+        };
+        assert_eq!(
+            change_commands(k, &desk, Some(2), Some("3")).unwrap(),
+            vec!["movetoworkspacesilent 3,address:0x55f94a3aaeb0".to_string()]
+        );
+        // Out of special:minimized onto the workspace asked for, not back.
+        let restore = WindowChange {
+            state: Some("restore".into()),
+            ..desk
+        };
+        assert_eq!(
+            change_commands(a, &restore, None, Some("3")).unwrap(),
+            vec!["movetoworkspacesilent 3,address:0x55f94a3a5470".to_string()]
+        );
+        assert_eq!(close_command(k), "closewindow address:0x55f94a3aaeb0");
     }
 
     #[test]
@@ -593,7 +872,7 @@ mod tests {
         let listener = tokio::net::UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(async move {
             let mut got = Vec::new();
-            for _ in 0..6 {
+            for _ in 0..9 {
                 let (mut s, _) = listener.accept().await.unwrap();
                 let mut buf = vec![0u8; 256];
                 let n = s.read(&mut buf).await.unwrap();
@@ -602,10 +881,15 @@ mod tests {
                     "j/activewindow" => r#"{"address":"0x1","pid":42,"title":"t"}"#,
                     "dispatch movecursor 10 20" => "ok",
                     "j/cursorpos" => r#"{"x": 10, "y": 20}"#,
-                    "[[BATCH]]j/clients;j/monitors;j/activewindow" => {
-                        "[{\"address\":\"0x1\"}]\n\n\n[]\n\n\n{\"address\":\"0x1\"}"
+                    "[[BATCH]]j/clients;j/monitors;j/activewindow;j/workspaces" => {
+                        "[{\"address\":\"0x1\"}]\n\n\n[]\n\n\n{\"address\":\"0x1\"}\n\n\n[{\"id\":1,\"name\":\"1\"}]"
                     }
                     "[[BATCH]]dispatch a;dispatch b" => "ok\n\n\nInvalid dispatcher",
+                    "dispatch closewindow address:0x1" => {
+                        "error: [string \"return hl.dispatch(closewindow address:0x1)\"]"
+                    }
+                    "dispatch hl.dsp.window.close({window = \"address:0x1\"})"
+                    | "dispatch hl.dsp.window.close({window = \"address:0x2\"})" => "ok",
                     _ => "Invalid dispatcher",
                 };
                 s.write_all(reply.as_bytes()).await.unwrap();
@@ -613,7 +897,7 @@ mod tests {
             }
             got
         });
-        let h = Hypr { socket: path };
+        let h = Hypr::at(path);
         assert_eq!(h.active_window().await.unwrap().unwrap()["pid"], 42);
         h.dispatch("movecursor 10 20").await.unwrap();
         assert_eq!(h.cursor_pos().await.unwrap(), (10, 20));
@@ -625,6 +909,12 @@ mod tests {
         );
         let err = h.dispatch_all(&["a".into(), "b".into()]).await.unwrap_err();
         assert_eq!(err, "hyprctl dispatch b: Invalid dispatcher");
+        // Hyprland 0.57: the classic form fails as Lua, the Lua form is sent
+        // instead, and from then on right away.
+        h.dispatch("closewindow address:0x1").await.unwrap();
+        h.dispatch("closewindow address:0x2").await.unwrap();
+        let err = h.dispatch("setfloating address:0x1").await.unwrap_err();
+        assert!(err.contains("no Lua form"), "{err}");
         assert_eq!(
             server.await.unwrap(),
             vec![
@@ -632,8 +922,11 @@ mod tests {
                 "dispatch movecursor 10 20",
                 "j/cursorpos",
                 "dispatch nope",
-                "[[BATCH]]j/clients;j/monitors;j/activewindow",
+                "[[BATCH]]j/clients;j/monitors;j/activewindow;j/workspaces",
                 "[[BATCH]]dispatch a;dispatch b",
+                "dispatch closewindow address:0x1",
+                "dispatch hl.dsp.window.close({window = \"address:0x1\"})",
+                "dispatch hl.dsp.window.close({window = \"address:0x2\"})",
             ]
         );
     }
