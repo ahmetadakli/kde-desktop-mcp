@@ -196,7 +196,7 @@ it exits with the server. To turn it off, set the environment variable
   as `[n] tool failed (optional): …` and the remaining steps still run, so a
   final observation step (`find`, `screenshot`) is not lost.
 
-The `initialize` reply carries `instructions` (about 2.1 KB): the workflow,
+The `initialize` reply carries `instructions` (about 2.6 KB): the workflow,
 the targeting rules shared by the tools above, the allowlist and which tools
 to load together. Clients that load tool schemas on demand, such as Claude
 Code, show it at session start before any schema is loaded; the per-tool
@@ -224,6 +224,42 @@ Rules:
   opened for a listed app; a dialog opened by another app is refused.
 
 Use the `apps` tool to see the right names.
+
+### Tiers, confirmation and password fields
+
+An app can be limited to a tier with `app:tier`; a plain name means `full`, so
+files without tiers keep working unchanged:
+
+```text
+firefox                 # full: everything
+konsole:view            # read tools only
+dolphin:click           # no typing
+confirm: close_window, key:konsole
+passwords: keepassxc
+```
+
+| tier | allows |
+| --- | --- |
+| `view` | `tree`, `find`, `get_text`, `wait_for`, `screenshot`, `clipboard_get` (and `activate_window`) |
+| `click` | plus `act`, `click`, `focus`, `scroll`, `drag`, `mouse`, `move_window`, `launch` without `args` |
+| `full` | plus `key`, `type_text`, `set_text`, `clipboard_set`, `file_dialog`, `launch` with `args` |
+
+The tier is checked against the app a call reaches: the target element's app
+for element tools, the active window's app for keyboard and pointer input
+(both for `click`, `scroll` and `focus`). An app listed twice gets the lower
+tier; an unknown tier counts as `view`. A refusal names the tier.
+
+`confirm:` lists tools (`tool`) or tools in one app (`tool:app`) that need
+the user's consent per call. When the client supports MCP elicitation the
+server asks the user through it; otherwise the call is refused unless it
+carries `confirm: true` (the agent is told to ask the user first).
+
+Password fields (AT-SPI role `password text`, UIA `IsPassword`) never show
+their text in `tree`, `find` or `wait_for`, and `get_text` refuses them.
+`set_text`, and `type_text` while one has focus, refuse them too unless the
+app is on a `passwords:` line (`passwords: all` for every app) or the server
+runs with `DESKTOP_MCP_ALLOW_PASSWORDS=1`. `doctor` shows the tiers, the
+confirm list and the password setting.
 
 ## Installation
 

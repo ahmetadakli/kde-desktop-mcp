@@ -9,6 +9,7 @@
 mod backend;
 #[cfg(target_os = "linux")]
 mod linux;
+mod policy;
 mod render;
 mod shot;
 mod tools;
@@ -33,6 +34,7 @@ use tokio::sync::Mutex;
 use backend::{
     Backend, Cache, Clip, Fetch, FileDialog, Focused, Info, R, Shot, WindowChange, WindowGeo,
 };
+use policy::{Policy, Tier};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
@@ -127,7 +129,7 @@ fn name_is_stable<Id>(info: &Info<Id>) -> bool {
 /// accessibility note (both in `doctor`) only come when no app is allowed.
 fn apps_text(
     list: Vec<backend::AppEntry>,
-    allow: &[String],
+    allow: &Policy,
     allow_file: &std::path::Path,
     note: &str,
 ) -> String {
@@ -138,15 +140,18 @@ fn apps_text(
         if app.windows.is_empty() {
             continue;
         }
-        if !allow.contains(&app.name.to_lowercase()) {
+        let Some(tier) = allow.tier(&app.name) else {
             let active = app.windows.iter().any(|w| w.active);
             match blocked.iter_mut().find(|(n, _)| *n == app.name) {
                 Some((_, a)) => *a |= active,
                 None => blocked.push((app.name, active)),
             }
             continue;
-        }
-        lines.push(format!("{} (allowed)", app.name));
+        };
+        lines.push(match tier {
+            Tier::Full => format!("{} (allowed)", app.name),
+            t => format!("{} (allowed: {t} tier)", app.name),
+        });
         for w in app.windows {
             if w.title.is_empty() && !w.active {
                 continue;
@@ -193,6 +198,60 @@ struct Server<B: Backend> {
     /// `app_key`s of apps whose accessibility text writes report success
     /// and change nothing (Firefox); set_text types there right away.
     inert_writes: Mutex<HashSet<String>>,
+    /// The way back to the client, for requests the server sends it
+    /// (elicitation); see `Server::request`.
+    link: std::cell::RefCell<ClientLink>,
+}
+
+/// The server's side of requests it sends the client. `run_loop` sets `out`
+/// and hands responses to `pending`; `initialize` notes what the client can
+/// do.
+#[derive(Default)]
+struct ClientLink {
+    /// The client declared `elicitation` in initialize: it can ask the user.
+    elicitation: bool,
+    out: Option<tokio::sync::mpsc::UnboundedSender<Json>>,
+    /// Requests waiting for their response, by id (its JSON text).
+    pending: HashMap<String, tokio::sync::oneshot::Sender<Json>>,
+    next: u64,
+}
+
+/// How long a confirmation waits for the user's answer.
+const CONFIRM_WAIT: Duration = Duration::from_secs(300);
+
+/// The tool call running on this task, for the allowlist checks deep in
+/// the tools (`Server::permit`): its name, its arguments, and whether the
+/// user already confirmed it. Set by `call_inner` (per batch step too).
+struct Gate {
+    tool: String,
+    args: Json,
+    confirmed: bool,
+}
+
+tokio::task_local! {
+    static GATE: std::cell::RefCell<Gate>;
+}
+
+/// `tool` and its arguments, briefly, for a confirmation question: long
+/// texts cut, `confirm` and `window` left out.
+fn describe_call(tool: &str, app: Option<&str>, a: &Json) -> String {
+    let mut args = a.clone();
+    if let Some(map) = args.as_object_mut() {
+        map.remove("confirm");
+        for v in map.values_mut() {
+            if let Some(t) = v.as_str()
+                && t.chars().count() > 200
+            {
+                let cut: String = t.chars().take(200).collect();
+                *v = Json::String(format!("{cut}… ({} chars)", t.chars().count()));
+            }
+        }
+    }
+    let on = app.map(|a| format!(" on {a}")).unwrap_or_default();
+    match args.as_object() {
+        Some(m) if !m.is_empty() => format!("{tool}{on} {args}"),
+        _ => format!("{tool}{on}"),
+    }
 }
 
 /// Tools that send keyboard or pointer input, run an app's actions (`act`
@@ -549,6 +608,17 @@ struct Target<Id> {
     id: Id,
     /// `[id] role "name"` when found by query, so the reply says what was hit.
     found: Option<String>,
+    /// The app it belongs to (lower case) and its role.
+    app: String,
+    role: String,
+}
+
+impl<Id> Target<Id> {
+    /// A password field: its text is never read, and written only where
+    /// the allowlist (or DESKTOP_MCP_ALLOW_PASSWORDS) allows it.
+    fn protected(&self) -> bool {
+        render::is_protected_role(&self.role)
+    }
 }
 
 impl<Id> Target<Id> {
@@ -621,31 +691,173 @@ impl<B: Backend> Server<B> {
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
+            link: Default::default(),
         }
     }
 
     // ------------------------------------------------------------ allowlist
 
-    fn allowed(&self) -> Vec<String> {
+    /// The allowlist file, parsed (see `policy`); created with the
+    /// backend's default list when missing.
+    fn policy(&self) -> Policy {
         if !self.allow_file.exists() {
             if let Some(dir) = self.allow_file.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             let _ = std::fs::write(&self.allow_file, self.b.default_allow());
         }
-        let text = std::fs::read_to_string(&self.allow_file).unwrap_or_default();
-        let mut names: Vec<String> = text
-            .lines()
-            .map(|l| l.split('#').next().unwrap_or("").trim().to_lowercase())
-            .filter(|l| !l.is_empty())
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+        Policy::parse(&std::fs::read_to_string(&self.allow_file).unwrap_or_default())
+    }
+
+    /// Allowed app names (any tier), sorted.
+    fn allowed(&self) -> Vec<String> {
+        self.policy().names()
     }
 
     fn is_allowed(&self, app: &str) -> bool {
-        self.allowed().contains(&app.trim().to_lowercase())
+        self.policy().tier(app).is_some()
+    }
+
+    /// Check that the running tool call may use `app`: the app is allowed
+    /// with the tier the tool needs (`policy::needed_tier`), and, when the
+    /// allowlist's `confirm` list names the tool (for every app or this
+    /// one), the user confirmed it (`confirm`). Every tool that reads from or
+    /// sends input to an app comes through here, with the app it reaches:
+    /// the target element's app, or the active window's
+    /// (`require_active_allowed`). A new tool that acts on an app (e.g.
+    /// close_window) only needs to call `self.permit(&app).await?` before
+    /// acting; its tier comes from `policy::needed_tier` (unknown tools need
+    /// full). One confirmation covers the whole call.
+    async fn permit(&self, app: &str) -> R<()> {
+        let (tool, args, confirmed) = GATE
+            .try_with(|g| {
+                let g = g.borrow();
+                (g.tool.clone(), g.args.clone(), g.confirmed)
+            })
+            .unwrap_or_else(|_| (String::new(), Json::Null, false));
+        let policy = self.policy();
+        let app = app.trim().to_lowercase();
+        let tier = policy.tier(&app).ok_or_else(|| self.not_allowed(&app))?;
+        let need = policy::needed_tier(&tool, &args);
+        if tier < need {
+            return Err(format!(
+                "{tool} needs the {need} tier, but '{app}' is allowed with the {tier} tier \
+                 ('{app}:{tier}' in {}), which allows {}; changing it is the user's decision",
+                self.allow_file.display(),
+                tier.allows()
+            ));
+        }
+        if !confirmed && policy.needs_confirm(&tool, Some(&app)) {
+            self.confirm(&tool, Some(&app), &args).await?;
+        }
+        Ok(())
+    }
+
+    /// Ask the user to confirm `tool` (on `app`): through MCP elicitation
+    /// when the client declared it, else the call must carry `confirm: true`
+    /// (the agent asked the user itself). Notes the confirmation in `GATE`.
+    async fn confirm(&self, tool: &str, app: Option<&str>, a: &Json) -> R<()> {
+        let what = describe_call(tool, app, a);
+        if self.link.borrow().elicitation {
+            let message = format!("The agent wants to run: {what}\nAllow it?");
+            let params = json!({
+                "message": message,
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "confirm": {
+                            "type": "boolean",
+                            "title": "Allow",
+                            "description": "Allow this action once",
+                            "default": true,
+                        }
+                    },
+                },
+            });
+            let answer = self
+                .request("elicitation/create", params, CONFIRM_WAIT)
+                .await
+                .map_err(|e| {
+                    format!("{what} needs the user's confirmation, but asking failed: {e}")
+                })?;
+            let accepted = answer["action"] == "accept"
+                && answer.pointer("/content/confirm") != Some(&json!(false));
+            if !accepted {
+                let how = match answer["action"].as_str() {
+                    Some("accept" | "decline") => "declined",
+                    _ => "dismissed",
+                };
+                return Err(format!(
+                    "the user {how} {what}; nothing was done (the allowlist's confirm list \
+                     asks for it)"
+                ));
+            }
+        } else if !arg_b(a, "confirm", false) {
+            return Err(format!(
+                "{tool} needs the user's confirmation here (confirm list in {}), and this \
+                 client cannot ask (no elicitation): ask the user, and only if they agree \
+                 call again with confirm: true",
+                self.allow_file.display()
+            ));
+        }
+        let _ = GATE.try_with(|g| g.borrow_mut().confirmed = true);
+        Ok(())
+    }
+
+    /// Send the client a request and wait up to `limit` for its response
+    /// (its `result`). Other messages keep flowing meanwhile: `run_loop`
+    /// hands the response over through `ClientLink::pending`.
+    async fn request(&self, method: &str, params: Json, limit: Duration) -> R<Json> {
+        let (key, rx) = {
+            let mut link = self.link.borrow_mut();
+            let out = link.out.clone().ok_or("the client connection is closed")?;
+            link.next += 1;
+            let id = json!(format!("desktop-mcp-{}", link.next));
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            link.pending.insert(id.to_string(), tx);
+            out.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+                .map_err(|_| "the client connection is closed")?;
+            (id.to_string(), rx)
+        };
+        // Forget the request however this ends (answer, timeout, the call
+        // cancelled while waiting).
+        struct Forget<'a>(&'a std::cell::RefCell<ClientLink>, String);
+        impl Drop for Forget<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().pending.remove(&self.1);
+            }
+        }
+        let _forget = Forget(&self.link, key);
+        let reply = match tokio::time::timeout(limit, rx).await {
+            Err(_) => return Err(format!("no answer within {} s", limit.as_secs())),
+            Ok(Err(_)) => return Err("the client connection closed before it answered".into()),
+            Ok(Ok(reply)) => reply,
+        };
+        match reply.get("error") {
+            Some(e) => Err(format!(
+                "the client answered with an error: {}",
+                e["message"].as_str().unwrap_or("unknown")
+            )),
+            None => Ok(reply["result"].clone()),
+        }
+    }
+
+    /// A response from the client to one of `request`'s requests.
+    fn deliver(&self, msg: Json) {
+        let tx = self
+            .link
+            .borrow_mut()
+            .pending
+            .remove(&msg["id"].to_string());
+        if let Some(tx) = tx {
+            let _ = tx.send(msg);
+        }
+    }
+
+    /// Whether set_text and type_text may fill in a password field of `app`.
+    fn passwords_allowed(&self, app: &str) -> bool {
+        self.policy()
+            .passwords_allowed(app, std::env::var(policy::PASSWORDS_ENV).ok().as_deref())
     }
 
     fn not_allowed(&self, app: &str) -> String {
@@ -668,6 +880,7 @@ impl<B: Backend> Server<B> {
                 self.allow_file.display()
             ));
         }
+        self.permit(&name).await?;
         Ok(name)
     }
 
@@ -717,6 +930,12 @@ impl<B: Backend> Server<B> {
     /// with. Every use of an id goes through here, reads included, so a
     /// stale id never acts on, or reads, another element.
     async fn resolve_with_app(&self, rid: i64) -> R<(B::Id, String)> {
+        let r = self.resolve_ref(rid).await?;
+        Ok((r.id, r.app))
+    }
+
+    /// `resolve_with_app`, with the role the element (still) has.
+    async fn resolve_ref(&self, rid: i64) -> R<Ref<B::Id>> {
         let found = self.refs.lock().await.map.get(&(rid as u64)).cloned();
         let r = found.ok_or_else(|| format!("unknown id {rid}; call tree/find again"))?;
         if !self.is_allowed(&r.app) {
@@ -734,11 +953,7 @@ impl<B: Backend> Server<B> {
                 render::role_and_name(&r.role, &r.name)
             ));
         }
-        Ok((r.id, r.app))
-    }
-
-    async fn resolve(&self, rid: i64) -> R<B::Id> {
-        Ok(self.resolve_with_app(rid).await?.0)
+        Ok(r)
     }
 
     async fn app_windows(&self, name: &str) -> R<Vec<B::Id>> {
@@ -798,11 +1013,19 @@ impl<B: Backend> Server<B> {
     }
 
     /// The element a tool call names: `id`, or `app` + `query` (+ `role`).
+    /// The tool's tier (and confirmation, `permit`) is checked against the
+    /// element's app before anything is looked up there.
     async fn target(&self, a: &Json) -> R<Target<B::Id>> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
-            let id = self.resolve(rid).await?;
+            let r = self.resolve_ref(rid).await?;
+            self.permit(&r.app).await?;
             note_step_element(rid as u64, true);
-            return Ok(Target { id, found: None });
+            return Ok(Target {
+                id: r.id,
+                found: None,
+                app: r.app,
+                role: r.role,
+            });
         }
         let (Some(app), Some(query)) = (
             a.get("app").and_then(Json::as_str),
@@ -810,6 +1033,10 @@ impl<B: Backend> Server<B> {
         ) else {
             return Err("pass `id` (from tree/find), or `app` and `query`".into());
         };
+        if !self.is_allowed(app) {
+            return Err(self.not_allowed(app));
+        }
+        self.permit(app).await?;
         self.b.enable().await;
         let role = arg_s(a, "role", "");
         let (id, mut cache) = self.locate(app, query, &role, true).await?.ok_or_else(|| {
@@ -826,7 +1053,13 @@ impl<B: Backend> Server<B> {
         let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
         note_step_element(rid, true);
         let found = Some(render::describe(&cache[&id], rid));
-        Ok(Target { id, found })
+        let role = cache[&id].role.clone();
+        Ok(Target {
+            id,
+            found,
+            app: app.to_lowercase(),
+            role,
+        })
     }
 
     /// Title of the active window, if any.
@@ -889,7 +1122,7 @@ impl<B: Backend> Server<B> {
         let list = self.b.list_apps().await;
         Ok(apps_text(
             list,
-            &self.allowed(),
+            &self.policy(),
             &self.allow_file,
             self.b.apps_note(),
         ))
@@ -944,8 +1177,17 @@ impl<B: Backend> Server<B> {
         {
             return Err("pass x/y, width/height or state".into());
         }
-        let allowed = self.allowed();
-        let mut w = self.b.set_window(&query, &allowed, &change).await?;
+        // The window it will move, for the tier check (and confirmation);
+        // only apps with that tier are passed on, so it stays the same one.
+        let policy = self.policy();
+        let allowed = policy.names();
+        if let Ok(list) = self.b.windows(&query, &allowed).await
+            && let Some(first) = list.first()
+        {
+            self.permit(&first.app).await?;
+        }
+        let tiered = policy.names_with(policy::needed_tier("move_window", a));
+        let mut w = self.b.set_window(&query, &tiered, &change).await?;
         // On Wayland the app applies a new size (and KWin a state) a moment
         // later; wait for it so the reply, and the next call, see the result.
         let start = Instant::now();
@@ -971,6 +1213,7 @@ impl<B: Backend> Server<B> {
         if !self.is_allowed(&app) {
             return Err(self.not_allowed(&app));
         }
+        self.permit(&app).await?;
         let bad_args = || "args must be a list of strings".to_string();
         let args = match a.get("args") {
             None | Some(Json::Null) => Vec::new(),
@@ -1012,7 +1255,8 @@ impl<B: Backend> Server<B> {
 
     async fn doctor(&self) -> R<String> {
         self.b.enable().await;
-        let allow = self.allowed();
+        let policy = self.policy();
+        let allow = policy.names();
         let mut lines = vec![format!(
             "desktop-mcp {} ({} {})",
             env!("CARGO_PKG_VERSION"),
@@ -1032,16 +1276,53 @@ impl<B: Backend> Server<B> {
                 "{} ({} apps: {})",
                 self.allow_file.display(),
                 allow.len(),
-                allow.join(", ")
+                policy.apps_line()
             ),
+        );
+        for w in &policy.warnings {
+            row(false, "allowlist line", w);
+        }
+        let asks = if self.link.borrow().elicitation {
+            "the client asks the user (elicitation)"
+        } else {
+            "this client cannot ask the user (no elicitation): calls need confirm: true"
+        };
+        row(
+            true,
+            "confirm",
+            &if policy.confirm.is_empty() {
+                "none (add e.g. 'confirm: key:konsole' to the allowlist)".to_string()
+            } else {
+                let list: Vec<String> = policy.confirm.iter().map(|r| r.to_string()).collect();
+                format!("{}; {asks}", list.join(", "))
+            },
+        );
+        let env_on = std::env::var(policy::PASSWORDS_ENV).is_ok_and(|v| v.trim() == "1");
+        row(
+            true,
+            "password fields",
+            &match (env_on, policy.passwords.is_empty()) {
+                (true, _) => format!(
+                    "may be filled in every allowed app ({}=1)",
+                    policy::PASSWORDS_ENV
+                ),
+                (false, true) => "never read or filled in".to_string(),
+                (false, false) => format!(
+                    "never read; filled in only in: {}",
+                    policy.passwords.join(", ")
+                ),
+            },
         );
         let (mut allowed, mut blocked) = (Vec::new(), Vec::new());
         for app in self.b.list_apps().await {
             if app.windows.is_empty() {
                 continue;
             }
-            if allow.contains(&app.name.to_lowercase()) {
-                allowed.push(app.name);
+            if let Some(tier) = policy.tier(&app.name) {
+                allowed.push(match tier {
+                    Tier::Full => app.name,
+                    t => format!("{} ({t})", app.name),
+                });
             } else {
                 blocked.push(app.name);
             }
@@ -1273,10 +1554,13 @@ impl<B: Backend> Server<B> {
     async fn set_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
         let t = self.target(a).await?;
+        if t.protected() && !self.passwords_allowed(&t.app) {
+            return Err(t.reply(&self.password_refusal("set_text", &t.app)));
+        }
         if !self.b.set_text(&t.id, &text).await? {
             return Ok(t.reply("failed"));
         }
-        if self.b.info(&t.id, 0).await.role.contains("password") {
+        if t.protected() {
             return Ok(t.reply("ok (password field: contents cannot be read back)"));
         }
         // Firefox reports success for accessibility writes and changes
@@ -1354,8 +1638,22 @@ impl<B: Backend> Server<B> {
         self.b.press_combo("ctrl+a").await.is_ok() && self.b.type_text(text).await.is_ok()
     }
 
+    /// Why a password field is not filled in, and how the user can allow it.
+    fn password_refusal(&self, tool: &str, app: &str) -> String {
+        format!(
+            "{tool} refused: the target is a password field. Ask the user to type it \
+             themselves; only they can allow agents to fill in passwords ('passwords: {app}' \
+             in {}, or {}=1)",
+            self.allow_file.display(),
+            policy::PASSWORDS_ENV
+        )
+    }
+
     async fn get_text(&self, a: &Json) -> R<String> {
         let t = self.target(a).await?;
+        if t.protected() {
+            return Err(t.reply("a password field: its text is never read"));
+        }
         let limit = arg_i(a, "limit", 20000).max(0) as usize;
         let mut text = self.b.full_text(&t.id, limit).await?;
         if render::has_embedded_objects(&text) {
@@ -1524,7 +1822,9 @@ impl<B: Backend> Server<B> {
     /// `<end>_x`/`<end>_y`, as screenshot pixels when `image` is true.
     async fn drag_end(&self, a: &Json, end: &str) -> R<DragEnd<B::Id>> {
         if let Some(rid) = a.get(format!("{end}_id")).and_then(Json::as_i64) {
-            return Ok(DragEnd::Element(self.resolve_with_app(rid).await?.0));
+            let (id, app) = self.resolve_with_app(rid).await?;
+            self.permit(&app).await?;
+            return Ok(DragEnd::Element(id));
         }
         let (x, y) = (
             req_i(a, &format!("{end}_x"))?,
@@ -1624,6 +1924,12 @@ impl<B: Backend> Server<B> {
     async fn type_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
         let app = self.require_active_allowed().await?;
+        if let Some(f) = self.b.focused().await
+            && render::is_protected_role(&f.info.role)
+            && !self.passwords_allowed(&f.app)
+        {
+            return Err(self.password_refusal("type_text", &f.app.to_lowercase()));
+        }
         let note = self.b.type_text(&text).await?;
         let focus = self.focus_note(true).await;
         Ok(format!(
@@ -1795,6 +2101,7 @@ impl<B: Backend> Server<B> {
         let allowed = self.allowed();
         let owner = file_dialog_owner(&d, &allowed)
             .map_err(|e| format!("{e} (allowlist: {})", self.allow_file.display()))?;
+        self.permit(&owner).await?;
         let text = path.display().to_string();
         if !self.b.set_text(&d.field, &text).await? {
             return Err("the file name field refused the path".into());
@@ -1980,8 +2287,21 @@ impl<B: Backend> Server<B> {
         a: &'a Json,
         held: bool,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
-        Box::pin(async move {
+        let gate = Gate {
+            tool: name.to_string(),
+            args: a.clone(),
+            confirmed: false,
+        };
+        Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
             let window = window_arg(name, a)?;
+            // Tools that reach no app through `permit` are confirmed here,
+            // by their `app` argument if any.
+            if NO_PERMIT_TOOLS.contains(&name) {
+                let app = a.get("app").and_then(Json::as_str);
+                if self.policy().needs_confirm(name, app) {
+                    self.confirm(name, app, a).await?;
+                }
+            }
             // A screenshot sends no input, but activating its window does. A
             // batch that holds the input lock already runs its steps `held`.
             let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
@@ -2036,9 +2356,24 @@ impl<B: Backend> Server<B> {
                 }
                 None => result,
             }
-        })
+        }))
     }
 }
+
+/// Tools that never call `Server::permit` (they reach no app, or only read
+/// with a tier every allowed app has); `call_inner` handles their
+/// confirmation.
+const NO_PERMIT_TOOLS: [&str; 9] = [
+    "apps",
+    "windows",
+    "doctor",
+    "tree",
+    "find",
+    "wait_for",
+    "pause",
+    "activate_window",
+    "batch",
+];
 
 // ---------------------------------------------------------------- MCP
 
@@ -2051,6 +2386,9 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
     let result = match method {
         "initialize" => {
             let asked = params["protocolVersion"].as_str().unwrap_or("");
+            server.link.borrow_mut().elicitation = params
+                .pointer("/capabilities/elicitation")
+                .is_some_and(Json::is_object);
             let version = if PROTOCOL_VERSIONS.contains(&asked) {
                 asked
             } else {
@@ -2139,6 +2477,7 @@ where
         }
         Ok::<(), String>(())
     });
+    server.link.borrow_mut().out = Some(tx.clone());
     let in_flight = std::rc::Rc::new(std::cell::RefCell::new(InFlight::default()));
     let mut calls = tokio::task::JoinSet::new();
     let mut lines = reader.lines();
@@ -2160,6 +2499,14 @@ where
             }
         };
         let method = msg.get("method").and_then(Json::as_str).unwrap_or("");
+        // The client's response to a request the server sent (a running
+        // call waits for it).
+        if msg.get("method").is_none()
+            && (msg.get("result").is_some() || msg.get("error").is_some())
+        {
+            server.deliver(msg);
+            continue;
+        }
         if method == "notifications/cancelled" {
             if let Some(id) = msg.pointer("/params/requestId") {
                 in_flight.borrow_mut().cancel(id);
@@ -2188,6 +2535,13 @@ where
         {
             break; // the writer stopped: its error is returned below
         }
+    }
+    // No answer can come any more: requests still waiting fail now, so the
+    // calls behind them finish, and the writer ends once they did.
+    {
+        let mut link = server.link.borrow_mut();
+        link.out = None;
+        link.pending.clear();
     }
     while calls.join_next().await.is_some() {}
     drop(tx);
@@ -3204,7 +3558,7 @@ mod tests {
             ]
         };
         let file = PathBuf::from("/home/u/.config/desktop-mcp/allow.txt");
-        let allow = vec!["firefox".to_string()];
+        let allow = Policy::parse("firefox");
         assert_eq!(
             apps_text(list(), &allow, &file, "restart note"),
             "Firefox (allowed)\n  - frame: 'Page — Mozilla Firefox' [active]\n\
@@ -3223,7 +3577,7 @@ mod tests {
         );
         // Nothing allowed: where the allowlist is, and the note.
         assert_eq!(
-            apps_text(list(), &[], &file, "restart note"),
+            apps_text(list(), &Policy::default(), &file, "restart note"),
             "blocked: kwin, konsole, Firefox [active], plasmashell\n\
              no allowed app has a window; allowlist file: \
              /home/u/.config/desktop-mcp/allow.txt\nrestart note"
@@ -3618,6 +3972,286 @@ mod tests {
             let r = call_tool(&mut s, 3, "key", json!({"combo": "c"})).await;
             assert_eq!(r["id"], 3, "{r}");
             assert_eq!(*s.keys.borrow(), ["down a", "up a", "down c", "up c"]);
+        });
+    }
+
+    /// Replace the allowlist of the session made by `session(name)`.
+    fn set_allow(name: &str, text: &str) {
+        let file = std::env::temp_dir().join(format!(
+            "desktop-mcp-test-{}-{name}.txt",
+            std::process::id()
+        ));
+        std::fs::write(file, text).unwrap();
+    }
+
+    /// One call of each tool class against the fake app, by tool name.
+    fn tier_calls() -> Vec<(&'static str, Json)> {
+        vec![
+            ("tree", json!({"app": "fake"})),
+            ("find", json!({"app": "fake", "query": "OK"})),
+            ("get_text", json!({"app": "fake", "query": "OK"})),
+            ("screenshot", json!({"inline": false})),
+            ("clipboard_get", json!({})),
+            ("act", json!({"app": "fake", "query": "OK"})),
+            ("click", json!({"app": "fake", "query": "OK"})),
+            ("focus", json!({"app": "fake", "query": "OK"})),
+            ("scroll", json!({"app": "fake", "query": "OK"})),
+            ("mouse", json!({"x": 1, "y": 2})),
+            (
+                "drag",
+                json!({"from_x": 0, "from_y": 0, "to_x": 5, "to_y": 5}),
+            ),
+            ("key", json!({"combo": "a"})),
+            ("type_text", json!({"text": "hi"})),
+            (
+                "set_text",
+                json!({"app": "fake", "query": "OK", "text": "x"}),
+            ),
+            ("clipboard_set", json!({"text": "x"})),
+        ]
+    }
+
+    #[test]
+    fn tiers_limit_each_tool_class() {
+        let view = ["tree", "find", "get_text", "screenshot", "clipboard_get"];
+        let click = ["act", "click", "focus", "scroll", "mouse", "drag"];
+        for (tier, ok) in [
+            ("view", view.to_vec()),
+            ("click", [&view[..], &click[..]].concat()),
+            ("full", Vec::new()),
+        ] {
+            local(async move {
+                let name = format!("tier-{tier}");
+                let mut s = session(&name);
+                set_allow(&name, &format!("fake:{tier}\n"));
+                for (i, (tool, args)) in tier_calls().into_iter().enumerate() {
+                    let r = call_tool(&mut s, 10 + i as u64, tool, args).await;
+                    let text = reply_text(&r);
+                    let refused = text.contains("needs the");
+                    if tier == "full" || ok.contains(&tool) {
+                        assert!(!refused, "{tier}: {tool} refused: {text}");
+                    } else {
+                        assert!(refused, "{tier}: {tool} not refused: {text}");
+                        assert!(
+                            text.contains(&format!("'fake' is allowed with the {tier} tier")),
+                            "{text}"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_view_tier_app_gets_no_input_and_nothing_is_sent() {
+        local(async {
+            let mut s = session("tier-input");
+            set_allow("tier-input", "fake:view\nkonsole\n");
+            let r = call_tool(&mut s, 2, "type_text", json!({"text": "rm -rf ~"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains("type_text needs the full tier"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "enter"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // A batch step is checked like a call of its own.
+            let r = call_tool(
+                &mut s,
+                4,
+                "batch",
+                json!({"steps": [{"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                                  {"tool": "act", "args": {"id": "$1"}}]}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("act needs the click tier"), "{r}");
+            assert_eq!(actions_run(&s), 0);
+            // apps says which tier an app has.
+            assert!(policy::Policy::parse("fake:view").tier("fake") == Some(Tier::View));
+        });
+    }
+
+    #[test]
+    fn password_fields_are_not_read_or_filled() {
+        local(async {
+            let mut s = session("password");
+            *s.focus.borrow_mut() = Info {
+                role: "password text".into(),
+                name: "Password".into(),
+                showing: true,
+                states: vec!["focused", "editable"],
+                text: Some("hunter2".into()),
+                ..Info::default()
+            };
+            let r = call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "pass"})).await;
+            assert!(!reply_text(&r).contains("hunter2"), "{r}");
+            let r = call_tool(
+                &mut s,
+                3,
+                "get_text",
+                json!({"app": "fake", "query": "Password"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("never read"), "{r}");
+            let r = call_tool(
+                &mut s,
+                4,
+                "set_text",
+                json!({"app": "fake", "query": "Password", "text": "x"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("set_text refused"), "{r}");
+            let r = call_tool(&mut s, 5, "type_text", json!({"text": "x"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("type_text refused"), "{r}");
+            // The user's opt-in for this app.
+            set_allow("password", "fake\npasswords: fake\n");
+            let r = call_tool(
+                &mut s,
+                6,
+                "set_text",
+                json!({"app": "fake", "query": "Password", "text": "x"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("cannot be read back"), "{r}");
+            let r = call_tool(&mut s, 7, "type_text", json!({"text": "x"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            // Still never read.
+            let r = call_tool(
+                &mut s,
+                8,
+                "get_text",
+                json!({"app": "fake", "query": "Password"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    #[test]
+    fn confirm_needs_confirm_true_without_elicitation() {
+        local(async {
+            let mut s = session("confirm-arg");
+            set_allow("confirm-arg", "fake\nconfirm: key:fake, tree\n");
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("confirm: true"), "{r}");
+            assert!(s.keys.borrow().is_empty());
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "a", "confirm": true})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert_eq!(*s.keys.borrow(), ["down a", "up a"]);
+            // Other tools and apps are not asked about.
+            let r = call_tool(&mut s, 4, "find", json!({"app": "fake", "query": "OK"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            // A tool that reaches no app through permit.
+            let r = call_tool(&mut s, 5, "tree", json!({"app": "fake"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    /// The next message the server writes.
+    async fn next(s: &mut Session) -> Json {
+        let line = tokio::time::timeout(Duration::from_secs(2), s.stdout.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn confirm_asks_the_user_through_elicitation() {
+        local(async {
+            let mut s = session("elicit");
+            set_allow("elicit", "fake\nconfirm: key:fake\n");
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"elicitation": {}},
+                    "clientInfo": {"name": "test", "version": "0"}}}),
+            )
+            .await;
+            let init = replies_within(&mut s, Duration::from_millis(200)).await;
+            assert_eq!(ids(&init), vec![json!(1)]);
+            for (call, answer, pressed) in [
+                (
+                    2,
+                    json!({"action": "accept", "content": {"confirm": true}}),
+                    true,
+                ),
+                (3, json!({"action": "decline"}), false),
+                (
+                    4,
+                    json!({"action": "accept", "content": {"confirm": false}}),
+                    false,
+                ),
+                (5, json!({"action": "cancel"}), false),
+            ] {
+                s.keys.borrow_mut().clear();
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": call, "method": "tools/call",
+                    "params": {"name": "key", "arguments": {"combo": "enter", "confirm": true}}}),
+                )
+                .await;
+                let ask = next(&mut s).await;
+                assert_eq!(ask["method"], "elicitation/create", "{ask}");
+                let message = ask["params"]["message"].as_str().unwrap();
+                assert!(
+                    message.contains("key on fake {\"combo\":\"enter\"}"),
+                    "{message}"
+                );
+                assert!(s.keys.borrow().is_empty(), "sent before the answer");
+                // Other messages are answered while the user decides.
+                send(&mut s, ping(100 + call)).await;
+                assert_eq!(next(&mut s).await["id"], 100 + call);
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": ask["id"], "result": answer}),
+                )
+                .await;
+                let r = next(&mut s).await;
+                assert_eq!(r["id"], call, "{r}");
+                assert_eq!(r["result"]["isError"], !pressed, "{r}");
+                assert_eq!(s.keys.borrow().is_empty(), !pressed, "{r}");
+                if !pressed {
+                    assert!(reply_text(&r).contains("nothing was done"), "{r}");
+                }
+            }
+            // An error response refuses too.
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {"name": "key", "arguments": {"combo": "a"}}}),
+            )
+            .await;
+            let ask = next(&mut s).await;
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": ask["id"],
+                       "error": {"code": -32601, "message": "nope"}}),
+            )
+            .await;
+            let r = next(&mut s).await;
+            assert!(reply_text(&r).contains("asking failed"), "{r}");
+            // A call waiting for the user is cancelled cleanly, and end of
+            // input ends it too.
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": {"name": "key", "arguments": {"combo": "a"}}}),
+            )
+            .await;
+            let _ask = next(&mut s).await;
+            drop(std::mem::replace(&mut s.stdin, tokio::io::duplex(1).0));
+            let replies = replies_within(&mut s, Duration::from_secs(2)).await;
+            assert_eq!(ids(&replies), vec![json!(10)], "{replies:?}");
+            assert!(reply_text(&replies[0]).contains("closed"), "{replies:?}");
+            assert!(s.keys.borrow().is_empty());
         });
     }
 }

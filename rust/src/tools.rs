@@ -86,12 +86,19 @@ the user's own window (often a terminal) is in front.
 something seen only in it, pass its pixel position to mouse as image_x/image_y.
 
 Allowlist: only apps listed in the user's allowlist file can be read, activated or sent input, \
-and input only goes to an allowed active window. Errors name the file; adding apps is the \
-user's decision. When tools fail as if the setup were broken (AT-SPI, virtual input, KWin, \
+and input only goes to an allowed active window. An app may be limited to a tier: view (read \
+tools only) or click (no typing, keys, set_text or clipboard_set). Tools on its confirm list \
+ask the user; when a refusal says to, ask the user yourself and retry with confirm: true only \
+if they agree. Password fields are never read, and not filled in unless the user allowed it. \
+Errors name the file; changing it is the user's decision. When tools fail as if the setup were broken (AT-SPI, virtual input, KWin, \
 screenshots), run doctor.
 
 Clients that load tool schemas on demand: load the common ones in one search: batch, find, \
 act, activate_window, key, type_text, wait_for, screenshot, tree, apps.";
+
+/// The `confirm` argument of tools that change something.
+const CONFIRM: &str =
+    "Only when a refusal asked for the user's confirmation and the user agreed to this exact call.";
 
 /// Shared by the tools that take a target; the matching rules are in
 /// INSTRUCTIONS.
@@ -161,14 +168,14 @@ pub fn tools() -> Json {
         t(
             "set_text",
             &d(
-                "Replace the contents of an editable text element, then read it back:\nthe reply says \"verified\", or fails with what the field holds instead\n(a length limit, reformatting). Password fields cannot be read back."
+                "Replace the contents of an editable text element, then read it back:\nthe reply says \"verified\", or fails with what the field holds instead\n(a length limit, reformatting). Refused on a password field unless the\nuser allowed it in the allowlist (then it is not read back)."
             ),
             target(&[("text", "string", None)])
         ),
         t(
             "get_text",
             &d(
-                "Read the full text of an element (documents, fields, labels). A web page or\nother container gives the text of everything in it, in reading order."
+                "Read the full text of an element (documents, fields, labels). A web page or\nother container gives the text of everything in it, in reading order.\nPassword fields are never read (tree and find show no text for them either)."
             ),
             target(&[("limit", "integer", Some(json!(20000)))])
         ),
@@ -236,7 +243,7 @@ pub fn tools() -> Json {
         ),
         t(
             "type_text",
-            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. On Linux this may paste through the clipboard;\nthe text it held is put back afterwards (images and files are not; the reply\nsays so). The reply names the focused element and warns when it is not an\neditable field.",
+            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. On Linux this may paste through the clipboard;\nthe text it held is put back afterwards (images and files are not; the reply\nsays so). The reply names the focused element and warns when it is not an\neditable field. Refused while a password field has focus, unless the user\nallowed it in the allowlist.",
             schema(&[("text", "string", None)])
         ),
         t(
@@ -307,7 +314,7 @@ pub fn tools() -> Json {
         ),
         t(
             "doctor",
-            "Check the setup in one report: version, allowlist, which running apps\nare allowed or blocked, the session, AT-SPI, the virtual keyboard and\npointer, KWin scripting, screens and the screenshot path. Run it first\nwhen tools fail in ways that look like a broken installation.",
+            "Check the setup in one report: version, allowlist (each app's tier, the\nconfirm list, password fields), which running apps are allowed or blocked, the session, AT-SPI, the virtual keyboard and\npointer, KWin scripting, screens and the screenshot path. Run it first\nwhen tools fail in ways that look like a broken installation.",
             schema(&[])
         ),
         t(
@@ -336,6 +343,11 @@ pub fn tools() -> Json {
         }
         if READ_ONLY.contains(&tool["name"].as_str().unwrap()) {
             tool["annotations"] = json!({ "readOnlyHint": true });
+        } else if tool["name"] != "batch" {
+            tool["inputSchema"]["properties"]["confirm"] = json!({
+                "type": "boolean",
+                "description": CONFIRM
+            });
         }
     }
     list
@@ -352,6 +364,8 @@ mod tests {
             let name = tool["name"].as_str().unwrap();
             let ro = tool["annotations"]["readOnlyHint"] == json!(true);
             assert_eq!(ro, READ_ONLY.contains(&name), "{name}");
+            let c = tool["inputSchema"]["properties"]["confirm"]["type"] == json!("boolean");
+            assert_eq!(c, !ro && name != "batch", "{name} confirm");
             let w = tool["inputSchema"]["properties"]["window"]["type"] == json!("string");
             assert_eq!(w, WINDOW_TOOLS.contains(&name), "{name} window");
         }

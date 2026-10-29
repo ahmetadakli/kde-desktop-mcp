@@ -62,7 +62,19 @@ pub fn json_str(s: &str) -> String {
 /// text for each child element; it says nothing the tree does not.
 const EMBEDDED_OBJECT: char = '\u{FFFC}';
 
+/// Whether an element with this role is a password field (AT-SPI
+/// `password text`; the Windows backend names UIA's IsPassword fields so
+/// too): its text is never shown, searched or read.
+pub fn is_protected_role(role: &str) -> bool {
+    role.contains("password")
+}
+
+/// The element's text for tree/find output and searches; empty for a
+/// password field, whatever the toolkit exposes as its text.
 pub fn text_preview<Id>(info: &Info<Id>, limit: usize) -> String {
+    if is_protected_role(&info.role) {
+        return String::new();
+    }
     info.text
         .as_deref()
         .map(|t| first_chars(&t.replace(EMBEDDED_OBJECT, ""), limit))
@@ -726,6 +738,10 @@ fn read_into<Id: Clone + Eq + Hash>(
 ) {
     *seen += 1;
     if *seen > FIND_MAX_SEEN || (out.len() > limit && out.chars().count() > limit) {
+        return;
+    }
+    // A password field in a form reads as nothing.
+    if is_protected_role(&info.role) {
         return;
     }
     let mut kids = info.children.iter();
@@ -1409,6 +1425,40 @@ mod tests {
         c.insert("/li1", texted("list item", "", Some("• one"), &[]));
         c.insert("/li2", texted("list item", "", Some("• two"), &[]));
         c
+    }
+
+    #[test]
+    fn password_fields_show_no_text_anywhere() {
+        let mut c = Cache::new();
+        c.insert(
+            "/form",
+            texted(
+                "form",
+                "",
+                Some("User \u{FFFC} Pass \u{FFFC}"),
+                &["/u", "/pw"],
+            ),
+        );
+        c.insert("/u", texted("entry", "User", Some("ahmet"), &[]));
+        c.insert("/pw", texted("password text", "Pass", Some("hunter2"), &[]));
+        let pw = &c["/pw"];
+        assert_eq!(describe(pw, 5), "[5] password text \"Pass\"");
+        assert_eq!(text_preview(pw, 80), "");
+        // A search for the secret does not find the field (no oracle).
+        assert_eq!(
+            find(&c, &["/form"], "hunter", "", 10).unwrap(),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            find(&c, &["/form"], "pass", "", 10).unwrap(),
+            vec!["/form", "/pw"]
+        );
+        assert_eq!(
+            container_text(&c, &"/form", 1000).unwrap(),
+            "User ahmet Pass"
+        );
+        // The ordinary field still shows its text.
+        assert!(describe(&c["/u"], 4).contains("text=\"ahmet\""));
     }
 
     #[test]

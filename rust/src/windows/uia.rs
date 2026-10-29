@@ -43,6 +43,7 @@ const PROPS: &[UIA_PROPERTY_ID] = &[
     UIA_ValueValuePropertyId,
     UIA_ValueIsReadOnlyPropertyId,
     UIA_LegacyIAccessibleDefaultActionPropertyId,
+    UIA_IsPasswordPropertyId,
 ];
 
 /// Properties needed to list and match top-level windows.
@@ -177,6 +178,7 @@ pub fn props(el: &IUIAutomationElement) -> Props {
         value_text: s(UIA_ValueValuePropertyId),
         read_only: b(UIA_ValueIsReadOnlyPropertyId, d.read_only),
         default_action: s(UIA_LegacyIAccessibleDefaultActionPropertyId),
+        password: b(UIA_IsPasswordPropertyId, false),
     }
 }
 
