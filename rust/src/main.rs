@@ -40,6 +40,10 @@ use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
 const TREE_TEXT_LIMIT: usize = 80;
+/// Longest `tree` reply by default, in characters (about 5k tokens).
+const TREE_MAX_CHARS: i64 = 20_000;
+/// Characters kept free in a capped tree for the line saying how to go on.
+const CONTINUATION_CHARS: usize = 150;
 /// Nodes fetched ahead when rendering reaches an unfetched part of the tree.
 const PREFETCH_MORE: usize = 500;
 
@@ -477,6 +481,51 @@ const WAIT_FALLBACK: Duration = Duration::from_millis(250);
 /// app that changes all the time costs no more than polling did.
 const WAIT_MIN_GAP: Duration = Duration::from_millis(50);
 
+/// How often `wait_idle` reads the tree where no change events come.
+const IDLE_POLL: Duration = Duration::from_millis(100);
+
+/// What `wait_for` `state` asks of the element.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WaitState {
+    Enabled,
+    Focused,
+    Checked,
+    Selected,
+}
+
+impl WaitState {
+    fn parse(s: &str) -> R<Self> {
+        Ok(match s.trim().to_lowercase().as_str() {
+            "enabled" => WaitState::Enabled,
+            "focused" => WaitState::Focused,
+            "checked" => WaitState::Checked,
+            "selected" => WaitState::Selected,
+            other => {
+                return Err(format!(
+                    "unknown state '{other}'; use enabled, focused, checked or selected"
+                ));
+            }
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            WaitState::Enabled => "enabled",
+            WaitState::Focused => "focused",
+            WaitState::Checked => "checked",
+            WaitState::Selected => "selected",
+        }
+    }
+
+    /// Whether an element with `states` (as `Info::states`) has it.
+    fn holds(self, states: &[&str]) -> bool {
+        match self {
+            WaitState::Enabled => !states.contains(&"disabled"),
+            s => states.contains(&s.name()),
+        }
+    }
+}
+
 /// Requested wait in ms, clamped to 0..=MAX_WAIT_MS, and a note when it was cut.
 fn wait_ms(a: &Json, k: &str, d: i64) -> (u64, String) {
     let asked = arg_i(a, k, d);
@@ -894,6 +943,49 @@ impl<Id> Target<Id> {
             None => text.to_string(),
         }
     }
+}
+
+/// The last line of a cut tree: how much is left and the call that lists
+/// it, `after` the last element printed. Ids are stable, so the next page
+/// starts right after that element while it is still there.
+fn continuation(a: &Json, app: &str, last: Option<u64>, left: usize, truncated: bool) -> String {
+    let Some(last) = last else {
+        return render::TRUNCATED.to_string();
+    };
+    let left = match (left, truncated) {
+        (0, _) => "more nodes".to_string(),
+        (n, true) => format!("{n}+ more nodes"),
+        (n, false) => format!("{n} more nodes"),
+    };
+    let mut call = Vec::new();
+    match arg_i(a, "root_id", 0) {
+        0 => {
+            call.push(format!("app={}", render::json_str(app)));
+            if arg_b(a, "document", false) {
+                call.push("document=true".into());
+            }
+        }
+        root => call.push(format!("root_id={root}")),
+    }
+    for flag in ["interactive", "include_hidden"] {
+        if arg_b(a, flag, false) {
+            call.push(format!("{flag}=true"));
+        }
+    }
+    for (k, d) in [("max_depth", 12), ("max_nodes", 300)] {
+        let v = arg_i(a, k, d);
+        if v != d {
+            call.push(format!("{k}={v}"));
+        }
+    }
+    if a.get("max_chars").is_some() {
+        call.push(format!(
+            "max_chars={}",
+            arg_i(a, "max_chars", TREE_MAX_CHARS)
+        ));
+    }
+    call.push(format!("after={last}"));
+    format!("… {left}; continue with tree({})", call.join(", "))
 }
 
 fn arg_s(a: &Json, k: &str, d: &str) -> String {
@@ -1598,7 +1690,7 @@ impl<B: Backend> Server<B> {
             Some(rid) => json!({"root_id": rid, "max_nodes": OBSERVE_TREE_NODES}),
             None => json!({"app": app, "max_nodes": OBSERVE_TREE_NODES}),
         };
-        Ok(cap_lines(self.tree(&args).await?, OBSERVE_TREE_CHARS))
+        Ok(cap_lines(self.tree(&args).await?.text, OBSERVE_TREE_CHARS))
     }
 
     /// The lines as text, and the id of the first element printed.
@@ -1608,14 +1700,27 @@ impl<B: Backend> Server<B> {
         cache: &Cache<B::Id>,
         app: &str,
     ) -> (String, Option<u64>) {
+        let printed = self.printed(lines, cache, app).await;
+        let first = printed.iter().find_map(|p| match p {
+            Printed::Node { rid, .. } => Some(*rid),
+            Printed::Raw(_) => None,
+        });
+        (render::format(&printed), first)
+    }
+
+    /// The lines with their ids issued.
+    async fn printed<'c>(
+        &self,
+        lines: Vec<Line<B::Id>>,
+        cache: &'c Cache<B::Id>,
+        app: &str,
+    ) -> Vec<Printed<'c, B::Id>> {
         let mut out = Vec::with_capacity(lines.len());
-        let mut first = None;
         for line in lines {
             out.push(match line {
                 Line::Raw(s) => Printed::Raw(s),
                 Line::Node { depth, id } => {
                     let rid = self.add_ref(&id, &cache[&id], app).await;
-                    first.get_or_insert(rid);
                     Printed::Node {
                         depth,
                         rid,
@@ -1624,7 +1729,7 @@ impl<B: Backend> Server<B> {
                 }
             });
         }
-        (render::format(&out), first)
+        out
     }
 
     // ------------------------------------------------------------ tools
@@ -1869,15 +1974,18 @@ impl<B: Backend> Server<B> {
         Ok(lines.join("\n"))
     }
 
-    async fn tree(&self, a: &Json) -> R<String> {
+    async fn tree(&self, a: &Json) -> R<Out> {
         self.b.enable().await;
         let root_id = arg_i(a, "root_id", 0);
+        let interactive = arg_b(a, "interactive", false);
         let opts = WalkOpts {
             max_depth: arg_i(a, "max_depth", 12).max(0) as usize,
             budget: arg_i(a, "max_nodes", 300).max(0) as usize,
             only_showing: !arg_b(a, "include_hidden", false),
             boring_roles: self.b.boring_roles(),
+            interactive,
         };
+        let max_chars = arg_i(a, "max_chars", TREE_MAX_CHARS).max(0) as usize;
         let mut cache = Cache::new();
         let (header, roots, app) = if root_id != 0 {
             let (id, app) = self.resolve_with_app(root_id).await?;
@@ -1900,6 +2008,19 @@ impl<B: Backend> Server<B> {
             let windows = self.app_windows(&app).await?;
             (app.clone(), windows, app.to_lowercase())
         };
+        // The element the previous page ended with.
+        let after_rid = arg_i(a, "after", 0);
+        let after = if after_rid != 0 {
+            let (id, of) = self.resolve_with_app(after_rid).await?;
+            if of != app {
+                return Err(format!(
+                    "`after` id {after_rid} belongs to '{of}', not '{app}'"
+                ));
+            }
+            Some(id)
+        } else {
+            None
+        };
         let first = (opts.budget * 4).max(1000);
         self.b
             .prefetch(
@@ -1910,10 +2031,14 @@ impl<B: Backend> Server<B> {
                 first,
             )
             .await;
-        let lines = loop {
+        let header = match after_rid {
+            0 => header,
+            rid => format!("{header} (continued after [{rid}])"),
+        };
+        let (lines, walked) = loop {
             let mut lines = vec![Line::Raw(header.clone())];
-            match render::walk(&cache, &roots, 1, &opts, &mut lines) {
-                Ok(()) => break lines,
+            match render::walk(&cache, &roots, 1, &opts, after.as_ref(), &mut lines) {
+                Ok(walked) => break (lines, walked),
                 Err(missing) => {
                     self.b
                         .prefetch(
@@ -1927,7 +2052,49 @@ impl<B: Backend> Server<B> {
                 }
             }
         };
-        Ok(self.print(lines, &cache, &app).await.0)
+        if !walked.after_found {
+            return Err(format!(
+                "`after` id {after_rid} is not in this tree (any more); call tree without `after`"
+            ));
+        }
+        let printed = self.printed(lines, &cache, &app).await;
+        // Room for the continuation line.
+        let room = match max_chars {
+            0 => 0,
+            n => n.saturating_sub(CONTINUATION_CHARS).max(1),
+        };
+        let capped = render::format_capped(&printed, room);
+        let mut text = capped.text;
+        if capped.left > 0 || walked.truncated {
+            text.push('\n');
+            text.push_str(&continuation(
+                a,
+                &app,
+                capped.last,
+                capped.left,
+                walked.truncated,
+            ));
+        }
+        if !arg_b(a, "screenshot", false) {
+            return Ok(Out::from(text));
+        }
+        // The image of the window the tree shows: only while it is in front,
+        // as screenshots capture the active window.
+        let active = self.b.active_app().await.to_lowercase();
+        if active != app {
+            text.push_str(&format!(
+                "\nno screenshot: the active window is not {app}'s (screenshot with \
+                 window=… brings it to the front)"
+            ));
+            return Ok(Out::from(text));
+        }
+        match self.screenshot(&json!({})).await {
+            Ok(shot) => Ok(Out {
+                text: format!("{text}\nscreenshot: {}", shot.text),
+                images: shot.images,
+            }),
+            Err(e) => Ok(Out::from(format!("{text}\nno screenshot: {e}"))),
+        }
     }
 
     /// The page or document of `app`'s active window (else its first visible
@@ -2213,6 +2380,7 @@ impl<B: Backend> Server<B> {
                                 actions: Vec::new(),
                                 text: None,
                                 children: Vec::new(),
+                                operable: false,
                             });
                         }
                     }
@@ -2222,10 +2390,22 @@ impl<B: Backend> Server<B> {
     }
 
     async fn wait_for(&self, a: &Json) -> R<String> {
+        if let Some(window) = a.get("window").and_then(Json::as_str) {
+            if a.get("query").is_some() {
+                return Err(
+                    "pass `query` (an element) or `window` (a window title), not both".into(),
+                );
+            }
+            return self.wait_window(a, window).await;
+        }
         let app = req_s(a, "app")?;
         let query = req_s(a, "query")?;
         let role = arg_s(a, "role", "");
         let gone = arg_b(a, "gone", false);
+        let state = arg_s(a, "state", "");
+        let state = (!state.is_empty())
+            .then(|| WaitState::parse(&state))
+            .transpose()?;
         let (limit_ms, note) = wait_ms(a, "timeout_ms", 5000);
         let limit = Duration::from_millis(limit_ms);
         if !self.is_allowed(&app) {
@@ -2245,23 +2425,32 @@ impl<B: Backend> Server<B> {
                 self.locate_in(windows.clone(), &query, &role, false).await
             };
             let ms = start.elapsed().as_millis();
+            // With `state`, a match without it counts as no match.
+            let has = |info: &Info<B::Id>| state.is_none_or(|s| s.holds(&info.states));
             match found {
-                Some((id, mut cache)) if !gone => {
+                Some((id, mut cache)) if gone != has(&cache[&id]) => {
                     self.b
                         .fill_actions(&mut cache, std::slice::from_ref(&id))
                         .await;
                     let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
+                    let line = render::describe(&cache[&id], rid);
+                    if gone {
+                        let s = state.map_or("", WaitState::name);
+                        return Ok(format!("no longer {s} after {ms} ms{note}: {line}"));
+                    }
                     note_step_element(rid, true);
-                    return Ok(format!(
-                        "found after {ms} ms{note}: {}",
-                        render::describe(&cache[&id], rid)
-                    ));
+                    return Ok(format!("found after {ms} ms{note}: {line}"));
                 }
                 None if gone => return Ok(format!("gone after {ms} ms{note}")),
                 _ => {}
             }
             if start.elapsed() >= limit {
-                let what = if gone { "to disappear" } else { "to appear" };
+                let what = match (state, gone) {
+                    (None, false) => "to appear".to_string(),
+                    (None, true) => "to disappear".to_string(),
+                    (Some(s), false) => format!("to be {}", s.name()),
+                    (Some(s), true) => format!("to stop being {}", s.name()),
+                };
                 return Err(format!(
                     "timed out after {ms} ms waiting for '{query}' in '{app}' {what}{note}"
                 ));
@@ -2274,6 +2463,128 @@ impl<B: Backend> Server<B> {
             // Never more often than the old poll, however busy the app.
             tokio::time::sleep(WAIT_MIN_GAP.saturating_sub(checked.elapsed()).min(left)).await;
         }
+    }
+
+    /// `wait_for` a window of an allowed app (`app`, when given) whose
+    /// title or app name contains `query` to open, or with `gone` to close.
+    /// Re-checks the compositor's window list when an app's windows changed
+    /// (AT-SPI), or every WAIT_FALLBACK.
+    async fn wait_window(&self, a: &Json, query: &str) -> R<String> {
+        let app = arg_s(a, "app", "").to_lowercase();
+        let gone = arg_b(a, "gone", false);
+        let (limit_ms, note) = wait_ms(a, "timeout_ms", 5000);
+        let limit = Duration::from_millis(limit_ms);
+        if !app.is_empty() && !self.is_allowed(&app) {
+            return Err(self.not_allowed(&app));
+        }
+        self.b.enable().await;
+        let start = Instant::now();
+        loop {
+            let mark = self.b.change_mark();
+            let allowed = self.allowed();
+            let list = self.b.windows_quick(query, &allowed).await?;
+            // KWin's class may carry a prefix ("org.kde.kate").
+            let hit = list.iter().find(|w| w.app.to_lowercase().contains(&app));
+            let ms = start.elapsed().as_millis();
+            match hit {
+                Some(w) if !gone => {
+                    return Ok(format!(
+                        "window found after {ms} ms{note}: {}",
+                        describe_window(w)
+                    ));
+                }
+                None if gone => return Ok(format!("window gone after {ms} ms{note}")),
+                _ => {}
+            }
+            if start.elapsed() >= limit {
+                let what = if gone { "to close" } else { "to open" };
+                let of = if app.is_empty() {
+                    "an allowed app".to_string()
+                } else {
+                    format!("'{app}'")
+                };
+                return Err(format!(
+                    "timed out after {ms} ms waiting for a window of {of} matching '{query}' {what}{note}"
+                ));
+            }
+            let checked = Instant::now();
+            let left = limit.saturating_sub(start.elapsed());
+            // Window changes of every app wake this; the app's own changes
+            // too (a renamed window).
+            let near = if app.is_empty() {
+                Vec::new()
+            } else {
+                self.b.app_windows(&app).await.unwrap_or_default()
+            };
+            self.b
+                .wait_change(&near, mark, left.min(WAIT_FALLBACK))
+                .await;
+            tokio::time::sleep(WAIT_MIN_GAP.saturating_sub(checked.elapsed()).min(left)).await;
+        }
+    }
+
+    /// Wait until `app` stopped changing for `quiet_ms`: no accessibility
+    /// change events from it (children added or removed, names, text), or,
+    /// where the backend hears none, the same fingerprint of its visible
+    /// tree.
+    async fn wait_idle(&self, a: &Json) -> R<String> {
+        let app = req_s(a, "app")?;
+        let quiet = Duration::from_millis(arg_i(a, "quiet_ms", 300).clamp(10, MAX_WAIT_MS) as u64);
+        let (limit_ms, note) = wait_ms(a, "timeout_ms", 10_000);
+        let limit = Duration::from_millis(limit_ms);
+        self.b.enable().await;
+        let windows = self.app_windows(&app).await?;
+        let start = Instant::now();
+        let mut since = Instant::now();
+        let mut print = None;
+        loop {
+            if since.elapsed() >= quiet && self.b.loading(&windows).await {
+                // Quiet only because the page waits for the network.
+                since = Instant::now();
+            }
+            if since.elapsed() >= quiet {
+                let ms = start.elapsed().as_millis();
+                return Ok(format!(
+                    "idle after {ms} ms (no change for {} ms){note}",
+                    quiet.as_millis()
+                ));
+            }
+            if start.elapsed() >= limit {
+                let ms = start.elapsed().as_millis();
+                return Err(format!(
+                    "'{app}' still changing after {ms} ms (never quiet for {} ms){note}",
+                    quiet.as_millis()
+                ));
+            }
+            let left = limit
+                .saturating_sub(start.elapsed())
+                .min(quiet.saturating_sub(since.elapsed()));
+            if self.b.changes_live() {
+                let mark = self.b.change_mark();
+                if self.b.wait_change(&windows, mark, left).await {
+                    since = Instant::now();
+                }
+            } else {
+                let now = self.content_hash(&windows).await;
+                if print.replace(now) != Some(now) {
+                    since = Instant::now();
+                }
+                tokio::time::sleep(left.min(IDLE_POLL)).await;
+            }
+        }
+    }
+
+    /// A hash of what the visible part of `windows` shows.
+    async fn content_hash(&self, windows: &[B::Id]) -> u64 {
+        let mut cache = Cache::new();
+        self.b
+            .prefetch_with(
+                &mut cache,
+                windows.to_vec(),
+                &search_fetch(TREE_TEXT_LIMIT, render::FIND_MAX_SEEN),
+            )
+            .await;
+        render::fingerprint(&cache, windows)
     }
 
     async fn pause(&self, a: &Json) -> R<String> {
@@ -3021,12 +3332,13 @@ impl<B: Backend> Server<B> {
             };
             let result = match name {
                 "apps" => self.apps().await.map(Out::from),
-                "tree" => self.tree(a).await.map(Out::from),
+                "tree" => self.tree(a).await,
                 "find" => self.find(a).await.map(Out::from),
                 "act" => self.act(a).await.map(Out::from),
                 "set_text" => self.set_text(a).await.map(Out::from),
                 "get_text" => self.get_text(a).await.map(Out::from),
                 "wait_for" => self.wait_for(a).await.map(Out::from),
+                "wait_idle" => self.wait_idle(a).await.map(Out::from),
                 "pause" => self.pause(a).await.map(Out::from),
                 "focus" => self.focus(a).await.map(Out::from),
                 "click" => self.click(a).await.map(Out::from),
@@ -3855,6 +4167,192 @@ mod tests {
             assert_eq!(ids(&replies), vec![json!(3), json!(2)], "{replies:?}");
             let text = replies[1]["result"]["content"][0]["text"].as_str().unwrap();
             assert_eq!(text, "paused 300 ms");
+        });
+    }
+
+    #[test]
+    fn wait_for_state_needs_the_element_to_have_it() {
+        local(async {
+            let mut s = session("wait-state");
+            let wait = |state: &str, gone: bool| {
+                json!({"app": "fake", "query": "OK", "state": state, "gone": gone,
+                       "timeout_ms": 60})
+            };
+            // The fake's button is enabled, not focused.
+            let r = call_tool(&mut s, 2, "wait_for", wait("enabled", false)).await;
+            assert!(reply_text(&r).starts_with("found after "), "{r}");
+            let r = call_tool(&mut s, 3, "wait_for", wait("focused", false)).await;
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            assert!(
+                reply_text(&r).contains("waiting for 'OK' in 'fake' to be focused"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 4, "wait_for", wait("focused", true)).await;
+            assert!(
+                reply_text(&r).starts_with("no longer focused after "),
+                "{r}"
+            );
+            s.focus.borrow_mut().states = vec!["focused", "checked"];
+            let r = call_tool(&mut s, 5, "wait_for", wait("Checked", false)).await;
+            assert!(reply_text(&r).contains("{focused,checked}"), "{r}");
+            s.focus.borrow_mut().states = vec!["disabled"];
+            let r = call_tool(&mut s, 6, "wait_for", wait("enabled", false)).await;
+            assert!(reply_text(&r).contains("to be enabled"), "{r}");
+            let r = call_tool(&mut s, 7, "wait_for", wait("enabled", true)).await;
+            assert!(
+                reply_text(&r).starts_with("no longer enabled after "),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 8, "wait_for", wait("pressed", false)).await;
+            assert!(reply_text(&r).contains(": unknown state 'pressed'"), "{r}");
+            // Without `state`, as before.
+            let r = call_tool(
+                &mut s,
+                9,
+                "wait_for",
+                json!({"app": "fake", "query": "OK", "gone": true, "timeout_ms": 60}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("waiting for 'OK' in 'fake' to disappear"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn wait_for_window_watches_allowed_windows() {
+        local(async {
+            let mut s = session("wait-window");
+            let r = call_tool(&mut s, 2, "wait_for", json!({"window": "TODO"})).await;
+            let text = reply_text(&r);
+            assert!(text.starts_with("window found after "), "{r}");
+            assert!(text.contains("'todo.txt — Fake' [fake]"), "{r}");
+            // Konsole's window is not an allowed app's.
+            let r = call_tool(
+                &mut s,
+                3,
+                "wait_for",
+                json!({"window": "bash", "timeout_ms": 60}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("waiting for a window of an allowed app matching 'bash' to open"),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "wait_for",
+                json!({"window": "bash", "gone": true}),
+            )
+            .await;
+            assert!(reply_text(&r).starts_with("window gone after "), "{r}");
+            let r = call_tool(
+                &mut s,
+                5,
+                "wait_for",
+                json!({"window": "notes", "app": "konsole"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("is not in"), "{r}");
+            let r = call_tool(
+                &mut s,
+                6,
+                "wait_for",
+                json!({"window": "notes", "query": "OK"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("not both"), "{r}");
+        });
+    }
+
+    #[test]
+    fn wait_idle_returns_once_the_app_stops_changing() {
+        local(async {
+            let mut s = session("wait-idle");
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 50, "timeout_ms": 2000}),
+            )
+            .await;
+            assert!(reply_text(&r).starts_with("idle after "), "{r}");
+            assert!(reply_text(&r).contains("no change for 50 ms"), "{r}");
+            // Renamed on every look: never quiet.
+            let focus = s.focus.clone();
+            let busy = tokio::task::spawn_local(async move {
+                for k in 0..=u32::MAX {
+                    focus.borrow_mut().name = format!("OK {k}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            let r = call_tool(
+                &mut s,
+                3,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 150, "timeout_ms": 400}),
+            )
+            .await;
+            busy.abort();
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            assert!(reply_text(&r).contains("still changing after "), "{r}");
+            let r = call_tool(&mut s, 4, "wait_idle", json!({"app": "konsole"})).await;
+            assert!(reply_text(&r).contains("is not in"), "{r}");
+        });
+    }
+
+    #[test]
+    fn tree_continuation_repeats_the_call_after_the_last_element() {
+        let a = json!({"app": "Firefox", "document": true, "interactive": true, "max_nodes": 50});
+        assert_eq!(
+            continuation(&a, "firefox", Some(42), 7, false),
+            "… 7 more nodes; continue with tree(app=\"firefox\", document=true, \
+             interactive=true, max_nodes=50, after=42)"
+        );
+        let a = json!({"root_id": 9, "max_chars": 5000});
+        assert_eq!(
+            continuation(&a, "kate", Some(12), 3, true),
+            "… 3+ more nodes; continue with tree(root_id=9, max_chars=5000, after=12)"
+        );
+        assert_eq!(
+            continuation(&a, "kate", Some(12), 0, true),
+            "… more nodes; continue with tree(root_id=9, max_chars=5000, after=12)"
+        );
+        assert_eq!(continuation(&a, "kate", None, 0, true), render::TRUNCATED);
+    }
+
+    #[test]
+    fn tree_with_screenshot_adds_the_active_window_image() {
+        local(async {
+            let mut s = session("tree-shot");
+            let r = call_tool(
+                &mut s,
+                2,
+                "tree",
+                json!({"app": "fake", "screenshot": true}),
+            )
+            .await;
+            let content = r["result"]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 2, "{r}");
+            assert_eq!(content[1]["type"], json!("image"));
+            let text = reply_text(&r);
+            assert!(text.starts_with("fake\n [1] push button \"OK\""), "{r}");
+            assert!(text.contains("\nscreenshot: "), "{r}");
+            // Another app in front: the tree alone, and why.
+            *s.active.borrow_mut() = ("konsole".into(), "~ : bash — Konsole".into());
+            let r = call_tool(
+                &mut s,
+                3,
+                "tree",
+                json!({"app": "fake", "screenshot": true}),
+            )
+            .await;
+            assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1, "{r}");
+            assert!(reply_text(&r).contains("no screenshot: the active window is not fake's"));
         });
     }
 

@@ -94,16 +94,20 @@ const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
 
 // AtspiStateType bit positions.
 pub const ACTIVE: u32 = 1;
+pub const BUSY: u32 = 3;
 pub const CHECKED: u32 = 4;
 pub const EDITABLE: u32 = 7;
 pub const ENABLED: u32 = 8;
+pub const EXPANDABLE: u32 = 9;
 pub const EXPANDED: u32 = 10;
 pub const FOCUSED: u32 = 12;
 pub const MULTI_LINE: u32 = 17;
+pub const SELECTABLE: u32 = 22;
 pub const SELECTED: u32 = 23;
 pub const SHOWING: u32 = 25;
 pub const VISIBLE: u32 = 30;
 pub const IS_DEFAULT: u32 = 39;
+pub const CHECKABLE: u32 = 41;
 
 // AtspiRelationType: a browser window EMBEDS its current tab's document.
 pub const RELATION_EMBEDS: u32 = 13;
@@ -500,6 +504,11 @@ impl A11y {
             .then(|| self.changes.since(buses, mark))
     }
 
+    /// Whether change events are registered (`wait_change` hears of them).
+    pub fn changes_live(&self) -> bool {
+        self.changes.live.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn note_effect(&self, bus: &str) {
         if self.effects.receiver_count() > 0 {
             let _ = self.effects.send(bus.into());
@@ -742,6 +751,9 @@ impl A11y {
             actions,
             text,
             children,
+            operable: [SELECTABLE, CHECKABLE, EXPANDABLE]
+                .iter()
+                .any(|s| has(raw, *s)),
         };
         (info, hidden_visible)
     }

@@ -87,8 +87,9 @@ Why it is fast:
   and lie inside the window are entered as well, while content scrolled out of
   view is still skipped. Example: Gemini's upload menu ("Dosya yükleyin") is
   now found without a screenshot.
-- Read tools (`apps`, `tree`, `find`, `get_text`, `wait_for`, `screenshot`,
-  `pause`, `clipboard_get`, `windows`, `doctor`) carry MCP's `readOnlyHint`;
+- Read tools (`apps`, `tree`, `find`, `get_text`, `wait_for`, `wait_idle`,
+  `screenshot`, `pause`, `clipboard_get`, `windows`, `doctor`) carry MCP's
+  `readOnlyHint`;
   Claude Code runs several of them in parallel when asked for in one message.
 
 ## On-screen indicator
@@ -147,6 +148,14 @@ tool; `off` turns it off). Not available on Windows yet.
   browser, that tab's page without tabs and toolbars). `get_text` on a web page
   or another container returns the text of everything in it in reading order
   (web containers' own text is only a placeholder per child element).
+- Large trees: `tree(interactive: true)` lists only elements one can operate
+  (actions, editable/checkable/selectable/expandable) under their nearest
+  named ancestor; on a GitHub issues page in Firefox it was 15,339 instead of
+  24,687 characters and still listed all 259 links, buttons and fields. A
+  reply is capped at `max_chars` (default 20,000) and `max_nodes`; a cut one
+  ends with `… N more nodes; continue with tree(…, after=ID)`, which lists the
+  rest after that element (ids are stable, so pages join up exactly).
+  `screenshot: true` adds the image of the app's window when it is in front.
 - `set_text` reads back what it wrote: the reply says "verified", or it fails
   saying what the field holds (a length limit, reformatting). Firefox's input
   fields report accessibility writes as successful and do nothing, so when
@@ -200,6 +209,16 @@ tool; `off` turns it off). Not available on Windows yet.
 - `wait_for`: waits until an element appears or disappears (checks every
   50 ms, at most 10 minutes); for dialogs opened by a key or click, a long
   load or a build. A longer timeout is cut to 10 minutes and the reply says so.
+  `state` (enabled, focused, checked, selected) waits until the element has
+  that state (with `gone`, until it no longer does). `window` instead of
+  `query` waits for a window of an allowed app whose title or app name
+  contains it to open, or with `gone` to close (KDE and Hyprland window
+  lists, re-read when AT-SPI reports a window change).
+- `wait_idle`: waits until an app's accessibility tree has not changed for
+  `quiet_ms` (default 300), e.g. after a page load; a browser page still
+  marked busy does not count as quiet. A page waiting for the network sends
+  nothing, so after a click that loads a page raise `quiet_ms` or use
+  `wait_for` on content of the new page.
 - `pause`: waits a fixed time (`ms`, at most 10 minutes); for waiting on time
   only, not on a visible change.
 - `windows`: lists windows of allowed apps with position, size, state (active,

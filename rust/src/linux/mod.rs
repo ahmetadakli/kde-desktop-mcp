@@ -675,16 +675,7 @@ impl LinuxBackend {
 
     /// Every window of an allowed app, without terminals (launch's poll).
     async fn all_windows(&self, allowed: &[String]) -> R<Vec<WindowGeo>> {
-        match &self.comp {
-            Compositor::Kde(kwin) => kwin.windows("", &self.kwin_allow(allowed).await).await,
-            Compositor::Hyprland(h) => Ok(self
-                .hypr_clients(h, "", allowed)
-                .await?
-                .1
-                .into_iter()
-                .map(|c| c.geo)
-                .collect()),
-        }
+        self.windows_quick("", allowed).await
     }
 
     // ------------------------------------------------------------ focus
@@ -1040,11 +1031,15 @@ impl Backend for LinuxBackend {
         self.a11y.change_mark()
     }
 
-    async fn wait_change(&self, near: &[Obj], mark: u64, timeout: Duration) {
+    async fn wait_change(&self, near: &[Obj], mark: u64, timeout: Duration) -> bool {
         let mut buses: Vec<&str> = near.iter().map(|o| o.bus.as_ref()).collect();
         buses.sort_unstable();
         buses.dedup();
-        self.a11y.wait_change(&buses, mark, timeout).await;
+        self.a11y.wait_change(&buses, mark, timeout).await
+    }
+
+    fn changes_live(&self) -> bool {
+        self.a11y.changes_live()
     }
 
     fn changed_since(&self, near: &[Obj], mark: u64) -> Option<bool> {
@@ -1093,6 +1088,17 @@ impl Backend for LinuxBackend {
 
     async fn embedded_document(&self, window: &Obj) -> Option<Obj> {
         self.a11y.relation(window, atspi::RELATION_EMBEDS).await
+    }
+
+    async fn loading(&self, windows: &[Obj]) -> bool {
+        let busy = futures_util::future::join_all(windows.iter().map(|w| async move {
+            match self.embedded_document(w).await {
+                Some(doc) => self.a11y.has_state(&doc, atspi::BUSY).await,
+                None => false,
+            }
+        }))
+        .await;
+        busy.into_iter().any(|b| b)
     }
 
     async fn actions(&self, id: &Obj) -> Vec<String> {
@@ -1184,6 +1190,7 @@ impl Backend for LinuxBackend {
             actions,
             text: None,
             children: Vec::new(),
+            operable: false,
         };
         Some(Focused {
             id: hint,
@@ -1481,6 +1488,19 @@ impl Backend for LinuxBackend {
                 with_terminals(&mut list).await;
                 Ok(list)
             }
+        }
+    }
+
+    async fn windows_quick(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
+        match &self.comp {
+            Compositor::Kde(kwin) => kwin.windows(query, &self.kwin_allow(allowed).await).await,
+            Compositor::Hyprland(h) => Ok(self
+                .hypr_clients(h, query, allowed)
+                .await?
+                .1
+                .into_iter()
+                .map(|c| c.geo)
+                .collect()),
         }
     }
 

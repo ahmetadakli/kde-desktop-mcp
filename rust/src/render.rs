@@ -256,6 +256,15 @@ const MIN_RUN: usize = 3;
 /// `list item ×3: [8] "a" [9] "b" [10] "c"`,
 /// `check box ×2 actions=Toggle: [11] "Bold" [12]`.
 pub fn format<Id>(items: &[Printed<Id>]) -> String {
+    format_lines(items)
+        .into_iter()
+        .map(|(line, _)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The lines `format` joins, each with the number of `items` it covers.
+fn format_lines<Id>(items: &[Printed<Id>]) -> Vec<(String, usize)> {
     // A node is a leaf here when the next line is not deeper.
     let leaf = |i: usize, depth: usize| match items.get(i + 1) {
         Some(Printed::Node { depth: d, .. }) => *d <= depth,
@@ -266,7 +275,7 @@ pub fn format<Id>(items: &[Printed<Id>]) -> String {
     while i < items.len() {
         let (depth, rid, info) = match &items[i] {
             Printed::Raw(s) => {
-                out.push(s.clone());
+                out.push((s.clone(), 1));
                 i += 1;
                 continue;
             }
@@ -312,18 +321,59 @@ pub fn format<Id>(items: &[Printed<Id>]) -> String {
                     Printed::Raw(_) => unreachable!(),
                 })
                 .collect();
-            out.push(format!(
-                "{indent}{role} ×{}{actions}: {}",
+            out.push((
+                format!("{indent}{role} ×{}{actions}: {}", j - i, members.join(" ")),
                 j - i,
-                members.join(" ")
             ));
             i = j;
         } else {
-            out.push(format!("{indent}{}", describe(info, rid)));
+            out.push((format!("{indent}{}", describe(info, rid)), 1));
             i += 1;
         }
     }
-    out.join("\n")
+    out
+}
+
+/// What `format_capped` printed.
+pub struct Capped {
+    pub text: String,
+    /// Id of the last element printed, where a continuation starts after.
+    pub last: Option<u64>,
+    /// Elements among `items` left out.
+    pub left: usize,
+}
+
+/// `format` cut to whole lines of at most `max_chars` characters in all
+/// (0: no cap). At least one element line is kept, so paging always moves on.
+pub fn format_capped<Id>(items: &[Printed<Id>], max_chars: usize) -> Capped {
+    let mut text = String::new();
+    let mut chars = 0;
+    let mut used = 0;
+    let mut nodes = false;
+    for (line, n) in format_lines(items) {
+        let len = line.chars().count() + usize::from(!text.is_empty());
+        if max_chars > 0 && nodes && chars + len > max_chars {
+            break;
+        }
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&line);
+        chars += len;
+        nodes |= items[used..used + n]
+            .iter()
+            .any(|it| matches!(it, Printed::Node { .. }));
+        used += n;
+    }
+    let last = items[..used].iter().rev().find_map(|it| match it {
+        Printed::Node { rid, .. } => Some(*rid),
+        Printed::Raw(_) => None,
+    });
+    let left = items[used..]
+        .iter()
+        .filter(|it| matches!(it, Printed::Node { .. }))
+        .count();
+    Capped { text, last, left }
 }
 
 pub struct WalkOpts {
@@ -331,22 +381,160 @@ pub struct WalkOpts {
     pub budget: usize,
     pub only_showing: bool,
     pub boring_roles: &'static [&'static str],
+    /// Only elements one can operate (see `interactive`), each with its
+    /// nearest named ancestor for context.
+    pub interactive: bool,
+}
+
+/// How a walk ended.
+#[derive(Debug, PartialEq)]
+pub struct Walked {
+    /// The budget ran out before the end.
+    pub truncated: bool,
+    /// The `after` element was met (always true without one).
+    pub after_found: bool,
 }
 
 /// Python `walk`: unnamed, actionless nodes of boring roles are skipped and
 /// their children lifted to the same depth (see `Shape` for what else is
-/// left out). On Err, every node the walk could not reach yet, so one fetch
-/// brings them all.
+/// left out). With `after`, only the lines after that element's line are
+/// kept and count against the budget: the next page of a cut tree. On Err,
+/// every node the walk could not reach yet, so one fetch brings them all.
 pub fn walk<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     children: &[Id],
     depth: usize,
     opts: &WalkOpts,
+    after: Option<&Id>,
     lines: &mut Vec<Line<Id>>,
-) -> Result<(), Vec<Id>> {
-    let mut missing = Vec::new();
-    walk_into(cache, children, depth, opts, lines, &mut missing);
-    done((), missing)
+) -> Result<Walked, Vec<Id>> {
+    let base = lines.len();
+    let mut st = Walk {
+        cache,
+        opts,
+        lines,
+        missing: Vec::new(),
+        after,
+        start: None,
+        truncated: false,
+    };
+    walk_into(&mut st, children, depth);
+    let after_found = after.is_none() || st.start.is_some();
+    match st.start {
+        Some(start) => drop(st.lines.drain(base..start)),
+        None if after.is_some() => st.lines.truncate(base),
+        None => {}
+    }
+    let walked = Walked {
+        truncated: st.truncated,
+        after_found,
+    };
+    done(walked, st.missing)
+}
+
+/// A walk in progress.
+struct Walk<'a, Id> {
+    cache: &'a Cache<Id>,
+    opts: &'a WalkOpts,
+    lines: &'a mut Vec<Line<Id>>,
+    missing: Vec<Id>,
+    /// Lines up to this element's are skipped.
+    after: Option<&'a Id>,
+    /// Index of the first line after `after`'s, once it was printed.
+    start: Option<usize>,
+    truncated: bool,
+}
+
+impl<Id> Walk<'_, Id> {
+    /// Lines that count against the budget.
+    fn counted(&self) -> usize {
+        match (self.after, self.start) {
+            (None, _) => self.lines.len(),
+            (Some(_), Some(s)) => self.lines.len().saturating_sub(s),
+            (Some(_), None) => 0,
+        }
+    }
+
+    /// Drop the line at `at`; with `lift`, its subtree (the lines after it)
+    /// moves up a level.
+    fn remove(&mut self, at: usize, lift: bool) {
+        self.lines.remove(at);
+        if let Some(s) = self.start
+            && s > at
+        {
+            self.start = Some(s - 1);
+        }
+        if lift {
+            for line in &mut self.lines[at..] {
+                if let Line::Node { depth, .. } = line {
+                    *depth = depth.saturating_sub(1);
+                }
+            }
+        }
+    }
+}
+
+/// Roles one operates whatever actions the platform lists (AT-SPI, then
+/// UI Automation names).
+const INTERACTIVE_ROLES: [&str; 25] = [
+    "push button",
+    "button",
+    "toggle button",
+    "link",
+    "page tab",
+    "check box",
+    "check menu item",
+    "radio button",
+    "radio menu item",
+    "menu item",
+    "combo box",
+    "entry",
+    "password text",
+    "spin button",
+    "slider",
+    "hyperlink",
+    "checkbox",
+    "radiobutton",
+    "combobox",
+    "tabitem",
+    "menuitem",
+    "edit",
+    "splitbutton",
+    "spinner",
+    "listitem",
+];
+
+/// States that mark an element one operates.
+const INTERACTIVE_STATES: [&str; 5] = ["editable", "checked", "selected", "expanded", "focused"];
+
+/// Whether `tree(interactive=true)` lists the element: it has an action
+/// worth listing (implied ones included), an interactive role or state, or
+/// the platform marks it selectable, checkable or expandable.
+/// A container's implied click (a web page's section or panel with a click
+/// handler somewhere inside, the page itself) does not count: nearly every
+/// page wrapper has one.
+pub fn interactive<Id>(info: &Info<Id>) -> bool {
+    let role = info.role.as_str();
+    let container = IMPLIED_ACTIONS
+        .iter()
+        .any(|i| !i.expected && i.roles.contains(&role));
+    let acts = if container {
+        !listed_actions(info).is_empty()
+    } else {
+        !shown_actions(info).is_empty()
+    };
+    acts || info.operable
+        || INTERACTIVE_ROLES.contains(&role)
+        || info.states.iter().any(|s| INTERACTIVE_STATES.contains(s))
+}
+
+/// Name compared for `echoes_only_child`: trimmed, whitespace runs as one
+/// space, lower case.
+fn norm_name(name: &str) -> String {
+    name.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 /// Wrapper roles beyond the backend's boring ones: printed only when they
@@ -431,49 +619,77 @@ fn shape<Id: Clone + Eq + Hash>(cache: &Cache<Id>, info: &Info<Id>, opts: &WalkO
 }
 
 /// `walk`, going on past missing nodes (the lines are then incomplete and
-/// get thrown away) to collect all of them.
-fn walk_into<Id: Clone + Eq + Hash>(
-    cache: &Cache<Id>,
-    children: &[Id],
-    depth: usize,
-    opts: &WalkOpts,
-    lines: &mut Vec<Line<Id>>,
-    missing: &mut Vec<Id>,
-) {
-    if lines.len() >= opts.budget || depth > opts.max_depth {
-        return;
+/// get thrown away) to collect all of them. In an interactive walk, true
+/// when a line it kept still wants its nearest named ancestor printed.
+fn walk_into<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, children: &[Id], depth: usize) -> bool {
+    let (cache, opts) = (st.cache, st.opts);
+    let mut wants_context = false;
+    if st.truncated || depth > opts.max_depth {
+        return false;
     }
-    for (c, info) in get(cache, children, missing) {
-        if lines.len() >= opts.budget {
-            // Once, not once per open level.
-            if !matches!(lines.last(), Some(Line::Raw(s)) if s == TRUNCATED) {
-                lines.push(Line::Raw(TRUNCATED.into()));
-            }
-            return;
+    for (c, info) in get(cache, children, &mut st.missing) {
+        if st.truncated {
+            break;
+        }
+        if st.counted() >= opts.budget {
+            st.truncated = true;
+            break;
         }
         if opts.only_showing && !info.showing {
             continue;
         }
         if shape(cache, info, opts) == Shape::Lift {
-            walk_into(cache, &info.children, depth, opts, lines, missing);
+            wants_context |= walk_into(st, &info.children, depth);
             continue;
         }
-        let at = lines.len();
-        lines.push(Line::Node {
+        let at = st.lines.len();
+        st.lines.push(Line::Node {
             depth,
             id: c.clone(),
         });
+        if st.start.is_none() && st.after == Some(c) {
+            st.start = Some(at + 1);
+        }
         // Whether the children were looked at, not cut by budget or depth.
-        let walked = at + 1 < opts.budget && depth < opts.max_depth;
-        walk_into(cache, &info.children, depth + 1, opts, lines, missing);
-        if lines.len() == at + 1
+        let walked = st.counted() < opts.budget && depth < opts.max_depth;
+        let kids_want = walk_into(st, &info.children, depth + 1);
+        if opts.interactive {
+            if interactive(info) {
+                wants_context = true;
+            } else if !kids_want || info.name.trim().is_empty() || echoes_only_child(st, at, info) {
+                // Neither operable nor the context something below needs.
+                st.remove(at, true);
+                wants_context |= kids_want;
+            }
+        } else if st.lines.len() == at + 1
             && (info.children.is_empty() || walked)
             && EMPTY_LEAF_ROLES.contains(&info.role.as_str())
             && bare(info)
             && shown_actions(info).is_empty()
         {
-            lines.pop();
+            st.remove(at, false);
         }
+    }
+    wants_context
+}
+
+/// Whether the line at `at` (`info`'s) has a single line right below it
+/// that carries the same name: a list item or heading named after the one
+/// link in it says nothing as context.
+fn echoes_only_child<Id: Clone + Eq + Hash>(st: &Walk<'_, Id>, at: usize, info: &Info<Id>) -> bool {
+    let Some(Line::Node { depth, .. }) = st.lines.get(at) else {
+        return false;
+    };
+    let mut below = st.lines[at + 1..].iter().filter_map(|l| match l {
+        Line::Node { depth: d, id } if *d == depth + 1 => Some(id),
+        _ => None,
+    });
+    match (below.next(), below.next()) {
+        (Some(id), None) => st
+            .cache
+            .get(id)
+            .is_some_and(|kid| norm_name(&kid.name) == norm_name(&info.name)),
+        _ => false,
     }
 }
 
@@ -622,6 +838,31 @@ pub fn locate<Id: Clone + Eq + Hash>(
     }
     let best = first_partial.or(title_exact).or(title_partial);
     done(best.cloned(), missing)
+}
+
+/// A hash of the visible elements below `roots` (role, name, states,
+/// text), in document order, for telling whether a window changed. Nodes
+/// not fetched are left out.
+pub fn fingerprint<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id]) -> u64 {
+    use std::hash::Hasher;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    let mut stack: Vec<&Id> = roots.iter().rev().collect();
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        let Some(info) = cache.get(id) else { continue };
+        if !info.showing {
+            continue;
+        }
+        (&info.role, &info.name, &info.states, &info.text).hash(&mut h);
+        // Where a subtree ends, so moving a node changes the hash.
+        info.children.len().hash(&mut h);
+        stack.extend(info.children.iter().rev());
+    }
+    h.finish()
 }
 
 /// Roles of the page or document inside an app window: a browser tab's web
@@ -861,6 +1102,7 @@ mod tests {
             budget,
             only_showing: true,
             boring_roles: BORING,
+            interactive: false,
         }
     }
 
@@ -878,7 +1120,7 @@ mod tests {
     fn walk_lifts_boring_nodes_and_skips_hidden() {
         let cache = sample();
         let mut lines = Vec::new();
-        walk(&cache, &["/w"], 1, &opts(300), &mut lines).unwrap();
+        walk(&cache, &["/w"], 1, &opts(300), None, &mut lines).unwrap();
         let got: Vec<(usize, &str)> = lines
             .iter()
             .map(|l| match l {
@@ -893,16 +1135,21 @@ mod tests {
     fn walk_reports_missing_nodes_and_truncates() {
         let mut cache = sample();
         cache.remove("/b2");
-        let missing = walk(&cache, &["/w"], 1, &opts(300), &mut Vec::new()).unwrap_err();
+        let missing = walk(&cache, &["/w"], 1, &opts(300), None, &mut Vec::new()).unwrap_err();
         assert_eq!(missing, vec!["/b2"]);
 
         let cache = sample();
         let mut lines = Vec::new();
-        walk(&cache, &["/w"], 1, &opts(2), &mut lines).unwrap();
-        assert_eq!(lines.last(), Some(&Line::Raw(TRUNCATED.into())));
+        let walked = walk(&cache, &["/w"], 1, &opts(2), None, &mut lines).unwrap();
+        assert!(walked.truncated);
+        assert_eq!(lines.len(), 2);
+        let walked = walk(&cache, &["/w"], 1, &opts(300), None, &mut Vec::new()).unwrap();
         assert_eq!(
-            lines.iter().filter(|l| matches!(l, Line::Raw(_))).count(),
-            1
+            walked,
+            Walked {
+                truncated: false,
+                after_found: true
+            }
         );
     }
 
@@ -930,7 +1177,7 @@ mod tests {
         let mut cache = sample();
         cache.get_mut("/p").unwrap().actions = vec!["Set Focus".into()];
         let mut lines = Vec::new();
-        walk(&cache, &["/w"], 1, &opts(300), &mut lines).unwrap();
+        walk(&cache, &["/w"], 1, &opts(300), None, &mut lines).unwrap();
         assert_eq!(lines.len(), 3); // /w, /b1, /b2: the panel is still lifted
     }
 
@@ -1150,7 +1397,7 @@ mod tests {
         cache.remove("/b2");
         // Two branches, each with a node not fetched yet.
         let mut lines = Vec::new();
-        let missing = walk(&cache, &["/w"], 1, &opts(300), &mut lines).unwrap_err();
+        let missing = walk(&cache, &["/w"], 1, &opts(300), None, &mut lines).unwrap_err();
         assert_eq!(missing, vec!["/b2", "/c"]);
         let mut missing = find(&cache, &["/w"], "zz", "", 10).unwrap_err();
         missing.sort();
@@ -1239,7 +1486,7 @@ mod tests {
         o: &WalkOpts,
     ) -> Vec<(usize, &'static str)> {
         let mut lines = Vec::new();
-        walk(cache, roots, 1, o, &mut lines).unwrap();
+        walk(cache, roots, 1, o, None, &mut lines).unwrap();
         lines
             .iter()
             .filter_map(|l| match l {
@@ -1496,5 +1743,156 @@ mod tests {
         assert_eq!(py_repr("it's"), "\"it's\"");
         assert_eq!(py_repr("a'b\"c"), "'a\\'b\"c'");
         assert_eq!(py_repr("x\ty"), "'x\\ty'");
+    }
+
+    /// (depth, id) of the node lines of a walk that may start `after`.
+    fn walked_after(
+        cache: &Cache<&'static str>,
+        roots: &[&'static str],
+        o: &WalkOpts,
+        after: Option<&'static str>,
+    ) -> (Vec<(usize, &'static str)>, Walked) {
+        let mut lines = Vec::new();
+        let w = walk(cache, roots, 1, o, after.as_ref(), &mut lines).unwrap();
+        let nodes = lines
+            .iter()
+            .filter_map(|l| match l {
+                Line::Node { depth, id } => Some((*depth, *id)),
+                Line::Raw(_) => None,
+            })
+            .collect();
+        (nodes, w)
+    }
+
+    #[test]
+    fn a_cut_walk_continues_after_its_last_element_to_the_end() {
+        let cache = web_page();
+        let o = |budget| WalkOpts {
+            boring_roles: &["section", "panel"],
+            ..opts(budget)
+        };
+        let (full, _) = walked_after(&cache, &["/doc"], &o(300), None);
+        // Pages of two lines, each after the last element of the one before.
+        let mut paged = Vec::new();
+        let mut after = None;
+        loop {
+            let (page, w) = walked_after(&cache, &["/doc"], &o(2), after);
+            assert!(w.after_found);
+            paged.extend(page.iter().copied());
+            if !w.truncated {
+                break;
+            }
+            after = Some(page.last().unwrap().1);
+        }
+        assert_eq!(paged, full);
+        // An element no longer in the tree is reported.
+        let (page, w) = walked_after(&cache, &["/doc"], &o(2), Some("/gone"));
+        assert!(page.is_empty() && !w.after_found);
+    }
+
+    #[test]
+    fn interactive_walk_keeps_operable_elements_under_named_ancestors() {
+        let mut c = web_page();
+        // A named list item around one same-named link says nothing; a
+        // named list with two items is context; a section's click is no
+        // reason to list it.
+        c.insert("/nav", node("landmark", "Navigation", true, &[], &["/l"]));
+        c.insert("/l", node("list", "Menu", true, &[], &["/li", "/li2"]));
+        c.insert("/li", node("list item", "Home", true, &[], &["/link"]));
+        c.insert("/li2", node("list item", "", true, &[], &["/txt", "/chk"]));
+        c.insert("/txt", node("static", "Plain text", true, &[], &[]));
+        let mut chk = node("static", "Remember", true, &[], &[]);
+        chk.operable = true;
+        c.insert("/chk", chk);
+        let o = WalkOpts {
+            boring_roles: &["section", "panel"],
+            interactive: true,
+            ..opts(300)
+        };
+        assert_eq!(
+            walked_after(&c, &["/doc"], &o, None).0,
+            vec![
+                (1, "/doc"),
+                (2, "/btn"),
+                (2, "/lab2"),
+                (3, "/btn2"),
+                (2, "/l"),
+                (3, "/link"),
+                (3, "/chk"),
+            ]
+        );
+        assert!(!interactive(&c["/sec"]));
+        assert!(interactive(&with_actions(
+            node("section", "", true, &[], &[]),
+            &["click", "expand"]
+        )));
+        assert!(interactive(&node("text", "", true, &["editable"], &[])));
+    }
+
+    fn printed_nodes<'a>(infos: &'a [Info<&'static str>]) -> Vec<Printed<'a, &'static str>> {
+        let mut out = vec![Printed::Raw("app".into())];
+        out.extend(infos.iter().enumerate().map(|(k, info)| Printed::Node {
+            depth: 1,
+            rid: k as u64 + 1,
+            info,
+        }));
+        out
+    }
+
+    #[test]
+    fn capped_format_cuts_at_whole_lines_and_names_the_last_element() {
+        let infos: Vec<Info<&str>> = ["Alpha", "Beta", "Gamma", "Delta"]
+            .iter()
+            .enumerate()
+            .map(|(k, n)| {
+                node(
+                    "label",
+                    n,
+                    true,
+                    if k % 2 == 0 { &["focused"] } else { &[] },
+                    &[],
+                )
+            })
+            .collect();
+        let items = printed_nodes(&infos);
+        let all = format(&items);
+        let c = format_capped(&items, 0);
+        assert_eq!(
+            (c.text.as_str(), c.last, c.left),
+            (all.as_str(), Some(4), 0)
+        );
+        // "app" and the first two lines fit in 60 characters.
+        let c = format_capped(&items, 60);
+        assert_eq!(c.text.lines().count(), 3, "{}", c.text);
+        assert!(c.text.chars().count() <= 60);
+        assert_eq!((c.last, c.left), (Some(2), 2));
+        // At least one element, however small the cap.
+        let c = format_capped(&items, 1);
+        assert_eq!((c.last, c.left), (Some(1), 3));
+        // A folded run is one line: kept or cut whole.
+        let plain: Vec<Info<&str>> = ["a", "b", "c"]
+            .iter()
+            .map(|n| node("list item", n, true, &[], &[]))
+            .collect();
+        let items = printed_nodes(&plain);
+        let c = format_capped(&items, 5);
+        assert_eq!((c.last, c.left), (Some(3), 0));
+    }
+
+    #[test]
+    fn fingerprint_follows_visible_content_only() {
+        let cache = sample();
+        let fp = fingerprint(&cache, &["/w"]);
+        assert_eq!(fp, fingerprint(&sample(), &["/w"]));
+        let mut renamed = sample();
+        renamed.get_mut("/b1").unwrap().name = "Save".into();
+        assert_ne!(fp, fingerprint(&renamed, &["/w"]));
+        let mut texted = sample();
+        texted.get_mut("/b2").unwrap().text = Some("more".into());
+        assert_ne!(fp, fingerprint(&texted, &["/w"]));
+        // The hidden button may change freely.
+        let mut hidden = sample();
+        hidden.get_mut("/h").unwrap().name = "other".into();
+        assert_eq!(fp, fingerprint(&hidden, &["/w"]));
     }
 }
