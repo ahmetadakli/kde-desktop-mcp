@@ -358,6 +358,11 @@ pub trait Backend {
     async fn screens(&self) -> Vec<Screen> {
         Vec::new()
     }
+    /// Who owns the seat: the user's input and the stop shortcut, watched
+    /// by the backend (see takeover.rs). None where nothing watches.
+    fn takeover(&self) -> Option<std::sync::Arc<crate::takeover::Takeover>> {
+        None
+    }
     /// Show what the agent is doing on screen, when the desktop has an
     /// indicator.
     async fn indicate(&self, _label: &str) {}

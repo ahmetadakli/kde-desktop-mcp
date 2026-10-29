@@ -11,6 +11,7 @@ mod input;
 mod kwin;
 mod launch;
 mod roles;
+mod takeover;
 mod terminals;
 
 use std::collections::HashMap;
@@ -167,6 +168,8 @@ pub struct LinuxBackend {
     /// KWin refused ScreenShot2; use spectacle from now on.
     shot_unauthorized: AtomicBool,
     indicator: tokio::sync::Mutex<IndicatorProc>,
+    /// The user's input and the stop shortcut (watched from `warm_up`).
+    takeover: Arc<crate::takeover::Takeover>,
 }
 
 /// The `--indicator` child process, started on the first action.
@@ -484,6 +487,7 @@ impl LinuxBackend {
             focus_record: Mutex::new(FocusRecord::default()),
             shot_unauthorized: AtomicBool::new(false),
             indicator: tokio::sync::Mutex::new(IndicatorProc::default()),
+            takeover: Arc::new(crate::takeover::Takeover::from_env()),
         })
     }
 
@@ -979,6 +983,15 @@ impl Backend for LinuxBackend {
         std::thread::spawn(move || input.warm_up_keyboard());
         let input = self.input.clone();
         std::thread::spawn(move || input.warm_up_pointer());
+        takeover::start(
+            self.takeover.clone(),
+            matches!(self.comp, Compositor::Kde(_)),
+            self.session.clone(),
+        );
+    }
+
+    fn takeover(&self) -> Option<Arc<crate::takeover::Takeover>> {
+        Some(self.takeover.clone())
     }
 
     async fn list_apps(&self) -> Vec<AppEntry> {

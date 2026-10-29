@@ -11,6 +11,7 @@ mod backend;
 mod linux;
 mod render;
 mod shot;
+mod takeover;
 mod tools;
 #[cfg(windows)]
 mod windows;
@@ -193,6 +194,11 @@ struct Server<B: Backend> {
     /// `app_key`s of apps whose accessibility text writes report success
     /// and change nothing (Firefox); set_text types there right away.
     inert_writes: Mutex<HashSet<String>>,
+    /// The user's input and the stop shortcut, when the backend watches them.
+    takeover: Option<std::sync::Arc<takeover::Takeover>>,
+    /// When the current holder of `input` took it: user input after this
+    /// interrupts the rest of its run (a batch's later steps, a drag).
+    run_start: std::sync::Mutex<Option<Instant>>,
 }
 
 /// Tools that send keyboard or pointer input, run an app's actions (`act`
@@ -213,6 +219,25 @@ const INPUT_TOOLS: [&str; 13] = [
     "clipboard_get",
     "clipboard_set",
     "file_dialog",
+];
+
+/// Tools that act on the seat or what the user sees: they pause while the
+/// user uses the keyboard or mouse, and stop after the stop shortcut. The
+/// clipboard tools send no input and are not held up.
+const GATED_TOOLS: [&str; 13] = [
+    "act",
+    "set_text",
+    "focus",
+    "click",
+    "drag",
+    "scroll",
+    "key",
+    "type_text",
+    "mouse",
+    "activate_window",
+    "file_dialog",
+    "move_window",
+    "launch",
 ];
 
 /// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
@@ -609,6 +634,7 @@ where
 impl<B: Backend> Server<B> {
     fn new(b: B) -> Self {
         let allow_file = b.allow_file();
+        let b_takeover = b.takeover();
         Server {
             b,
             refs: Mutex::new(Refs {
@@ -621,6 +647,38 @@ impl<B: Backend> Server<B> {
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
+            takeover: b_takeover,
+            run_start: std::sync::Mutex::new(None),
+        }
+    }
+
+    // ------------------------------------------------------------ takeover
+
+    /// Note that a run of input starts now (the input lock was just taken).
+    fn start_run(&self) {
+        *self.run_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    /// Whether a gated tool may act now: not after the stop shortcut, not
+    /// while the user uses the seat, and in a run of input (a batch, a
+    /// drag), not once the user started using it after the run began. A
+    /// refusal shows on the indicator.
+    /// `in_run`: called inside a run that holds the input lock (a batch
+    /// step, a drag's moves), whose start counts.
+    async fn gate(&self, in_run: bool) -> R<()> {
+        let Some(t) = &self.takeover else {
+            return Ok(());
+        };
+        let start = match in_run {
+            true => *self.run_start.lock().unwrap_or_else(|e| e.into_inner()),
+            false => None,
+        };
+        match t.check_since(start, Instant::now()) {
+            Ok(()) => Ok(()),
+            Err(block) => {
+                self.b.indicate(&block.label()).await;
+                Err(block.message(t.window()))
+            }
         }
     }
 
@@ -1065,6 +1123,10 @@ impl<B: Backend> Server<B> {
         );
         for c in self.b.doctor().await {
             row(c.ok, c.name, &c.detail);
+        }
+        if let Some(t) = &self.takeover {
+            let (ok, detail) = t.report();
+            row(ok, "takeover detection", &detail);
         }
         if !self.b.apps_note().is_empty() {
             lines.push(format!("note: {}", self.b.apps_note()));
@@ -1585,6 +1647,11 @@ impl<B: Backend> Server<B> {
         for i in 1..=DRAG_STEPS {
             let x = x0 + (x1 - x0) * i / DRAG_STEPS;
             let y = y0 + (y1 - y0) * i / DRAG_STEPS;
+            // The user took over (or pressed the stop shortcut): let go.
+            moved = self.gate(true).await;
+            if moved.is_err() {
+                break;
+            }
             moved = self.b.move_pointer(x, y).await;
             if moved.is_err() {
                 break;
@@ -1614,7 +1681,10 @@ impl<B: Backend> Server<B> {
         let repeat = arg_i(a, "repeat", 1);
         self.b.check_combo(&combo)?;
         let app = self.require_active_allowed().await?;
-        for _ in 0..repeat.clamp(1, 100) {
+        for i in 0..repeat.clamp(1, 100) {
+            if i > 0 {
+                self.gate(true).await?;
+            }
             self.b.press_combo(&combo).await?;
         }
         let focus = self.focus_note(false).await;
@@ -1911,7 +1981,9 @@ impl<B: Backend> Server<B> {
             INPUT_TOOLS.contains(&tool_of(s)) || matches!(window_arg(tool_of(s), args), Ok(Some(_)))
         });
         let _input = if input {
-            Some(self.input.lock().await)
+            let guard = self.input.lock().await;
+            self.start_run();
+            Some(guard)
         } else {
             None
         };
@@ -1985,9 +2057,24 @@ impl<B: Backend> Server<B> {
             // A screenshot sends no input, but activating its window does. A
             // batch that holds the input lock already runs its steps `held`.
             let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
-                Some(self.input.lock().await)
+                let guard = self.input.lock().await;
+                self.start_run();
+                Some(guard)
             } else {
                 None
+            };
+            let gated = GATED_TOOLS.contains(&name) || window.is_some();
+            // Only an activate_window call of its own resumes after the stop
+            // shortcut, never a step of a batch that was running then.
+            let resumed = name == "activate_window"
+                && !held
+                && self.takeover.as_ref().is_some_and(|t| t.resume());
+            if gated {
+                self.gate(held).await?;
+            }
+            let _ours = match &self.takeover {
+                Some(t) if gated => Some(t.ours()),
+                _ => None,
             };
             if let Some(label) = indicator_label(name, a) {
                 self.b.indicate(&label).await;
@@ -2024,7 +2111,7 @@ impl<B: Backend> Server<B> {
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
             };
-            match activated {
+            let result = match activated {
                 Some(title) => {
                     let done = format!("activated {}; ", render::py_repr(&title));
                     result
@@ -2035,6 +2122,13 @@ impl<B: Backend> Server<B> {
                         .map_err(|e| format!("{done}{e}"))
                 }
                 None => result,
+            };
+            match resumed {
+                true => result.map(|mut o| {
+                    o.text.insert_str(0, "resumed after the user's stop; ");
+                    o
+                }),
+                false => result,
             }
         })
     }
@@ -2300,6 +2394,8 @@ mod tests {
         /// The active window (app, title); activate_window picks one of
         /// FAKE_WINDOWS and logs "activate <title>" in `keys`.
         active: Rc<RefCell<(String, String)>>,
+        /// Fed by the tests: user input and the stop shortcut.
+        takeover: std::sync::Arc<takeover::Takeover>,
     }
 
     /// Windows on the fake desktop: (app, title).
@@ -2324,6 +2420,14 @@ mod tests {
             &[]
         }
         async fn enable(&self) {}
+        fn takeover(&self) -> Option<std::sync::Arc<takeover::Takeover>> {
+            Some(self.takeover.clone())
+        }
+        async fn indicate(&self, label: &str) {
+            if label.starts_with("paused") || label.starts_with("stopped") {
+                self.keys.borrow_mut().push(format!("indicate {label}"));
+            }
+        }
         async fn list_apps(&self) -> Vec<AppEntry> {
             Vec::new()
         }
@@ -2498,6 +2602,7 @@ mod tests {
         focus_app: Rc<RefCell<String>>,
         field: Rc<RefCell<Option<String>>>,
         active: Rc<RefCell<(String, String)>>,
+        takeover: std::sync::Arc<takeover::Takeover>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -2521,7 +2626,12 @@ mod tests {
             FAKE_WINDOWS[1].0.to_string(),
             FAKE_WINDOWS[1].1.to_string(),
         )));
+        let takeover = std::sync::Arc::new(takeover::Takeover::new(
+            Duration::from_millis(1500),
+            Some("meta+alt+esc"),
+        ));
         let server = Rc::new(Server::new(FakeBackend {
+            takeover: takeover.clone(),
             allow_file,
             keys: keys.clone(),
             focus: focus.clone(),
@@ -2541,6 +2651,7 @@ mod tests {
             focus_app,
             field,
             active,
+            takeover,
         }
     }
 
@@ -3618,6 +3729,141 @@ mod tests {
             let r = call_tool(&mut s, 3, "key", json!({"combo": "c"})).await;
             assert_eq!(r["id"], 3, "{r}");
             assert_eq!(*s.keys.borrow(), ["down a", "up a", "down c", "up c"]);
+        });
+    }
+    #[test]
+    fn input_pauses_while_the_user_is_active_and_reads_go_on() {
+        local(async {
+            let mut s = session("takeover-pause");
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Keyboard);
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("paused: the user is using the keyboard"),
+                "{text}"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                ["indicate paused while you use the keyboard"]
+            );
+            // Reading and the clipboard are not held up.
+            let r = call_tool(&mut s, 3, "find", json!({"app": "fake", "query": "OK"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            let r = call_tool(&mut s, 4, "clipboard_set", json!({"text": "x"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            // Once the window passed, input goes through.
+            let mut s = session("takeover-pause-2");
+            s.takeover.user_input(
+                Instant::now() - Duration::from_millis(1600),
+                takeover::Device::Keyboard,
+            );
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+        });
+    }
+
+    #[test]
+    fn the_stop_shortcut_holds_until_activate_window() {
+        local(async {
+            let mut s = session("takeover-stop");
+            s.takeover.stop();
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert!(
+                reply_text(&r).contains("stopped by the user (Meta+Alt+Esc)"),
+                "{r}"
+            );
+            // A batch step cannot resume.
+            let steps = json!({"steps": [
+                {"tool": "activate_window", "args": {"query": "todo"}},
+                {"tool": "key", "args": {"combo": "b"}},
+            ]});
+            let r = call_tool(&mut s, 3, "batch", steps).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("[1] activate_window failed: stopped by the user")
+                    && text.contains("1 step(s) not run"),
+                "{text}"
+            );
+            // Neither does `window` on an input tool.
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "c", "window": "todo"})).await;
+            assert!(reply_text(&r).contains("stopped by the user"), "{r}");
+            assert!(
+                s.keys
+                    .borrow()
+                    .iter()
+                    .all(|k| k.starts_with("indicate stopped")),
+                "{:?}",
+                s.keys.borrow()
+            );
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 5, "activate_window", json!({"query": "todo"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(
+                reply_text(&r).starts_with("resumed after the user's stop; "),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "d"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert_eq!(
+                *s.keys.borrow(),
+                ["activate todo.txt — Fake", "down d", "up d"]
+            );
+        });
+    }
+
+    #[test]
+    fn user_input_during_a_batch_stops_its_remaining_input() {
+        local(async {
+            let mut s = session("takeover-batch");
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                t.user_input(Instant::now(), takeover::Device::Pointer);
+            });
+            let steps = json!({"steps": [
+                {"tool": "key", "args": {"combo": "a"}},
+                {"tool": "pause", "args": {"ms": 300}},
+                {"tool": "key", "args": {"combo": "b"}},
+                {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+            ]});
+            let r = call_tool(&mut s, 2, "batch", steps).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("[3] key failed: interrupted: the user started using the mouse")
+                    && text.contains("stopped; 1 step(s) not run"),
+                "{text}"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                ["down a", "up a", "indicate paused while you use the mouse"]
+            );
+        });
+    }
+
+    #[test]
+    fn the_stop_shortcut_ends_a_drag_and_releases_the_button() {
+        local(async {
+            let mut s = session("takeover-drag");
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                t.stop();
+            });
+            let r = call_tool(
+                &mut s,
+                2,
+                "drag",
+                json!({"from_x": 0, "from_y": 0, "to_x": 120, "to_y": 60}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("stopped by the user"), "{r}");
+            let log = s.keys.borrow().clone();
+            assert_eq!(log[..2], ["move 0,0", "press left"]);
+            assert_eq!(log.last().unwrap(), "release left", "{log:?}");
+            assert!(log.len() < 2 + DRAG_STEPS as usize + 1, "{log:?}");
         });
     }
 }
