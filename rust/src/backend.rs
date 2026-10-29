@@ -310,6 +310,13 @@ pub trait Backend {
     async fn move_pointer(&self, x: i64, y: i64) -> R<()>;
     /// Press (`down`) or release a mouse button where the cursor is.
     async fn button(&self, button: &str, down: bool) -> R<()>;
+    /// Press (`down`) or release one key ("ctrl", "shift", "a", ...) and
+    /// leave it so: modifiers around a click, keys held across calls.
+    async fn key(&self, key: &str, down: bool) -> R<()>;
+    /// Where the cursor is, in the coordinates `pointer` takes.
+    async fn cursor_position(&self) -> R<(i64, i64)> {
+        Err("the cursor position is not available on this desktop".into())
+    }
     /// Raise the first window of an allowed app whose title or app name
     /// contains `query`, and wait until it is in front. Some names the
     /// window in front when that wait already found it; None leaves it to

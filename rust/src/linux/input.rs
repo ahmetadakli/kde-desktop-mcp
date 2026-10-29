@@ -31,8 +31,16 @@ const POINTER_SETTLE: Duration = Duration::from_millis(2);
 const EXTERNAL_MOVE_SETTLE: Duration = Duration::from_millis(25);
 /// After a button press, before its release or a drag's first move.
 const BUTTON_HOLD: Duration = Duration::from_millis(3);
-/// Between the clicks of a double or triple click.
+/// Between the clicks of a double or triple click. Well inside the
+/// multi-click interval of Qt, GTK and KWin (400-500 ms by default), so a
+/// third click still counts as part of the same triple click.
 const BUTTON_GAP: Duration = Duration::from_millis(30);
+/// The keyboard and the pointer are two devices, read from two fds: their
+/// events are not ordered against each other. A key pressed (a modifier
+/// before a click) waits this long before what follows, and a key released
+/// waits this long first, so the compositor has handled the click before
+/// the modifier goes up.
+const CROSS_DEVICE_SETTLE: Duration = Duration::from_millis(10);
 
 const ALIASES: &[(&str, &str)] = &[
     ("ctrl", "LEFTCTRL"),
@@ -201,6 +209,24 @@ impl Input {
         let released = self.with_kbd(|d| d.emit(&up).map_err(io));
         *self.key_up.lock().unwrap() = Some(Instant::now());
         released
+    }
+
+    /// Press (`down`) or release one key and leave it so.
+    pub async fn key(&self, name: &str, down: bool) -> R<()> {
+        let code = keycode(name)?;
+        if !down {
+            tokio::time::sleep(CROSS_DEVICE_SETTLE).await;
+        }
+        self.with_kbd(|d| {
+            d.emit(&[ev(EventType::KEY, code.0, i32::from(down))])
+                .map_err(io)
+        })?;
+        if down {
+            tokio::time::sleep(CROSS_DEVICE_SETTLE).await;
+        } else {
+            *self.key_up.lock().unwrap() = Some(Instant::now());
+        }
+        Ok(())
     }
 
     /// Move to absolute device coordinates (0..=ABS_MAX) and let the

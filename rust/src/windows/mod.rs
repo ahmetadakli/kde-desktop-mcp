@@ -362,6 +362,20 @@ impl Backend for WindowsBackend {
         Ok(())
     }
 
+    async fn key(&self, key: &str, down: bool) -> R<()> {
+        // One SendInput queue for keyboard and mouse: no settle needed to
+        // keep a modifier ordered before a click.
+        input::send_keys(&[logic::key_event(logic::vk(key)?, !down)])?;
+        if down {
+            tokio::time::sleep(KEY_HOLD).await;
+        }
+        Ok(())
+    }
+
+    async fn cursor_position(&self) -> R<(i64, i64)> {
+        input::cursor()
+    }
+
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {
         let q = query.to_lowercase();
         for (_, p) in self.uia.top_level() {

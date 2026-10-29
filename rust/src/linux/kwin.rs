@@ -251,6 +251,17 @@ const ACTIVE_PARENT: &str = "JSON.stringify((() => { const w = workspace.activeW
 const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtualScreenGeometry; \
      return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
 
+const CURSOR_POS: &str = "JSON.stringify({x: workspace.cursorPos.x, y: workspace.cursorPos.y})";
+
+/// Parse what CURSOR_POS reports.
+fn cursor_pos_of(raw: &str) -> R<(i64, i64)> {
+    let p: Json = serde_json::from_str(raw).unwrap_or(Json::Null);
+    match (p["x"].as_f64(), p["y"].as_f64()) {
+        (Some(x), Some(y)) => Ok((x.round() as i64, y.round() as i64)),
+        _ => Err(format!("KWin: no cursor position in '{raw}'")),
+    }
+}
+
 impl KWin {
     pub async fn new(session: Connection) -> R<Self> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -364,6 +375,13 @@ impl KWin {
             .await;
         ran?;
         Ok(data)
+    }
+
+    /// The cursor position in logical screen coordinates
+    /// (`workspace.cursorPos`), the space `move_pointer` takes.
+    pub async fn cursor_pos(&self) -> R<(i64, i64)> {
+        let raw = self.query(CURSOR_POS).await?.unwrap_or_default();
+        cursor_pos_of(&raw)
     }
 
     /// Raise a window; returns its caption and pid, None when nothing
@@ -729,6 +747,14 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cursor_position_is_parsed_and_rounded() {
+        assert_eq!(cursor_pos_of(r#"{"x":1920,"y":-5}"#), Ok((1920, -5)));
+        assert_eq!(cursor_pos_of(r#"{"x":10.6,"y":3.2}"#), Ok((11, 3)));
+        assert!(cursor_pos_of("").is_err());
+        assert!(cursor_pos_of(r#"{"x":1}"#).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]

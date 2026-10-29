@@ -115,6 +115,23 @@ it exits with the server. To turn it off, set the environment variable
   single-line text does not take, it focuses the element, selects all with
   Ctrl+A and types it. Password fields cannot be read back.
 - `scroll`: turns the wheel over an element (a list, a page, a panel).
+- Modifier clicks: `click`, `mouse` and `scroll` take `modifiers` (`ctrl`,
+  `shift`, `alt`, `meta`), pressed before the pointer action and released in
+  reverse order afterwards, also when it fails (ctrl+click adds to a
+  selection, shift+click selects a range, ctrl+scroll zooms). `clicks: 2` is a
+  double and `clicks: 3` a triple click (select a line); `button` is `left`,
+  `right` or `middle`.
+- `hold`: presses a key, chord or mouse button and leaves it down across calls
+  (`down: false` releases it; without `key`/`button` it releases everything).
+  Every input reply ends with what is still held (`; held: shift, left`).
+  Everything held is released when a call fails, when a call is cancelled
+  (`notifications/cancelled`) and when the server exits (end of input,
+  SIGTERM/SIGINT/SIGHUP); on Linux the kernel also releases the keys of the
+  virtual devices when the process dies. Meant for modifiers and buttons: a
+  held letter auto-repeats like a real key.
+- `cursor_position`: where the cursor is, in the coordinates `mouse` takes
+  (KDE: `workspace.cursorPos` through a KWin script; Hyprland: `cursorpos`;
+  Windows: `GetCursorPos`). Read-only.
 - `drag`: presses, moves in steps and releases (drag and drop, sliders,
   selections). Each end is an element id (`from_id`/`to_id`), a screen
   coordinate, or with `image: true` a pixel of the last screenshot.
@@ -196,7 +213,7 @@ it exits with the server. To turn it off, set the environment variable
   as `[n] tool failed (optional): …` and the remaining steps still run, so a
   final observation step (`find`, `screenshot`) is not lost.
 
-The `initialize` reply carries `instructions` (about 2.1 KB): the workflow,
+The `initialize` reply carries `instructions` (about 2.4 KB): the workflow,
 the targeting rules shared by the tools above, the allowlist and which tools
 to load together. Clients that load tool schemas on demand, such as Claude
 Code, show it at session start before any schema is loaded; the per-tool

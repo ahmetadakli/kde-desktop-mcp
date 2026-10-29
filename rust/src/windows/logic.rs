@@ -103,6 +103,15 @@ fn key_flags(vk: u16, up: bool) -> u32 {
     }) | (if up { KEYEVENTF_KEYUP } else { 0 })
 }
 
+/// One key's down (or, with `up`, up) event.
+pub fn key_event(vk: u16, up: bool) -> KeyEv {
+    KeyEv {
+        vk,
+        scan: 0,
+        flags: key_flags(vk, up),
+    }
+}
+
 /// Key-down events in order, then key-up events in reverse order.
 pub fn combo_events(vks: &[u16]) -> (Vec<KeyEv>, Vec<KeyEv>) {
     let downs = vks

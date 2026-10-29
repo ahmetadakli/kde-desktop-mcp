@@ -1379,6 +1379,17 @@ impl Backend for LinuxBackend {
         self.input.button(button, down).await
     }
 
+    async fn key(&self, key: &str, down: bool) -> R<()> {
+        self.input.key(key, down).await
+    }
+
+    async fn cursor_position(&self) -> R<(i64, i64)> {
+        match &self.comp {
+            Compositor::Kde(kwin) => kwin.cursor_pos().await,
+            Compositor::Hyprland(h) => h.cursor_pos().await,
+        }
+    }
+
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {
         match &self.comp {
             Compositor::Kde(kwin) => {

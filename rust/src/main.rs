@@ -193,13 +193,100 @@ struct Server<B: Backend> {
     /// `app_key`s of apps whose accessibility text writes report success
     /// and change nothing (Firefox); set_text types there right away.
     inert_writes: Mutex<HashSet<String>>,
+    /// Keys and buttons down now, in the order they were pressed: held by
+    /// `hold` across calls, or by an input tool for the length of its
+    /// action (a click's modifiers, a drag's button). A cancelled call
+    /// leaves its own there, so `release_all` finds them. Never locked
+    /// across an await.
+    held: std::sync::Mutex<Vec<Held>>,
+}
+
+/// A key or mouse button the server pressed and has not released.
+#[derive(Clone, Debug, PartialEq)]
+enum Held {
+    /// Canonical key name (`canon_key`).
+    Key(String),
+    Button(String),
+}
+
+impl Held {
+    fn name(&self) -> &str {
+        match self {
+            Held::Key(k) | Held::Button(k) => k,
+        }
+    }
+}
+
+/// Modifiers click, mouse and scroll take.
+const MODIFIERS: [&str; 4] = ["ctrl", "shift", "alt", "meta"];
+const BUTTONS: [&str; 3] = ["left", "right", "middle"];
+
+/// One name per key, so "control" held and "ctrl" asked are the same key.
+fn canon_key(name: &str) -> String {
+    let n = name.trim().to_lowercase();
+    match n.as_str() {
+        "control" => "ctrl".into(),
+        "super" | "win" => "meta".into(),
+        "return" => "enter".into(),
+        "escape" => "esc".into(),
+        _ => n,
+    }
+}
+
+/// The keys of a chord ("ctrl+shift"), canonical, without repeats.
+fn chord_keys(chord: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for k in chord.split('+').map(canon_key).filter(|k| !k.is_empty()) {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// The `modifiers` argument: a list (["ctrl", "shift"]) or a chord
+/// ("ctrl+shift"); only ctrl, shift, alt and meta.
+fn modifiers_arg(a: &Json) -> R<Vec<String>> {
+    let names: Vec<String> = match a.get("modifiers") {
+        None | Some(Json::Null) => return Ok(Vec::new()),
+        Some(Json::String(s)) => chord_keys(s),
+        Some(Json::Array(list)) => {
+            let mut keys: Vec<String> = Vec::new();
+            for v in list {
+                let s = v
+                    .as_str()
+                    .ok_or("'modifiers' must be a list of strings, e.g. [\"ctrl\"]")?;
+                for k in chord_keys(s) {
+                    if !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
+            }
+            keys
+        }
+        Some(_) => return Err("'modifiers' must be a list of strings, e.g. [\"ctrl\"]".into()),
+    };
+    match names.iter().find(|k| !MODIFIERS.contains(&k.as_str())) {
+        Some(k) => Err(format!("unknown modifier '{k}' (ctrl, shift, alt, meta)")),
+        None => Ok(names),
+    }
+}
+
+/// " with ctrl+shift" for modifiers ["ctrl", "shift"], "" for none: the
+/// end of a pointer tool's reply.
+fn with_modifiers_note(mods: &[String]) -> String {
+    if mods.is_empty() {
+        String::new()
+    } else {
+        format!(" with {}", mods.join("+"))
+    }
 }
 
 /// Tools that send keyboard or pointer input, run an app's actions (`act`
 /// presses buttons and opens menus; `set_text` may retype through the
 /// keyboard), or use the clipboard that type_text pastes through; they run
 /// one at a time.
-const INPUT_TOOLS: [&str; 13] = [
+const INPUT_TOOLS: [&str; 14] = [
     "act",
     "set_text",
     "focus",
@@ -213,6 +300,7 @@ const INPUT_TOOLS: [&str; 13] = [
     "clipboard_get",
     "clipboard_set",
     "file_dialog",
+    "hold",
 ];
 
 /// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
@@ -621,7 +709,131 @@ impl<B: Backend> Server<B> {
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
+            held: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    // ------------------------------------------------------------ held input
+
+    fn held_names(&self) -> Vec<String> {
+        let held = self.held.lock().unwrap();
+        held.iter().map(|h| h.name().to_string()).collect()
+    }
+
+    fn is_held(&self, h: &Held) -> bool {
+        self.held.lock().unwrap().contains(h)
+    }
+
+    /// "; held: ctrl, left" while anything is held, for input replies.
+    fn held_note(&self) -> String {
+        let names = self.held_names();
+        if names.is_empty() {
+            String::new()
+        } else {
+            format!("; held: {}", names.join(", "))
+        }
+    }
+
+    /// Press and record `h`. It is recorded first: a call cancelled during
+    /// the press still leaves it for `release_all`.
+    async fn press_held(&self, h: &Held) -> R<()> {
+        self.held.lock().unwrap().push(h.clone());
+        let pressed = match h {
+            Held::Key(k) => self.b.key(k, true).await,
+            Held::Button(b) => self.b.button(b, true).await,
+        };
+        if pressed.is_err() {
+            self.forget(h);
+        }
+        pressed
+    }
+
+    /// Release `h` (even when not recorded: harmless, and it frees a key
+    /// stuck some other way). Forgotten only once the release was sent, so
+    /// a cancelled release is retried by `release_all`; a failed one is
+    /// forgotten too, or every later reply would list it.
+    async fn release_held(&self, h: &Held) -> R<()> {
+        let released = match h {
+            Held::Key(k) => self.b.key(k, false).await,
+            Held::Button(b) => self.b.button(b, false).await,
+        };
+        self.forget(h);
+        released
+    }
+
+    fn forget(&self, h: &Held) {
+        let mut held = self.held.lock().unwrap();
+        if let Some(i) = held.iter().rposition(|x| x == h) {
+            held.remove(i);
+        }
+    }
+
+    /// Release everything held, last pressed first, under the input lock
+    /// (wait for the input running now). Called after a failed call, a
+    /// cancelled one and at exit; returns the names released and the first
+    /// error.
+    async fn release_all(&self) -> (Vec<String>, R<()>) {
+        let _input = self.input.lock().await;
+        self.release_all_held().await
+    }
+
+    /// `release_all` for a caller holding the input lock.
+    async fn release_all_held(&self) -> (Vec<String>, R<()>) {
+        let mut names = Vec::new();
+        let mut result = Ok(());
+        loop {
+            let last = self.held.lock().unwrap().last().cloned();
+            let Some(h) = last else { break };
+            let r = self.release_held(&h).await;
+            names.push(h.name().to_string());
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        (names, result)
+    }
+
+    /// Run `action` with `mods` pressed: modifiers go down in order, the
+    /// action runs, they come up in reverse order, whatever the action
+    /// returned. Modifiers already held (by `hold`) are left as they are.
+    async fn with_modifiers<T>(&self, mods: &[String], action: impl Future<Output = R<T>>) -> R<T> {
+        let mut pressed: Vec<Held> = Vec::new();
+        let mut ready = Ok(());
+        for m in mods {
+            let h = Held::Key(m.clone());
+            if self.is_held(&h) {
+                continue;
+            }
+            if let Err(e) = self.press_held(&h).await {
+                ready = Err(e);
+                break;
+            }
+            pressed.push(h);
+        }
+        let out = match ready {
+            Ok(()) => action.await,
+            Err(e) => Err(e),
+        };
+        let mut released = Ok(());
+        for h in pressed.iter().rev() {
+            let r = self.release_held(h).await;
+            if released.is_ok() {
+                released = r;
+            }
+        }
+        let out = out?;
+        released?;
+        Ok(out)
+    }
+
+    /// Err when `button` is held: a click would release it.
+    fn check_button_free(&self, button: &str) -> R<()> {
+        if self.is_held(&Held::Button(button.to_string())) {
+            return Err(format!(
+                "the {button} button is held; release it with hold (down=false) first"
+            ));
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ allowlist
@@ -1486,12 +1698,19 @@ impl<B: Backend> Server<B> {
 
     async fn click(&self, a: &Json) -> R<String> {
         let button = arg_s(a, "button", "left");
-        let clicks = arg_i(a, "clicks", 1);
+        let clicks = arg_i(a, "clicks", 1).clamp(0, 3);
+        let mods = modifiers_arg(a)?;
+        if clicks > 0 {
+            self.check_button_free(&button)?;
+        }
         let (t, (x, y)) = self.target_center(a).await?;
-        self.b
-            .pointer(x as i64, y as i64, &button, clicks, 0)
-            .await?;
-        Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}")))
+        self.with_modifiers(
+            &mods,
+            self.b.pointer(x as i64, y as i64, &button, clicks, 0),
+        )
+        .await?;
+        let m = with_modifiers_note(&mods);
+        Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}{m}")))
     }
 
     /// Centre of `id` for a pointer tool, once the active window is checked
@@ -1578,9 +1797,12 @@ impl<B: Backend> Server<B> {
 
     async fn drag(&self, a: &Json) -> R<String> {
         let button = arg_s(a, "button", "left");
+        self.check_button_free(&button)?;
         let (app, (x0, y0), (x1, y1)) = self.drag_points(a).await?;
         self.b.move_pointer(x0, y0).await?;
-        self.b.button(&button, true).await?;
+        // Recorded as held while it is down: a cancelled drag releases it.
+        let held = Held::Button(button.clone());
+        self.press_held(&held).await?;
         let mut moved = Ok(());
         for i in 1..=DRAG_STEPS {
             let x = x0 + (x1 - x0) * i / DRAG_STEPS;
@@ -1592,7 +1814,7 @@ impl<B: Backend> Server<B> {
             tokio::time::sleep(DRAG_STEP_GAP).await;
         }
         // Never leave the button held, whatever happened on the way.
-        let released = self.b.button(&button, false).await;
+        let released = self.release_held(&held).await;
         moved?;
         released?;
         Ok(format!(
@@ -1602,20 +1824,32 @@ impl<B: Backend> Server<B> {
 
     async fn scroll(&self, a: &Json) -> R<String> {
         let amount = arg_i(a, "amount", 3).clamp(-50, 50);
+        let mods = modifiers_arg(a)?;
         let (t, (x, y)) = self.target_center(a).await?;
-        self.b
-            .pointer(x as i64, y as i64, "left", 0, amount)
+        self.with_modifiers(&mods, self.b.pointer(x as i64, y as i64, "left", 0, amount))
             .await?;
-        Ok(t.reply(&format!("scrolled {amount} at {x},{y}")))
+        let m = with_modifiers_note(&mods);
+        Ok(t.reply(&format!("scrolled {amount} at {x},{y}{m}")))
     }
 
     async fn key(&self, a: &Json) -> R<String> {
         let combo = req_s(a, "combo")?;
         let repeat = arg_i(a, "repeat", 1);
         self.b.check_combo(&combo)?;
+        // Held keys stay down: pressing one again would release it.
+        let keys: Vec<String> = chord_keys(&combo)
+            .into_iter()
+            .filter(|k| !self.is_held(&Held::Key(k.clone())))
+            .collect();
+        if keys.is_empty() {
+            return Ok(format!(
+                "nothing sent: {combo} is held already (hold with down=false releases it)"
+            ));
+        }
+        let send = keys.join("+");
         let app = self.require_active_allowed().await?;
         for _ in 0..repeat.clamp(1, 100) {
-            self.b.press_combo(&combo).await?;
+            self.b.press_combo(&send).await?;
         }
         let focus = self.focus_note(false).await;
         Ok(format!("sent {combo} x{repeat} to {app}{focus}"))
@@ -1693,17 +1927,93 @@ impl<B: Backend> Server<B> {
             }
             _ => (req_i(a, "x")?, req_i(a, "y")?),
         };
+        let button = arg_s(a, "button", "left");
+        let clicks = arg_i(a, "clicks", 1).clamp(0, 3);
+        let mods = modifiers_arg(a)?;
+        if clicks > 0 {
+            self.check_button_free(&button)?;
+        }
         let app = self.require_active_allowed().await?;
-        self.b
-            .pointer(
-                x,
-                y,
-                &arg_s(a, "button", "left"),
-                arg_i(a, "clicks", 1),
-                arg_i(a, "scroll", 0),
-            )
-            .await?;
-        Ok(format!("pointer at ({x},{y}) in {app}"))
+        self.with_modifiers(
+            &mods,
+            self.b.pointer(x, y, &button, clicks, arg_i(a, "scroll", 0)),
+        )
+        .await?;
+        let m = with_modifiers_note(&mods);
+        Ok(format!("pointer at ({x},{y}) in {app}{m}"))
+    }
+
+    /// Press (`down`, the default) or release a key, chord or mouse button
+    /// and leave it so across calls. down=false without key or button
+    /// releases everything held.
+    async fn hold(&self, a: &Json) -> R<String> {
+        let down = arg_b(a, "down", true);
+        let key = a.get("key").and_then(Json::as_str).map(str::trim);
+        let button = a.get("button").and_then(Json::as_str).map(str::trim);
+        let items: Vec<Held> = match (key, button) {
+            (Some(_), Some(_)) => return Err("give `key` or `button`, not both".into()),
+            (None, None) if !down => {
+                let (names, r) = self.release_all_held().await;
+                r?;
+                return Ok(if names.is_empty() {
+                    "nothing was held".into()
+                } else {
+                    format!("released {}; nothing held", names.join(", "))
+                });
+            }
+            (None, None) => {
+                return Err(
+                    "hold needs `key` (e.g. \"shift\") or `button` (left, right, \
+                            middle); down=false alone releases everything"
+                        .into(),
+                );
+            }
+            (Some(k), None) => {
+                let keys = chord_keys(k);
+                if keys.is_empty() {
+                    return Err("empty `key`".into());
+                }
+                for k in &keys {
+                    self.b.check_combo(k)?;
+                }
+                keys.into_iter().map(Held::Key).collect()
+            }
+            (None, Some(b)) => {
+                if !BUTTONS.contains(&b) {
+                    return Err(format!("unknown button '{b}' (left, right, middle)"));
+                }
+                vec![Held::Button(b.to_string())]
+            }
+        };
+        let what = items.iter().map(|h| h.name()).collect::<Vec<_>>().join("+");
+        if down {
+            let app = self.require_active_allowed().await?;
+            for h in &items {
+                if !self.is_held(h) {
+                    self.press_held(h).await?;
+                }
+            }
+            return Ok(format!("holding {what} in {app}"));
+        }
+        let mut result = Ok(());
+        for h in items.iter().rev() {
+            let r = self.release_held(h).await;
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        result?;
+        let rest = if self.held_names().is_empty() {
+            "; nothing held"
+        } else {
+            ""
+        };
+        Ok(format!("released {what}{rest}"))
+    }
+
+    async fn cursor_position(&self) -> R<String> {
+        let (x, y) = self.b.cursor_position().await?;
+        Ok(format!("cursor at ({x},{y})"))
     }
 
     async fn activate_window(&self, a: &Json) -> R<String> {
@@ -1964,12 +2274,28 @@ impl<B: Backend> Server<B> {
         })
     }
 
+    /// Run a tool. When it fails, everything held is released (keys and
+    /// buttons left down by `hold` would otherwise go on acting on what
+    /// the agent does next, after something went wrong).
     fn call<'a>(
         &'a self,
         name: &'a str,
         a: &'a Json,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
-        self.call_inner(name, a, false)
+        Box::pin(async move {
+            let result = self.call_inner(name, a, false).await;
+            match result {
+                Err(e) if !self.held_names().is_empty() => {
+                    let (names, released) = self.release_all().await;
+                    let failed = match released {
+                        Ok(()) => String::new(),
+                        Err(r) => format!(" (release failed: {r})"),
+                    };
+                    Err(format!("{e}; released {}{failed}", names.join(", ")))
+                }
+                r => r,
+            }
+        })
     }
 
     /// `call`, for a caller that may already hold the input lock (`held`: a
@@ -2018,12 +2344,25 @@ impl<B: Backend> Server<B> {
                 "clipboard_get" => self.clipboard_get(a).await.map(Out::from),
                 "clipboard_set" => self.clipboard_set(a).await.map(Out::from),
                 "mouse" => self.mouse(a).await.map(Out::from),
+                "hold" => self.hold(a).await.map(Out::from),
+                "cursor_position" => self.cursor_position().await.map(Out::from),
                 "activate_window" => self.activate_window(a).await.map(Out::from),
                 "file_dialog" => self.file_dialog(a).await.map(Out::from),
                 "screenshot" => self.screenshot(a).await,
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
             };
+            // What is still held, after every input step but a batch (its
+            // steps say it).
+            let note = if name == "batch" {
+                String::new()
+            } else {
+                self.held_note()
+            };
+            let result = result.map(|mut o| {
+                o.text.push_str(&note);
+                o
+            });
             match activated {
                 Some(title) => {
                     let done = format!("activated {}; ", render::py_repr(&title));
@@ -2095,15 +2434,47 @@ async fn serve<B: Backend + 'static>(backend: B) -> R<()> {
     // Creating virtual input devices takes a moment; do it while the client
     // is still connecting so the first key/click is not delayed.
     backend.warm_up();
-    let server = Server::new(backend);
+    let server = std::rc::Rc::new(Server::new(backend));
     server.b.enable().await;
     server.allowed();
-    run_loop(
-        std::rc::Rc::new(server),
-        BufReader::new(tokio::io::stdin()),
-        tokio::io::stdout(),
-    )
-    .await
+    let result = tokio::select! {
+        r = run_loop(
+            server.clone(),
+            BufReader::new(tokio::io::stdin()),
+            tokio::io::stdout(),
+        ) => r,
+        _ = shutdown_signal() => Ok(()),
+    };
+    // On a signal the calls still running were dropped with run_loop:
+    // release what they or `hold` left pressed before exiting.
+    let _ = server.release_all().await;
+    result
+}
+
+/// SIGTERM, SIGINT or SIGHUP (Ctrl+C on Windows): the client is shutting
+/// the server down. Never resolves when the handlers cannot be installed.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let kinds = [
+            SignalKind::terminate(),
+            SignalKind::interrupt(),
+            SignalKind::hangup(),
+        ];
+        let mut streams: Vec<_> = kinds.into_iter().filter_map(|k| signal(k).ok()).collect();
+        if streams.is_empty() {
+            std::future::pending::<()>().await;
+        }
+        let waits = streams.iter_mut().map(|s| Box::pin(s.recv()));
+        futures_util::future::select_all(waits).await;
+    }
+    #[cfg(windows)]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// The JSON-RPC loop over newline-delimited messages, apart from the
@@ -2161,8 +2532,17 @@ where
         };
         let method = msg.get("method").and_then(Json::as_str).unwrap_or("");
         if method == "notifications/cancelled" {
-            if let Some(id) = msg.pointer("/params/requestId") {
-                in_flight.borrow_mut().cancel(id);
+            if let Some(id) = msg.pointer("/params/requestId")
+                && in_flight.borrow_mut().cancel(id)
+            {
+                // Whatever the call held (a drag's button, a click's
+                // modifiers, keys `hold` pressed) comes up; the release
+                // takes the input lock, so it waits until the aborted call
+                // has let go of it.
+                let server = server.clone();
+                calls.spawn_local(async move {
+                    let _ = server.release_all().await;
+                });
             }
             continue;
         }
@@ -2190,6 +2570,8 @@ where
         }
     }
     while calls.join_next().await.is_some() {}
+    // The client went away: nothing may stay pressed after the server.
+    let _ = server.release_all().await;
     drop(tx);
     writer.await.map_err(|e| e.to_string())?
 }
@@ -2226,11 +2608,15 @@ impl InFlight {
         }
     }
 
-    /// Abort the running call with this id, if any. An unknown or finished id
-    /// is ignored, as the MCP spec asks.
-    fn cancel(&mut self, id: &Json) {
-        if let Some((_, handle)) = self.by_id.remove(&id.to_string()) {
-            handle.abort();
+    /// Abort the running call with this id, if any; true when there was
+    /// one. An unknown or finished id is ignored, as the MCP spec asks.
+    fn cancel(&mut self, id: &Json) -> bool {
+        match self.by_id.remove(&id.to_string()) {
+            Some((_, handle)) => {
+                handle.abort();
+                true
+            }
+            None => false,
         }
     }
 }
@@ -2420,8 +2806,32 @@ mod tests {
             *self.clipboard.borrow_mut() = text.to_string();
             Ok(())
         }
-        async fn pointer(&self, _: i64, _: i64, _: &str, _: i64, _: i64) -> R<()> {
+        /// Logs clicks and scrolls; fails at x = FAIL_X, and waits at
+        /// x = SLOW_X (for a call to cancel).
+        async fn pointer(&self, x: i64, _: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {
+            if x == FAIL_X {
+                return Err("pointer failed".into());
+            }
+            if x == SLOW_X {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            if clicks > 0 {
+                self.keys
+                    .borrow_mut()
+                    .push(format!("click {button} x{clicks}"));
+            }
+            if scroll != 0 {
+                self.keys.borrow_mut().push(format!("scroll {scroll}"));
+            }
             Ok(())
+        }
+        async fn key(&self, key: &str, down: bool) -> R<()> {
+            let what = if down { "keydown" } else { "keyup" };
+            self.keys.borrow_mut().push(format!("{what} {key}"));
+            Ok(())
+        }
+        async fn cursor_position(&self) -> R<(i64, i64)> {
+            Ok((12, 34))
         }
         async fn move_pointer(&self, x: i64, y: i64) -> R<()> {
             self.keys.borrow_mut().push(format!("move {x},{y}"));
@@ -2489,6 +2899,10 @@ mod tests {
     }
 
     const FAKE_FOCUS: u32 = 7;
+    /// `pointer` at this x fails.
+    const FAIL_X: i64 = 666;
+    /// `pointer` at this x takes 5 s.
+    const SLOW_X: i64 = 777;
 
     struct Session {
         stdin: DuplexStream,
@@ -3065,6 +3479,261 @@ mod tests {
         assert!(written_matches("", ""));
         assert!(!written_matches("hello world", "hello"));
         assert!(!written_matches("Ahmet", "ahmet"));
+    }
+
+    fn log(s: &Session) -> Vec<String> {
+        s.keys.borrow().clone()
+    }
+
+    #[test]
+    fn modifiers_go_down_before_the_click_and_up_after_it_in_reverse() {
+        local(async {
+            let mut s = session("modifiers");
+            let r = call_tool(
+                &mut s,
+                2,
+                "mouse",
+                json!({"x": 5, "y": 5, "button": "middle", "clicks": 3,
+                       "modifiers": ["ctrl", "Shift"]}),
+            )
+            .await;
+            assert_eq!(reply_text(&r), "pointer at (5,5) in fake with ctrl+shift");
+            assert_eq!(
+                log(&s),
+                [
+                    "keydown ctrl",
+                    "keydown shift",
+                    "click middle x3",
+                    "keyup shift",
+                    "keyup ctrl"
+                ]
+            );
+            s.keys.borrow_mut().clear();
+            // A chord string works too; scroll and click take them as well.
+            let r = call_tool(
+                &mut s,
+                3,
+                "scroll",
+                json!({"app": "fake", "query": "OK", "amount": 2, "modifiers": "control"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).ends_with("scrolled 2 at 0,0 with ctrl"),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "click",
+                json!({"app": "fake", "query": "OK", "modifiers": ["alt"]}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).ends_with("clicked left x1 at 0,0 with alt"),
+                "{r}"
+            );
+            assert_eq!(
+                log(&s),
+                [
+                    "keydown ctrl",
+                    "scroll 2",
+                    "keyup ctrl",
+                    "keydown alt",
+                    "click left x1",
+                    "keyup alt"
+                ]
+            );
+            // Anything but ctrl/shift/alt/meta fails before any input.
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                5,
+                "mouse",
+                json!({"x": 5, "y": 5, "modifiers": ["ctrl", "a"]}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("unknown modifier 'a'"), "{r}");
+            assert!(log(&s).is_empty(), "{:?}", log(&s));
+        });
+    }
+
+    #[test]
+    fn modifiers_are_parsed_from_lists_and_chords() {
+        assert_eq!(modifiers_arg(&json!({})), Ok(vec![]));
+        assert_eq!(
+            modifiers_arg(&json!({"modifiers": ["Control", "win", "ctrl"]})),
+            Ok(vec!["ctrl".to_string(), "meta".to_string()])
+        );
+        assert_eq!(
+            modifiers_arg(&json!({"modifiers": "shift+alt"})),
+            Ok(vec!["shift".to_string(), "alt".to_string()])
+        );
+        assert!(modifiers_arg(&json!({"modifiers": [1]})).is_err());
+        assert!(modifiers_arg(&json!({"modifiers": ["enter"]})).is_err());
+    }
+
+    #[test]
+    fn held_keys_and_buttons_are_listed_and_left_alone() {
+        local(async {
+            let mut s = session("hold");
+            let r = call_tool(&mut s, 2, "hold", json!({"key": "shift"})).await;
+            assert_eq!(reply_text(&r), "holding shift in fake; held: shift");
+            let r = call_tool(&mut s, 3, "hold", json!({"button": "left"})).await;
+            assert_eq!(reply_text(&r), "holding left in fake; held: shift, left");
+            // A held modifier is not pressed or released again by a click,
+            // nor a held key by a chord.
+            let r = call_tool(
+                &mut s,
+                4,
+                "mouse",
+                json!({"x": 1, "y": 1, "button": "right", "modifiers": ["shift", "ctrl"]}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "pointer at (1,1) in fake with shift+ctrl; held: shift, left"
+            );
+            let r = call_tool(&mut s, 5, "key", json!({"combo": "shift+a"})).await;
+            assert!(reply_text(&r).starts_with("sent shift+a x1 to fake"), "{r}");
+            assert!(reply_text(&r).ends_with("; held: shift, left"), "{r}");
+            // Moving with the button held drags; read-only tools say it too.
+            let r = call_tool(&mut s, 6, "mouse", json!({"x": 9, "y": 9, "clicks": 0})).await;
+            assert_eq!(
+                reply_text(&r),
+                "pointer at (9,9) in fake; held: shift, left"
+            );
+            let r = call_tool(&mut s, 7, "cursor_position", json!({})).await;
+            assert_eq!(reply_text(&r), "cursor at (12,34); held: shift, left");
+            let r = call_tool(&mut s, 8, "hold", json!({"key": "shift", "down": false})).await;
+            assert_eq!(reply_text(&r), "released shift; held: left");
+            let r = call_tool(&mut s, 9, "hold", json!({"down": false})).await;
+            assert_eq!(reply_text(&r), "released left; nothing held");
+            let r = call_tool(&mut s, 10, "hold", json!({"down": false})).await;
+            assert_eq!(reply_text(&r), "nothing was held");
+            assert_eq!(
+                log(&s),
+                [
+                    "keydown shift",
+                    "press left",
+                    "keydown ctrl",
+                    "click right x1",
+                    "keyup ctrl",
+                    "down a",
+                    "up a",
+                    "keyup shift",
+                    "release left"
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn hold_presses_only_into_an_allowed_window_but_always_releases() {
+        local(async {
+            let mut s = session("hold-allow");
+            let r = call_tool(&mut s, 2, "hold", json!({"key": "ctrl+alt"})).await;
+            assert_eq!(reply_text(&r), "holding ctrl+alt in fake; held: ctrl, alt");
+            set_active(&s, 0);
+            let r = call_tool(&mut s, 3, "hold", json!({"key": "meta"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            // The failure released what was held.
+            assert!(reply_text(&r).ends_with("; released alt, ctrl"), "{r}");
+            let r = call_tool(&mut s, 4, "hold", json!({"key": "alt", "down": false})).await;
+            assert_eq!(reply_text(&r), "released alt; nothing held");
+            assert_eq!(
+                log(&s),
+                [
+                    "keydown ctrl",
+                    "keydown alt",
+                    "keyup alt",
+                    "keyup ctrl",
+                    "keyup alt"
+                ]
+            );
+            for bad in [
+                json!({}),
+                json!({"key": "a", "button": "left"}),
+                json!({"button": "x"}),
+            ] {
+                let r = call_tool(&mut s, 5, "hold", bad).await;
+                assert_eq!(r["result"]["isError"], true, "{r}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_failed_call_releases_its_modifiers_and_everything_held() {
+        local(async {
+            let mut s = session("hold-fail");
+            call_tool(&mut s, 2, "hold", json!({"key": "ctrl"})).await;
+            let r = call_tool(
+                &mut s,
+                3,
+                "mouse",
+                json!({"x": FAIL_X, "y": 0, "modifiers": ["alt"]}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "Error executing tool mouse: pointer failed; released ctrl"
+            );
+            assert_eq!(
+                log(&s),
+                ["keydown ctrl", "keydown alt", "keyup alt", "keyup ctrl"]
+            );
+            // Clicking a held button would release it: refused, and the
+            // failure releases it.
+            call_tool(&mut s, 4, "hold", json!({"button": "left"})).await;
+            let r = call_tool(&mut s, 5, "mouse", json!({"x": 1, "y": 1})).await;
+            assert!(
+                reply_text(&r).contains("the left button is held; release it with hold"),
+                "{r}"
+            );
+            assert!(reply_text(&r).ends_with("; released left"), "{r}");
+            let r = call_tool(&mut s, 6, "cursor_position", json!({})).await;
+            assert_eq!(reply_text(&r), "cursor at (12,34)");
+        });
+    }
+
+    #[test]
+    fn a_cancelled_call_leaves_nothing_held() {
+        local(async {
+            let mut s = session("hold-cancel");
+            call_tool(&mut s, 2, "hold", json!({"key": "shift"})).await;
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                    "name": "mouse",
+                    "arguments": {"x": SLOW_X, "y": 0, "modifiers": ["ctrl"]}}}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(log(&s), ["keydown shift", "keydown ctrl"]);
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                       "params": {"requestId": 3}}),
+            )
+            .await;
+            let r = call_tool(&mut s, 4, "cursor_position", json!({})).await;
+            assert_eq!(r["id"], 4, "{r}");
+            assert_eq!(reply_text(&r), "cursor at (12,34)");
+            assert_eq!(
+                log(&s),
+                ["keydown shift", "keydown ctrl", "keyup ctrl", "keyup shift"]
+            );
+        });
+    }
+
+    #[test]
+    fn end_of_input_releases_what_is_held() {
+        local(async {
+            let mut s = session("hold-eof");
+            call_tool(&mut s, 2, "hold", json!({"button": "right"})).await;
+            drop(std::mem::replace(&mut s.stdin, tokio::io::duplex(1).0));
+            replies_within(&mut s, Duration::from_secs(1)).await;
+            assert_eq!(log(&s), ["press right", "release right"]);
+        });
     }
 
     #[test]

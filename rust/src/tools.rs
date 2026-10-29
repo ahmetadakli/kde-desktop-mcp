@@ -26,7 +26,7 @@ fn schema(params: &[(&str, &str, Option<Json>)]) -> Json {
 }
 
 /// Tools that only read, marked `readOnlyHint` so clients may run them in parallel.
-const READ_ONLY: [&str; 10] = [
+const READ_ONLY: [&str; 11] = [
     "apps",
     "windows",
     "doctor",
@@ -37,6 +37,7 @@ const READ_ONLY: [&str; 10] = [
     "screenshot",
     "pause",
     "clipboard_get",
+    "cursor_position",
 ];
 
 /// Input tools that take an optional `window` (title or app-name
@@ -80,6 +81,8 @@ the element step N found or acted on (find: its first hit).
 take `window` (title or app-name substring): pass it instead of a separate activate_window \
 step; it activates that window only when it isn't in front. Without it, input fails while \
 the user's own window (often a terminal) is in front.
+- click, mouse and scroll take `modifiers` (e.g. [\"ctrl\"]: add to a selection); hold keeps \
+a key or button down across calls, and replies end with what is still held.
 - pause for a fixed wait; wait_for only for something that visibly appears or goes away \
 (gone=true), never a query that can't match as a sleep.
 - screenshot is a last resort; the image comes back inline (don't Read the file). To click \
@@ -182,19 +185,23 @@ pub fn tools() -> Json {
         t(
             "click",
             &d(
-                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. To see what the click opened, use\nwait_for."
+                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. `button`: left, right or middle;\n`clicks`: 2 = double, 3 = triple (select a line). `modifiers` are held\nduring the click, e.g. [\"ctrl\"] to add to a selection, [\"shift\"] for a\nrange. To see what the click opened, use wait_for."
             ),
             target(&[
                 ("button", "string", Some(json!("left"))),
-                ("clicks", "integer", Some(json!(1)))
+                ("clicks", "integer", Some(json!(1))),
+                ("modifiers", "array", Some(Json::Null)),
             ])
         ),
         t(
             "scroll",
             &d(
-                "Scroll the wheel over an element (a list, a page, a panel): `amount`\nnotches, positive = down. The element's window must be active."
+                "Scroll the wheel over an element (a list, a page, a panel): `amount`\nnotches, positive = down. `modifiers` are held while scrolling, e.g.\n[\"ctrl\"] to zoom. The element's window must be active."
             ),
-            target(&[("amount", "integer", Some(json!(3)))])
+            target(&[
+                ("amount", "integer", Some(json!(3))),
+                ("modifiers", "array", Some(Json::Null)),
+            ])
         ),
         t(
             "drag",
@@ -251,7 +258,7 @@ pub fn tools() -> Json {
         ),
         t(
             "mouse",
-            "Fallback pointer input: move, then click (`clicks`=0 to only move) and/or\nscroll (positive = down). Give either screen coordinates `x`/`y`, or\n`image_x`/`image_y`: a pixel position in the last screenshot, converted to\nthe screen for you (window position and display scaling included).",
+            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple; `button` left, right or middle) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags.",
             schema(&[
                 ("x", "integer", Some(Json::Null)),
                 ("y", "integer", Some(Json::Null)),
@@ -259,8 +266,23 @@ pub fn tools() -> Json {
                 ("image_y", "integer", Some(Json::Null)),
                 ("button", "string", Some(json!("left"))),
                 ("clicks", "integer", Some(json!(1))),
-                ("scroll", "integer", Some(json!(0)))
+                ("scroll", "integer", Some(json!(0))),
+                ("modifiers", "array", Some(Json::Null)),
             ])
+        ),
+        t(
+            "hold",
+            "Press a key, chord or mouse button and leave it down across calls\n(`down`=true), or release it (`down`=false): `key` e.g. \"shift\" or\n\"ctrl+alt\", or `button` left/right/middle (at the cursor; move it with\nmouse clicks=0 first, and later moves drag). Held keys apply to all input\nthat follows. Every input reply ends with what is still held (\"held:\nshift\"). down=false alone releases everything. A failed or cancelled call\nand the server's exit release everything too.",
+            schema(&[
+                ("key", "string", Some(Json::Null)),
+                ("button", "string", Some(Json::Null)),
+                ("down", "boolean", Some(json!(true))),
+            ])
+        ),
+        t(
+            "cursor_position",
+            "Where the mouse cursor is, in the screen coordinates mouse takes (KDE:\nfrom KWin; Hyprland: cursorpos; Windows: GetCursorPos).",
+            schema(&[])
         ),
         t(
             "activate_window",
@@ -327,6 +349,9 @@ pub fn tools() -> Json {
     for tool in list.as_array_mut().unwrap() {
         if tool["name"] == "launch" {
             tool["inputSchema"]["properties"]["args"]["items"] = json!({ "type": "string" });
+        }
+        if let Some(m) = tool["inputSchema"]["properties"].get_mut("modifiers") {
+            m["items"] = json!({ "type": "string", "enum": ["ctrl", "shift", "alt", "meta"] });
         }
         if WINDOW_TOOLS.contains(&tool["name"].as_str().unwrap()) {
             tool["inputSchema"]["properties"]["window"] = json!({
