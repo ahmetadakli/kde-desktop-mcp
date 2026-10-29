@@ -83,6 +83,10 @@ step; it activates that window only when it isn't in front. Without it, input fa
 the user's own window (often a terminal) is in front.
 - click, mouse and scroll take `modifiers` (e.g. [\"ctrl\"]: add to a selection); hold keeps \
 a key or button down across calls, and replies end with what is still held.
+- The user may take over the keyboard and mouse. Input tools then fail with \"paused: the \
+user is using ...\" (or \"interrupted\" mid-batch) without acting: pause ~2 s, check the state \
+again, and retry. \"stopped by the user\" means they pressed the stop shortcut: stop and ask \
+them; only once they agree, a standalone activate_window call resumes input.
 - pause for a fixed wait; wait_for only for something that visibly appears or goes away \
 (gone=true), never a query that can't match as a sleep.
 - screenshot is a last resort; the image comes back inline (don't Read the file). To click \
@@ -286,7 +290,7 @@ pub fn tools() -> Json {
         ),
         t(
             "activate_window",
-            "Bring an allowed app's window to the front by title or app-name substring\n(`query`), or with `terminal` the window whose terminal runs a command or\nis in a directory containing it (as listed by windows; KDE). A terminal\nwith several tabs comes to the front on whichever tab was shown.",
+            "Bring an allowed app's window to the front by title or app-name substring\n(`query`), or with `terminal` the window whose terminal runs a command or\nis in a directory containing it (as listed by windows; KDE). A terminal\nwith several tabs comes to the front on whichever tab was shown.\nAfter the user pressed the stop shortcut, this call (not as a batch step)\nresumes input: only do it once the user agreed.",
             schema(&[
                 ("query", "string", Some(Json::Null)),
                 ("terminal", "string", Some(Json::Null)),

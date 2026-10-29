@@ -102,6 +102,44 @@ server starts the indicator on the first action as `desktop-mcp --indicator`;
 it exits with the server. To turn it off, set the environment variable
 `DESKTOP_MCP_INDICATOR=0` in the MCP configuration.
 
+## When the user takes over
+
+The agent and the user share one keyboard and mouse. Input tools (`act`,
+`set_text`, `focus`, `click`, `drag`, `scroll`, `key`, `type_text`, `mouse`,
+`activate_window`, `file_dialog`, `move_window`, `launch`, and any tool given
+`window`) wait for the user:
+
+- **Pause.** While the user typed or moved the pointer in the last 1.5 s,
+  they fail with `paused: the user is using the keyboard ...` without
+  sending anything; the agent retries once the user stops. User input during
+  a batch, a drag or a repeated `key` stops the remaining input
+  (`interrupted: ...`). Read tools and the clipboard tools keep working.
+- **Stop shortcut: Meta+Alt+Esc.** It ends a running drag or batch and refuses
+  every input tool with `stopped by the user` until the agent calls
+  `activate_window` on its own (not as a batch step and not through
+  `window`); the agent is told to ask you first. The indicator shows
+  "paused" or "stopped" when it refuses. (Plasma 6 already uses Meta+Esc for
+  System Monitor.)
+
+How it is seen (`doctor` shows it under "takeover detection"):
+- With read access to `/dev/input` (the user is in the `input` group), the
+  server reads the real keyboards and pointers there: read-only, never
+  grabbed, its own `desktop-mcp-*` devices left out. This is exact, and the
+  stop chord is seen on every compositor. Note that the `input` group lets
+  every program of the user read all keystrokes.
+- Otherwise it follows the compositor's idle notifications
+  (`ext-idle-notify-v1`, KDE and Hyprland). They count the agent's own input
+  too, so user input is only noticed outside of it (between steps, or when
+  it lasts longer than the agent's).
+- KDE registers the stop shortcut with KGlobalAccel: it appears under System
+  Settings > Shortcuts > Desktop MCP, where it can be changed. On Hyprland the
+  stop shortcut needs `/dev/input`.
+
+Settings (environment variables in the MCP configuration):
+`DESKTOP_MCP_TAKEOVER_MS` (default 1500; 0 turns the pause off) and
+`DESKTOP_MCP_STOP_KEY` (default `meta+alt+esc`, key names as for the `key`
+tool; `off` turns it off). Not available on Windows yet.
+
 ## Tools
 
 - `apps`, `tree`, `find`, `get_text`: reading and searching. With
