@@ -55,6 +55,22 @@ pub const WINDOW_TOOLS: [&str; 10] = [
     "screenshot",
 ];
 
+/// Input tools that report an `effect` line and take `observe` and
+/// `settle_ms`: what to look at once the input settled.
+pub const OBSERVE_TOOLS: [&str; 8] = [
+    "act",
+    "set_text",
+    "click",
+    "drag",
+    "scroll",
+    "key",
+    "type_text",
+    "mouse",
+];
+
+/// Values of `observe`.
+pub const OBSERVE_KINDS: [&str; 4] = ["none", "focus", "tree", "screenshot"];
+
 /// Sent as `instructions` in the initialize result. Clients that load tool
 /// schemas lazily show only this and the tool names at session start, so it
 /// carries the workflow and the targeting rules that every tool shares. It
@@ -82,8 +98,12 @@ step; it activates that window only when it isn't in front. Without it, input fa
 the user's own window (often a terminal) is in front.
 - pause for a fixed wait; wait_for only for something that visibly appears or goes away \
 (gone=true), never a query that can't match as a sleep.
+- Input replies end with `effect:` changed, no visible change (judged by the accessibility \
+tree and focus) or window changed to …. `observe`=focus|tree|screenshot adds that view after \
+the input settled: no separate call.
 - screenshot is a last resort; the image comes back inline (don't Read the file). To click \
-something seen only in it, pass its pixel position to mouse as image_x/image_y.
+something seen only in it, pass its pixel position to mouse as image_x/image_y. Small text: \
+`region`=[x, y, w, h] (its pixels) zooms in at full resolution.
 
 Allowlist: only apps listed in the user's allowlist file can be read, activated or sent input, \
 and input only goes to an allowed active window. Errors name the file; adding apps is the \
@@ -154,7 +174,7 @@ pub fn tools() -> Json {
         t(
             "act",
             &d(
-                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nMentions it when the active window changed (e.g. a dialog opened)."
+                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nThe effect line says when the active window changed (e.g. a dialog opened)."
             ),
             target(&[("action", "string", Some(json!("")))])
         ),
@@ -312,10 +332,11 @@ pub fn tools() -> Json {
         ),
         t(
             "screenshot",
-            "Last resort only: capture the active window. The image comes back in the\nreply (no need to Read the file), shrunk so its longer side is at most\n`max_size` px; `inline`=false returns only the file path. Also says which\nscreen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y.",
+            "Last resort only: capture the active window. The image comes back in the\nreply (no need to Read the file), shrunk so its longer side is at most\n`max_size` px; `inline`=false returns only the file path. Also says which\nscreen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution; image_x/image_y then refer to the zoomed image.",
             schema(&[
                 ("max_size", "integer", Some(json!(1024))),
                 ("inline", "boolean", Some(json!(true))),
+                ("region", "array", Some(Json::Null)),
             ])
         ),
         t(
@@ -332,6 +353,26 @@ pub fn tools() -> Json {
             tool["inputSchema"]["properties"]["window"] = json!({
                 "type": "string",
                 "description": "Title or app-name substring: activate that window first unless it is already in front."
+            });
+        }
+        if tool["name"] == "screenshot" {
+            tool["inputSchema"]["properties"]["region"]["items"] = json!({ "type": "number" });
+            tool["inputSchema"]["properties"]["region"]["description"] = json!(
+                "[x, y, width, height] in pixels of the last screenshot: zoom into that part."
+            );
+        }
+        if OBSERVE_TOOLS.contains(&tool["name"].as_str().unwrap()) {
+            let props = &mut tool["inputSchema"]["properties"];
+            props["observe"] = json!({
+                "type": "string",
+                "enum": OBSERVE_KINDS,
+                "default": "none",
+                "description": "After the input settled, also return: focus (the focused element), tree (compact tree of the active window, or of `app`'s), or screenshot (inline image)."
+            });
+            props["settle_ms"] = json!({
+                "type": "integer",
+                "default": 150,
+                "description": "Longest wait for the app to react before the effect line and observation; ends early once it changed."
             });
         }
         if READ_ONLY.contains(&tool["name"].as_str().unwrap()) {
@@ -354,6 +395,8 @@ mod tests {
             assert_eq!(ro, READ_ONLY.contains(&name), "{name}");
             let w = tool["inputSchema"]["properties"]["window"]["type"] == json!("string");
             assert_eq!(w, WINDOW_TOOLS.contains(&name), "{name} window");
+            let o = tool["inputSchema"]["properties"]["observe"]["type"] == json!("string");
+            assert_eq!(o, OBSERVE_TOOLS.contains(&name), "{name} observe");
         }
         let names: Vec<_> = list
             .as_array()
