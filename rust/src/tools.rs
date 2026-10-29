@@ -39,6 +39,12 @@ const READ_ONLY: [&str; 10] = [
     "clipboard_get",
 ];
 
+/// Tools that change something but destroy nothing: they raise, arrange or
+/// start windows. Every other tool that is not read-only gets
+/// `destructiveHint`: close_window, and the input tools, which can do
+/// anything the user could (focus may click; a wheel changes a slider).
+const NOT_DESTRUCTIVE: [&str; 3] = ["activate_window", "move_window", "launch"];
+
 /// Input tools that take an optional `window` (title or app-name
 /// substring): they activate the matching window first unless it is
 /// already in front.
@@ -80,6 +86,8 @@ the element step N found or acted on (find: its first hit).
 take `window` (title or app-name substring): pass it instead of a separate activate_window \
 step; it activates that window only when it isn't in front. Without it, input fails while \
 the user's own window (often a terminal) is in front.
+- menu (app + path, e.g. \"File > Save As\") runs a menu bar entry in one call, hidden \
+hamburger menu bars included; without path it lists the entries.
 - pause for a fixed wait; wait_for only for something that visibly appears or goes away \
 (gone=true), never a query that can't match as a sleep.
 - screenshot is a last resort; the image comes back inline (don't Read the file). To click \
@@ -272,12 +280,12 @@ pub fn tools() -> Json {
         ),
         t(
             "windows",
-            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state and output, after the\nscreens (name, geometry, scale). Terminal windows also list each tab's\npseudo-terminal with its foreground command and directory. `query` filters\nby title or app name. KDE Plasma and Hyprland.",
+            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state, output and virtual desktop\n(Hyprland: workspace), after the screens (name, geometry, scale) and the\ndesktops (number, name, the current one). Terminal windows also list each\ntab's pseudo-terminal with its foreground command and directory. `query`\nfilters by title or app name. KDE Plasma and Hyprland.",
             schema(&[("query", "string", Some(json!("")))])
         ),
         t(
             "move_window",
-            "Move and/or resize the first window of an allowed app whose title or\napp name contains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), or set `state` to maximize, minimize or restore.\nReplies with the new geometry. KDE Plasma and Hyprland (there a tiled\nwindow is floated to move or resize it; minimize parks it on the special\nworkspace special:minimized).",
+            "Move and/or resize the first window of an allowed app whose title or\napp name contains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), set `state` to maximize, minimize or restore, and/or\nmove it to virtual desktop `desktop` (number or name as windows lists them;\nHyprland: a workspace, created when the number is new; the view stays).\nReplies with the new geometry. KDE Plasma and Hyprland (there a tiled\nwindow is floated to move or resize it; minimize parks it on the special\nworkspace special:minimized).",
             schema(&[
                 ("query", "string", None),
                 ("x", "integer", Some(Json::Null)),
@@ -285,7 +293,21 @@ pub fn tools() -> Json {
                 ("width", "integer", Some(Json::Null)),
                 ("height", "integer", Some(Json::Null)),
                 ("state", "string", Some(Json::Null)),
+                ("desktop", "string", Some(Json::Null)),
             ])
+        ),
+        t(
+            "close_window",
+            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes, which the reply then says. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma and\nHyprland.",
+            schema(&[
+                ("query", "string", None),
+                ("confirm", "boolean", Some(json!(false))),
+            ])
+        ),
+        t(
+            "menu",
+            "Use an app's menu bar by labels, in one call: `path` is a list\n([\"File\", \"Save As…\"]) or one string (\"File > Save As\"), in the app's\nlanguage. Labels match case-insensitively, without & or _ markers or a\ntrailing ellipsis; a unique part is enough. The last entry's action runs\n(the reply notes a dialog it opened). Without `path`, lists the top\nlevel; a path ending at a submenu lists its entries with ids instead.\nWorks on the active window's menu bar even when hidden behind a\nhamburger button (KDE apps). Firefox lists a menu's entries only while\nit is open: open it with key (e.g. alt+f) first.",
+            schema(&[("app", "string", None), ("path", "array", Some(Json::Null)),])
         ),
         t(
             "launch",
@@ -328,14 +350,31 @@ pub fn tools() -> Json {
         if tool["name"] == "launch" {
             tool["inputSchema"]["properties"]["args"]["items"] = json!({ "type": "string" });
         }
+        if tool["name"] == "menu" {
+            tool["inputSchema"]["properties"]["path"] = json!({
+                "type": ["array", "string"],
+                "items": { "type": "string" },
+            });
+        }
+        if tool["name"] == "move_window" {
+            tool["inputSchema"]["properties"]["desktop"]["type"] = json!(["string", "integer"]);
+        }
         if WINDOW_TOOLS.contains(&tool["name"].as_str().unwrap()) {
             tool["inputSchema"]["properties"]["window"] = json!({
                 "type": "string",
                 "description": "Title or app-name substring: activate that window first unless it is already in front."
             });
         }
-        if READ_ONLY.contains(&tool["name"].as_str().unwrap()) {
+        let name = tool["name"].as_str().unwrap();
+        if READ_ONLY.contains(&name) {
             tool["annotations"] = json!({ "readOnlyHint": true });
+        } else {
+            // MCP assumes a tool that is not read-only may be destructive;
+            // say which ones only arrange or start things.
+            tool["annotations"] = json!({
+                "readOnlyHint": false,
+                "destructiveHint": !NOT_DESTRUCTIVE.contains(&name),
+            });
         }
     }
     list
@@ -352,6 +391,12 @@ mod tests {
             let name = tool["name"].as_str().unwrap();
             let ro = tool["annotations"]["readOnlyHint"] == json!(true);
             assert_eq!(ro, READ_ONLY.contains(&name), "{name}");
+            let destructive = tool["annotations"]["destructiveHint"] == json!(true);
+            assert_eq!(
+                destructive,
+                !ro && !NOT_DESTRUCTIVE.contains(&name),
+                "{name} destructive"
+            );
             let w = tool["inputSchema"]["properties"]["window"]["type"] == json!("string");
             assert_eq!(w, WINDOW_TOOLS.contains(&name), "{name} window");
         }
@@ -361,8 +406,15 @@ mod tests {
             .iter()
             .map(|t| t["name"].clone())
             .collect();
-        for name in READ_ONLY {
+        for name in READ_ONLY.iter().chain(&NOT_DESTRUCTIVE) {
             assert!(names.contains(&json!(name)), "{name} missing");
         }
+        let close = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == "close_window")
+            .unwrap();
+        assert_eq!(close["annotations"]["destructiveHint"], json!(true));
     }
 }

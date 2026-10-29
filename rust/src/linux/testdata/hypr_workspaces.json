@@ -1,0 +1,6 @@
+[
+  {"id": 2, "name": "2", "monitor": "HEADLESS-1", "monitorID": 1, "windows": 1, "hasfullscreen": true, "lastwindow": "0x55f94a3aaeb0", "lastwindowtitle": "K Hesap", "ispersistent": false},
+  {"id": -98, "name": "special:minimized", "monitor": "HEADLESS-1", "monitorID": 1, "windows": 1, "hasfullscreen": false, "lastwindow": "0x55f94a3a5470", "lastwindowtitle": "alpha term", "ispersistent": false},
+  {"id": 1, "name": "1", "monitor": "HEADLESS-2", "monitorID": 0, "windows": 1, "hasfullscreen": false, "lastwindow": "0x55f94a444680", "lastwindowtitle": "beta term", "ispersistent": false},
+  {"id": 5, "name": "mail", "monitor": "HEADLESS-1", "monitorID": 1, "windows": 0, "hasfullscreen": false, "lastwindow": "0x0", "lastwindowtitle": "", "ispersistent": true}
+]

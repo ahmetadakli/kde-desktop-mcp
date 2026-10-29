@@ -98,6 +98,30 @@ pub struct WindowGeo {
     pub pid: u32,
     /// Pseudo-terminals the window's processes hold (terminal emulators).
     pub terminals: Vec<Terminal>,
+    /// The virtual desktops (KDE: their numbers; Hyprland: the workspace
+    /// name) the window is on, `["all"]` when on every one; empty when the
+    /// desktop does not say.
+    pub desktops: Vec<String>,
+}
+
+/// A virtual desktop (KDE) or workspace (Hyprland).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Desktop {
+    /// KDE: position, from 1. Hyprland: the workspace id.
+    pub number: i64,
+    pub name: String,
+    /// KDE: the current desktop. Hyprland: shown on a monitor.
+    pub current: bool,
+    /// Hyprland: the monitor showing or holding it; "" on KDE.
+    pub output: String,
+}
+
+/// What `windows` reads in one go: screens, virtual desktops and the
+/// matching windows.
+pub struct Layout {
+    pub screens: Vec<Screen>,
+    pub desktops: Vec<Desktop>,
+    pub windows: R<Vec<WindowGeo>>,
 }
 
 /// A terminal in a window: device, foreground command and its directory.
@@ -136,6 +160,9 @@ pub struct WindowChange {
     pub height: Option<f64>,
     /// "maximize", "minimize" or "restore".
     pub state: Option<String>,
+    /// Virtual desktop (KDE) or workspace (Hyprland) to move the window
+    /// to: its number or name.
+    pub desktop: Option<String>,
 }
 
 /// A display output: name, logical geometry and scale factor.
@@ -270,6 +297,12 @@ pub trait Backend {
         None
     }
 
+    /// Whether `menu` may open the submenu entry `id` through its action
+    /// to read entries the app lists only while it is open.
+    async fn may_open_menu(&self, _id: &Self::Id) -> bool {
+        true
+    }
+
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
     /// Complete text content (falls back to the name).
@@ -320,13 +353,15 @@ pub trait Backend {
     async fn windows(&self, _query: &str, _allowed: &[String]) -> R<Vec<WindowGeo>> {
         Err(NO_WINDOW_CONTROL.into())
     }
-    /// `screens` and `windows` together, for backends that read both at once.
-    async fn screens_and_windows(
-        &self,
-        query: &str,
-        allowed: &[String],
-    ) -> (Vec<Screen>, R<Vec<WindowGeo>>) {
-        tokio::join!(self.screens(), self.windows(query, allowed))
+    /// `screens`, the virtual desktops and `windows` together, for backends
+    /// that read them at once. Desktops are empty where there are none.
+    async fn layout(&self, query: &str, allowed: &[String]) -> Layout {
+        let (screens, windows) = tokio::join!(self.screens(), self.windows(query, allowed));
+        Layout {
+            screens,
+            desktops: Vec::new(),
+            windows,
+        }
     }
     /// Move, resize, maximize, minimize or restore the first such window.
     async fn set_window(
@@ -335,6 +370,13 @@ pub trait Backend {
         _allowed: &[String],
         _change: &WindowChange,
     ) -> R<WindowGeo> {
+        Err(NO_WINDOW_CONTROL.into())
+    }
+    /// Ask the only window of an allowed app whose title or app contains
+    /// `query` to close, as its close button does: the app may still ask to
+    /// save changes. Returns that window as it was; Err when no window or
+    /// more than one matches.
+    async fn close_window(&self, _query: &str, _allowed: &[String]) -> R<WindowGeo> {
         Err(NO_WINDOW_CONTROL.into())
     }
     /// Read the clipboard as text, at most `limit` characters.
@@ -371,4 +413,22 @@ pub trait Backend {
     }
     /// Capture the active window; `path` is a new private file.
     async fn screenshot(&self) -> Option<Shot>;
+}
+
+/// Why `close_window` closed nothing: no window or several match `query`.
+// The Windows backend has no window control yet.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn not_one_window(query: &str, matches: &[WindowGeo]) -> String {
+    if matches.is_empty() {
+        return format!("no window of an allowed app matches '{query}'");
+    }
+    let list: Vec<String> = matches
+        .iter()
+        .map(|w| format!("{:?} [{}]", w.title, w.app))
+        .collect();
+    format!(
+        "{} windows match '{query}': {}; pass more of the title so only one does",
+        matches.len(),
+        list.join(", ")
+    )
 }
