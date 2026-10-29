@@ -73,6 +73,7 @@ fn dead() -> Info<Elem> {
         actions: Vec::new(),
         text: None,
         children: Vec::new(),
+        operable: false,
     }
 }
 
@@ -111,6 +112,7 @@ impl WindowsBackend {
             actions: p.actions().into_iter().map(String::from).collect(),
             text: text.filter(|t| !t.is_empty()),
             children,
+            operable: p.select || p.toggle || p.expand,
         }
     }
 

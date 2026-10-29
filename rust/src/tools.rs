@@ -26,7 +26,7 @@ fn schema(params: &[(&str, &str, Option<Json>)]) -> Json {
 }
 
 /// Tools that only read, marked `readOnlyHint` so clients may run them in parallel.
-const READ_ONLY: [&str; 10] = [
+const READ_ONLY: [&str; 11] = [
     "apps",
     "windows",
     "doctor",
@@ -34,6 +34,7 @@ const READ_ONLY: [&str; 10] = [
     "find",
     "get_text",
     "wait_for",
+    "wait_idle",
     "screenshot",
     "pause",
     "clipboard_get",
@@ -81,7 +82,9 @@ take `window` (title or app-name substring): pass it instead of a separate activ
 step; it activates that window only when it isn't in front. Without it, input fails while \
 the user's own window (often a terminal) is in front.
 - pause for a fixed wait; wait_for only for something that visibly appears or goes away \
-(gone=true), never a query that can't match as a sleep.
+(gone=true), gets a state (state=enabled…) or a window that opens or closes (window=…), \
+never a query that can't match as a sleep; wait_idle until an app stops changing. \
+tree(interactive=true) for large pages; a cut tree says how to continue (after=…).
 - screenshot is a last resort; the image comes back inline (don't Read the file). To click \
 something seen only in it, pass its pixel position to mouse as image_x/image_y.
 
@@ -131,14 +134,18 @@ pub fn tools() -> Json {
         ),
         t(
             "tree",
-            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. Actions the role implies (a link's jump, a\nbutton's press, a tab's switch, a section's click) are omitted;\n`actions=none` marks a button or link without any. Nameless wrappers are left\nout (their children lifted). Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nWith `document`=true only the page of `app`'s active window is listed: in a\nbrowser, the current tab's web page without the tabs and toolbars.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.",
+            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. Actions the role implies (a link's jump, a\nbutton's press, a tab's switch, a section's click) are omitted;\n`actions=none` marks a button or link without any. Nameless wrappers are left\nout (their children lifted). Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nWith `document`=true only the page of `app`'s active window is listed: in a\nbrowser, the current tab's web page without the tabs and toolbars.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.\n`interactive`=true lists only what can be operated (actions, editable,\nselectable, checkable, expandable), each under its nearest named ancestor.\nA reply over `max_chars` (0 = no cap) or `max_nodes` ends with\n`… N more nodes; continue with tree(…, after=ID)`: repeat that call for the\nnext part. `screenshot`=true also returns the image of the app's window\nwhen it is the active one.",
             schema(&[
                 ("app", "string", Some(json!(""))),
                 ("root_id", "integer", Some(json!(0))),
                 ("max_depth", "integer", Some(json!(12))),
                 ("max_nodes", "integer", Some(json!(300))),
+                ("max_chars", "integer", Some(json!(20000))),
                 ("include_hidden", "boolean", Some(json!(false))),
                 ("document", "boolean", Some(json!(false))),
+                ("interactive", "boolean", Some(json!(false))),
+                ("after", "integer", Some(Json::Null)),
+                ("screenshot", "boolean", Some(json!(false))),
             ])
         ),
         t(
@@ -212,13 +219,24 @@ pub fn tools() -> Json {
         ),
         t(
             "wait_for",
-            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). Matches like act's `query`, except that window and\ntab titles (frame, window, page tab), which name a page before it has loaded,\nmatch only when `role` names that role. To just wait a fixed time, use pause,\nnot a query that never matches.",
+            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). Matches like act's `query`, except that window and\ntab titles (frame, window, page tab), which name a page before it has loaded,\nmatch only when `role` names that role. `state` (enabled, focused, checked,\nselected): the element must also have it (with `gone`: until it no longer\ndoes). `window` instead of `query`: wait for a window of an allowed app\n(`app`, if given) whose title or app name contains it to open, or with\n`gone` to close. To just wait a fixed time, use pause, not a query that\nnever matches.",
             schema(&[
-                ("app", "string", None),
-                ("query", "string", None),
+                ("app", "string", Some(Json::Null)),
+                ("query", "string", Some(Json::Null)),
                 ("role", "string", Some(json!(""))),
+                ("state", "string", Some(Json::Null)),
+                ("window", "string", Some(Json::Null)),
                 ("gone", "boolean", Some(json!(false))),
                 ("timeout_ms", "integer", Some(json!(5000)))
+            ])
+        ),
+        t(
+            "wait_idle",
+            "Wait until `app` stops changing: no change in its accessibility tree\n(elements added or removed, names, text) for `quiet_ms`, e.g. after a page\nload or an animation; at most `timeout_ms` (fails when it never settles).\nCheaper than polling with tree or screenshots.",
+            schema(&[
+                ("app", "string", None),
+                ("quiet_ms", "integer", Some(json!(300))),
+                ("timeout_ms", "integer", Some(json!(10000)))
             ])
         ),
         t(
@@ -352,7 +370,8 @@ mod tests {
             let name = tool["name"].as_str().unwrap();
             let ro = tool["annotations"]["readOnlyHint"] == json!(true);
             assert_eq!(ro, READ_ONLY.contains(&name), "{name}");
-            let w = tool["inputSchema"]["properties"]["window"]["type"] == json!("string");
+            // wait_for's `window` is what it waits for, not one to activate.
+            let w = tool["inputSchema"]["properties"]["window"]["description"].is_string();
             assert_eq!(w, WINDOW_TOOLS.contains(&name), "{name} window");
         }
         let names: Vec<_> = list

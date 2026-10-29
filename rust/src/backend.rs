@@ -25,6 +25,9 @@ pub struct Info<Id> {
     /// the limit asked for; None when the element has no text.
     pub text: Option<String>,
     pub children: Vec<Id>,
+    /// The platform marks it selectable, checkable or expandable (a list
+    /// entry without actions). Not printed; `tree(interactive=true)` lists it.
+    pub operable: bool,
 }
 
 pub type Cache<Id> = HashMap<Id, Info<Id>>;
@@ -224,11 +227,21 @@ pub trait Backend {
         0
     }
     /// Wait until the app whose windows are `near` (none: not running) may
-    /// have changed after `mark`, or `timeout` passed. Backends that get
-    /// change events return once the app sent some and they settled; the
-    /// default just waits one poll interval.
-    async fn wait_change(&self, _near: &[Self::Id], _mark: u64, timeout: std::time::Duration) {
+    /// have changed after `mark`, or `timeout` passed; false when it surely
+    /// did not. Backends that get change events return once the app sent
+    /// some and they settled; the default just waits one poll interval.
+    async fn wait_change(
+        &self,
+        _near: &[Self::Id],
+        _mark: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
         tokio::time::sleep(timeout.min(std::time::Duration::from_millis(50))).await;
+        true
+    }
+    /// Whether `wait_change` hears of changes (else it only paces polls).
+    fn changes_live(&self) -> bool {
+        false
     }
     /// App name owning the foreground window, "" when unknown.
     async fn active_app(&self) -> String;
@@ -268,6 +281,12 @@ pub trait Backend {
     /// tab's page). None to search the window for it instead.
     async fn embedded_document(&self, _window: &Self::Id) -> Option<Self::Id> {
         None
+    }
+
+    /// Whether a document in `windows` says it is still loading (a
+    /// browser page waiting for the network sends no change events).
+    async fn loading(&self, _windows: &[Self::Id]) -> bool {
+        false
     }
 
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
@@ -319,6 +338,10 @@ pub trait Backend {
     /// empty).
     async fn windows(&self, _query: &str, _allowed: &[String]) -> R<Vec<WindowGeo>> {
         Err(NO_WINDOW_CONTROL.into())
+    }
+    /// `windows` without what costs extra (terminals), for polling.
+    async fn windows_quick(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
+        self.windows(query, allowed).await
     }
     /// `screens` and `windows` together, for backends that read both at once.
     async fn screens_and_windows(
