@@ -94,16 +94,20 @@ const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
 
 // AtspiStateType bit positions.
 pub const ACTIVE: u32 = 1;
+pub const BUSY: u32 = 3;
 pub const CHECKED: u32 = 4;
 pub const EDITABLE: u32 = 7;
 pub const ENABLED: u32 = 8;
+pub const EXPANDABLE: u32 = 9;
 pub const EXPANDED: u32 = 10;
 pub const FOCUSED: u32 = 12;
 pub const MULTI_LINE: u32 = 17;
+pub const SELECTABLE: u32 = 22;
 pub const SELECTED: u32 = 23;
 pub const SHOWING: u32 = 25;
 pub const VISIBLE: u32 = 30;
 pub const IS_DEFAULT: u32 = 39;
+pub const CHECKABLE: u32 = 41;
 
 // AtspiRelationType: a browser window EMBEDS its current tab's document.
 pub const RELATION_EMBEDS: u32 = 13;
@@ -491,6 +495,20 @@ impl A11y {
         self.changes.wait(buses, mark, timeout, CHANGE_SETTLE).await
     }
 
+    /// Whether an app on one of `buses` (or the set of apps or windows)
+    /// changed after `mark`; None without change events.
+    pub fn changed_since(&self, buses: &[&str], mark: u64) -> Option<bool> {
+        self.changes
+            .live
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| self.changes.since(buses, mark))
+    }
+
+    /// Whether change events are registered (`wait_change` hears of them).
+    pub fn changes_live(&self) -> bool {
+        self.changes.live.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn note_effect(&self, bus: &str) {
         if self.effects.receiver_count() > 0 {
             let _ = self.effects.send(bus.into());
@@ -733,6 +751,9 @@ impl A11y {
             actions,
             text,
             children,
+            operable: [SELECTABLE, CHECKABLE, EXPANDABLE]
+                .iter()
+                .any(|s| has(raw, *s)),
         };
         (info, hidden_visible)
     }
@@ -1020,6 +1041,17 @@ impl Changes {
         self.windows.0.send_replace(n);
     }
 
+    /// See `A11y::changed_since`.
+    fn since(&self, buses: &[&str], mark: u64) -> bool {
+        if *self.windows.0.borrow() > mark {
+            return true;
+        }
+        let map = self.buses.lock().unwrap();
+        buses
+            .iter()
+            .any(|bus| map.get(*bus).is_some_and(|tx| *tx.borrow() > mark))
+    }
+
     /// See `A11y::wait_change`; `settle` is the time a burst gets.
     async fn wait(
         &self,
@@ -1283,6 +1315,23 @@ mod tests {
         });
         assert!(changed && start.elapsed().as_millis() < 150);
         assert!(!changes.buses.lock().unwrap().contains_key(":1.5"));
+    }
+
+    #[test]
+    fn changed_since_sees_only_the_watched_apps_and_windows() {
+        let changes = Changes::default();
+        changes.note(":1.5", false);
+        let mark = changes.mark();
+        assert!(!changes.since(&[":1.5"], mark));
+        changes.note(":1.6", false);
+        assert!(!changes.since(&[":1.5"], mark));
+        assert!(changes.since(&[":1.5", ":1.6"], mark));
+        changes.note(":1.5", false);
+        assert!(changes.since(&[":1.5"], mark));
+        // A window or app coming or going counts for everyone.
+        let mark = changes.mark();
+        changes.note(":1.9", true);
+        assert!(changes.since(&[], mark));
     }
 
     #[test]

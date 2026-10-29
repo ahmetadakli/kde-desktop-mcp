@@ -11,6 +11,7 @@ mod input;
 mod kwin;
 mod launch;
 mod roles;
+mod takeover;
 mod terminals;
 
 use std::collections::HashMap;
@@ -25,7 +26,7 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    Layout, NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -167,6 +168,8 @@ pub struct LinuxBackend {
     /// KWin refused ScreenShot2; use spectacle from now on.
     shot_unauthorized: AtomicBool,
     indicator: tokio::sync::Mutex<IndicatorProc>,
+    /// The user's input and the stop shortcut (watched from `warm_up`).
+    takeover: Arc<crate::takeover::Takeover>,
 }
 
 /// The `--indicator` child process, started on the first action.
@@ -484,6 +487,7 @@ impl LinuxBackend {
             focus_record: Mutex::new(FocusRecord::default()),
             shot_unauthorized: AtomicBool::new(false),
             indicator: tokio::sync::Mutex::new(IndicatorProc::default()),
+            takeover: Arc::new(crate::takeover::Takeover::from_env()),
         })
     }
 
@@ -671,16 +675,7 @@ impl LinuxBackend {
 
     /// Every window of an allowed app, without terminals (launch's poll).
     async fn all_windows(&self, allowed: &[String]) -> R<Vec<WindowGeo>> {
-        match &self.comp {
-            Compositor::Kde(kwin) => kwin.windows("", &self.kwin_allow(allowed).await).await,
-            Compositor::Hyprland(h) => Ok(self
-                .hypr_clients(h, "", allowed)
-                .await?
-                .1
-                .into_iter()
-                .map(|c| c.geo)
-                .collect()),
-        }
+        self.windows_quick("", allowed).await
     }
 
     // ------------------------------------------------------------ focus
@@ -979,6 +974,15 @@ impl Backend for LinuxBackend {
         std::thread::spawn(move || input.warm_up_keyboard());
         let input = self.input.clone();
         std::thread::spawn(move || input.warm_up_pointer());
+        takeover::start(
+            self.takeover.clone(),
+            matches!(self.comp, Compositor::Kde(_)),
+            self.session.clone(),
+        );
+    }
+
+    fn takeover(&self) -> Option<Arc<crate::takeover::Takeover>> {
+        Some(self.takeover.clone())
     }
 
     async fn list_apps(&self) -> Vec<AppEntry> {
@@ -1027,11 +1031,20 @@ impl Backend for LinuxBackend {
         self.a11y.change_mark()
     }
 
-    async fn wait_change(&self, near: &[Obj], mark: u64, timeout: Duration) {
+    async fn wait_change(&self, near: &[Obj], mark: u64, timeout: Duration) -> bool {
         let mut buses: Vec<&str> = near.iter().map(|o| o.bus.as_ref()).collect();
         buses.sort_unstable();
         buses.dedup();
-        self.a11y.wait_change(&buses, mark, timeout).await;
+        self.a11y.wait_change(&buses, mark, timeout).await
+    }
+
+    fn changes_live(&self) -> bool {
+        self.a11y.changes_live()
+    }
+
+    fn changed_since(&self, near: &[Obj], mark: u64) -> Option<bool> {
+        let buses: Vec<&str> = near.iter().map(|o| o.bus.as_ref()).collect();
+        self.a11y.changed_since(&buses, mark)
     }
 
     async fn active_app(&self) -> String {
@@ -1075,6 +1088,24 @@ impl Backend for LinuxBackend {
 
     async fn embedded_document(&self, window: &Obj) -> Option<Obj> {
         self.a11y.relation(window, atspi::RELATION_EMBEDS).await
+    }
+
+    async fn loading(&self, windows: &[Obj]) -> bool {
+        let busy = futures_util::future::join_all(windows.iter().map(|w| async move {
+            match self.embedded_document(w).await {
+                Some(doc) => self.a11y.has_state(&doc, atspi::BUSY).await,
+                None => false,
+            }
+        }))
+        .await;
+        busy.into_iter().any(|b| b)
+    }
+
+    /// Not in Firefox: opening a menu of its (hidden) menu bar through
+    /// DoAction hung or crashed a freshly started Firefox in tests (an
+    /// abort on invalid UTF-8 in a D-Bus message), most times.
+    async fn may_open_menu(&self, id: &Obj) -> bool {
+        !self.toolkit(&id.bus).await.eq_ignore_ascii_case("gecko")
     }
 
     async fn actions(&self, id: &Obj) -> Vec<String> {
@@ -1166,6 +1197,7 @@ impl Backend for LinuxBackend {
             actions,
             text: None,
             children: Vec::new(),
+            operable: false,
         };
         Some(Focused {
             id: hint,
@@ -1379,6 +1411,17 @@ impl Backend for LinuxBackend {
         self.input.button(button, down).await
     }
 
+    async fn key(&self, key: &str, down: bool) -> R<()> {
+        self.input.key(key, down).await
+    }
+
+    async fn cursor_position(&self) -> R<(i64, i64)> {
+        match &self.comp {
+            Compositor::Kde(kwin) => kwin.cursor_pos().await,
+            Compositor::Hyprland(h) => h.cursor_pos().await,
+        }
+    }
+
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {
         match &self.comp {
             Compositor::Kde(kwin) => {
@@ -1439,6 +1482,13 @@ impl Backend for LinuxBackend {
         Ok(None)
     }
 
+    async fn window_app(&self, w: &WindowGeo) -> String {
+        self.app_names_by_pid()
+            .await
+            .remove(&i64::from(w.pid))
+            .unwrap_or_else(|| w.app.clone())
+    }
+
     async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
         match &self.comp {
             Compositor::Kde(kwin) => {
@@ -1455,29 +1505,51 @@ impl Backend for LinuxBackend {
         }
     }
 
-    async fn screens_and_windows(
-        &self,
-        query: &str,
-        allowed: &[String],
-    ) -> (Vec<Screen>, R<Vec<WindowGeo>>) {
+    async fn windows_quick(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
+        match &self.comp {
+            Compositor::Kde(kwin) => kwin.windows(query, &self.kwin_allow(allowed).await).await,
+            Compositor::Hyprland(h) => Ok(self
+                .hypr_clients(h, query, allowed)
+                .await?
+                .1
+                .into_iter()
+                .map(|c| c.geo)
+                .collect()),
+        }
+    }
+
+    async fn layout(&self, query: &str, allowed: &[String]) -> Layout {
+        let failed = |e| Layout {
+            screens: Vec::new(),
+            desktops: Vec::new(),
+            windows: Err(e),
+        };
         match &self.comp {
             Compositor::Kde(kwin) => {
                 let allow = self.kwin_allow(allowed).await;
-                match kwin.screens_and_windows(query, &allow).await {
-                    Ok((screens, mut list)) => {
+                match kwin.layout(query, &allow).await {
+                    Ok((screens, desktops, mut list)) => {
                         with_terminals(&mut list).await;
-                        (screens, Ok(list))
+                        Layout {
+                            screens,
+                            desktops,
+                            windows: Ok(list),
+                        }
                     }
-                    Err(e) => (Vec::new(), Err(e)),
+                    Err(e) => failed(e),
                 }
             }
             Compositor::Hyprland(h) => match self.hypr_clients(h, query, allowed).await {
                 Ok((snap, clients)) => {
                     let mut list: Vec<WindowGeo> = clients.into_iter().map(|c| c.geo).collect();
                     with_terminals(&mut list).await;
-                    (hyprland::screens_of(&snap.monitors), Ok(list))
+                    Layout {
+                        screens: hyprland::screens_of(&snap.monitors),
+                        desktops: hyprland::workspaces_of(&snap),
+                        windows: Ok(list),
+                    }
                 }
-                Err(e) => (Vec::new(), Err(e)),
+                Err(e) => failed(e),
             },
         }
     }
@@ -1502,8 +1574,17 @@ impl Backend for LinuxBackend {
                     .or(clients.first())
                     .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
                 let back = hyprland::monitor_workspace(&snap.monitors, c.monitor);
-                h.dispatch_all(&hyprland::change_commands(c, change, back)?)
-                    .await?;
+                let desk = match &change.desktop {
+                    Some(d) => Some(hyprland::workspace_target(&snap, d)?),
+                    None => None,
+                };
+                h.dispatch_all(&hyprland::change_commands(
+                    c,
+                    change,
+                    back,
+                    desk.as_deref(),
+                )?)
+                .await?;
                 // Hyprland applies geometry at once; the caller waits for the
                 // app (and the state) by re-reading `windows`.
                 let snap = h.snapshot().await?;
@@ -1512,6 +1593,24 @@ impl Backend for LinuxBackend {
                     .find(|n| n.address == c.address)
                     .map(|n| n.geo)
                     .ok_or_else(|| format!("the window '{}' closed", c.geo.title))
+            }
+        }
+    }
+
+    async fn close_window(&self, query: &str, allowed: &[String]) -> R<WindowGeo> {
+        match &self.comp {
+            Compositor::Kde(kwin) => {
+                kwin.close_window(query, &self.kwin_allow(allowed).await)
+                    .await
+            }
+            Compositor::Hyprland(h) => {
+                let (_, clients) = self.hypr_clients(h, query, allowed).await?;
+                let [c] = clients.as_slice() else {
+                    let list: Vec<WindowGeo> = clients.into_iter().map(|c| c.geo).collect();
+                    return Err(crate::backend::not_one_window(query, &list));
+                };
+                h.dispatch(&hyprland::close_command(c)).await?;
+                Ok(c.geo.clone())
             }
         }
     }
@@ -1984,5 +2083,51 @@ mod tests {
         ];
         let names = LinuxBackend::names_by_pid(&apps);
         assert_eq!(names, HashMap::from([(7, "kate".to_string())]));
+    }
+
+    /// Read-only timing of the reads an effect fingerprint makes, on the
+    /// live desktop: `cargo test --release -- --ignored --nocapture fingerprint_timing`.
+    #[test]
+    #[ignore]
+    fn fingerprint_timing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let b = LinuxBackend::new().await.unwrap();
+            let time = |name: &str, t: std::time::Instant, n: u32| {
+                let ms = t.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
+                println!("{name}: {ms:.2} ms");
+            };
+            let n = 20;
+            let _ = b.list_apps().await;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(b.list_apps().await);
+            }
+            time("list_apps", t, n);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(b.active_app().await);
+            }
+            time("active_app", t, n);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(b.focused().await);
+            }
+            time("focused", t, n);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(tokio::join!(b.list_apps(), b.focused()));
+            }
+            time("list_apps + focused", t, n);
+            let apps = b.list_apps().await;
+            println!(
+                "{} apps, {} windows",
+                apps.len(),
+                apps.iter().map(|a| a.windows.len()).sum::<usize>()
+            );
+        });
     }
 }

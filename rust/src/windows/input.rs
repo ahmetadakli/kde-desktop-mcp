@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{CloseHandle, GetLastError, HWND, RECT};
+use windows::Win32::Foundation::{CloseHandle, GetLastError, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC,
@@ -19,8 +19,8 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GetAncestor, GetForegroundWindow, GetWindowRect, GetWindowThreadProcessId, IsIconic,
-    SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
+    GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect,
+    GetWindowThreadProcessId, IsIconic, SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
 };
 use windows::core::PWSTR;
 
@@ -109,6 +109,14 @@ pub fn set_cursor(x: i64, y: i64) -> R<()> {
     let clamp = |v: i64| v.clamp(i32::MIN as i64, i32::MAX as i64) as i32;
     unsafe { SetCursorPos(clamp(x), clamp(y)) }
         .map_err(|_| format!("[Errno {}] SetCursorPos failed", last_error()))
+}
+
+/// Where the cursor is, in the physical pixels `set_cursor` takes.
+pub fn cursor() -> R<(i64, i64)> {
+    let mut p = POINT::default();
+    unsafe { GetCursorPos(&mut p) }
+        .map_err(|_| format!("[Errno {}] GetCursorPos failed", last_error()))?;
+    Ok((p.x as i64, p.y as i64))
 }
 
 pub fn foreground() -> HWND {

@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, mpsc};
 use zbus::Connection;
 use zbus::zvariant::{Fd, OwnedValue, Value};
 
-use crate::backend::{R, Screen, WindowChange, WindowGeo};
+use crate::backend::{Desktop, R, Screen, WindowChange, WindowGeo};
 
 const SINK_PATH: &str = "/org/desktopmcp/sink";
 const QUERY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -192,24 +192,39 @@ function matching() {
     && (!q || w.caption.toLowerCase().includes(q)
         || (w.resourceClass || "").toLowerCase().includes(q)));
 }
+function deskNumber(d) {
+  return String(workspace.desktops.findIndex(x => x.id === d.id) + 1);
+}
 function geo(w) {
   const g = w.frameGeometry;
   const m = workspace.clientArea(KWin.MaximizeArea, w);
   return {title: w.caption, app: w.resourceClass || "", x: g.x, y: g.y,
     width: g.width, height: g.height, active: w === workspace.activeWindow,
     minimized: w.minimized, output: w.output ? w.output.name : "", pid: w.pid,
-    maximized: g.x === m.x && g.y === m.y && g.width === m.width && g.height === m.height};
+    maximized: g.x === m.x && g.y === m.y && g.width === m.width && g.height === m.height,
+    desktops: w.onAllDesktops ? ["all"] : (w.desktops || []).map(deskNumber)};
 }
 "#;
 
 const WINDOWS: &str = "(() => { %JS% return JSON.stringify(matching().map(geo)); })()";
 
-/// Applies %CHANGE% ({x, y, width, height, state}; null fields kept) to the
-/// first matching window; evaluates to its new geometry, "" when none.
+/// Applies %CHANGE% ({x, y, width, height, state, desktop}; null fields
+/// kept) to the first matching window; evaluates to its new geometry, "" when
+/// none, or {error} when the desktop does not exist. A desktop is its
+/// number (from 1), name or id; the window is then on that one only.
 const SET_WINDOW: &str = r#"(() => { %JS%
 const c = %CHANGE%;
 const w = matching()[0];
 if (!w) return "";
+if (c.desktop !== null) {
+  const all = workspace.desktops;
+  const s = String(c.desktop).trim();
+  let d = /^[0-9]+$/.test(s) ? all[Number(s) - 1] : undefined;
+  if (!d) d = all.find(x => x.name.toLowerCase() === s.toLowerCase() || x.id === s);
+  if (!d) return JSON.stringify({error: "no virtual desktop '" + s + "'; there are: "
+    + all.map((x, i) => (i + 1) + ' "' + x.name + '"').join(", ")});
+  w.desktops = [d];
+}
 if (c.state === "minimize") w.minimized = true;
 if (c.state === "maximize") { w.minimized = false; w.setMaximize(true, true); }
 if (c.state === "restore") { w.minimized = false; w.setMaximize(false, false); }
@@ -226,9 +241,25 @@ const SCREENS_JS: &str = "workspace.screens.map(o => ({name: o.name, \
      x: o.geometry.x, y: o.geometry.y, width: o.geometry.width, \
      height: o.geometry.height, scale: o.devicePixelRatio}))";
 
-/// The outputs and the matching windows in one script run.
-const SCREENS_AND_WINDOWS: &str = "(() => { %JS% return JSON.stringify(\
-     {screens: %SCREENS%, windows: matching().map(geo)}); })()";
+/// The virtual desktops in order, the current one marked.
+const DESKTOPS_JS: &str = "workspace.desktops.map((d, i) => ({number: i + 1, name: d.name, \
+     current: !!workspace.currentDesktop && d.id === workspace.currentDesktop.id}))";
+
+/// The outputs, the virtual desktops and the matching windows in one
+/// script run.
+const LAYOUT: &str = "(() => { %JS% return JSON.stringify(\
+     {screens: %SCREENS%, desktops: %DESKTOPS%, windows: matching().map(geo)}); })()";
+
+/// Asks the only matching window to close (closeWindow: as its close
+/// button, so the app may still ask to save); evaluates to {closed: geo},
+/// or {matches: [geo...]} when not exactly one matched.
+const CLOSE_WINDOW: &str = r#"(() => { %JS%
+const list = matching();
+if (list.length !== 1) return JSON.stringify({matches: list.map(geo)});
+const g = geo(list[0]);
+list[0].closeWindow();
+return JSON.stringify({closed: g});
+})()"#;
 
 const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
      const g = w.clientGeometry; const s = workspace.virtualScreenGeometry; \
@@ -250,6 +281,17 @@ const ACTIVE_PARENT: &str = "JSON.stringify((() => { const w = workspace.activeW
 
 const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtualScreenGeometry; \
      return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
+
+const CURSOR_POS: &str = "JSON.stringify({x: workspace.cursorPos.x, y: workspace.cursorPos.y})";
+
+/// Parse what CURSOR_POS reports.
+fn cursor_pos_of(raw: &str) -> R<(i64, i64)> {
+    let p: Json = serde_json::from_str(raw).unwrap_or(Json::Null);
+    match (p["x"].as_f64(), p["y"].as_f64()) {
+        (Some(x), Some(y)) => Ok((x.round() as i64, y.round() as i64)),
+        _ => Err(format!("KWin: no cursor position in '{raw}'")),
+    }
+}
 
 impl KWin {
     pub async fn new(session: Connection) -> R<Self> {
@@ -366,6 +408,13 @@ impl KWin {
         Ok(data)
     }
 
+    /// The cursor position in logical screen coordinates
+    /// (`workspace.cursorPos`), the space `move_pointer` takes.
+    pub async fn cursor_pos(&self) -> R<(i64, i64)> {
+        let raw = self.query(CURSOR_POS).await?.unwrap_or_default();
+        cursor_pos_of(&raw)
+    }
+
     /// Raise a window; returns its caption and pid, None when nothing
     /// matched.
     pub async fn activate(&self, query: &str, allow: &Allow) -> R<Option<Raised>> {
@@ -412,6 +461,7 @@ impl KWin {
         let change = serde_json::json!({
             "x": change.x, "y": change.y, "width": change.width,
             "height": change.height, "state": change.state,
+            "desktop": change.desktop,
         });
         let script = SET_WINDOW
             .replace("%JS%", &window_js(query, allow))
@@ -421,7 +471,18 @@ impl KWin {
             return Ok(None);
         }
         let g: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
+        if let Some(e) = g["error"].as_str() {
+            return Err(e.to_string());
+        }
         Ok(Some(window_geo(&g)))
+    }
+
+    /// Close the only matching window, see CLOSE_WINDOW.
+    pub async fn close_window(&self, query: &str, allow: &Allow) -> R<WindowGeo> {
+        let script = CLOSE_WINDOW.replace("%JS%", &window_js(query, allow));
+        let raw = self.query(&script).await?.unwrap_or_default();
+        let v: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
+        closed_of(&v, query)
     }
 
     pub async fn screens(&self) -> R<Vec<Screen>> {
@@ -431,22 +492,19 @@ impl KWin {
         Ok(screens_of(&list))
     }
 
-    /// `screens` and `windows` in one script run.
-    pub async fn screens_and_windows(
+    /// Screens, virtual desktops and windows in one script run.
+    pub async fn layout(
         &self,
         query: &str,
         allow: &Allow,
-    ) -> R<(Vec<Screen>, Vec<WindowGeo>)> {
-        let script = SCREENS_AND_WINDOWS
+    ) -> R<(Vec<Screen>, Vec<Desktop>, Vec<WindowGeo>)> {
+        let script = LAYOUT
             .replace("%JS%", &window_js(query, allow))
-            .replace("%SCREENS%", SCREENS_JS);
+            .replace("%SCREENS%", SCREENS_JS)
+            .replace("%DESKTOPS%", DESKTOPS_JS);
         let raw = self.query(&script).await?.unwrap_or_default();
         let v: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
-        let windows = v["windows"]
-            .as_array()
-            .map(|a| a.iter().map(window_geo).collect())
-            .unwrap_or_default();
-        Ok((screens_of(&v["screens"]), windows))
+        Ok(layout_of(&v))
     }
 
     /// KWin's active window with its transient parent, see ACTIVE_PARENT;
@@ -693,7 +751,52 @@ fn window_geo(g: &Json) -> WindowGeo {
             .and_then(|p| u32::try_from(p).ok())
             .unwrap_or(0),
         terminals: Vec::new(),
+        desktops: g["desktops"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|d| d.as_str().map(str::to_string))
+            .collect(),
     }
+}
+
+fn desktops_of(list: &Json) -> Vec<Desktop> {
+    list.as_array()
+        .into_iter()
+        .flatten()
+        .map(|d| Desktop {
+            number: d["number"].as_i64().unwrap_or(0),
+            name: d["name"].as_str().unwrap_or("").to_string(),
+            current: d["current"].as_bool().unwrap_or(false),
+            output: String::new(),
+        })
+        .collect()
+}
+
+/// What LAYOUT evaluated to.
+fn layout_of(v: &Json) -> (Vec<Screen>, Vec<Desktop>, Vec<WindowGeo>) {
+    let windows = v["windows"]
+        .as_array()
+        .map(|a| a.iter().map(window_geo).collect())
+        .unwrap_or_default();
+    (
+        screens_of(&v["screens"]),
+        desktops_of(&v["desktops"]),
+        windows,
+    )
+}
+
+/// What CLOSE_WINDOW evaluated to: the window asked to close, or why none
+/// was.
+fn closed_of(v: &Json, query: &str) -> R<WindowGeo> {
+    if v["closed"].is_object() {
+        return Ok(window_geo(&v["closed"]));
+    }
+    let matches: Vec<WindowGeo> = v["matches"]
+        .as_array()
+        .map(|a| a.iter().map(window_geo).collect())
+        .unwrap_or_default();
+    Err(crate::backend::not_one_window(query, &matches))
 }
 
 /// Fallback when the KWin query fails.
@@ -729,6 +832,14 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn cursor_position_is_parsed_and_rounded() {
+        assert_eq!(cursor_pos_of(r#"{"x":1920,"y":-5}"#), Ok((1920, -5)));
+        assert_eq!(cursor_pos_of(r#"{"x":10.6,"y":3.2}"#), Ok((11, 3)));
+        assert!(cursor_pos_of("").is_err());
+        assert!(cursor_pos_of(r#"{"x":1}"#).is_err());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -795,10 +906,78 @@ mod tests {
         assert!(!js.contains('%'));
         let act = ACTIVATE.replace("%OK_APP%", &allow.ok_app_js());
         assert!(act.contains("const allowPids = [10];") && act.contains("okApp(w)"));
-        let both = SCREENS_AND_WINDOWS
+        let both = LAYOUT
             .replace("%JS%", &js)
-            .replace("%SCREENS%", SCREENS_JS);
+            .replace("%SCREENS%", SCREENS_JS)
+            .replace("%DESKTOPS%", DESKTOPS_JS);
         assert!(!both.contains('%') && both.contains("workspace.screens.map"));
+        assert!(both.contains("workspace.desktops.map"));
+        for script in [SET_WINDOW, CLOSE_WINDOW] {
+            let s = script.replace("%JS%", &js).replace("%CHANGE%", "{}");
+            assert!(!s.contains('%'), "{s}");
+        }
+    }
+
+    #[test]
+    fn reads_desktops_windows_and_close_results() {
+        let v: Json = serde_json::from_str(
+            r#"{"screens": [], "desktops": [
+                {"number": 1, "name": "Masaüstü 1", "current": false},
+                {"number": 2, "name": "Web", "current": true}],
+              "windows": [
+                {"title": "a — Kate", "app": "org.kde.kate", "x": 10, "y": 20,
+                 "width": 300, "height": 200, "active": true, "minimized": false,
+                 "maximized": false, "output": "eDP-1", "pid": 42, "desktops": ["2"]},
+                {"title": "Dolphin", "app": "org.kde.dolphin", "pid": 43,
+                 "desktops": ["all"]}]}"#,
+        )
+        .unwrap();
+        let (screens, desktops, windows) = layout_of(&v);
+        assert!(screens.is_empty());
+        assert_eq!(
+            desktops,
+            vec![
+                Desktop {
+                    number: 1,
+                    name: "Masaüstü 1".into(),
+                    current: false,
+                    output: String::new(),
+                },
+                Desktop {
+                    number: 2,
+                    name: "Web".into(),
+                    current: true,
+                    output: String::new(),
+                },
+            ]
+        );
+        assert_eq!(windows[0].desktops, vec!["2"]);
+        assert_eq!((windows[0].pid, windows[0].active), (42, true));
+        assert_eq!(windows[1].desktops, vec!["all"]);
+        // An older KWin without the field: unknown, not "none".
+        assert!(
+            window_geo(&serde_json::json!({"title": "x"}))
+                .desktops
+                .is_empty()
+        );
+
+        let closed: Json =
+            serde_json::from_str(r#"{"closed": {"title": "a — Kate", "pid": 42}}"#).unwrap();
+        assert_eq!(closed_of(&closed, "kate").unwrap().title, "a — Kate");
+        let none: Json = serde_json::from_str(r#"{"matches": []}"#).unwrap();
+        assert_eq!(
+            closed_of(&none, "x").unwrap_err(),
+            "no window of an allowed app matches 'x'"
+        );
+        let two: Json = serde_json::from_str(
+            r#"{"matches": [{"title": "a", "app": "k"}, {"title": "b", "app": "k"}]}"#,
+        )
+        .unwrap();
+        let err = closed_of(&two, "k").unwrap_err();
+        assert!(
+            err.starts_with("2 windows match 'k': \"a\" [k], \"b\" [k]"),
+            "{err}"
+        );
     }
 
     #[test]

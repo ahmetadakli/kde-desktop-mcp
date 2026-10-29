@@ -25,6 +25,9 @@ pub struct Info<Id> {
     /// the limit asked for; None when the element has no text.
     pub text: Option<String>,
     pub children: Vec<Id>,
+    /// The platform marks it selectable, checkable or expandable (a list
+    /// entry without actions). Not printed; `tree(interactive=true)` lists it.
+    pub operable: bool,
 }
 
 pub type Cache<Id> = HashMap<Id, Info<Id>>;
@@ -98,6 +101,30 @@ pub struct WindowGeo {
     pub pid: u32,
     /// Pseudo-terminals the window's processes hold (terminal emulators).
     pub terminals: Vec<Terminal>,
+    /// The virtual desktops (KDE: their numbers; Hyprland: the workspace
+    /// name) the window is on, `["all"]` when on every one; empty when the
+    /// desktop does not say.
+    pub desktops: Vec<String>,
+}
+
+/// A virtual desktop (KDE) or workspace (Hyprland).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Desktop {
+    /// KDE: position, from 1. Hyprland: the workspace id.
+    pub number: i64,
+    pub name: String,
+    /// KDE: the current desktop. Hyprland: shown on a monitor.
+    pub current: bool,
+    /// Hyprland: the monitor showing or holding it; "" on KDE.
+    pub output: String,
+}
+
+/// What `windows` reads in one go: screens, virtual desktops and the
+/// matching windows.
+pub struct Layout {
+    pub screens: Vec<Screen>,
+    pub desktops: Vec<Desktop>,
+    pub windows: R<Vec<WindowGeo>>,
 }
 
 /// A terminal in a window: device, foreground command and its directory.
@@ -136,6 +163,9 @@ pub struct WindowChange {
     pub height: Option<f64>,
     /// "maximize", "minimize" or "restore".
     pub state: Option<String>,
+    /// Virtual desktop (KDE) or workspace (Hyprland) to move the window
+    /// to: its number or name.
+    pub desktop: Option<String>,
 }
 
 /// A display output: name, logical geometry and scale factor.
@@ -224,11 +254,27 @@ pub trait Backend {
         0
     }
     /// Wait until the app whose windows are `near` (none: not running) may
-    /// have changed after `mark`, or `timeout` passed. Backends that get
-    /// change events return once the app sent some and they settled; the
-    /// default just waits one poll interval.
-    async fn wait_change(&self, _near: &[Self::Id], _mark: u64, timeout: std::time::Duration) {
+    /// have changed after `mark`, or `timeout` passed; false when it surely
+    /// did not. Backends that get change events return once the app sent
+    /// some and they settled; the default just waits one poll interval.
+    async fn wait_change(
+        &self,
+        _near: &[Self::Id],
+        _mark: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
         tokio::time::sleep(timeout.min(std::time::Duration::from_millis(50))).await;
+        true
+    }
+    /// Whether `wait_change` hears of changes (else it only paces polls).
+    fn changes_live(&self) -> bool {
+        false
+    }
+    /// Whether the app whose windows (or elements) are `near` reported a
+    /// change after `mark`, or windows or apps came or went; None when the
+    /// backend gets no change events. Cheap: no round trip.
+    fn changed_since(&self, _near: &[Self::Id], _mark: u64) -> Option<bool> {
+        None
     }
     /// App name owning the foreground window, "" when unknown.
     async fn active_app(&self) -> String;
@@ -268,6 +314,18 @@ pub trait Backend {
     /// tab's page). None to search the window for it instead.
     async fn embedded_document(&self, _window: &Self::Id) -> Option<Self::Id> {
         None
+    }
+
+    /// Whether a document in `windows` says it is still loading (a
+    /// browser page waiting for the network sends no change events).
+    async fn loading(&self, _windows: &[Self::Id]) -> bool {
+        false
+    }
+
+    /// Whether `menu` may open the submenu entry `id` through its action
+    /// to read entries the app lists only while it is open.
+    async fn may_open_menu(&self, _id: &Self::Id) -> bool {
+        true
     }
 
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
@@ -310,23 +368,41 @@ pub trait Backend {
     async fn move_pointer(&self, x: i64, y: i64) -> R<()>;
     /// Press (`down`) or release a mouse button where the cursor is.
     async fn button(&self, button: &str, down: bool) -> R<()>;
+    /// Press (`down`) or release one key ("ctrl", "shift", "a", ...) and
+    /// leave it so: modifiers around a click, keys held across calls.
+    async fn key(&self, key: &str, down: bool) -> R<()>;
+    /// Where the cursor is, in the coordinates `pointer` takes.
+    async fn cursor_position(&self) -> R<(i64, i64)> {
+        Err("the cursor position is not available on this desktop".into())
+    }
     /// Raise the first window of an allowed app whose title or app name
     /// contains `query`, and wait until it is in front. Some names the
     /// window in front when that wait already found it; None leaves it to
     /// the caller to look.
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>>;
+    /// The accessibility app name of the process behind `w` (the name the
+    /// allowlist uses), when it differs from the compositor's app id.
+    async fn window_app(&self, w: &WindowGeo) -> String {
+        w.app.clone()
+    }
     /// Windows of allowed apps whose title or app contains `query` (all when
     /// empty).
     async fn windows(&self, _query: &str, _allowed: &[String]) -> R<Vec<WindowGeo>> {
         Err(NO_WINDOW_CONTROL.into())
     }
-    /// `screens` and `windows` together, for backends that read both at once.
-    async fn screens_and_windows(
-        &self,
-        query: &str,
-        allowed: &[String],
-    ) -> (Vec<Screen>, R<Vec<WindowGeo>>) {
-        tokio::join!(self.screens(), self.windows(query, allowed))
+    /// `windows` without what costs extra (terminals), for polling.
+    async fn windows_quick(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
+        self.windows(query, allowed).await
+    }
+    /// `screens`, the virtual desktops and `windows` together, for backends
+    /// that read them at once. Desktops are empty where there are none.
+    async fn layout(&self, query: &str, allowed: &[String]) -> Layout {
+        let (screens, windows) = tokio::join!(self.screens(), self.windows(query, allowed));
+        Layout {
+            screens,
+            desktops: Vec::new(),
+            windows,
+        }
     }
     /// Move, resize, maximize, minimize or restore the first such window.
     async fn set_window(
@@ -335,6 +411,13 @@ pub trait Backend {
         _allowed: &[String],
         _change: &WindowChange,
     ) -> R<WindowGeo> {
+        Err(NO_WINDOW_CONTROL.into())
+    }
+    /// Ask the only window of an allowed app whose title or app contains
+    /// `query` to close, as its close button does: the app may still ask to
+    /// save changes. Returns that window as it was; Err when no window or
+    /// more than one matches.
+    async fn close_window(&self, _query: &str, _allowed: &[String]) -> R<WindowGeo> {
         Err(NO_WINDOW_CONTROL.into())
     }
     /// Read the clipboard as text, at most `limit` characters.
@@ -358,6 +441,11 @@ pub trait Backend {
     async fn screens(&self) -> Vec<Screen> {
         Vec::new()
     }
+    /// Who owns the seat: the user's input and the stop shortcut, watched
+    /// by the backend (see takeover.rs). None where nothing watches.
+    fn takeover(&self) -> Option<std::sync::Arc<crate::takeover::Takeover>> {
+        None
+    }
     /// Show what the agent is doing on screen, when the desktop has an
     /// indicator.
     async fn indicate(&self, _label: &str) {}
@@ -371,4 +459,22 @@ pub trait Backend {
     }
     /// Capture the active window; `path` is a new private file.
     async fn screenshot(&self) -> Option<Shot>;
+}
+
+/// Why `close_window` closed nothing: no window or several match `query`.
+// The Windows backend has no window control yet.
+#[cfg_attr(windows, allow(dead_code))]
+pub fn not_one_window(query: &str, matches: &[WindowGeo]) -> String {
+    if matches.is_empty() {
+        return format!("no window of an allowed app matches '{query}'");
+    }
+    let list: Vec<String> = matches
+        .iter()
+        .map(|w| format!("{:?} [{}]", w.title, w.app))
+        .collect();
+    format!(
+        "{} windows match '{query}': {}; pass more of the title so only one does",
+        matches.len(),
+        list.join(", ")
+    )
 }

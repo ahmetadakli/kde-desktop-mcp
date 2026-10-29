@@ -87,9 +87,13 @@ Why it is fast:
   and lie inside the window are entered as well, while content scrolled out of
   view is still skipped. Example: Gemini's upload menu ("Dosya yükleyin") is
   now found without a screenshot.
-- Read tools (`apps`, `tree`, `find`, `get_text`, `wait_for`, `screenshot`,
-  `pause`, `clipboard_get`, `windows`, `doctor`) carry MCP's `readOnlyHint`;
+- Read tools (`apps`, `tree`, `find`, `get_text`, `wait_for`, `wait_idle`,
+  `screenshot`, `pause`, `clipboard_get`, `windows`, `doctor`) carry MCP's
+  `readOnlyHint`;
   Claude Code runs several of them in parallel when asked for in one message.
+  The others carry `destructiveHint`: true for `close_window` and the input
+  tools (which can do whatever the user could), false for `activate_window`,
+  `move_window` and `launch`.
 
 ## On-screen indicator
 
@@ -102,6 +106,44 @@ server starts the indicator on the first action as `desktop-mcp --indicator`;
 it exits with the server. To turn it off, set the environment variable
 `DESKTOP_MCP_INDICATOR=0` in the MCP configuration.
 
+## When the user takes over
+
+The agent and the user share one keyboard and mouse. Input tools (`act`,
+`set_text`, `focus`, `click`, `drag`, `scroll`, `key`, `type_text`, `mouse`,
+`activate_window`, `file_dialog`, `move_window`, `launch`, and any tool given
+`window`) wait for the user:
+
+- **Pause.** While the user typed or moved the pointer in the last 1.5 s,
+  they fail with `paused: the user is using the keyboard ...` without
+  sending anything; the agent retries once the user stops. User input during
+  a batch, a drag or a repeated `key` stops the remaining input
+  (`interrupted: ...`). Read tools and the clipboard tools keep working.
+- **Stop shortcut: Meta+Alt+Esc.** It ends a running drag or batch and refuses
+  every input tool with `stopped by the user` until the agent calls
+  `activate_window` on its own (not as a batch step and not through
+  `window`); the agent is told to ask you first. The indicator shows
+  "paused" or "stopped" when it refuses. (Plasma 6 already uses Meta+Esc for
+  System Monitor.)
+
+How it is seen (`doctor` shows it under "takeover detection"):
+- With read access to `/dev/input` (the user is in the `input` group), the
+  server reads the real keyboards and pointers there: read-only, never
+  grabbed, its own `desktop-mcp-*` devices left out. This is exact, and the
+  stop chord is seen on every compositor. Note that the `input` group lets
+  every program of the user read all keystrokes.
+- Otherwise it follows the compositor's idle notifications
+  (`ext-idle-notify-v1`, KDE and Hyprland). They count the agent's own input
+  too, so user input is only noticed outside of it (between steps, or when
+  it lasts longer than the agent's).
+- KDE registers the stop shortcut with KGlobalAccel: it appears under System
+  Settings > Shortcuts > Desktop MCP, where it can be changed. On Hyprland the
+  stop shortcut needs `/dev/input`.
+
+Settings (environment variables in the MCP configuration):
+`DESKTOP_MCP_TAKEOVER_MS` (default 1500; 0 turns the pause off) and
+`DESKTOP_MCP_STOP_KEY` (default `meta+alt+esc`, key names as for the `key`
+tool; `off` turns it off). Not available on Windows yet.
+
 ## Tools
 
 - `apps`, `tree`, `find`, `get_text`: reading and searching. With
@@ -109,12 +151,37 @@ it exits with the server. To turn it off, set the environment variable
   browser, that tab's page without tabs and toolbars). `get_text` on a web page
   or another container returns the text of everything in it in reading order
   (web containers' own text is only a placeholder per child element).
+- Large trees: `tree(interactive: true)` lists only elements one can operate
+  (actions, editable/checkable/selectable/expandable) under their nearest
+  named ancestor; on a GitHub issues page in Firefox it was 15,339 instead of
+  24,687 characters and still listed all 259 links, buttons and fields. A
+  reply is capped at `max_chars` (default 20,000) and `max_nodes`; a cut one
+  ends with `… N more nodes; continue with tree(…, after=ID)`, which lists the
+  rest after that element (ids are stable, so pages join up exactly).
+  `screenshot: true` adds the image of the app's window when it is in front.
 - `set_text` reads back what it wrote: the reply says "verified", or it fails
   saying what the field holds (a length limit, reformatting). Firefox's input
   fields report accessibility writes as successful and do nothing, so when
   single-line text does not take, it focuses the element, selects all with
   Ctrl+A and types it. Password fields cannot be read back.
 - `scroll`: turns the wheel over an element (a list, a page, a panel).
+- Modifier clicks: `click`, `mouse` and `scroll` take `modifiers` (`ctrl`,
+  `shift`, `alt`, `meta`), pressed before the pointer action and released in
+  reverse order afterwards, also when it fails (ctrl+click adds to a
+  selection, shift+click selects a range, ctrl+scroll zooms). `clicks: 2` is a
+  double and `clicks: 3` a triple click (select a line); `button` is `left`,
+  `right` or `middle`.
+- `hold`: presses a key, chord or mouse button and leaves it down across calls
+  (`down: false` releases it; without `key`/`button` it releases everything).
+  Every input reply ends with what is still held (`; held: shift, left`).
+  Everything held is released when a call fails, when a call is cancelled
+  (`notifications/cancelled`) and when the server exits (end of input,
+  SIGTERM/SIGINT/SIGHUP); on Linux the kernel also releases the keys of the
+  virtual devices when the process dies. Meant for modifiers and buttons: a
+  held letter auto-repeats like a real key.
+- `cursor_position`: where the cursor is, in the coordinates `mouse` takes
+  (KDE: `workspace.cursorPos` through a KWin script; Hyprland: `cursorpos`;
+  Windows: `GetCursorPos`). Read-only.
 - `drag`: presses, moves in steps and releases (drag and drop, sliders,
   selections). Each end is an element id (`from_id`/`to_id`), a screen
   coordinate, or with `image: true` a pixel of the last screenshot.
@@ -123,8 +190,18 @@ it exits with the server. To turn it off, set the environment variable
   (+ `role`): the first visible element whose name equals `query`, else the
   first whose name or text contains it. Window and tab titles (frame, window,
   page tab) count only when nothing else matches or `role` names that role;
-  `wait_for` skips them unless `role` names them. `act` reports when the
-  active window changed (e.g. a dialog opened).
+  `wait_for` skips them unless `role` names them.
+- Effect and `observe` on input tools (`act`, `click`, `key`, `type_text`,
+  `mouse`, `drag`, `scroll`, `set_text`): the reply ends with an `effect:`
+  line comparing the active window before and after the input (its title, the
+  focused element, and on Linux the app's accessibility change events):
+  `changed`, `no visible change`, or `window changed to '<title>'` (a dialog
+  opened, a window closed). It waits for the app to react up to `settle_ms`
+  (default 150), returning as soon as it reported a change; the fingerprint
+  itself costs about 1 ms. A canvas that draws without accessibility events
+  may report `no visible change`. `observe` adds a view in the same reply:
+  `focus` (the focused element), `tree` (compact tree of the active window, or
+  of `app`'s, at most 6000 characters) or `screenshot` (inline image).
 - Stale ids: every use of an `id` reads the element's role and name again (one
   round trip). If the element is gone, or its role or name changed (the page
   was redrawn, the object path now belongs to another element), nothing is
@@ -135,14 +212,49 @@ it exits with the server. To turn it off, set the environment variable
 - `wait_for`: waits until an element appears or disappears (checks every
   50 ms, at most 10 minutes); for dialogs opened by a key or click, a long
   load or a build. A longer timeout is cut to 10 minutes and the reply says so.
+  `state` (enabled, focused, checked, selected) waits until the element has
+  that state (with `gone`, until it no longer does). `window` instead of
+  `query` waits for a window of an allowed app whose title or app name
+  contains it to open, or with `gone` to close (KDE and Hyprland window
+  lists, re-read when AT-SPI reports a window change).
+- `wait_idle`: waits until an app's accessibility tree has not changed for
+  `quiet_ms` (default 300), e.g. after a page load; a browser page still
+  marked busy does not count as quiet. A page waiting for the network sends
+  nothing, so after a click that loads a page raise `quiet_ms` or use
+  `wait_for` on content of the new page.
 - `pause`: waits a fixed time (`ms`, at most 10 minutes); for waiting on time
   only, not on a visible change.
 - `windows`: lists windows of allowed apps with position, size, state (active,
-  maximized, minimized) and output in screen coordinates, after the screen
-  layout (name, area, scale) (KDE and Hyprland).
-- `move_window`: moves, resizes, maximizes, minimizes or restores a window;
-  waits (at most 1 s) until the window has its new geometry and reports the
-  real result (KDE and Hyprland; see the Hyprland limitations).
+  maximized, minimized), output and virtual desktop in screen coordinates,
+  after the screen layout (name, area, scale) and the virtual desktops
+  (KDE: number, name, the current one; Hyprland: the regular workspaces and
+  the monitor each is on) (KDE and Hyprland).
+- `move_window`: moves, resizes, maximizes, minimizes or restores a window,
+  and with `desktop` (a number or name as `windows` lists them) moves it to
+  that virtual desktop (KDE: the window is then on that one only) or
+  workspace (Hyprland: silently, the view stays; a new number makes the
+  workspace); waits (at most 1 s) until the window has its new geometry and
+  reports the real result (KDE and Hyprland; see the Hyprland limitations).
+- `close_window`: closes the one window whose title or app name contains
+  `query` (several matches: an error listing them) as its close button does
+  (KWin `closeWindow()`, Hyprland `closewindow`), so an app with unsaved
+  changes still asks; the reply then says the window is still open. Always
+  needs the user's consent, as tools on the `confirm:` list do (see
+  [Tiers, confirmation and password fields](#tiers-confirmation-and-password-fields)).
+- `menu`: runs a menu bar entry by its labels in one call: `path` is a list
+  (`["Dosya", "Farklı Kaydet…"]`) or one string (`"Dosya > Farklı Kaydet"`).
+  Labels are matched case-insensitively (Turkish dotted and dotless i
+  alike), without `&`/`_` accelerator markers, a shortcut after a tab or a
+  trailing ellipsis; an exact label wins, else a unique part of one. Without
+  `path` it lists the top level, and a path ending at a submenu lists that
+  submenu's entries with ids (read-only where the app keeps closed submenus
+  in the tree). Qt and GTK apps keep closed submenus' entries in the tree, so
+  nothing is opened. KDE apps that replace the menu bar with a hamburger
+  button ("Menüyü Aç", which has no accessibility action and no children)
+  keep the hidden menu bar in the tree, and its entries work: `menu` finds it
+  too (Kate, Dolphin). Firefox fills a menu only while it is open; `menu`
+  does not open Firefox menus itself (doing so through accessibility hung or
+  crashed a fresh Firefox in tests), so open the menu with `key` first.
 - `launch`: starts an allowed app (`app`, e.g. `kate`) with an optional `args`
   list (no shell; its `.desktop` file first, else the program on `PATH`) and
   waits until its window opens (`wait_ms`, default 15 s, at most 60 s; 0 does
@@ -189,14 +301,17 @@ it exits with the server. To turn it off, set the environment variable
   side is 1024 px by default (`max_size`; `inline: false` returns only the file
   path) and reports which screen area it shows; given `image_x`/`image_y`,
   `mouse` converts a pixel of the image to a screen coordinate (window position
-  and display scaling, e.g. 125 %, included).
+  and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
+  in pixels of the last screenshot captures again and returns only that part,
+  cropped before shrinking, at up to full resolution (`max_size` still
+  applies); `image_x`/`image_y` then refer to the zoomed image.
 - `batch`: runs several tools in order in one call and stops at the first
   error; reduces Claude's number of turns. A step with `"optional": true`
   (typically a `wait_for`) may fail without stopping the batch: it is reported
   as `[n] tool failed (optional): …` and the remaining steps still run, so a
   final observation step (`find`, `screenshot`) is not lost.
 
-The `initialize` reply carries `instructions` (about 2.1 KB): the workflow,
+The `initialize` reply carries `instructions` (about 2.6 KB): the workflow,
 the targeting rules shared by the tools above, the allowlist and which tools
 to load together. Clients that load tool schemas on demand, such as Claude
 Code, show it at session start before any schema is loaded; the per-tool
@@ -224,6 +339,42 @@ Rules:
   opened for a listed app; a dialog opened by another app is refused.
 
 Use the `apps` tool to see the right names.
+
+### Tiers, confirmation and password fields
+
+An app can be limited to a tier with `app:tier`; a plain name means `full`, so
+files without tiers keep working unchanged:
+
+```text
+firefox                 # full: everything
+konsole:view            # read tools only
+dolphin:click           # no typing
+confirm: close_window, key:konsole
+passwords: keepassxc
+```
+
+| tier | allows |
+| --- | --- |
+| `view` | `tree`, `find`, `get_text`, `wait_for`, `wait_idle`, `screenshot`, `clipboard_get`, `cursor_position` (and `activate_window`) |
+| `click` | plus `act`, `menu`, `click`, `focus`, `scroll`, `drag`, `mouse`, `move_window`, `close_window`, `launch` without `args` |
+| `full` | plus `key`, `hold`, `type_text`, `set_text`, `clipboard_set`, `file_dialog`, `launch` with `args` |
+
+The tier is checked against the app a call reaches: the target element's app
+for element tools, the active window's app for keyboard and pointer input
+(both for `click`, `scroll` and `focus`). An app listed twice gets the lower
+tier; an unknown tier counts as `view`. A refusal names the tier.
+
+`confirm:` lists tools (`tool`) or tools in one app (`tool:app`) that need
+the user's consent per call. When the client supports MCP elicitation the
+server asks the user through it; otherwise the call is refused unless it
+carries `confirm: true` (the agent is told to ask the user first).
+
+Password fields (AT-SPI role `password text`, UIA `IsPassword`) never show
+their text in `tree`, `find` or `wait_for`, and `get_text` refuses them.
+`set_text`, and `type_text` while one has focus, refuse them too unless the
+app is on a `passwords:` line (`passwords: all` for every app) or the server
+runs with `DESKTOP_MCP_ALLOW_PASSWORDS=1`. `doctor` shows the tiers, the
+confirm list and the password setting.
 
 ## Installation
 
@@ -452,6 +603,14 @@ Hyprland:
   of a maximized window also focus it.
 - Moving or resizing a tiled window makes it floating first (`setfloating`);
   it stays floating afterwards.
+- Hyprland 0.57 takes only Lua dispatchers over its socket (`hyprctl
+  dispatch X` became `hl.dispatch(X)`). The server notices the first Lua
+  error and then sends Lua forms (`hl.dsp.window.move`,
+  `hl.dsp.window.close`) for moving windows between workspaces (including
+  minimize) and closing them; its other dispatchers (focus, floating,
+  geometry, fullscreen, cursor) have no Lua form yet and fail there with a
+  message saying so. Named workspaces have no number there; `windows` lists
+  them by name.
 
 Windows:
 - Input cannot be sent to windows running as administrator from a server that

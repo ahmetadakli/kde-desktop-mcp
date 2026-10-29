@@ -103,6 +103,15 @@ fn key_flags(vk: u16, up: bool) -> u32 {
     }) | (if up { KEYEVENTF_KEYUP } else { 0 })
 }
 
+/// One key's down (or, with `up`, up) event.
+pub fn key_event(vk: u16, up: bool) -> KeyEv {
+    KeyEv {
+        vk,
+        scan: 0,
+        flags: key_flags(vk, up),
+    }
+}
+
 /// Key-down events in order, then key-up events in reverse order.
 pub fn combo_events(vks: &[u16]) -> (Vec<KeyEv>, Vec<KeyEv>) {
     let downs = vks
@@ -275,6 +284,8 @@ pub struct Props {
     pub value_text: String,
     pub read_only: bool,
     pub default_action: String,
+    /// UIA IsPassword: a password field, shown as role "password text".
+    pub password: bool,
 }
 
 impl Default for Props {
@@ -302,17 +313,23 @@ impl Default for Props {
             value_text: String::new(),
             read_only: true,
             default_action: String::new(),
+            password: false,
         }
     }
 }
 
 impl Props {
+    /// The control type's name; a password field (IsPassword) reads as
+    /// AT-SPI's "password text", so its text is hidden like on Linux.
     pub fn role(&self) -> &'static str {
-        role_name(self.control_type).unwrap_or("")
+        match role_name(self.control_type) {
+            Some("edit") if self.password => "password text",
+            r => r.unwrap_or(""),
+        }
     }
 
     fn is_text_role(&self) -> bool {
-        matches!(self.role(), "edit" | "document")
+        matches!(self.role(), "edit" | "password text" | "document")
     }
 
     /// TextPattern must be read live for the preview (it is not cacheable).
@@ -584,6 +601,20 @@ mod tests {
         c.toggle = false;
         c.read_only = true;
         assert_eq!(c.states(0), vec!["selected", "expanded"]);
+    }
+
+    #[test]
+    fn password_edits_are_password_text() {
+        let mut p = edit();
+        p.password = true;
+        assert_eq!(p.role(), "password text");
+        assert_eq!(p.states(0), vec!["editable"]);
+        let doc = Props {
+            control_type: 50030,
+            password: true,
+            ..Default::default()
+        };
+        assert_eq!(doc.role(), "document");
     }
 
     #[test]

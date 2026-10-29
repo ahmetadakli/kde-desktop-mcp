@@ -73,6 +73,7 @@ fn dead() -> Info<Elem> {
         actions: Vec::new(),
         text: None,
         children: Vec::new(),
+        operable: false,
     }
 }
 
@@ -111,6 +112,7 @@ impl WindowsBackend {
             actions: p.actions().into_iter().map(String::from).collect(),
             text: text.filter(|t| !t.is_empty()),
             children,
+            operable: p.select || p.toggle || p.expand,
         }
     }
 
@@ -360,6 +362,20 @@ impl Backend for WindowsBackend {
         input::button(if down { d } else { u })?;
         tokio::time::sleep(BUTTON_HOLD).await;
         Ok(())
+    }
+
+    async fn key(&self, key: &str, down: bool) -> R<()> {
+        // One SendInput queue for keyboard and mouse: no settle needed to
+        // keep a modifier ordered before a click.
+        input::send_keys(&[logic::key_event(logic::vk(key)?, !down)])?;
+        if down {
+            tokio::time::sleep(KEY_HOLD).await;
+        }
+        Ok(())
+    }
+
+    async fn cursor_position(&self) -> R<(i64, i64)> {
+        input::cursor()
     }
 
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {

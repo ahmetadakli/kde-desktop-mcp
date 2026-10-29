@@ -9,8 +9,10 @@
 mod backend;
 #[cfg(target_os = "linux")]
 mod linux;
+mod policy;
 mod render;
 mod shot;
+mod takeover;
 mod tools;
 #[cfg(windows)]
 mod windows;
@@ -33,10 +35,15 @@ use tokio::sync::Mutex;
 use backend::{
     Backend, Cache, Clip, Fetch, FileDialog, Focused, Info, R, Shot, WindowChange, WindowGeo,
 };
+use policy::{Policy, Tier};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
 const TREE_TEXT_LIMIT: usize = 80;
+/// Longest `tree` reply by default, in characters (about 5k tokens).
+const TREE_MAX_CHARS: i64 = 20_000;
+/// Characters kept free in a capped tree for the line saying how to go on.
+const CONTINUATION_CHARS: usize = 150;
 /// Nodes fetched ahead when rendering reaches an unfetched part of the tree.
 const PREFETCH_MORE: usize = 500;
 
@@ -127,7 +134,7 @@ fn name_is_stable<Id>(info: &Info<Id>) -> bool {
 /// accessibility note (both in `doctor`) only come when no app is allowed.
 fn apps_text(
     list: Vec<backend::AppEntry>,
-    allow: &[String],
+    allow: &Policy,
     allow_file: &std::path::Path,
     note: &str,
 ) -> String {
@@ -138,15 +145,18 @@ fn apps_text(
         if app.windows.is_empty() {
             continue;
         }
-        if !allow.contains(&app.name.to_lowercase()) {
+        let Some(tier) = allow.tier(&app.name) else {
             let active = app.windows.iter().any(|w| w.active);
             match blocked.iter_mut().find(|(n, _)| *n == app.name) {
                 Some((_, a)) => *a |= active,
                 None => blocked.push((app.name, active)),
             }
             continue;
-        }
-        lines.push(format!("{} (allowed)", app.name));
+        };
+        lines.push(match tier {
+            Tier::Full => format!("{} (allowed)", app.name),
+            t => format!("{} (allowed: {t} tier)", app.name),
+        });
         for w in app.windows {
             if w.title.is_empty() && !w.active {
                 continue;
@@ -193,14 +203,161 @@ struct Server<B: Backend> {
     /// `app_key`s of apps whose accessibility text writes report success
     /// and change nothing (Firefox); set_text types there right away.
     inert_writes: Mutex<HashSet<String>>,
+    /// The user's input and the stop shortcut, when the backend watches them.
+    takeover: Option<std::sync::Arc<takeover::Takeover>>,
+    /// When the current holder of `input` took it: user input after this
+    /// interrupts the rest of its run (a batch's later steps, a drag).
+    run_start: std::sync::Mutex<Option<Instant>>,
+    /// Keys and buttons down now, in the order they were pressed: held by
+    /// `hold` across calls, or by an input tool for the length of its
+    /// action (a click's modifiers, a drag's button). A cancelled call
+    /// leaves its own there, so `release_all` finds them. Never locked
+    /// across an await.
+    held: std::sync::Mutex<Vec<Held>>,
+    /// The way back to the client, for requests the server sends it
+    /// (elicitation); see `Server::request`.
+    link: std::cell::RefCell<ClientLink>,
+}
+
+/// A key or mouse button the server pressed and has not released.
+#[derive(Clone, Debug, PartialEq)]
+enum Held {
+    /// Canonical key name (`canon_key`).
+    Key(String),
+    Button(String),
+}
+
+impl Held {
+    fn name(&self) -> &str {
+        match self {
+            Held::Key(k) | Held::Button(k) => k,
+        }
+    }
+}
+
+/// Modifiers click, mouse and scroll take.
+const MODIFIERS: [&str; 4] = ["ctrl", "shift", "alt", "meta"];
+const BUTTONS: [&str; 3] = ["left", "right", "middle"];
+
+/// One name per key, so "control" held and "ctrl" asked are the same key.
+fn canon_key(name: &str) -> String {
+    let n = name.trim().to_lowercase();
+    match n.as_str() {
+        "control" => "ctrl".into(),
+        "super" | "win" => "meta".into(),
+        "return" => "enter".into(),
+        "escape" => "esc".into(),
+        _ => n,
+    }
+}
+
+/// The keys of a chord ("ctrl+shift"), canonical, without repeats.
+fn chord_keys(chord: &str) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for k in chord.split('+').map(canon_key).filter(|k| !k.is_empty()) {
+        if !keys.contains(&k) {
+            keys.push(k);
+        }
+    }
+    keys
+}
+
+/// The `modifiers` argument: a list (["ctrl", "shift"]) or a chord
+/// ("ctrl+shift"); only ctrl, shift, alt and meta.
+fn modifiers_arg(a: &Json) -> R<Vec<String>> {
+    let names: Vec<String> = match a.get("modifiers") {
+        None | Some(Json::Null) => return Ok(Vec::new()),
+        Some(Json::String(s)) => chord_keys(s),
+        Some(Json::Array(list)) => {
+            let mut keys: Vec<String> = Vec::new();
+            for v in list {
+                let s = v
+                    .as_str()
+                    .ok_or("'modifiers' must be a list of strings, e.g. [\"ctrl\"]")?;
+                for k in chord_keys(s) {
+                    if !keys.contains(&k) {
+                        keys.push(k);
+                    }
+                }
+            }
+            keys
+        }
+        Some(_) => return Err("'modifiers' must be a list of strings, e.g. [\"ctrl\"]".into()),
+    };
+    match names.iter().find(|k| !MODIFIERS.contains(&k.as_str())) {
+        Some(k) => Err(format!("unknown modifier '{k}' (ctrl, shift, alt, meta)")),
+        None => Ok(names),
+    }
+}
+
+/// " with ctrl+shift" for modifiers ["ctrl", "shift"], "" for none: the
+/// end of a pointer tool's reply.
+fn with_modifiers_note(mods: &[String]) -> String {
+    if mods.is_empty() {
+        String::new()
+    } else {
+        format!(" with {}", mods.join("+"))
+    }
+}
+
+/// The server's side of requests it sends the client. `run_loop` sets `out`
+/// and hands responses to `pending`; `initialize` notes what the client can
+/// do.
+#[derive(Default)]
+struct ClientLink {
+    /// The client declared `elicitation` in initialize: it can ask the user.
+    elicitation: bool,
+    out: Option<tokio::sync::mpsc::UnboundedSender<Json>>,
+    /// Requests waiting for their response, by id (its JSON text).
+    pending: HashMap<String, tokio::sync::oneshot::Sender<Json>>,
+    next: u64,
+}
+
+/// How long a confirmation waits for the user's answer.
+const CONFIRM_WAIT: Duration = Duration::from_secs(300);
+
+/// The tool call running on this task, for the allowlist checks deep in
+/// the tools (`Server::permit`): its name, its arguments, and whether the
+/// user already confirmed it. Set by `call_inner` (per batch step too).
+struct Gate {
+    tool: String,
+    args: Json,
+    confirmed: bool,
+}
+
+tokio::task_local! {
+    static GATE: std::cell::RefCell<Gate>;
+}
+
+/// `tool` and its arguments, briefly, for a confirmation question: long
+/// texts cut, `confirm` and `window` left out.
+fn describe_call(tool: &str, app: Option<&str>, a: &Json) -> String {
+    let mut args = a.clone();
+    if let Some(map) = args.as_object_mut() {
+        map.remove("confirm");
+        for v in map.values_mut() {
+            if let Some(t) = v.as_str()
+                && t.chars().count() > 200
+            {
+                let cut: String = t.chars().take(200).collect();
+                *v = Json::String(format!("{cut}… ({} chars)", t.chars().count()));
+            }
+        }
+    }
+    let on = app.map(|a| format!(" on {a}")).unwrap_or_default();
+    match args.as_object() {
+        Some(m) if !m.is_empty() => format!("{tool}{on} {args}"),
+        _ => format!("{tool}{on}"),
+    }
 }
 
 /// Tools that send keyboard or pointer input, run an app's actions (`act`
 /// presses buttons and opens menus; `set_text` may retype through the
 /// keyboard), or use the clipboard that type_text pastes through; they run
 /// one at a time.
-const INPUT_TOOLS: [&str; 13] = [
+const INPUT_TOOLS: [&str; 15] = [
     "act",
+    "menu",
     "set_text",
     "focus",
     "click",
@@ -213,6 +370,29 @@ const INPUT_TOOLS: [&str; 13] = [
     "clipboard_get",
     "clipboard_set",
     "file_dialog",
+    "hold",
+];
+
+/// Tools that act on the seat or what the user sees: they pause while the
+/// user uses the keyboard or mouse, and stop after the stop shortcut. The
+/// clipboard tools send no input and are not held up.
+const GATED_TOOLS: [&str; 16] = [
+    "act",
+    "menu",
+    "close_window",
+    "hold",
+    "set_text",
+    "focus",
+    "click",
+    "drag",
+    "scroll",
+    "key",
+    "type_text",
+    "mouse",
+    "activate_window",
+    "file_dialog",
+    "move_window",
+    "launch",
 ];
 
 /// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
@@ -305,6 +485,51 @@ const WAIT_FALLBACK: Duration = Duration::from_millis(250);
 /// app that changes all the time costs no more than polling did.
 const WAIT_MIN_GAP: Duration = Duration::from_millis(50);
 
+/// How often `wait_idle` reads the tree where no change events come.
+const IDLE_POLL: Duration = Duration::from_millis(100);
+
+/// What `wait_for` `state` asks of the element.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WaitState {
+    Enabled,
+    Focused,
+    Checked,
+    Selected,
+}
+
+impl WaitState {
+    fn parse(s: &str) -> R<Self> {
+        Ok(match s.trim().to_lowercase().as_str() {
+            "enabled" => WaitState::Enabled,
+            "focused" => WaitState::Focused,
+            "checked" => WaitState::Checked,
+            "selected" => WaitState::Selected,
+            other => {
+                return Err(format!(
+                    "unknown state '{other}'; use enabled, focused, checked or selected"
+                ));
+            }
+        })
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            WaitState::Enabled => "enabled",
+            WaitState::Focused => "focused",
+            WaitState::Checked => "checked",
+            WaitState::Selected => "selected",
+        }
+    }
+
+    /// Whether an element with `states` (as `Info::states`) has it.
+    fn holds(self, states: &[&str]) -> bool {
+        match self {
+            WaitState::Enabled => !states.contains(&"disabled"),
+            s => states.contains(&s.name()),
+        }
+    }
+}
+
 /// Requested wait in ms, clamped to 0..=MAX_WAIT_MS, and a note when it was cut.
 fn wait_ms(a: &Json, k: &str, d: i64) -> (u64, String) {
     let asked = arg_i(a, k, d);
@@ -347,6 +572,160 @@ impl ShotMap {
             (self.y + (py as f64 + 0.5) * self.sy).floor() as i64,
         )
     }
+
+    /// The screen area of the image pixels (x, y, w, h).
+    fn area_of(self, (x, y, w, h): (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+        (
+            self.x + x * self.sx,
+            self.y + y * self.sy,
+            w * self.sx,
+            h * self.sy,
+        )
+    }
+}
+
+/// The part of a capture showing screen area `area` that screen area `want`
+/// covers, as fractions of the capture; None when they do not overlap.
+fn region_frac(
+    (ax, ay, aw, ah): (f64, f64, f64, f64),
+    (x, y, w, h): (f64, f64, f64, f64),
+) -> Option<shot::Frac> {
+    let (x0, y0) = (x.max(ax), y.max(ay));
+    let (x1, y1) = ((x + w).min(ax + aw), (y + h).min(ay + ah));
+    (aw > 0.0 && ah > 0.0 && x1 > x0 && y1 > y0).then(|| shot::Frac {
+        x: (x0 - ax) / aw,
+        y: (y0 - ay) / ah,
+        w: (x1 - x0) / aw,
+        h: (y1 - y0) / ah,
+    })
+}
+
+/// The screenshot's `region` argument: [x, y, w, h], None when absent.
+fn region_arg(a: &Json) -> R<Option<(f64, f64, f64, f64)>> {
+    let bad =
+        || "region must be [x, y, width, height] in pixels of the last screenshot".to_string();
+    match a.get("region") {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Array(v)) if v.len() == 4 => {
+            let n: Vec<f64> = v
+                .iter()
+                .map(Json::as_f64)
+                .collect::<Option<_>>()
+                .ok_or_else(bad)?;
+            if n[2] <= 0.0 || n[3] <= 0.0 {
+                return Err(bad());
+            }
+            Ok(Some((n[0], n[1], n[2], n[3])))
+        }
+        Some(_) => Err(bad()),
+    }
+}
+
+/// What an input tool's `observe` asks to see after the input settled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Observe {
+    Nothing,
+    Focus,
+    Tree,
+    Screenshot,
+}
+
+/// A tool's `observe` argument; None when the tool reports no effect
+/// (tools::OBSERVE_TOOLS).
+fn observe_arg(tool: &str, a: &Json) -> R<Option<Observe>> {
+    if !tools::OBSERVE_TOOLS.contains(&tool) {
+        return Ok(None);
+    }
+    // Without `observe` nothing is measured, so plain input stays as fast
+    // as before; act, menu and close_window keep their effect line (it
+    // replaced their note that the active window changed).
+    let default = match tool {
+        "act" | "close_window" => Some(Observe::Nothing),
+        // Listing the menu bar changes nothing.
+        "menu" if a.get("path").is_some_and(|p| !p.is_null()) => Some(Observe::Nothing),
+        _ => None,
+    };
+    Ok(match a.get("observe") {
+        None | Some(Json::Null) => default,
+        Some(Json::String(s)) => Some(match s.trim().to_lowercase().as_str() {
+            "" | "none" => return Ok(default),
+            "effect" => Observe::Nothing,
+            "focus" => Observe::Focus,
+            "tree" => Observe::Tree,
+            "screenshot" => Observe::Screenshot,
+            other => {
+                return Err(format!(
+                    "observe '{other}': use one of {}",
+                    tools::OBSERVE_KINDS.join(", ")
+                ));
+            }
+        }),
+        Some(_) => {
+            return Err("observe must be a string (none, effect, focus, tree, screenshot)".into());
+        }
+    })
+}
+
+/// Default and longest settle before the effect line and observation.
+const SETTLE_MS: i64 = 150;
+const MAX_SETTLE_MS: i64 = 5000;
+/// Size of the tree `observe: "tree"` returns.
+const OBSERVE_TREE_NODES: i64 = 150;
+const OBSERVE_TREE_CHARS: usize = 6000;
+
+/// What an input is compared on: the active window (app, title) and the
+/// focused element (id, role, name, states). Two reads, about 1 ms.
+#[derive(Clone, Debug, PartialEq)]
+struct Fingerprint<Id> {
+    window: Option<(String, String)>,
+    focus: Option<(Id, String, String, Vec<&'static str>)>,
+}
+
+/// The effect line: how `after` differs from `before`. `events`: whether
+/// the app reported changes meanwhile (None: the backend cannot tell).
+/// Titles of windows of apps not `allowed` are not named.
+fn effect_text<Id: PartialEq>(
+    before: &Fingerprint<Id>,
+    after: &Fingerprint<Id>,
+    events: Option<bool>,
+    allowed: impl Fn(&str) -> bool,
+) -> String {
+    if before.window != after.window {
+        let same_app = matches!((&before.window, &after.window),
+            (Some((a, _)), Some((b, _))) if a == b);
+        return match &after.window {
+            Some((app, title)) if allowed(app) && same_app => {
+                format!("changed (window title now {})", render::py_repr(title))
+            }
+            Some((app, title)) if allowed(app) => {
+                format!("window changed to {}", render::py_repr(title))
+            }
+            Some((app, _)) => format!("window changed to one of '{app}' (not allowed)"),
+            None => "window changed (none active now)".into(),
+        };
+    }
+    if before.focus != after.focus || events == Some(true) {
+        "changed".into()
+    } else {
+        "no visible change".into()
+    }
+}
+
+/// `text` cut to at most `max` characters at a line end, with a note.
+fn cap_lines(text: String, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text;
+    }
+    let mut out = String::new();
+    for line in text.lines() {
+        if out.chars().count() + line.chars().count() + 1 > max {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!("… (cut at {max} chars; call tree for the rest)"));
+    out
 }
 
 /// A tool's reply: text, plus base64 PNGs sent as MCP image blocks.
@@ -395,11 +774,77 @@ fn indicator_label(tool: &str, a: &Json) -> Option<String> {
         "scroll" => "scrolling".into(),
         "activate_window" => "switching windows".into(),
         "move_window" => "arranging windows".into(),
+        "close_window" => "closing a window".into(),
+        "menu" => "using a menu".into(),
         "clipboard_set" => "copying".into(),
         "launch" => format!("launching {}", arg_s(a, "app", "an app")),
         "file_dialog" => "choosing a file".into(),
         _ => return None,
     })
+}
+
+/// Rounds of fetching what a menu walk misses before giving up on a part
+/// of the tree that does not answer.
+const MENU_FETCH_ROUNDS: usize = 50;
+/// How long `menu` waits for a submenu it opened to list its entries.
+const MENU_OPEN_WAIT: Duration = Duration::from_millis(2000);
+
+/// The action that runs a menu entry: press, click and the like, else its
+/// only (or first) action; None without any.
+fn menu_action(actions: &[String]) -> Option<usize> {
+    const RUN: [&str; 7] = [
+        "press", "click", "activate", "trigger", "toggle", "select", "check",
+    ];
+    actions
+        .iter()
+        .position(|a| RUN.contains(&a.to_lowercase().as_str()))
+        .or((!actions.is_empty()).then_some(0))
+}
+
+/// How long close_window waits for the window to go before saying it is
+/// still open (an app asking to save changes keeps it).
+const CLOSE_SETTLE: Duration = Duration::from_millis(1500);
+
+/// `desktops: 1 "Main" (current), 2 "Web"`; Hyprland: `workspaces: …`
+/// with the monitor each is on.
+fn desktops_line(list: &[backend::Desktop]) -> String {
+    let hypr = list.iter().any(|d| !d.output.is_empty());
+    let items: Vec<String> = list
+        .iter()
+        .map(|d| {
+            // Hyprland's named workspaces have no number (0).
+            let mut s = if d.number == 0 {
+                render::py_repr(&d.name)
+            } else {
+                d.number.to_string()
+            };
+            if d.number != 0 && d.name != s {
+                s.push_str(&format!(" {}", render::py_repr(&d.name)));
+            }
+            match (d.current, d.output.is_empty()) {
+                (true, true) => s.push_str(" (current)"),
+                (true, false) => s.push_str(&format!(" (shown on {})", d.output)),
+                (false, false) => s.push_str(&format!(" (on {})", d.output)),
+                (false, true) => {}
+            }
+            s
+        })
+        .collect();
+    format!(
+        "{}: {}",
+        if hypr { "workspaces" } else { "desktops" },
+        items.join(", ")
+    )
+}
+
+/// move_window's `desktop`: a number or a name; None when absent.
+fn desktop_arg(a: &Json) -> R<Option<String>> {
+    match a.get("desktop") {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Number(n)) => Ok(Some(n.to_string())),
+        Some(Json::String(s)) if !s.trim().is_empty() => Ok(Some(s.trim().to_string())),
+        Some(_) => Err("desktop must be a desktop number or name".into()),
+    }
 }
 
 /// How long move_window waits for a window to take its new geometry.
@@ -418,7 +863,7 @@ fn window_reached(w: &WindowGeo, c: &WindowChange) -> bool {
     state && near(c.x, w.x) && near(c.y, w.y) && near(c.width, w.width) && near(c.height, w.height)
 }
 
-/// `"title" [app] at (x,y) WxH {active,maximized} on OUTPUT`.
+/// `"title" [app] at (x,y) WxH {active,maximized} on OUTPUT, desktop 2`.
 fn describe_window(w: &WindowGeo) -> String {
     let states: Vec<&str> = [
         (w.active, "active"),
@@ -443,6 +888,12 @@ fn describe_window(w: &WindowGeo) -> String {
     }
     if !w.output.is_empty() {
         line.push_str(&format!(" on {}", w.output));
+    }
+    match w.desktops.as_slice() {
+        [] => {}
+        [all] if all == "all" => line.push_str(", all desktops"),
+        [one] => line.push_str(&format!(", desktop {one}")),
+        many => line.push_str(&format!(", desktops {}", many.join(","))),
     }
     for t in &w.terminals {
         line.push_str(&format!(
@@ -549,6 +1000,17 @@ struct Target<Id> {
     id: Id,
     /// `[id] role "name"` when found by query, so the reply says what was hit.
     found: Option<String>,
+    /// The app it belongs to (lower case) and its role.
+    app: String,
+    role: String,
+}
+
+impl<Id> Target<Id> {
+    /// A password field: its text is never read, and written only where
+    /// the allowlist (or DESKTOP_MCP_ALLOW_PASSWORDS) allows it.
+    fn protected(&self) -> bool {
+        render::is_protected_role(&self.role)
+    }
 }
 
 impl<Id> Target<Id> {
@@ -559,6 +1021,49 @@ impl<Id> Target<Id> {
             None => text.to_string(),
         }
     }
+}
+
+/// The last line of a cut tree: how much is left and the call that lists
+/// it, `after` the last element printed. Ids are stable, so the next page
+/// starts right after that element while it is still there.
+fn continuation(a: &Json, app: &str, last: Option<u64>, left: usize, truncated: bool) -> String {
+    let Some(last) = last else {
+        return render::TRUNCATED.to_string();
+    };
+    let left = match (left, truncated) {
+        (0, _) => "more nodes".to_string(),
+        (n, true) => format!("{n}+ more nodes"),
+        (n, false) => format!("{n} more nodes"),
+    };
+    let mut call = Vec::new();
+    match arg_i(a, "root_id", 0) {
+        0 => {
+            call.push(format!("app={}", render::json_str(app)));
+            if arg_b(a, "document", false) {
+                call.push("document=true".into());
+            }
+        }
+        root => call.push(format!("root_id={root}")),
+    }
+    for flag in ["interactive", "include_hidden"] {
+        if arg_b(a, flag, false) {
+            call.push(format!("{flag}=true"));
+        }
+    }
+    for (k, d) in [("max_depth", 12), ("max_nodes", 300)] {
+        let v = arg_i(a, k, d);
+        if v != d {
+            call.push(format!("{k}={v}"));
+        }
+    }
+    if a.get("max_chars").is_some() {
+        call.push(format!(
+            "max_chars={}",
+            arg_i(a, "max_chars", TREE_MAX_CHARS)
+        ));
+    }
+    call.push(format!("after={last}"));
+    format!("… {left}; continue with tree({})", call.join(", "))
 }
 
 fn arg_s(a: &Json, k: &str, d: &str) -> String {
@@ -609,6 +1114,7 @@ where
 impl<B: Backend> Server<B> {
     fn new(b: B) -> Self {
         let allow_file = b.allow_file();
+        let b_takeover = b.takeover();
         Server {
             b,
             refs: Mutex::new(Refs {
@@ -621,31 +1127,329 @@ impl<B: Backend> Server<B> {
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
+            held: std::sync::Mutex::new(Vec::new()),
+            takeover: b_takeover,
+            run_start: std::sync::Mutex::new(None),
+            link: Default::default(),
         }
+    }
+
+    // ------------------------------------------------------------ takeover
+
+    /// Note that a run of input starts now (the input lock was just taken).
+    fn start_run(&self) {
+        *self.run_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+    }
+
+    /// Whether a gated tool may act now: not after the stop shortcut, not
+    /// while the user uses the seat, and in a run of input (a batch, a
+    /// drag), not once the user started using it after the run began. A
+    /// refusal shows on the indicator.
+    /// `in_run`: called inside a run that holds the input lock (a batch
+    /// step, a drag's moves), whose start counts.
+    async fn gate(&self, in_run: bool) -> R<()> {
+        let Some(t) = &self.takeover else {
+            return Ok(());
+        };
+        let start = match in_run {
+            true => *self.run_start.lock().unwrap_or_else(|e| e.into_inner()),
+            false => None,
+        };
+        match t.check_since(start, Instant::now()) {
+            Ok(()) => Ok(()),
+            Err(block) => {
+                self.b.indicate(&block.label()).await;
+                Err(block.message(t.window()))
+            }
+        }
+    }
+
+    // ------------------------------------------------------------ held input
+
+    fn held_names(&self) -> Vec<String> {
+        let held = self.held.lock().unwrap();
+        held.iter().map(|h| h.name().to_string()).collect()
+    }
+
+    fn is_held(&self, h: &Held) -> bool {
+        self.held.lock().unwrap().contains(h)
+    }
+
+    /// "; held: ctrl, left" while anything is held, for input replies.
+    fn held_note(&self) -> String {
+        let names = self.held_names();
+        if names.is_empty() {
+            String::new()
+        } else {
+            format!("; held: {}", names.join(", "))
+        }
+    }
+
+    /// Press and record `h`. It is recorded first: a call cancelled during
+    /// the press still leaves it for `release_all`.
+    async fn press_held(&self, h: &Held) -> R<()> {
+        self.held.lock().unwrap().push(h.clone());
+        let pressed = match h {
+            Held::Key(k) => self.b.key(k, true).await,
+            Held::Button(b) => self.b.button(b, true).await,
+        };
+        if pressed.is_err() {
+            self.forget(h);
+        }
+        pressed
+    }
+
+    /// Release `h` (even when not recorded: harmless, and it frees a key
+    /// stuck some other way). Forgotten only once the release was sent, so
+    /// a cancelled release is retried by `release_all`; a failed one is
+    /// forgotten too, or every later reply would list it.
+    async fn release_held(&self, h: &Held) -> R<()> {
+        let released = match h {
+            Held::Key(k) => self.b.key(k, false).await,
+            Held::Button(b) => self.b.button(b, false).await,
+        };
+        self.forget(h);
+        released
+    }
+
+    fn forget(&self, h: &Held) {
+        let mut held = self.held.lock().unwrap();
+        if let Some(i) = held.iter().rposition(|x| x == h) {
+            held.remove(i);
+        }
+    }
+
+    /// Release everything held, last pressed first, under the input lock
+    /// (wait for the input running now). Called after a failed call, a
+    /// cancelled one and at exit; returns the names released and the first
+    /// error.
+    async fn release_all(&self) -> (Vec<String>, R<()>) {
+        let _input = self.input.lock().await;
+        self.release_all_held().await
+    }
+
+    /// `release_all` for a caller holding the input lock.
+    async fn release_all_held(&self) -> (Vec<String>, R<()>) {
+        let mut names = Vec::new();
+        let mut result = Ok(());
+        loop {
+            let last = self.held.lock().unwrap().last().cloned();
+            let Some(h) = last else { break };
+            let r = self.release_held(&h).await;
+            names.push(h.name().to_string());
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        (names, result)
+    }
+
+    /// Run `action` with `mods` pressed: modifiers go down in order, the
+    /// action runs, they come up in reverse order, whatever the action
+    /// returned. Modifiers already held (by `hold`) are left as they are.
+    async fn with_modifiers<T>(&self, mods: &[String], action: impl Future<Output = R<T>>) -> R<T> {
+        let mut pressed: Vec<Held> = Vec::new();
+        let mut ready = Ok(());
+        for m in mods {
+            let h = Held::Key(m.clone());
+            if self.is_held(&h) {
+                continue;
+            }
+            if let Err(e) = self.press_held(&h).await {
+                ready = Err(e);
+                break;
+            }
+            pressed.push(h);
+        }
+        let out = match ready {
+            Ok(()) => action.await,
+            Err(e) => Err(e),
+        };
+        let mut released = Ok(());
+        for h in pressed.iter().rev() {
+            let r = self.release_held(h).await;
+            if released.is_ok() {
+                released = r;
+            }
+        }
+        let out = out?;
+        released?;
+        Ok(out)
+    }
+
+    /// Err when `button` is held: a click would release it.
+    fn check_button_free(&self, button: &str) -> R<()> {
+        if self.is_held(&Held::Button(button.to_string())) {
+            return Err(format!(
+                "the {button} button is held; release it with hold (down=false) first"
+            ));
+        }
+        Ok(())
     }
 
     // ------------------------------------------------------------ allowlist
 
-    fn allowed(&self) -> Vec<String> {
+    /// The allowlist file, parsed (see `policy`); created with the
+    /// backend's default list when missing.
+    fn policy(&self) -> Policy {
         if !self.allow_file.exists() {
             if let Some(dir) = self.allow_file.parent() {
                 let _ = std::fs::create_dir_all(dir);
             }
             let _ = std::fs::write(&self.allow_file, self.b.default_allow());
         }
-        let text = std::fs::read_to_string(&self.allow_file).unwrap_or_default();
-        let mut names: Vec<String> = text
-            .lines()
-            .map(|l| l.split('#').next().unwrap_or("").trim().to_lowercase())
-            .filter(|l| !l.is_empty())
-            .collect();
-        names.sort();
-        names.dedup();
-        names
+        Policy::parse(&std::fs::read_to_string(&self.allow_file).unwrap_or_default())
+    }
+
+    /// Allowed app names (any tier), sorted.
+    fn allowed(&self) -> Vec<String> {
+        self.policy().names()
     }
 
     fn is_allowed(&self, app: &str) -> bool {
-        self.allowed().contains(&app.trim().to_lowercase())
+        self.policy().tier(app).is_some()
+    }
+
+    /// Check that the running tool call may use `app`: the app is allowed
+    /// with the tier the tool needs (`policy::needed_tier`), and, when the
+    /// allowlist's `confirm` list names the tool (for every app or this
+    /// one), the user confirmed it (`confirm`). Every tool that reads from or
+    /// sends input to an app comes through here, with the app it reaches:
+    /// the target element's app, or the active window's
+    /// (`require_active_allowed`). A new tool that acts on an app (e.g.
+    /// close_window) only needs to call `self.permit(&app).await?` before
+    /// acting; its tier comes from `policy::needed_tier` (unknown tools need
+    /// full). One confirmation covers the whole call.
+    async fn permit(&self, app: &str) -> R<()> {
+        let (tool, args, confirmed) = GATE
+            .try_with(|g| {
+                let g = g.borrow();
+                (g.tool.clone(), g.args.clone(), g.confirmed)
+            })
+            .unwrap_or_else(|_| (String::new(), Json::Null, false));
+        let policy = self.policy();
+        let app = app.trim().to_lowercase();
+        let tier = policy.tier(&app).ok_or_else(|| self.not_allowed(&app))?;
+        let need = policy::needed_tier(&tool, &args);
+        if tier < need {
+            return Err(format!(
+                "{tool} needs the {need} tier, but '{app}' is allowed with the {tier} tier \
+                 ('{app}:{tier}' in {}), which allows {}; changing it is the user's decision",
+                self.allow_file.display(),
+                tier.allows()
+            ));
+        }
+        if !confirmed && policy.needs_confirm(&tool, Some(&app)) {
+            self.confirm(&tool, Some(&app), &args).await?;
+        }
+        Ok(())
+    }
+
+    /// Ask the user to confirm `tool` (on `app`): through MCP elicitation
+    /// when the client declared it, else the call must carry `confirm: true`
+    /// (the agent asked the user itself). Notes the confirmation in `GATE`.
+    async fn confirm(&self, tool: &str, app: Option<&str>, a: &Json) -> R<()> {
+        let what = describe_call(tool, app, a);
+        if self.link.borrow().elicitation {
+            let message = format!("The agent wants to run: {what}\nAllow it?");
+            let params = json!({
+                "message": message,
+                "requestedSchema": {
+                    "type": "object",
+                    "properties": {
+                        "confirm": {
+                            "type": "boolean",
+                            "title": "Allow",
+                            "description": "Allow this action once",
+                            "default": true,
+                        }
+                    },
+                },
+            });
+            let answer = self
+                .request("elicitation/create", params, CONFIRM_WAIT)
+                .await
+                .map_err(|e| {
+                    format!("{what} needs the user's confirmation, but asking failed: {e}")
+                })?;
+            let accepted = answer["action"] == "accept"
+                && answer.pointer("/content/confirm") != Some(&json!(false));
+            if !accepted {
+                let how = match answer["action"].as_str() {
+                    Some("accept" | "decline") => "declined",
+                    _ => "dismissed",
+                };
+                return Err(format!("the user {how} {what}; nothing was done"));
+            }
+        } else if !arg_b(a, "confirm", false) {
+            let why = match self.policy().needs_confirm(tool, app) {
+                true => format!("confirm list in {}", self.allow_file.display()),
+                false => "it may lose unsaved work".into(),
+            };
+            return Err(format!(
+                "{what} needs the user's confirmation ({why}), and this client cannot ask \
+                 (no elicitation): ask the user, and only if they agree call again with \
+                 confirm: true"
+            ));
+        }
+        let _ = GATE.try_with(|g| g.borrow_mut().confirmed = true);
+        Ok(())
+    }
+
+    /// Send the client a request and wait up to `limit` for its response
+    /// (its `result`). Other messages keep flowing meanwhile: `run_loop`
+    /// hands the response over through `ClientLink::pending`.
+    async fn request(&self, method: &str, params: Json, limit: Duration) -> R<Json> {
+        let (key, rx) = {
+            let mut link = self.link.borrow_mut();
+            let out = link.out.clone().ok_or("the client connection is closed")?;
+            link.next += 1;
+            let id = json!(format!("desktop-mcp-{}", link.next));
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            link.pending.insert(id.to_string(), tx);
+            out.send(json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }))
+                .map_err(|_| "the client connection is closed")?;
+            (id.to_string(), rx)
+        };
+        // Forget the request however this ends (answer, timeout, the call
+        // cancelled while waiting).
+        struct Forget<'a>(&'a std::cell::RefCell<ClientLink>, String);
+        impl Drop for Forget<'_> {
+            fn drop(&mut self) {
+                self.0.borrow_mut().pending.remove(&self.1);
+            }
+        }
+        let _forget = Forget(&self.link, key);
+        let reply = match tokio::time::timeout(limit, rx).await {
+            Err(_) => return Err(format!("no answer within {} s", limit.as_secs())),
+            Ok(Err(_)) => return Err("the client connection closed before it answered".into()),
+            Ok(Ok(reply)) => reply,
+        };
+        match reply.get("error") {
+            Some(e) => Err(format!(
+                "the client answered with an error: {}",
+                e["message"].as_str().unwrap_or("unknown")
+            )),
+            None => Ok(reply["result"].clone()),
+        }
+    }
+
+    /// A response from the client to one of `request`'s requests.
+    fn deliver(&self, msg: Json) {
+        let tx = self
+            .link
+            .borrow_mut()
+            .pending
+            .remove(&msg["id"].to_string());
+        if let Some(tx) = tx {
+            let _ = tx.send(msg);
+        }
+    }
+
+    /// Whether set_text and type_text may fill in a password field of `app`.
+    fn passwords_allowed(&self, app: &str) -> bool {
+        self.policy()
+            .passwords_allowed(app, std::env::var(policy::PASSWORDS_ENV).ok().as_deref())
     }
 
     fn not_allowed(&self, app: &str) -> String {
@@ -668,6 +1472,7 @@ impl<B: Backend> Server<B> {
                 self.allow_file.display()
             ));
         }
+        self.permit(&name).await?;
         Ok(name)
     }
 
@@ -717,6 +1522,12 @@ impl<B: Backend> Server<B> {
     /// with. Every use of an id goes through here, reads included, so a
     /// stale id never acts on, or reads, another element.
     async fn resolve_with_app(&self, rid: i64) -> R<(B::Id, String)> {
+        let r = self.resolve_ref(rid).await?;
+        Ok((r.id, r.app))
+    }
+
+    /// `resolve_with_app`, with the role the element (still) has.
+    async fn resolve_ref(&self, rid: i64) -> R<Ref<B::Id>> {
         let found = self.refs.lock().await.map.get(&(rid as u64)).cloned();
         let r = found.ok_or_else(|| format!("unknown id {rid}; call tree/find again"))?;
         if !self.is_allowed(&r.app) {
@@ -734,11 +1545,16 @@ impl<B: Backend> Server<B> {
                 render::role_and_name(&r.role, &r.name)
             ));
         }
-        Ok((r.id, r.app))
+        Ok(r)
     }
 
-    async fn resolve(&self, rid: i64) -> R<B::Id> {
-        Ok(self.resolve_with_app(rid).await?.0)
+    /// The allowlist name of `w`'s app: the compositor's app id when the
+    /// allowlist names it, else the accessibility name of its process.
+    async fn window_app(&self, w: &WindowGeo) -> String {
+        match self.policy().tier(&w.app.to_lowercase()) {
+            Some(_) => w.app.clone(),
+            None => self.b.window_app(w).await,
+        }
     }
 
     async fn app_windows(&self, name: &str) -> R<Vec<B::Id>> {
@@ -798,11 +1614,19 @@ impl<B: Backend> Server<B> {
     }
 
     /// The element a tool call names: `id`, or `app` + `query` (+ `role`).
+    /// The tool's tier (and confirmation, `permit`) is checked against the
+    /// element's app before anything is looked up there.
     async fn target(&self, a: &Json) -> R<Target<B::Id>> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
-            let id = self.resolve(rid).await?;
+            let r = self.resolve_ref(rid).await?;
+            self.permit(&r.app).await?;
             note_step_element(rid as u64, true);
-            return Ok(Target { id, found: None });
+            return Ok(Target {
+                id: r.id,
+                found: None,
+                app: r.app,
+                role: r.role,
+            });
         }
         let (Some(app), Some(query)) = (
             a.get("app").and_then(Json::as_str),
@@ -810,6 +1634,10 @@ impl<B: Backend> Server<B> {
         ) else {
             return Err("pass `id` (from tree/find), or `app` and `query`".into());
         };
+        if !self.is_allowed(app) {
+            return Err(self.not_allowed(app));
+        }
+        self.permit(app).await?;
         self.b.enable().await;
         let role = arg_s(a, "role", "");
         let (id, mut cache) = self.locate(app, query, &role, true).await?.ok_or_else(|| {
@@ -826,7 +1654,13 @@ impl<B: Backend> Server<B> {
         let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
         note_step_element(rid, true);
         let found = Some(render::describe(&cache[&id], rid));
-        Ok(Target { id, found })
+        let role = cache[&id].role.clone();
+        Ok(Target {
+            id,
+            found,
+            app: app.to_lowercase(),
+            role,
+        })
     }
 
     /// Title of the active window, if any.
@@ -840,20 +1674,110 @@ impl<B: Backend> Server<B> {
             .map(|w| w.title)
     }
 
-    /// Append a note when an action changed the active window (a dialog
-    /// opened, a window closed), so no tree call is needed to notice. Only
-    /// for `act`: apps run actions before replying, while keys and clicks
-    /// take effect after the call returns (use wait_for for those).
-    async fn note_active_change(&self, mut reply: String) -> String {
-        let now = self.active_title().await;
-        let mut last = self.last_active.lock().await;
-        if now != *last {
-            if let Some(title) = &now {
-                reply.push_str(&format!("; active window now {}", render::py_repr(title)));
-            }
-            *last = now;
+    /// The active window and focused element, compared before and after
+    /// an input for its effect line.
+    async fn fingerprint(&self) -> Fingerprint<B::Id> {
+        let (apps, focus) = tokio::join!(self.b.list_apps(), self.b.focused());
+        let window = apps.into_iter().find_map(|a| {
+            let name = a.name;
+            a.windows
+                .into_iter()
+                .find(|w| w.active)
+                .map(|w| (name.to_lowercase(), w.title))
+        });
+        Fingerprint {
+            window,
+            focus: focus.map(|f| (f.id, f.info.role, f.info.name, f.info.states)),
         }
-        reply
+    }
+
+    /// After an input tool ran: wait up to `settle_ms` for the app to react
+    /// (ending early once it reported a change since `mark`), then the
+    /// effect line and what `observe` asks for.
+    async fn after_input(
+        &self,
+        tool: &str,
+        a: &Json,
+        observe: Observe,
+        mark: u64,
+        before: Fingerprint<B::Id>,
+    ) -> Out {
+        let settle = arg_i(a, "settle_ms", SETTLE_MS).clamp(0, MAX_SETTLE_MS) as u64;
+        // The focused element's app is the one that reacts (its bus, on Linux).
+        let near: Vec<B::Id> = before.focus.iter().map(|f| f.0.clone()).collect();
+        if settle > 0 {
+            self.b
+                .wait_change(&near, mark, Duration::from_millis(settle))
+                .await;
+        }
+        let events = self.b.changed_since(&near, mark);
+        let after = self.fingerprint().await;
+        let allowed = self.allowed();
+        let is_allowed = |app: &str| allowed.contains(&app.to_lowercase());
+        let mut text = format!(
+            "; effect: {}",
+            effect_text(&before, &after, events, is_allowed)
+        );
+        if before.window != after.window
+            && let Some((app, title)) = &after.window
+            && is_allowed(app)
+        {
+            // Named in the next "not in the allowlist" hint.
+            *self.last_active.lock().await = Some(title.clone());
+        }
+        let mut images = Vec::new();
+        match observe {
+            Observe::Nothing => {}
+            // key and type_text name the focus in their reply already.
+            Observe::Focus if matches!(tool, "key" | "type_text") => {}
+            Observe::Focus => {
+                let note = self.focus_note(false).await;
+                match note.strip_prefix("; ") {
+                    Some(n) => text.push_str(&format!("\n{n}")),
+                    None => text.push_str("\nfocus: none reported in an allowed app"),
+                }
+            }
+            Observe::Tree => {
+                let app = a.get("app").and_then(Json::as_str).map(str::to_string);
+                match self.observe_tree(app).await {
+                    Ok(t) => text.push_str(&format!("\n{t}")),
+                    Err(e) => text.push_str(&format!("\nobserve tree failed: {e}")),
+                }
+            }
+            Observe::Screenshot => match self.screenshot(&json!({})).await {
+                Ok(o) => {
+                    text.push_str(&format!("\n{}", o.text));
+                    images = o.images;
+                }
+                Err(e) => text.push_str(&format!("\nobserve screenshot failed: {e}")),
+            },
+        }
+        Out { text, images }
+    }
+
+    /// A compact tree of the active window of `app` (else of the app in
+    /// front), cut at OBSERVE_TREE_CHARS.
+    async fn observe_tree(&self, app: Option<String>) -> R<String> {
+        let app = match app {
+            Some(a) if !a.trim().is_empty() => a,
+            _ => self.require_active_allowed().await?,
+        };
+        let windows = self.app_windows(&app).await?;
+        let title = self.active_title().await;
+        let mut root = None;
+        for w in &windows {
+            let info = self.b.info(w, 0).await;
+            // Hyprland's active window is no AT-SPI state: match the title.
+            if info.states.contains(&"active") || title.as_deref() == Some(info.name.as_str()) {
+                root = Some(self.add_ref(w, &info, &app.to_lowercase()).await);
+                break;
+            }
+        }
+        let args = match root {
+            Some(rid) => json!({"root_id": rid, "max_nodes": OBSERVE_TREE_NODES}),
+            None => json!({"app": app, "max_nodes": OBSERVE_TREE_NODES}),
+        };
+        Ok(cap_lines(self.tree(&args).await?.text, OBSERVE_TREE_CHARS))
     }
 
     /// The lines as text, and the id of the first element printed.
@@ -863,14 +1787,27 @@ impl<B: Backend> Server<B> {
         cache: &Cache<B::Id>,
         app: &str,
     ) -> (String, Option<u64>) {
+        let printed = self.printed(lines, cache, app).await;
+        let first = printed.iter().find_map(|p| match p {
+            Printed::Node { rid, .. } => Some(*rid),
+            Printed::Raw(_) => None,
+        });
+        (render::format(&printed), first)
+    }
+
+    /// The lines with their ids issued.
+    async fn printed<'c>(
+        &self,
+        lines: Vec<Line<B::Id>>,
+        cache: &'c Cache<B::Id>,
+        app: &str,
+    ) -> Vec<Printed<'c, B::Id>> {
         let mut out = Vec::with_capacity(lines.len());
-        let mut first = None;
         for line in lines {
             out.push(match line {
                 Line::Raw(s) => Printed::Raw(s),
                 Line::Node { depth, id } => {
                     let rid = self.add_ref(&id, &cache[&id], app).await;
-                    first.get_or_insert(rid);
                     Printed::Node {
                         depth,
                         rid,
@@ -879,7 +1816,7 @@ impl<B: Backend> Server<B> {
                 }
             });
         }
-        (render::format(&out), first)
+        out
     }
 
     // ------------------------------------------------------------ tools
@@ -889,7 +1826,7 @@ impl<B: Backend> Server<B> {
         let list = self.b.list_apps().await;
         Ok(apps_text(
             list,
-            &self.allowed(),
+            &self.policy(),
             &self.allow_file,
             self.b.apps_note(),
         ))
@@ -898,8 +1835,9 @@ impl<B: Backend> Server<B> {
     async fn windows(&self, a: &Json) -> R<String> {
         let query = arg_s(a, "query", "");
         let allowed = self.allowed();
-        let (screens, list) = self.b.screens_and_windows(&query, &allowed).await;
-        let mut lines: Vec<String> = screens
+        let layout = self.b.layout(&query, &allowed).await;
+        let mut lines: Vec<String> = layout
+            .screens
             .iter()
             .map(|s| {
                 format!(
@@ -908,7 +1846,10 @@ impl<B: Backend> Server<B> {
                 )
             })
             .collect();
-        let list = list?;
+        if !layout.desktops.is_empty() {
+            lines.push(desktops_line(&layout.desktops));
+        }
+        let list = layout.windows?;
         if list.is_empty() {
             lines.push(if query.is_empty() {
                 "no windows of allowed apps".into()
@@ -929,6 +1870,7 @@ impl<B: Backend> Server<B> {
             width: num("width").map(|w| w.max(1.0)),
             height: num("height").map(|h| h.max(1.0)),
             state: a.get("state").and_then(Json::as_str).map(str::to_string),
+            desktop: desktop_arg(a)?,
         };
         if let Some(st) = &change.state
             && !["maximize", "minimize", "restore"].contains(&st.as_str())
@@ -938,14 +1880,24 @@ impl<B: Backend> Server<B> {
             ));
         }
         if change.state.is_none()
+            && change.desktop.is_none()
             && [change.x, change.y, change.width, change.height]
                 .iter()
                 .all(Option::is_none)
         {
-            return Err("pass x/y, width/height or state".into());
+            return Err("pass x/y, width/height, state or desktop".into());
         }
-        let allowed = self.allowed();
-        let mut w = self.b.set_window(&query, &allowed, &change).await?;
+        // The window it will move, for the tier check (and confirmation);
+        // only apps with that tier are passed on, so it stays the same one.
+        let policy = self.policy();
+        let allowed = policy.names();
+        if let Ok(list) = self.b.windows(&query, &allowed).await
+            && let Some(first) = list.first()
+        {
+            self.permit(&self.window_app(first).await).await?;
+        }
+        let tiered = policy.names_with(policy::needed_tier("move_window", a));
+        let mut w = self.b.set_window(&query, &tiered, &change).await?;
         // On Wayland the app applies a new size (and KWin a state) a moment
         // later; wait for it so the reply, and the next call, see the result.
         let start = Instant::now();
@@ -965,12 +1917,58 @@ impl<B: Backend> Server<B> {
         Ok(format!("now: {}{note}", describe_window(&w)))
     }
 
+    async fn close_window(&self, a: &Json) -> R<String> {
+        let query = req_s(a, "query")?;
+        if query.trim().is_empty() {
+            return Err("pass the title (or app name) of the window to close as `query`".into());
+        }
+        let allowed = self.allowed();
+        // Exactly one window, named in the confirmation and the reply.
+        let list = self.b.windows(&query, &allowed).await?;
+        let [w] = list.as_slice() else {
+            return Err(backend::not_one_window(&query, &list));
+        };
+        // Always confirmed, not only on the allowlist's confirm list:
+        // unsaved work may go with it.
+        let app = self.window_app(w).await;
+        self.permit(&app).await?;
+        if !GATE.try_with(|g| g.borrow().confirmed).unwrap_or(false) {
+            self.confirm("close_window", Some(&app), a).await?;
+        }
+        let closed = self.b.close_window(&query, &allowed).await?;
+        let start = Instant::now();
+        let gone = loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let open = self
+                .b
+                .windows(&closed.title, &allowed)
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|n| n.app == closed.app && n.pid == closed.pid && n.title == closed.title);
+            if !open || start.elapsed() >= CLOSE_SETTLE {
+                break !open;
+            }
+        };
+        let what = format!("{} [{}]", render::py_repr(&closed.title), closed.app);
+        let reply = if gone {
+            format!("closed {what}")
+        } else {
+            format!(
+                "asked {what} to close; it is still open, probably asking whether to save \
+                 changes (see apps, then find/act on its dialog)"
+            )
+        };
+        Ok(reply)
+    }
+
     async fn launch(&self, a: &Json) -> R<String> {
         let app = req_s(a, "app")?.trim().to_lowercase();
         // Refused before anything is resolved or started.
         if !self.is_allowed(&app) {
             return Err(self.not_allowed(&app));
         }
+        self.permit(&app).await?;
         let bad_args = || "args must be a list of strings".to_string();
         let args = match a.get("args") {
             None | Some(Json::Null) => Vec::new(),
@@ -1012,7 +2010,8 @@ impl<B: Backend> Server<B> {
 
     async fn doctor(&self) -> R<String> {
         self.b.enable().await;
-        let allow = self.allowed();
+        let policy = self.policy();
+        let allow = policy.names();
         let mut lines = vec![format!(
             "desktop-mcp {} ({} {})",
             env!("CARGO_PKG_VERSION"),
@@ -1032,16 +2031,53 @@ impl<B: Backend> Server<B> {
                 "{} ({} apps: {})",
                 self.allow_file.display(),
                 allow.len(),
-                allow.join(", ")
+                policy.apps_line()
             ),
+        );
+        for w in &policy.warnings {
+            row(false, "allowlist line", w);
+        }
+        let asks = if self.link.borrow().elicitation {
+            "the client asks the user (elicitation)"
+        } else {
+            "this client cannot ask the user (no elicitation): calls need confirm: true"
+        };
+        row(
+            true,
+            "confirm",
+            &if policy.confirm.is_empty() {
+                "none (add e.g. 'confirm: key:konsole' to the allowlist)".to_string()
+            } else {
+                let list: Vec<String> = policy.confirm.iter().map(|r| r.to_string()).collect();
+                format!("{}; {asks}", list.join(", "))
+            },
+        );
+        let env_on = std::env::var(policy::PASSWORDS_ENV).is_ok_and(|v| v.trim() == "1");
+        row(
+            true,
+            "password fields",
+            &match (env_on, policy.passwords.is_empty()) {
+                (true, _) => format!(
+                    "may be filled in every allowed app ({}=1)",
+                    policy::PASSWORDS_ENV
+                ),
+                (false, true) => "never read or filled in".to_string(),
+                (false, false) => format!(
+                    "never read; filled in only in: {}",
+                    policy.passwords.join(", ")
+                ),
+            },
         );
         let (mut allowed, mut blocked) = (Vec::new(), Vec::new());
         for app in self.b.list_apps().await {
             if app.windows.is_empty() {
                 continue;
             }
-            if allow.contains(&app.name.to_lowercase()) {
-                allowed.push(app.name);
+            if let Some(tier) = policy.tier(&app.name) {
+                allowed.push(match tier {
+                    Tier::Full => app.name,
+                    t => format!("{} ({t})", app.name),
+                });
             } else {
                 blocked.push(app.name);
             }
@@ -1066,21 +2102,28 @@ impl<B: Backend> Server<B> {
         for c in self.b.doctor().await {
             row(c.ok, c.name, &c.detail);
         }
+        if let Some(t) = &self.takeover {
+            let (ok, detail) = t.report();
+            row(ok, "takeover detection", &detail);
+        }
         if !self.b.apps_note().is_empty() {
             lines.push(format!("note: {}", self.b.apps_note()));
         }
         Ok(lines.join("\n"))
     }
 
-    async fn tree(&self, a: &Json) -> R<String> {
+    async fn tree(&self, a: &Json) -> R<Out> {
         self.b.enable().await;
         let root_id = arg_i(a, "root_id", 0);
+        let interactive = arg_b(a, "interactive", false);
         let opts = WalkOpts {
             max_depth: arg_i(a, "max_depth", 12).max(0) as usize,
             budget: arg_i(a, "max_nodes", 300).max(0) as usize,
             only_showing: !arg_b(a, "include_hidden", false),
             boring_roles: self.b.boring_roles(),
+            interactive,
         };
+        let max_chars = arg_i(a, "max_chars", TREE_MAX_CHARS).max(0) as usize;
         let mut cache = Cache::new();
         let (header, roots, app) = if root_id != 0 {
             let (id, app) = self.resolve_with_app(root_id).await?;
@@ -1103,6 +2146,19 @@ impl<B: Backend> Server<B> {
             let windows = self.app_windows(&app).await?;
             (app.clone(), windows, app.to_lowercase())
         };
+        // The element the previous page ended with.
+        let after_rid = arg_i(a, "after", 0);
+        let after = if after_rid != 0 {
+            let (id, of) = self.resolve_with_app(after_rid).await?;
+            if of != app {
+                return Err(format!(
+                    "`after` id {after_rid} belongs to '{of}', not '{app}'"
+                ));
+            }
+            Some(id)
+        } else {
+            None
+        };
         let first = (opts.budget * 4).max(1000);
         self.b
             .prefetch(
@@ -1113,10 +2169,14 @@ impl<B: Backend> Server<B> {
                 first,
             )
             .await;
-        let lines = loop {
+        let header = match after_rid {
+            0 => header,
+            rid => format!("{header} (continued after [{rid}])"),
+        };
+        let (lines, walked) = loop {
             let mut lines = vec![Line::Raw(header.clone())];
-            match render::walk(&cache, &roots, 1, &opts, &mut lines) {
-                Ok(()) => break lines,
+            match render::walk(&cache, &roots, 1, &opts, after.as_ref(), &mut lines) {
+                Ok(walked) => break (lines, walked),
                 Err(missing) => {
                     self.b
                         .prefetch(
@@ -1130,7 +2190,49 @@ impl<B: Backend> Server<B> {
                 }
             }
         };
-        Ok(self.print(lines, &cache, &app).await.0)
+        if !walked.after_found {
+            return Err(format!(
+                "`after` id {after_rid} is not in this tree (any more); call tree without `after`"
+            ));
+        }
+        let printed = self.printed(lines, &cache, &app).await;
+        // Room for the continuation line.
+        let room = match max_chars {
+            0 => 0,
+            n => n.saturating_sub(CONTINUATION_CHARS).max(1),
+        };
+        let capped = render::format_capped(&printed, room);
+        let mut text = capped.text;
+        if capped.left > 0 || walked.truncated {
+            text.push('\n');
+            text.push_str(&continuation(
+                a,
+                &app,
+                capped.last,
+                capped.left,
+                walked.truncated,
+            ));
+        }
+        if !arg_b(a, "screenshot", false) {
+            return Ok(Out::from(text));
+        }
+        // The image of the window the tree shows: only while it is in front,
+        // as screenshots capture the active window.
+        let active = self.b.active_app().await.to_lowercase();
+        if active != app {
+            text.push_str(&format!(
+                "\nno screenshot: the active window is not {app}'s (screenshot with \
+                 window=… brings it to the front)"
+            ));
+            return Ok(Out::from(text));
+        }
+        match self.screenshot(&json!({})).await {
+            Ok(shot) => Ok(Out {
+                text: format!("{text}\nscreenshot: {}", shot.text),
+                images: shot.images,
+            }),
+            Err(e) => Ok(Out::from(format!("{text}\nno screenshot: {e}"))),
+        }
     }
 
     /// The page or document of `app`'s active window (else its first visible
@@ -1262,21 +2364,246 @@ impl<B: Backend> Server<B> {
                 })?;
         }
         let ok = self.b.do_action(id, idx).await?;
-        let reply = t.reply(&format!(
+        // A window that opened or closed shows in the effect line.
+        Ok(t.reply(&format!(
             "{} -> {}",
             names[idx],
             if ok { "ok" } else { "failed" }
-        ));
-        Ok(self.note_active_change(reply).await)
+        )))
+    }
+
+    async fn menu(&self, a: &Json) -> R<String> {
+        let app = req_s(a, "app")?;
+        let path = render::menu_path(a.get("path"))?;
+        self.b.enable().await;
+        let windows = self.app_windows(&app).await?;
+        self.permit(&app).await?;
+        let app_key = app.to_lowercase();
+        let mut cache = Cache::new();
+        let bar = self.menu_bar(&app, &windows, &mut cache).await?;
+        let hidden = !cache[&bar].showing;
+        let mut node = bar;
+        let mut trail: Vec<String> = Vec::new();
+        let mut opened: Vec<String> = Vec::new();
+        let where_ = |trail: &[String]| {
+            if trail.is_empty() {
+                format!("{app}'s menu bar")
+            } else {
+                render::json_str(&trail.join(" > "))
+            }
+        };
+        let open_note = |opened: &[String]| {
+            if opened.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (opened {} to read it; it may still be open: key escape closes it)",
+                    opened.join(", ")
+                )
+            }
+        };
+        for seg in &path {
+            let mut items = self.menu_entries(&mut cache, &node).await;
+            if items.is_empty() && !trail.is_empty() {
+                items = self
+                    .open_submenu(&mut cache, &node, &windows)
+                    .await
+                    .map_err(|e| format!("{}: {e}{}", where_(&trail), open_note(&opened)))?;
+                opened.push(render::json_str(trail.last().unwrap()));
+            }
+            let item = render::pick_menu_item(&cache, &items, seg)
+                .map_err(|e| format!("in {}: {e}{}", where_(&trail), open_note(&opened)))?;
+            trail.push(cache[&item].name.trim().to_string());
+            node = item;
+        }
+        self.b
+            .fill_actions(&mut cache, std::slice::from_ref(&node))
+            .await;
+        let list = trail.is_empty() || render::is_submenu(&cache, &cache[&node]);
+        if list {
+            let mut items = self.menu_entries(&mut cache, &node).await;
+            if items.is_empty() && !trail.is_empty() {
+                items = self
+                    .open_submenu(&mut cache, &node, &windows)
+                    .await
+                    .map_err(|e| format!("{}: {e}{}", where_(&trail), open_note(&opened)))?;
+                opened.push(render::json_str(trail.last().unwrap()));
+            }
+            self.b.fill_actions(&mut cache, &items).await;
+            let mut lines = vec![format!(
+                "{}{}:",
+                where_(&trail),
+                if hidden && trail.is_empty() {
+                    " (hidden: its entries still work through `menu`)"
+                } else {
+                    ""
+                }
+            )];
+            for id in &items {
+                let rid = self.add_ref(id, &cache[id], &app_key).await;
+                // A submenu's action only opens it: "(submenu)" says that
+                // ("click" is implied for menu roles, so nothing is listed).
+                let line = if render::is_submenu(&cache, &cache[id]) {
+                    let info = Info {
+                        actions: vec!["click".into()],
+                        ..cache[id].clone()
+                    };
+                    format!("{} (submenu)", render::describe(&info, rid))
+                } else {
+                    render::describe(&cache[id], rid)
+                };
+                lines.push(line);
+            }
+            if items.is_empty() {
+                lines.push("(no entries)".into());
+            }
+            let note = open_note(&opened);
+            if !note.is_empty() {
+                lines.push(note.trim().to_string());
+            }
+            return Ok(lines.join("\n"));
+        }
+        let info = &cache[&node];
+        let what = render::json_str(&trail.join(" > "));
+        if info.states.contains(&"disabled") {
+            return Err(format!("{what} is disabled{}", open_note(&opened)));
+        }
+        let idx = menu_action(&info.actions)
+            .ok_or_else(|| format!("{what} has no action{}", open_note(&opened)))?;
+        let ok = self.b.do_action(&node, idx).await?;
+        let reply = format!("{what} -> {}", if ok { "ok" } else { "failed" });
+        Ok(reply)
+    }
+
+    /// The menu bar of `app`'s active window, else of its other windows (a
+    /// dialog in front has none). Hidden menu bars count: KDE apps keep
+    /// theirs in the tree when the hamburger menu replaces it, and their
+    /// entries still work.
+    async fn menu_bar(&self, app: &str, windows: &[B::Id], cache: &mut Cache<B::Id>) -> R<B::Id> {
+        let fetch = |limit| Fetch {
+            only_showing: false,
+            text_limit: 0,
+            limit,
+            actions: false,
+            stop_roles: &render::MENU_BAR_STOP,
+        };
+        self.b
+            .prefetch_with(cache, windows.to_vec(), &fetch(1))
+            .await;
+        let mut order: Vec<&B::Id> = windows.iter().filter(|w| cache.contains_key(*w)).collect();
+        order.sort_by_key(|w| {
+            let i = &cache[*w];
+            (!i.states.contains(&"active"), !i.showing)
+        });
+        for w in order {
+            let kids = cache[w].children.clone();
+            self.b
+                .prefetch_with(cache, kids, &fetch(render::FIND_MAX_SEEN))
+                .await;
+            for _ in 0..MENU_FETCH_ROUNDS {
+                match render::menu_bars(cache, std::slice::from_ref(w)) {
+                    Ok(bars) => {
+                        if let Some(bar) = bars.into_iter().next() {
+                            return Ok(bar);
+                        }
+                        break;
+                    }
+                    Err(missing) => {
+                        self.b
+                            .prefetch_with(cache, missing, &fetch(PREFETCH_MORE))
+                            .await
+                    }
+                }
+            }
+        }
+        Err(format!(
+            "no menu bar in '{app}'s windows; the app may have only a hamburger or \
+             context menu: find its button and act on it, or use key"
+        ))
+    }
+
+    /// The entries of `node` (a menu bar or submenu entry), fetching what is
+    /// missing.
+    async fn menu_entries(&self, cache: &mut Cache<B::Id>, node: &B::Id) -> Vec<B::Id> {
+        let fetch = Fetch {
+            only_showing: false,
+            text_limit: 0,
+            limit: PREFETCH_MORE,
+            actions: false,
+            stop_roles: &[],
+        };
+        for _ in 0..MENU_FETCH_ROUNDS {
+            match render::menu_items(cache, node) {
+                Ok(items) => return items,
+                Err(missing) => self.b.prefetch_with(cache, missing, &fetch).await,
+            }
+        }
+        Vec::new()
+    }
+
+    /// Open a submenu whose entries are not in the tree until it is shown
+    /// (Firefox), and wait for them.
+    async fn open_submenu(
+        &self,
+        cache: &mut Cache<B::Id>,
+        node: &B::Id,
+        windows: &[B::Id],
+    ) -> R<Vec<B::Id>> {
+        if !self.b.may_open_menu(node).await {
+            return Err(
+                "this app lists a submenu's entries only while it is open, and opening \
+                 its menus through accessibility can hang or crash it (Firefox); open the \
+                 menu with key (alt + its underlined letter, or f10), then call menu again"
+                    .into(),
+            );
+        }
+        let actions = self.b.actions(node).await;
+        let idx = actions
+            .iter()
+            .position(|a| {
+                ["show menu", "open", "click", "press", "activate"]
+                    .contains(&a.to_lowercase().as_str())
+            })
+            .or((!actions.is_empty()).then_some(0))
+            .ok_or(
+                "its entries are not in the accessibility tree and it has no action to open it",
+            )?;
+        let mut mark = self.b.change_mark();
+        self.b.do_action(node, idx).await?;
+        let start = Instant::now();
+        loop {
+            // Read the entry afresh: what the cache holds predates the popup.
+            let mut fresh = Cache::new();
+            fresh.insert(node.clone(), self.b.info(node, 0).await);
+            let items = self.menu_entries(&mut fresh, node).await;
+            cache.extend(fresh);
+            if !items.is_empty() {
+                return Ok(items);
+            }
+            let left = MENU_OPEN_WAIT.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return Err(format!(
+                    "opened it, but no entries appeared within {} ms",
+                    MENU_OPEN_WAIT.as_millis()
+                ));
+            }
+            self.b
+                .wait_change(windows, mark, left.min(WAIT_FALLBACK))
+                .await;
+            mark = self.b.change_mark();
+        }
     }
 
     async fn set_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
         let t = self.target(a).await?;
+        if t.protected() && !self.passwords_allowed(&t.app) {
+            return Err(t.reply(&self.password_refusal("set_text", &t.app)));
+        }
         if !self.b.set_text(&t.id, &text).await? {
             return Ok(t.reply("failed"));
         }
-        if self.b.info(&t.id, 0).await.role.contains("password") {
+        if t.protected() {
             return Ok(t.reply("ok (password field: contents cannot be read back)"));
         }
         // Firefox reports success for accessibility writes and changes
@@ -1354,8 +2681,22 @@ impl<B: Backend> Server<B> {
         self.b.press_combo("ctrl+a").await.is_ok() && self.b.type_text(text).await.is_ok()
     }
 
+    /// Why a password field is not filled in, and how the user can allow it.
+    fn password_refusal(&self, tool: &str, app: &str) -> String {
+        format!(
+            "{tool} refused: the target is a password field. Ask the user to type it \
+             themselves; only they can allow agents to fill in passwords ('passwords: {app}' \
+             in {}, or {}=1)",
+            self.allow_file.display(),
+            policy::PASSWORDS_ENV
+        )
+    }
+
     async fn get_text(&self, a: &Json) -> R<String> {
         let t = self.target(a).await?;
+        if t.protected() {
+            return Err(t.reply("a password field: its text is never read"));
+        }
         let limit = arg_i(a, "limit", 20000).max(0) as usize;
         let mut text = self.b.full_text(&t.id, limit).await?;
         if render::has_embedded_objects(&text) {
@@ -1399,6 +2740,7 @@ impl<B: Backend> Server<B> {
                                 actions: Vec::new(),
                                 text: None,
                                 children: Vec::new(),
+                                operable: false,
                             });
                         }
                     }
@@ -1408,10 +2750,22 @@ impl<B: Backend> Server<B> {
     }
 
     async fn wait_for(&self, a: &Json) -> R<String> {
+        if let Some(window) = a.get("window").and_then(Json::as_str) {
+            if a.get("query").is_some() {
+                return Err(
+                    "pass `query` (an element) or `window` (a window title), not both".into(),
+                );
+            }
+            return self.wait_window(a, window).await;
+        }
         let app = req_s(a, "app")?;
         let query = req_s(a, "query")?;
         let role = arg_s(a, "role", "");
         let gone = arg_b(a, "gone", false);
+        let state = arg_s(a, "state", "");
+        let state = (!state.is_empty())
+            .then(|| WaitState::parse(&state))
+            .transpose()?;
         let (limit_ms, note) = wait_ms(a, "timeout_ms", 5000);
         let limit = Duration::from_millis(limit_ms);
         if !self.is_allowed(&app) {
@@ -1431,23 +2785,32 @@ impl<B: Backend> Server<B> {
                 self.locate_in(windows.clone(), &query, &role, false).await
             };
             let ms = start.elapsed().as_millis();
+            // With `state`, a match without it counts as no match.
+            let has = |info: &Info<B::Id>| state.is_none_or(|s| s.holds(&info.states));
             match found {
-                Some((id, mut cache)) if !gone => {
+                Some((id, mut cache)) if gone != has(&cache[&id]) => {
                     self.b
                         .fill_actions(&mut cache, std::slice::from_ref(&id))
                         .await;
                     let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
+                    let line = render::describe(&cache[&id], rid);
+                    if gone {
+                        let s = state.map_or("", WaitState::name);
+                        return Ok(format!("no longer {s} after {ms} ms{note}: {line}"));
+                    }
                     note_step_element(rid, true);
-                    return Ok(format!(
-                        "found after {ms} ms{note}: {}",
-                        render::describe(&cache[&id], rid)
-                    ));
+                    return Ok(format!("found after {ms} ms{note}: {line}"));
                 }
                 None if gone => return Ok(format!("gone after {ms} ms{note}")),
                 _ => {}
             }
             if start.elapsed() >= limit {
-                let what = if gone { "to disappear" } else { "to appear" };
+                let what = match (state, gone) {
+                    (None, false) => "to appear".to_string(),
+                    (None, true) => "to disappear".to_string(),
+                    (Some(s), false) => format!("to be {}", s.name()),
+                    (Some(s), true) => format!("to stop being {}", s.name()),
+                };
                 return Err(format!(
                     "timed out after {ms} ms waiting for '{query}' in '{app}' {what}{note}"
                 ));
@@ -1460,6 +2823,128 @@ impl<B: Backend> Server<B> {
             // Never more often than the old poll, however busy the app.
             tokio::time::sleep(WAIT_MIN_GAP.saturating_sub(checked.elapsed()).min(left)).await;
         }
+    }
+
+    /// `wait_for` a window of an allowed app (`app`, when given) whose
+    /// title or app name contains `query` to open, or with `gone` to close.
+    /// Re-checks the compositor's window list when an app's windows changed
+    /// (AT-SPI), or every WAIT_FALLBACK.
+    async fn wait_window(&self, a: &Json, query: &str) -> R<String> {
+        let app = arg_s(a, "app", "").to_lowercase();
+        let gone = arg_b(a, "gone", false);
+        let (limit_ms, note) = wait_ms(a, "timeout_ms", 5000);
+        let limit = Duration::from_millis(limit_ms);
+        if !app.is_empty() && !self.is_allowed(&app) {
+            return Err(self.not_allowed(&app));
+        }
+        self.b.enable().await;
+        let start = Instant::now();
+        loop {
+            let mark = self.b.change_mark();
+            let allowed = self.allowed();
+            let list = self.b.windows_quick(query, &allowed).await?;
+            // KWin's class may carry a prefix ("org.kde.kate").
+            let hit = list.iter().find(|w| w.app.to_lowercase().contains(&app));
+            let ms = start.elapsed().as_millis();
+            match hit {
+                Some(w) if !gone => {
+                    return Ok(format!(
+                        "window found after {ms} ms{note}: {}",
+                        describe_window(w)
+                    ));
+                }
+                None if gone => return Ok(format!("window gone after {ms} ms{note}")),
+                _ => {}
+            }
+            if start.elapsed() >= limit {
+                let what = if gone { "to close" } else { "to open" };
+                let of = if app.is_empty() {
+                    "an allowed app".to_string()
+                } else {
+                    format!("'{app}'")
+                };
+                return Err(format!(
+                    "timed out after {ms} ms waiting for a window of {of} matching '{query}' {what}{note}"
+                ));
+            }
+            let checked = Instant::now();
+            let left = limit.saturating_sub(start.elapsed());
+            // Window changes of every app wake this; the app's own changes
+            // too (a renamed window).
+            let near = if app.is_empty() {
+                Vec::new()
+            } else {
+                self.b.app_windows(&app).await.unwrap_or_default()
+            };
+            self.b
+                .wait_change(&near, mark, left.min(WAIT_FALLBACK))
+                .await;
+            tokio::time::sleep(WAIT_MIN_GAP.saturating_sub(checked.elapsed()).min(left)).await;
+        }
+    }
+
+    /// Wait until `app` stopped changing for `quiet_ms`: no accessibility
+    /// change events from it (children added or removed, names, text), or,
+    /// where the backend hears none, the same fingerprint of its visible
+    /// tree.
+    async fn wait_idle(&self, a: &Json) -> R<String> {
+        let app = req_s(a, "app")?;
+        let quiet = Duration::from_millis(arg_i(a, "quiet_ms", 300).clamp(10, MAX_WAIT_MS) as u64);
+        let (limit_ms, note) = wait_ms(a, "timeout_ms", 10_000);
+        let limit = Duration::from_millis(limit_ms);
+        self.b.enable().await;
+        let windows = self.app_windows(&app).await?;
+        let start = Instant::now();
+        let mut since = Instant::now();
+        let mut print = None;
+        loop {
+            if since.elapsed() >= quiet && self.b.loading(&windows).await {
+                // Quiet only because the page waits for the network.
+                since = Instant::now();
+            }
+            if since.elapsed() >= quiet {
+                let ms = start.elapsed().as_millis();
+                return Ok(format!(
+                    "idle after {ms} ms (no change for {} ms){note}",
+                    quiet.as_millis()
+                ));
+            }
+            if start.elapsed() >= limit {
+                let ms = start.elapsed().as_millis();
+                return Err(format!(
+                    "'{app}' still changing after {ms} ms (never quiet for {} ms){note}",
+                    quiet.as_millis()
+                ));
+            }
+            let left = limit
+                .saturating_sub(start.elapsed())
+                .min(quiet.saturating_sub(since.elapsed()));
+            if self.b.changes_live() {
+                let mark = self.b.change_mark();
+                if self.b.wait_change(&windows, mark, left).await {
+                    since = Instant::now();
+                }
+            } else {
+                let now = self.content_hash(&windows).await;
+                if print.replace(now) != Some(now) {
+                    since = Instant::now();
+                }
+                tokio::time::sleep(left.min(IDLE_POLL)).await;
+            }
+        }
+    }
+
+    /// A hash of what the visible part of `windows` shows.
+    async fn content_hash(&self, windows: &[B::Id]) -> u64 {
+        let mut cache = Cache::new();
+        self.b
+            .prefetch_with(
+                &mut cache,
+                windows.to_vec(),
+                &search_fetch(TREE_TEXT_LIMIT, render::FIND_MAX_SEEN),
+            )
+            .await;
+        render::fingerprint(&cache, windows)
     }
 
     async fn pause(&self, a: &Json) -> R<String> {
@@ -1486,12 +2971,19 @@ impl<B: Backend> Server<B> {
 
     async fn click(&self, a: &Json) -> R<String> {
         let button = arg_s(a, "button", "left");
-        let clicks = arg_i(a, "clicks", 1);
+        let clicks = arg_i(a, "clicks", 1).clamp(0, 3);
+        let mods = modifiers_arg(a)?;
+        if clicks > 0 {
+            self.check_button_free(&button)?;
+        }
         let (t, (x, y)) = self.target_center(a).await?;
-        self.b
-            .pointer(x as i64, y as i64, &button, clicks, 0)
-            .await?;
-        Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}")))
+        self.with_modifiers(
+            &mods,
+            self.b.pointer(x as i64, y as i64, &button, clicks, 0),
+        )
+        .await?;
+        let m = with_modifiers_note(&mods);
+        Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}{m}")))
     }
 
     /// Centre of `id` for a pointer tool, once the active window is checked
@@ -1524,7 +3016,9 @@ impl<B: Backend> Server<B> {
     /// `<end>_x`/`<end>_y`, as screenshot pixels when `image` is true.
     async fn drag_end(&self, a: &Json, end: &str) -> R<DragEnd<B::Id>> {
         if let Some(rid) = a.get(format!("{end}_id")).and_then(Json::as_i64) {
-            return Ok(DragEnd::Element(self.resolve_with_app(rid).await?.0));
+            let (id, app) = self.resolve_with_app(rid).await?;
+            self.permit(&app).await?;
+            return Ok(DragEnd::Element(id));
         }
         let (x, y) = (
             req_i(a, &format!("{end}_x"))?,
@@ -1578,13 +3072,21 @@ impl<B: Backend> Server<B> {
 
     async fn drag(&self, a: &Json) -> R<String> {
         let button = arg_s(a, "button", "left");
+        self.check_button_free(&button)?;
         let (app, (x0, y0), (x1, y1)) = self.drag_points(a).await?;
         self.b.move_pointer(x0, y0).await?;
-        self.b.button(&button, true).await?;
+        // Recorded as held while it is down: a cancelled drag releases it.
+        let held = Held::Button(button.clone());
+        self.press_held(&held).await?;
         let mut moved = Ok(());
         for i in 1..=DRAG_STEPS {
             let x = x0 + (x1 - x0) * i / DRAG_STEPS;
             let y = y0 + (y1 - y0) * i / DRAG_STEPS;
+            // The user took over (or pressed the stop shortcut): let go.
+            moved = self.gate(true).await;
+            if moved.is_err() {
+                break;
+            }
             moved = self.b.move_pointer(x, y).await;
             if moved.is_err() {
                 break;
@@ -1592,7 +3094,7 @@ impl<B: Backend> Server<B> {
             tokio::time::sleep(DRAG_STEP_GAP).await;
         }
         // Never leave the button held, whatever happened on the way.
-        let released = self.b.button(&button, false).await;
+        let released = self.release_held(&held).await;
         moved?;
         released?;
         Ok(format!(
@@ -1602,20 +3104,35 @@ impl<B: Backend> Server<B> {
 
     async fn scroll(&self, a: &Json) -> R<String> {
         let amount = arg_i(a, "amount", 3).clamp(-50, 50);
+        let mods = modifiers_arg(a)?;
         let (t, (x, y)) = self.target_center(a).await?;
-        self.b
-            .pointer(x as i64, y as i64, "left", 0, amount)
+        self.with_modifiers(&mods, self.b.pointer(x as i64, y as i64, "left", 0, amount))
             .await?;
-        Ok(t.reply(&format!("scrolled {amount} at {x},{y}")))
+        let m = with_modifiers_note(&mods);
+        Ok(t.reply(&format!("scrolled {amount} at {x},{y}{m}")))
     }
 
     async fn key(&self, a: &Json) -> R<String> {
         let combo = req_s(a, "combo")?;
         let repeat = arg_i(a, "repeat", 1);
         self.b.check_combo(&combo)?;
+        // Held keys stay down: pressing one again would release it.
+        let keys: Vec<String> = chord_keys(&combo)
+            .into_iter()
+            .filter(|k| !self.is_held(&Held::Key(k.clone())))
+            .collect();
+        if keys.is_empty() {
+            return Ok(format!(
+                "nothing sent: {combo} is held already (hold with down=false releases it)"
+            ));
+        }
+        let send = keys.join("+");
         let app = self.require_active_allowed().await?;
-        for _ in 0..repeat.clamp(1, 100) {
-            self.b.press_combo(&combo).await?;
+        for i in 0..repeat.clamp(1, 100) {
+            if i > 0 {
+                self.gate(true).await?;
+            }
+            self.b.press_combo(&send).await?;
         }
         let focus = self.focus_note(false).await;
         Ok(format!("sent {combo} x{repeat} to {app}{focus}"))
@@ -1624,6 +3141,12 @@ impl<B: Backend> Server<B> {
     async fn type_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
         let app = self.require_active_allowed().await?;
+        if let Some(f) = self.b.focused().await
+            && render::is_protected_role(&f.info.role)
+            && !self.passwords_allowed(&f.app)
+        {
+            return Err(self.password_refusal("type_text", &f.app.to_lowercase()));
+        }
         let note = self.b.type_text(&text).await?;
         let focus = self.focus_note(true).await;
         Ok(format!(
@@ -1693,17 +3216,93 @@ impl<B: Backend> Server<B> {
             }
             _ => (req_i(a, "x")?, req_i(a, "y")?),
         };
+        let button = arg_s(a, "button", "left");
+        let clicks = arg_i(a, "clicks", 1).clamp(0, 3);
+        let mods = modifiers_arg(a)?;
+        if clicks > 0 {
+            self.check_button_free(&button)?;
+        }
         let app = self.require_active_allowed().await?;
-        self.b
-            .pointer(
-                x,
-                y,
-                &arg_s(a, "button", "left"),
-                arg_i(a, "clicks", 1),
-                arg_i(a, "scroll", 0),
-            )
-            .await?;
-        Ok(format!("pointer at ({x},{y}) in {app}"))
+        self.with_modifiers(
+            &mods,
+            self.b.pointer(x, y, &button, clicks, arg_i(a, "scroll", 0)),
+        )
+        .await?;
+        let m = with_modifiers_note(&mods);
+        Ok(format!("pointer at ({x},{y}) in {app}{m}"))
+    }
+
+    /// Press (`down`, the default) or release a key, chord or mouse button
+    /// and leave it so across calls. down=false without key or button
+    /// releases everything held.
+    async fn hold(&self, a: &Json) -> R<String> {
+        let down = arg_b(a, "down", true);
+        let key = a.get("key").and_then(Json::as_str).map(str::trim);
+        let button = a.get("button").and_then(Json::as_str).map(str::trim);
+        let items: Vec<Held> = match (key, button) {
+            (Some(_), Some(_)) => return Err("give `key` or `button`, not both".into()),
+            (None, None) if !down => {
+                let (names, r) = self.release_all_held().await;
+                r?;
+                return Ok(if names.is_empty() {
+                    "nothing was held".into()
+                } else {
+                    format!("released {}; nothing held", names.join(", "))
+                });
+            }
+            (None, None) => {
+                return Err(
+                    "hold needs `key` (e.g. \"shift\") or `button` (left, right, \
+                            middle); down=false alone releases everything"
+                        .into(),
+                );
+            }
+            (Some(k), None) => {
+                let keys = chord_keys(k);
+                if keys.is_empty() {
+                    return Err("empty `key`".into());
+                }
+                for k in &keys {
+                    self.b.check_combo(k)?;
+                }
+                keys.into_iter().map(Held::Key).collect()
+            }
+            (None, Some(b)) => {
+                if !BUTTONS.contains(&b) {
+                    return Err(format!("unknown button '{b}' (left, right, middle)"));
+                }
+                vec![Held::Button(b.to_string())]
+            }
+        };
+        let what = items.iter().map(|h| h.name()).collect::<Vec<_>>().join("+");
+        if down {
+            let app = self.require_active_allowed().await?;
+            for h in &items {
+                if !self.is_held(h) {
+                    self.press_held(h).await?;
+                }
+            }
+            return Ok(format!("holding {what} in {app}"));
+        }
+        let mut result = Ok(());
+        for h in items.iter().rev() {
+            let r = self.release_held(h).await;
+            if result.is_ok() {
+                result = r;
+            }
+        }
+        result?;
+        let rest = if self.held_names().is_empty() {
+            "; nothing held"
+        } else {
+            ""
+        };
+        Ok(format!("released {what}{rest}"))
+    }
+
+    async fn cursor_position(&self) -> R<String> {
+        let (x, y) = self.b.cursor_position().await?;
+        Ok(format!("cursor at ({x},{y})"))
     }
 
     async fn activate_window(&self, a: &Json) -> R<String> {
@@ -1795,6 +3394,7 @@ impl<B: Backend> Server<B> {
         let allowed = self.allowed();
         let owner = file_dialog_owner(&d, &allowed)
             .map_err(|e| format!("{e} (allowlist: {})", self.allow_file.display()))?;
+        self.permit(&owner).await?;
         let text = path.display().to_string();
         if !self.b.set_text(&d.field, &text).await? {
             return Err("the file name field refused the path".into());
@@ -1860,30 +3460,72 @@ impl<B: Backend> Server<B> {
         ))
     }
 
+    /// Capture the active window. With `region` (pixels of the last
+    /// screenshot): capture again and keep only that part, at up to full
+    /// resolution, mapped so image_x/image_y refer to the zoomed image.
     async fn screenshot(&self, a: &Json) -> R<Out> {
+        let region = region_arg(a)?;
         self.require_active_allowed().await?;
+        // The zoom's screen area, from the map of the image it was read in.
+        let zoom = match region {
+            Some(r) => {
+                let map = (*self.last_shot.lock().await)
+                    .ok_or("region needs a screenshot taken first (its pixels)")?;
+                Some((r, map.area_of(r)))
+            }
+            None => None,
+        };
         *self.last_shot.lock().await = None;
         let Shot { path, pixels, area } = self.b.screenshot().await.ok_or("screenshot failed")?;
+        let frac = match (zoom, area) {
+            (None, _) => shot::Frac::ALL,
+            (Some((_, want)), Some(area)) => region_frac(area, want).ok_or_else(|| {
+                let _ = std::fs::remove_file(&path);
+                "region is outside the active window now; take a new screenshot".to_string()
+            })?,
+            (Some(_), None) => {
+                let _ = std::fs::remove_file(&path);
+                return Err("region: the screen area of the capture is unknown here".into());
+            }
+        };
         let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, 8192) as u32;
         let inline = arg_b(a, "inline", true);
         // Converting, shrinking and encoding take milliseconds: keep other
         // calls moving.
         let file = path.clone();
-        let (size, png) = tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max))
+        let done = tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac))
             .await
             .map_err(|e| e.to_string())??;
-        let map = area.and_then(|a| ShotMap::new(size, a));
+        // The screen area the image shows: the part of the capture kept.
+        let area = area.map(|(x, y, w, h)| {
+            let k = done.kept;
+            (x + k.x * w, y + k.y * h, k.w * w, k.h * h)
+        });
+        let map = area.and_then(|a| ShotMap::new(done.size, a));
         *self.last_shot.lock().await = map;
-        let (iw, ih) = size;
+        let (iw, ih) = done.size;
         let mut text = format!("{path}\n{iw}x{ih} px");
         if let (Some((x, y, w, h)), Some(_)) = (area, map) {
             // How to click a point in it is in the server instructions.
-            text.push_str(&format!(" of screen area at ({x},{y}), {w}x{h}"));
+            let r = |v: f64| (v * 100.0).round() / 100.0;
+            text.push_str(&format!(
+                " of screen area at ({},{}), {}x{}",
+                r(x),
+                r(y),
+                r(w),
+                r(h)
+            ));
+        }
+        if let Some(((x, y, w, h), _)) = zoom {
+            text.push_str(&format!(
+                " (zoom of region [{x}, {y}, {w}, {h}] of the previous screenshot; \
+                 image_x/image_y now refer to this image)"
+            ));
         }
         Ok(Out {
             text,
             images: if inline {
-                vec![shot::base64(&png)]
+                vec![shot::base64(&done.png)]
             } else {
                 Vec::new()
             },
@@ -1911,7 +3553,9 @@ impl<B: Backend> Server<B> {
             INPUT_TOOLS.contains(&tool_of(s)) || matches!(window_arg(tool_of(s), args), Ok(Some(_)))
         });
         let _input = if input {
-            Some(self.input.lock().await)
+            let guard = self.input.lock().await;
+            self.start_run();
+            Some(guard)
         } else {
             None
         };
@@ -1964,12 +3608,28 @@ impl<B: Backend> Server<B> {
         })
     }
 
+    /// Run a tool. When it fails, everything held is released (keys and
+    /// buttons left down by `hold` would otherwise go on acting on what
+    /// the agent does next, after something went wrong).
     fn call<'a>(
         &'a self,
         name: &'a str,
         a: &'a Json,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
-        self.call_inner(name, a, false)
+        Box::pin(async move {
+            let result = self.call_inner(name, a, false).await;
+            match result {
+                Err(e) if !self.held_names().is_empty() => {
+                    let (names, released) = self.release_all().await;
+                    let failed = match released {
+                        Ok(()) => String::new(),
+                        Err(r) => format!(" (release failed: {r})"),
+                    };
+                    Err(format!("{e}; released {}{failed}", names.join(", ")))
+                }
+                r => r,
+            }
+        })
     }
 
     /// `call`, for a caller that may already hold the input lock (`held`: a
@@ -1980,14 +3640,43 @@ impl<B: Backend> Server<B> {
         a: &'a Json,
         held: bool,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
-        Box::pin(async move {
+        let gate = Gate {
+            tool: name.to_string(),
+            args: a.clone(),
+            confirmed: false,
+        };
+        Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
             let window = window_arg(name, a)?;
+            // Tools that reach no app through `permit` are confirmed here,
+            // by their `app` argument if any.
+            if NO_PERMIT_TOOLS.contains(&name) {
+                let app = a.get("app").and_then(Json::as_str);
+                if self.policy().needs_confirm(name, app) {
+                    self.confirm(name, app, a).await?;
+                }
+            }
+            let observe = observe_arg(name, a)?;
             // A screenshot sends no input, but activating its window does. A
             // batch that holds the input lock already runs its steps `held`.
             let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
-                Some(self.input.lock().await)
+                let guard = self.input.lock().await;
+                self.start_run();
+                Some(guard)
             } else {
                 None
+            };
+            let gated = GATED_TOOLS.contains(&name) || window.is_some();
+            // Only an activate_window call of its own resumes after the stop
+            // shortcut, never a step of a batch that was running then.
+            let resumed = name == "activate_window"
+                && !held
+                && self.takeover.as_ref().is_some_and(|t| t.resume());
+            if gated {
+                self.gate(held).await?;
+            }
+            let _ours = match &self.takeover {
+                Some(t) if gated => Some(t.ours()),
+                _ => None,
             };
             if let Some(label) = indicator_label(name, a) {
                 self.b.indicate(&label).await;
@@ -1996,20 +3685,28 @@ impl<B: Backend> Server<B> {
                 Some(q) => self.ensure_window(q).await?,
                 None => None,
             };
+            // Taken once the window is in front, before the input.
+            let before = match observe {
+                Some(_) => Some((self.b.change_mark(), self.fingerprint().await)),
+                None => None,
+            };
             let result = match name {
                 "apps" => self.apps().await.map(Out::from),
-                "tree" => self.tree(a).await.map(Out::from),
+                "tree" => self.tree(a).await,
                 "find" => self.find(a).await.map(Out::from),
                 "act" => self.act(a).await.map(Out::from),
                 "set_text" => self.set_text(a).await.map(Out::from),
                 "get_text" => self.get_text(a).await.map(Out::from),
                 "wait_for" => self.wait_for(a).await.map(Out::from),
+                "wait_idle" => self.wait_idle(a).await.map(Out::from),
                 "pause" => self.pause(a).await.map(Out::from),
                 "focus" => self.focus(a).await.map(Out::from),
                 "click" => self.click(a).await.map(Out::from),
                 "drag" => self.drag(a).await.map(Out::from),
                 "windows" => self.windows(a).await.map(Out::from),
                 "move_window" => self.move_window(a).await.map(Out::from),
+                "close_window" => self.close_window(a).await.map(Out::from),
+                "menu" => self.menu(a).await.map(Out::from),
                 "launch" => self.launch(a).await.map(Out::from),
                 "doctor" => self.doctor().await.map(Out::from),
                 "scroll" => self.scroll(a).await.map(Out::from),
@@ -2018,13 +3715,35 @@ impl<B: Backend> Server<B> {
                 "clipboard_get" => self.clipboard_get(a).await.map(Out::from),
                 "clipboard_set" => self.clipboard_set(a).await.map(Out::from),
                 "mouse" => self.mouse(a).await.map(Out::from),
+                "hold" => self.hold(a).await.map(Out::from),
+                "cursor_position" => self.cursor_position().await.map(Out::from),
                 "activate_window" => self.activate_window(a).await.map(Out::from),
                 "file_dialog" => self.file_dialog(a).await.map(Out::from),
                 "screenshot" => self.screenshot(a).await,
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
             };
-            match activated {
+            let result = match (result, observe, before) {
+                (Ok(mut o), Some(observe), Some((mark, before))) => {
+                    let seen = self.after_input(name, a, observe, mark, before).await;
+                    o.text.push_str(&seen.text);
+                    o.images.extend(seen.images);
+                    Ok(o)
+                }
+                (result, _, _) => result,
+            };
+            // What is still held, after every input step but a batch (its
+            // steps say it).
+            let note = if name == "batch" {
+                String::new()
+            } else {
+                self.held_note()
+            };
+            let result = result.map(|mut o| {
+                o.text.push_str(&note);
+                o
+            });
+            let result = match activated {
                 Some(title) => {
                     let done = format!("activated {}; ", render::py_repr(&title));
                     result
@@ -2035,10 +3754,34 @@ impl<B: Backend> Server<B> {
                         .map_err(|e| format!("{done}{e}"))
                 }
                 None => result,
+            };
+            match resumed {
+                true => result.map(|mut o| {
+                    o.text.insert_str(0, "resumed after the user's stop; ");
+                    o
+                }),
+                false => result,
             }
-        })
+        }))
     }
 }
+
+/// Tools that never call `Server::permit` (they reach no app, or only read
+/// with a tier every allowed app has); `call_inner` handles their
+/// confirmation.
+const NO_PERMIT_TOOLS: [&str; 11] = [
+    "apps",
+    "windows",
+    "doctor",
+    "tree",
+    "find",
+    "wait_for",
+    "wait_idle",
+    "cursor_position",
+    "pause",
+    "activate_window",
+    "batch",
+];
 
 // ---------------------------------------------------------------- MCP
 
@@ -2051,6 +3794,9 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
     let result = match method {
         "initialize" => {
             let asked = params["protocolVersion"].as_str().unwrap_or("");
+            server.link.borrow_mut().elicitation = params
+                .pointer("/capabilities/elicitation")
+                .is_some_and(Json::is_object);
             let version = if PROTOCOL_VERSIONS.contains(&asked) {
                 asked
             } else {
@@ -2095,15 +3841,47 @@ async fn serve<B: Backend + 'static>(backend: B) -> R<()> {
     // Creating virtual input devices takes a moment; do it while the client
     // is still connecting so the first key/click is not delayed.
     backend.warm_up();
-    let server = Server::new(backend);
+    let server = std::rc::Rc::new(Server::new(backend));
     server.b.enable().await;
     server.allowed();
-    run_loop(
-        std::rc::Rc::new(server),
-        BufReader::new(tokio::io::stdin()),
-        tokio::io::stdout(),
-    )
-    .await
+    let result = tokio::select! {
+        r = run_loop(
+            server.clone(),
+            BufReader::new(tokio::io::stdin()),
+            tokio::io::stdout(),
+        ) => r,
+        _ = shutdown_signal() => Ok(()),
+    };
+    // On a signal the calls still running were dropped with run_loop:
+    // release what they or `hold` left pressed before exiting.
+    let _ = server.release_all().await;
+    result
+}
+
+/// SIGTERM, SIGINT or SIGHUP (Ctrl+C on Windows): the client is shutting
+/// the server down. Never resolves when the handlers cannot be installed.
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        let kinds = [
+            SignalKind::terminate(),
+            SignalKind::interrupt(),
+            SignalKind::hangup(),
+        ];
+        let mut streams: Vec<_> = kinds.into_iter().filter_map(|k| signal(k).ok()).collect();
+        if streams.is_empty() {
+            std::future::pending::<()>().await;
+        }
+        let waits = streams.iter_mut().map(|s| Box::pin(s.recv()));
+        futures_util::future::select_all(waits).await;
+    }
+    #[cfg(windows)]
+    {
+        if tokio::signal::ctrl_c().await.is_err() {
+            std::future::pending::<()>().await;
+        }
+    }
 }
 
 /// The JSON-RPC loop over newline-delimited messages, apart from the
@@ -2139,6 +3917,7 @@ where
         }
         Ok::<(), String>(())
     });
+    server.link.borrow_mut().out = Some(tx.clone());
     let in_flight = std::rc::Rc::new(std::cell::RefCell::new(InFlight::default()));
     let mut calls = tokio::task::JoinSet::new();
     let mut lines = reader.lines();
@@ -2160,9 +3939,26 @@ where
             }
         };
         let method = msg.get("method").and_then(Json::as_str).unwrap_or("");
+        // The client's response to a request the server sent (a running
+        // call waits for it).
+        if msg.get("method").is_none()
+            && (msg.get("result").is_some() || msg.get("error").is_some())
+        {
+            server.deliver(msg);
+            continue;
+        }
         if method == "notifications/cancelled" {
-            if let Some(id) = msg.pointer("/params/requestId") {
-                in_flight.borrow_mut().cancel(id);
+            if let Some(id) = msg.pointer("/params/requestId")
+                && in_flight.borrow_mut().cancel(id)
+            {
+                // Whatever the call held (a drag's button, a click's
+                // modifiers, keys `hold` pressed) comes up; the release
+                // takes the input lock, so it waits until the aborted call
+                // has let go of it.
+                let server = server.clone();
+                calls.spawn_local(async move {
+                    let _ = server.release_all().await;
+                });
             }
             continue;
         }
@@ -2189,7 +3985,16 @@ where
             break; // the writer stopped: its error is returned below
         }
     }
+    // No answer can come any more: requests still waiting fail now, so the
+    // calls behind them finish, and the writer ends once they did.
+    {
+        let mut link = server.link.borrow_mut();
+        link.out = None;
+        link.pending.clear();
+    }
     while calls.join_next().await.is_some() {}
+    // The client went away: nothing may stay pressed after the server.
+    let _ = server.release_all().await;
     drop(tx);
     writer.await.map_err(|e| e.to_string())?
 }
@@ -2226,11 +4031,15 @@ impl InFlight {
         }
     }
 
-    /// Abort the running call with this id, if any. An unknown or finished id
-    /// is ignored, as the MCP spec asks.
-    fn cancel(&mut self, id: &Json) {
-        if let Some((_, handle)) = self.by_id.remove(&id.to_string()) {
-            handle.abort();
+    /// Abort the running call with this id, if any; true when there was
+    /// one. An unknown or finished id is ignored, as the MCP spec asks.
+    fn cancel(&mut self, id: &Json) -> bool {
+        match self.by_id.remove(&id.to_string()) {
+            Some((_, handle)) => {
+                handle.abort();
+                true
+            }
+            None => false,
         }
     }
 }
@@ -2300,6 +4109,12 @@ mod tests {
         /// The active window (app, title); activate_window picks one of
         /// FAKE_WINDOWS and logs "activate <title>" in `keys`.
         active: Rc<RefCell<(String, String)>>,
+        /// Fed by the tests: user input and the stop shortcut.
+        takeover: std::sync::Arc<takeover::Takeover>,
+        /// Elements other than `focus`, by id. An action on an empty
+        /// "menu" fills it with entry 99 "Opened", as Firefox shows a
+        /// submenu's entries only once it is open.
+        nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
     }
 
     /// Windows on the fake desktop: (app, title).
@@ -2324,6 +4139,14 @@ mod tests {
             &[]
         }
         async fn enable(&self) {}
+        fn takeover(&self) -> Option<std::sync::Arc<takeover::Takeover>> {
+            Some(self.takeover.clone())
+        }
+        async fn indicate(&self, label: &str) {
+            if label.starts_with("paused") || label.starts_with("stopped") {
+                self.keys.borrow_mut().push(format!("indicate {label}"));
+            }
+        }
         async fn list_apps(&self) -> Vec<AppEntry> {
             Vec::new()
         }
@@ -2336,7 +4159,7 @@ mod tests {
         async fn info(&self, id: &u32, _: usize) -> Info<u32> {
             match *id {
                 FAKE_FOCUS => self.focus.borrow().clone(),
-                _ => Info::default(),
+                _ => self.nodes.borrow().get(id).cloned().unwrap_or_default(),
             }
         }
         async fn focused(&self) -> Option<Focused<u32>> {
@@ -2366,6 +4189,14 @@ mod tests {
             self.keys
                 .borrow_mut()
                 .push(format!("action {index} on {id}"));
+            let mut nodes = self.nodes.borrow_mut();
+            if let Some(n) = nodes.get_mut(id)
+                && n.role == "menu"
+                && n.children.is_empty()
+            {
+                n.children = vec![99];
+                nodes.insert(99, fake_node("menu item", "Opened", &[]));
+            }
             Ok(true)
         }
         async fn full_text(&self, _: &u32, _: usize) -> R<String> {
@@ -2420,8 +4251,32 @@ mod tests {
             *self.clipboard.borrow_mut() = text.to_string();
             Ok(())
         }
-        async fn pointer(&self, _: i64, _: i64, _: &str, _: i64, _: i64) -> R<()> {
+        /// Logs clicks and scrolls; fails at x = FAIL_X, and waits at
+        /// x = SLOW_X (for a call to cancel).
+        async fn pointer(&self, x: i64, _: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {
+            if x == FAIL_X {
+                return Err("pointer failed".into());
+            }
+            if x == SLOW_X {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            if clicks > 0 {
+                self.keys
+                    .borrow_mut()
+                    .push(format!("click {button} x{clicks}"));
+            }
+            if scroll != 0 {
+                self.keys.borrow_mut().push(format!("scroll {scroll}"));
+            }
             Ok(())
+        }
+        async fn key(&self, key: &str, down: bool) -> R<()> {
+            let what = if down { "keydown" } else { "keyup" };
+            self.keys.borrow_mut().push(format!("{what} {key}"));
+            Ok(())
+        }
+        async fn cursor_position(&self) -> R<(i64, i64)> {
+            Ok((12, 34))
         }
         async fn move_pointer(&self, x: i64, y: i64) -> R<()> {
             self.keys.borrow_mut().push(format!("move {x},{y}"));
@@ -2489,6 +4344,21 @@ mod tests {
     }
 
     const FAKE_FOCUS: u32 = 7;
+    /// `pointer` at this x fails.
+    const FAIL_X: i64 = 666;
+    /// `pointer` at this x takes 5 s.
+    const SLOW_X: i64 = 777;
+
+    fn fake_node(role: &str, name: &str, kids: &[u32]) -> Info<u32> {
+        Info {
+            role: role.into(),
+            name: name.into(),
+            showing: true,
+            actions: vec!["Press".into()],
+            children: kids.to_vec(),
+            ..Info::default()
+        }
+    }
 
     struct Session {
         stdin: DuplexStream,
@@ -2498,6 +4368,8 @@ mod tests {
         focus_app: Rc<RefCell<String>>,
         field: Rc<RefCell<Option<String>>>,
         active: Rc<RefCell<(String, String)>>,
+        takeover: std::sync::Arc<takeover::Takeover>,
+        nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -2521,7 +4393,13 @@ mod tests {
             FAKE_WINDOWS[1].0.to_string(),
             FAKE_WINDOWS[1].1.to_string(),
         )));
+        let takeover = std::sync::Arc::new(takeover::Takeover::new(
+            Duration::from_millis(1500),
+            Some("meta+alt+esc"),
+        ));
+        let nodes = Rc::new(RefCell::new(HashMap::new()));
         let server = Rc::new(Server::new(FakeBackend {
+            takeover: takeover.clone(),
             allow_file,
             keys: keys.clone(),
             focus: focus.clone(),
@@ -2529,6 +4407,7 @@ mod tests {
             clipboard: RefCell::new(String::new()),
             field: field.clone(),
             active: active.clone(),
+            nodes: nodes.clone(),
         }));
         let (stdin, server_in) = tokio::io::duplex(64 * 1024);
         let (server_out, client_out) = tokio::io::duplex(64 * 1024);
@@ -2541,6 +4420,8 @@ mod tests {
             focus_app,
             field,
             active,
+            takeover,
+            nodes,
         }
     }
 
@@ -2681,6 +4562,192 @@ mod tests {
     }
 
     #[test]
+    fn wait_for_state_needs_the_element_to_have_it() {
+        local(async {
+            let mut s = session("wait-state");
+            let wait = |state: &str, gone: bool| {
+                json!({"app": "fake", "query": "OK", "state": state, "gone": gone,
+                       "timeout_ms": 60})
+            };
+            // The fake's button is enabled, not focused.
+            let r = call_tool(&mut s, 2, "wait_for", wait("enabled", false)).await;
+            assert!(reply_text(&r).starts_with("found after "), "{r}");
+            let r = call_tool(&mut s, 3, "wait_for", wait("focused", false)).await;
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            assert!(
+                reply_text(&r).contains("waiting for 'OK' in 'fake' to be focused"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 4, "wait_for", wait("focused", true)).await;
+            assert!(
+                reply_text(&r).starts_with("no longer focused after "),
+                "{r}"
+            );
+            s.focus.borrow_mut().states = vec!["focused", "checked"];
+            let r = call_tool(&mut s, 5, "wait_for", wait("Checked", false)).await;
+            assert!(reply_text(&r).contains("{focused,checked}"), "{r}");
+            s.focus.borrow_mut().states = vec!["disabled"];
+            let r = call_tool(&mut s, 6, "wait_for", wait("enabled", false)).await;
+            assert!(reply_text(&r).contains("to be enabled"), "{r}");
+            let r = call_tool(&mut s, 7, "wait_for", wait("enabled", true)).await;
+            assert!(
+                reply_text(&r).starts_with("no longer enabled after "),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 8, "wait_for", wait("pressed", false)).await;
+            assert!(reply_text(&r).contains(": unknown state 'pressed'"), "{r}");
+            // Without `state`, as before.
+            let r = call_tool(
+                &mut s,
+                9,
+                "wait_for",
+                json!({"app": "fake", "query": "OK", "gone": true, "timeout_ms": 60}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("waiting for 'OK' in 'fake' to disappear"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn wait_for_window_watches_allowed_windows() {
+        local(async {
+            let mut s = session("wait-window");
+            let r = call_tool(&mut s, 2, "wait_for", json!({"window": "TODO"})).await;
+            let text = reply_text(&r);
+            assert!(text.starts_with("window found after "), "{r}");
+            assert!(text.contains("'todo.txt — Fake' [fake]"), "{r}");
+            // Konsole's window is not an allowed app's.
+            let r = call_tool(
+                &mut s,
+                3,
+                "wait_for",
+                json!({"window": "bash", "timeout_ms": 60}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("waiting for a window of an allowed app matching 'bash' to open"),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "wait_for",
+                json!({"window": "bash", "gone": true}),
+            )
+            .await;
+            assert!(reply_text(&r).starts_with("window gone after "), "{r}");
+            let r = call_tool(
+                &mut s,
+                5,
+                "wait_for",
+                json!({"window": "notes", "app": "konsole"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("is not in"), "{r}");
+            let r = call_tool(
+                &mut s,
+                6,
+                "wait_for",
+                json!({"window": "notes", "query": "OK"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("not both"), "{r}");
+        });
+    }
+
+    #[test]
+    fn wait_idle_returns_once_the_app_stops_changing() {
+        local(async {
+            let mut s = session("wait-idle");
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 50, "timeout_ms": 2000}),
+            )
+            .await;
+            assert!(reply_text(&r).starts_with("idle after "), "{r}");
+            assert!(reply_text(&r).contains("no change for 50 ms"), "{r}");
+            // Renamed on every look: never quiet.
+            let focus = s.focus.clone();
+            let busy = tokio::task::spawn_local(async move {
+                for k in 0..=u32::MAX {
+                    focus.borrow_mut().name = format!("OK {k}");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            let r = call_tool(
+                &mut s,
+                3,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 150, "timeout_ms": 400}),
+            )
+            .await;
+            busy.abort();
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            assert!(reply_text(&r).contains("still changing after "), "{r}");
+            let r = call_tool(&mut s, 4, "wait_idle", json!({"app": "konsole"})).await;
+            assert!(reply_text(&r).contains("is not in"), "{r}");
+        });
+    }
+
+    #[test]
+    fn tree_continuation_repeats_the_call_after_the_last_element() {
+        let a = json!({"app": "Firefox", "document": true, "interactive": true, "max_nodes": 50});
+        assert_eq!(
+            continuation(&a, "firefox", Some(42), 7, false),
+            "… 7 more nodes; continue with tree(app=\"firefox\", document=true, \
+             interactive=true, max_nodes=50, after=42)"
+        );
+        let a = json!({"root_id": 9, "max_chars": 5000});
+        assert_eq!(
+            continuation(&a, "kate", Some(12), 3, true),
+            "… 3+ more nodes; continue with tree(root_id=9, max_chars=5000, after=12)"
+        );
+        assert_eq!(
+            continuation(&a, "kate", Some(12), 0, true),
+            "… more nodes; continue with tree(root_id=9, max_chars=5000, after=12)"
+        );
+        assert_eq!(continuation(&a, "kate", None, 0, true), render::TRUNCATED);
+    }
+
+    #[test]
+    fn tree_with_screenshot_adds_the_active_window_image() {
+        local(async {
+            let mut s = session("tree-shot");
+            let r = call_tool(
+                &mut s,
+                2,
+                "tree",
+                json!({"app": "fake", "screenshot": true}),
+            )
+            .await;
+            let content = r["result"]["content"].as_array().unwrap();
+            assert_eq!(content.len(), 2, "{r}");
+            assert_eq!(content[1]["type"], json!("image"));
+            let text = reply_text(&r);
+            assert!(text.starts_with("fake\n [1] push button \"OK\""), "{r}");
+            assert!(text.contains("\nscreenshot: "), "{r}");
+            // Another app in front: the tree alone, and why.
+            *s.active.borrow_mut() = ("konsole".into(), "~ : bash — Konsole".into());
+            let r = call_tool(
+                &mut s,
+                3,
+                "tree",
+                json!({"app": "fake", "screenshot": true}),
+            )
+            .await;
+            assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1, "{r}");
+            assert!(reply_text(&r).contains("no screenshot: the active window is not fake's"));
+        });
+    }
+
+    #[test]
     fn screenshot_pixels_map_to_scaled_screen_points() {
         // 125 % scaling: a 1920x1080 image of a window at (0,0), 1536x864.
         let map = ShotMap::new((1920, 1080), (0.0, 0.0, 1536.0, 864.0)).unwrap();
@@ -2705,6 +4772,200 @@ mod tests {
             .unwrap()
             .unwrap();
         serde_json::from_str(&line).unwrap()
+    }
+
+    /// The fake window as a KDE app with its menu bar hidden behind a
+    /// hamburger button: File (Qt-style popup, entries in the tree while
+    /// closed) and Tools (Firefox-style, empty until opened).
+    fn fake_menus(s: &Session) {
+        *s.focus.borrow_mut() = Info {
+            role: "frame".into(),
+            name: "notes.txt — Fake".into(),
+            showing: true,
+            states: vec!["active"],
+            children: vec![20],
+            ..Info::default()
+        };
+        let mut n = s.nodes.borrow_mut();
+        let mut bar = fake_node("menu bar", "", &[21, 30]);
+        bar.showing = false;
+        bar.actions.clear();
+        n.insert(20, bar);
+        let mut file = fake_node("menu item", "&File", &[22]);
+        file.actions = vec!["Show Menu".into()];
+        n.insert(21, file);
+        n.insert(22, fake_node("popup menu", "", &[23, 28, 24, 25]));
+        n.insert(23, fake_node("menu item", "Save As…", &[]));
+        n.insert(28, fake_node("separator", "", &[]));
+        let mut quit = fake_node("menu item", "Quit", &[]);
+        quit.states = vec!["disabled"];
+        n.insert(24, quit);
+        let mut recent = fake_node("menu item", "Open Recent", &[26]);
+        recent.actions = vec!["Show Menu".into()];
+        n.insert(25, recent);
+        n.insert(26, fake_node("popup menu", "", &[27]));
+        n.insert(27, fake_node("menu item", "a.txt", &[]));
+        let mut tools = fake_node("menu", "Tools", &[]);
+        tools.actions = vec!["click".into()];
+        n.insert(30, tools);
+    }
+
+    #[test]
+    fn menu_lists_and_invokes_entries_by_path() {
+        local(async {
+            let mut s = session("menu");
+            fake_menus(&s);
+            let r = call_tool(&mut s, 2, "menu", json!({"app": "fake"})).await;
+            let text = reply_text(&r).to_string();
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(text.starts_with("fake's menu bar (hidden"), "{text}");
+            assert!(text.contains("[1] menu item \"&File\" (submenu)"), "{text}");
+            assert!(text.contains("[2] menu \"Tools\" (submenu)"), "{text}");
+            let r = call_tool(
+                &mut s,
+                3,
+                "menu",
+                json!({"app": "fake", "path": "file > SAVE AS"}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "\"&File > Save As…\" -> ok; effect: no visible change",
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 23");
+            let r = call_tool(
+                &mut s,
+                4,
+                "menu",
+                json!({"app": "fake", "path": ["File", "recent"]}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(text.starts_with("\"&File > Open Recent\":\n"), "{text}");
+            assert!(text.contains("menu item \"a.txt\""), "{text}");
+            let r = call_tool(
+                &mut s,
+                5,
+                "menu",
+                json!({"app": "fake", "path": "File > Quit"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("is disabled"), "{r}");
+            let r = call_tool(
+                &mut s,
+                6,
+                "menu",
+                json!({"app": "fake", "path": "File > Print"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("there are: \"Save As…\", \"Quit\", \"Open Recent\""),
+                "{r}"
+            );
+            let before = s.keys.borrow().len();
+            // Tools has no entries until opened: opened, then the entry runs.
+            let r = call_tool(
+                &mut s,
+                7,
+                "menu",
+                json!({"app": "fake", "path": "Tools > Opened"}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "\"Tools > Opened\" -> ok; effect: no visible change",
+                "{r}"
+            );
+            assert_eq!(
+                s.keys.borrow()[before..].to_vec(),
+                vec!["action 0 on 30".to_string(), "action 0 on 99".to_string()]
+            );
+            let r = call_tool(&mut s, 8, "menu", json!({"app": "evil"})).await;
+            assert!(reply_text(&r).contains("is not in"), "{r}");
+        });
+    }
+
+    #[test]
+    fn close_window_names_one_window_and_needs_confirmation() {
+        local(async {
+            let mut s = session("close");
+            let r = call_tool(&mut s, 2, "close_window", json!({"query": "fake"})).await;
+            assert!(reply_text(&r).contains("2 windows match 'fake'"), "{r}");
+            let r = call_tool(&mut s, 3, "close_window", json!({"query": "konsole"})).await;
+            assert!(
+                reply_text(&r).contains("no window of an allowed app"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 4, "close_window", json!({"query": "notes"})).await;
+            let text = reply_text(&r);
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                text.contains("close_window on fake {\"query\":\"notes\"}")
+                    && text.contains("unsaved work")
+                    && text.contains("confirm: true"),
+                "{text}"
+            );
+            // Confirmed: it reaches the backend, which has no window control.
+            let r = call_tool(
+                &mut s,
+                5,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            assert!(reply_text(&r).contains(backend::NO_WINDOW_CONTROL), "{r}");
+            assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn windows_lines_show_desktops() {
+        let mut w = WindowGeo {
+            title: "a".into(),
+            app: "kate".into(),
+            output: "eDP-1".into(),
+            desktops: vec!["2".into()],
+            ..WindowGeo::default()
+        };
+        assert!(describe_window(&w).ends_with(" on eDP-1, desktop 2"));
+        w.desktops = vec!["all".into()];
+        assert!(describe_window(&w).ends_with(", all desktops"));
+        w.desktops = vec!["1".into(), "3".into()];
+        assert!(describe_window(&w).ends_with(", desktops 1,3"));
+        let d = |number, name: &str, current, output: &str| backend::Desktop {
+            number,
+            name: name.into(),
+            current,
+            output: output.into(),
+        };
+        assert_eq!(
+            desktops_line(&[d(1, "Masaüstü 1", true, ""), d(2, "2", false, "")]),
+            "desktops: 1 'Masaüstü 1' (current), 2"
+        );
+        assert_eq!(
+            desktops_line(&[d(1, "1", true, "DP-1"), d(5, "mail", false, "DP-1")]),
+            "workspaces: 1 (shown on DP-1), 5 'mail' (on DP-1)"
+        );
+        assert_eq!(
+            desktops_line(&[d(0, "mail", true, "DP-1")]),
+            "workspaces: 'mail' (shown on DP-1)"
+        );
+        assert_eq!(
+            desktop_arg(&json!({"desktop": 2})).unwrap(),
+            Some("2".into())
+        );
+        assert_eq!(
+            desktop_arg(&json!({"desktop": " Web "})).unwrap(),
+            Some("Web".into())
+        );
+        assert_eq!(desktop_arg(&json!({})).unwrap(), None);
+        assert!(desktop_arg(&json!({"desktop": true})).is_err());
+        let names = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(menu_action(&names(&["Show Menu", "Press"])), Some(1));
+        assert_eq!(menu_action(&names(&["<Alt>D;"])), Some(0));
+        assert_eq!(menu_action(&[]), None);
     }
 
     #[test]
@@ -3000,6 +5261,161 @@ mod tests {
     }
 
     #[test]
+    fn a_zoomed_screenshot_is_a_full_resolution_crop_and_clickable() {
+        local(async {
+            let mut s = session("zoom");
+            let r = call_tool(&mut s, 2, "screenshot", json!({"region": [0, 0, 5, 5]})).await;
+            assert!(
+                reply_text(&r).contains("needs a screenshot taken first"),
+                "{r}"
+            );
+            // 100x50 of the 400x200 area at (10, 20): 4 screen px per pixel.
+            call_tool(&mut s, 3, "screenshot", json!({"max_size": 100})).await;
+            // Pixels (25, 10)-(35, 15) are screen (110, 60), 40x20: the
+            // 2x capture's pixels (50, 20)-(70, 30), sent as they are.
+            let r = call_tool(&mut s, 4, "screenshot", json!({"region": [25, 10, 10, 5]})).await;
+            let content = &r["result"]["content"];
+            let text = content[0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("20x10 px of screen area at (110,60), 40x20 (zoom of region"),
+                "{text}"
+            );
+            assert_eq!(content[1]["type"], "image", "{r}");
+            let path = text.lines().next().unwrap();
+            let img = shot::read_png(path).unwrap();
+            assert_eq!((img.width, img.height), (20, 10));
+            // image_x/image_y now map through the zoom: 2 screen px each.
+            let r = call_tool(&mut s, 5, "mouse", json!({"image_x": 5, "image_y": 5})).await;
+            assert!(
+                reply_text(&r).starts_with("pointer at (121,71) in fake"),
+                "{r}"
+            );
+            // A region is read in the zoomed image's pixels; it may reach
+            // past that image, into the rest of the window.
+            let r = call_tool(&mut s, 6, "screenshot", json!({"region": [10, 5, 50, 50]})).await;
+            assert!(
+                reply_text(&r).contains("50x50 px of screen area at (130,70), 100x100"),
+                "{r}"
+            );
+            // Off the window: refused, and the last map is gone with it.
+            let r = call_tool(&mut s, 7, "screenshot", json!({"region": [500, 0, 5, 5]})).await;
+            assert!(reply_text(&r).contains("outside the active window"), "{r}");
+            for bad in [json!([1, 2, 3]), json!([0, 0, 0, 5]), json!("x")] {
+                let r = call_tool(&mut s, 8, "screenshot", json!({ "region": bad })).await;
+                assert!(reply_text(&r).contains("region must be"), "{r}");
+            }
+            let _ = std::fs::remove_file(path);
+        });
+    }
+
+    #[test]
+    fn region_maps_back_to_the_capture_it_lies_in() {
+        let map = ShotMap::new((100, 50), (10.0, 20.0, 400.0, 200.0)).unwrap();
+        let want = map.area_of((25.0, 10.0, 10.0, 5.0));
+        assert_eq!(want, (110.0, 60.0, 40.0, 20.0));
+        let f = region_frac((10.0, 20.0, 400.0, 200.0), want).unwrap();
+        assert_eq!(
+            (f.x, f.y, f.w, f.h),
+            (0.25, 0.2, 0.1, 0.1),
+            "fractions of the capture"
+        );
+        // Clipped to the capture; outside it: None.
+        let f = region_frac((0.0, 0.0, 100.0, 100.0), (90.0, -10.0, 20.0, 20.0)).unwrap();
+        assert_eq!((f.x, f.y, f.w, f.h), (0.9, 0.0, 0.1, 0.1));
+        assert_eq!(
+            region_frac((0.0, 0.0, 100.0, 100.0), (100.0, 0.0, 5.0, 5.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn effect_names_window_focus_and_event_changes() {
+        let fp = |window: Option<(&str, &str)>, focus: Option<&str>| Fingerprint {
+            window: window.map(|(a, t)| (a.to_string(), t.to_string())),
+            focus: focus.map(|n| (1u32, "push button".to_string(), n.to_string(), vec![])),
+        };
+        let allowed = |app: &str| app != "secret";
+        let kate = Some(("kate", "a.txt — Kate"));
+        let before = fp(kate, Some("OK"));
+        let effect =
+            |after: &Fingerprint<u32>, events| effect_text(&before, after, events, allowed);
+        assert_eq!(effect(&fp(kate, Some("OK")), None), "no visible change");
+        assert_eq!(
+            effect(&fp(kate, Some("OK")), Some(false)),
+            "no visible change"
+        );
+        assert_eq!(effect(&fp(kate, Some("OK")), Some(true)), "changed");
+        assert_eq!(effect(&fp(kate, Some("Cancel")), Some(false)), "changed");
+        assert_eq!(
+            effect(&fp(Some(("kate", "Save As — Kate")), None), None),
+            "changed (window title now 'Save As — Kate')"
+        );
+        assert_eq!(
+            effect(&fp(Some(("dolphin", "Home")), None), None),
+            "window changed to 'Home'"
+        );
+        // Titles of windows of apps not allowed are not shown.
+        assert_eq!(
+            effect(&fp(Some(("secret", "Bank — Secret")), None), None),
+            "window changed to one of 'secret' (not allowed)"
+        );
+        assert_eq!(
+            effect(&fp(None, None), None),
+            "window changed (none active now)"
+        );
+    }
+
+    #[test]
+    fn observe_adds_a_view_after_the_input() {
+        local(async {
+            let mut s = session("observe");
+            let r = call_tool(
+                &mut s,
+                2,
+                "click",
+                json!({"app": "fake", "query": "OK", "observe": "screenshot", "settle_ms": 0}),
+            )
+            .await;
+            let content = &r["result"]["content"];
+            let text = content[0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(
+                    "[1] push button \"OK\": clicked left x1 at 0,0; effect: no visible change\n"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains("200x100 px of screen area at (10,20)"),
+                "{text}"
+            );
+            assert_eq!(content[1]["type"], "image", "{r}");
+            let _ = std::fs::remove_file(text.lines().nth(1).unwrap());
+            let r = call_tool(&mut s, 3, "act", json!({"id": 1, "observe": "focus"})).await;
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change\nfocus: [1] push button \"OK\"",
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "mouse",
+                json!({"x": 1, "y": 2, "observe": "tree"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r)
+                    .starts_with("pointer at (1,2) in fake; effect: no visible change\nfake"),
+                "{r}"
+            );
+            // A bad value fails before any input.
+            let r = call_tool(&mut s, 5, "key", json!({"combo": "a", "observe": "all"})).await;
+            assert!(reply_text(&r).contains("observe 'all': use one of"), "{r}");
+            assert!(s.keys.borrow().iter().all(|k| !k.contains("down a")));
+        });
+    }
+
+    #[test]
     fn clipboard_round_trips_and_needs_an_allowed_window() {
         local(async {
             let mut s = session("clipboard");
@@ -3048,7 +5464,7 @@ mod tests {
                 "{text}"
             );
             assert!(
-                text.ends_with("(not an editable field: check where the text went)"),
+                text.contains("(not an editable field: check where the text went)"),
                 "{text}"
             );
             let r = call_tool(&mut s, 3, "key", json!({"combo": "a"})).await;
@@ -3065,6 +5481,261 @@ mod tests {
         assert!(written_matches("", ""));
         assert!(!written_matches("hello world", "hello"));
         assert!(!written_matches("Ahmet", "ahmet"));
+    }
+
+    fn log(s: &Session) -> Vec<String> {
+        s.keys.borrow().clone()
+    }
+
+    #[test]
+    fn modifiers_go_down_before_the_click_and_up_after_it_in_reverse() {
+        local(async {
+            let mut s = session("modifiers");
+            let r = call_tool(
+                &mut s,
+                2,
+                "mouse",
+                json!({"x": 5, "y": 5, "button": "middle", "clicks": 3,
+                       "modifiers": ["ctrl", "Shift"]}),
+            )
+            .await;
+            assert_eq!(reply_text(&r), "pointer at (5,5) in fake with ctrl+shift");
+            assert_eq!(
+                log(&s),
+                [
+                    "keydown ctrl",
+                    "keydown shift",
+                    "click middle x3",
+                    "keyup shift",
+                    "keyup ctrl"
+                ]
+            );
+            s.keys.borrow_mut().clear();
+            // A chord string works too; scroll and click take them as well.
+            let r = call_tool(
+                &mut s,
+                3,
+                "scroll",
+                json!({"app": "fake", "query": "OK", "amount": 2, "modifiers": "control"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).ends_with("scrolled 2 at 0,0 with ctrl"),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "click",
+                json!({"app": "fake", "query": "OK", "modifiers": ["alt"]}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).ends_with("clicked left x1 at 0,0 with alt"),
+                "{r}"
+            );
+            assert_eq!(
+                log(&s),
+                [
+                    "keydown ctrl",
+                    "scroll 2",
+                    "keyup ctrl",
+                    "keydown alt",
+                    "click left x1",
+                    "keyup alt"
+                ]
+            );
+            // Anything but ctrl/shift/alt/meta fails before any input.
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                5,
+                "mouse",
+                json!({"x": 5, "y": 5, "modifiers": ["ctrl", "a"]}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("unknown modifier 'a'"), "{r}");
+            assert!(log(&s).is_empty(), "{:?}", log(&s));
+        });
+    }
+
+    #[test]
+    fn modifiers_are_parsed_from_lists_and_chords() {
+        assert_eq!(modifiers_arg(&json!({})), Ok(vec![]));
+        assert_eq!(
+            modifiers_arg(&json!({"modifiers": ["Control", "win", "ctrl"]})),
+            Ok(vec!["ctrl".to_string(), "meta".to_string()])
+        );
+        assert_eq!(
+            modifiers_arg(&json!({"modifiers": "shift+alt"})),
+            Ok(vec!["shift".to_string(), "alt".to_string()])
+        );
+        assert!(modifiers_arg(&json!({"modifiers": [1]})).is_err());
+        assert!(modifiers_arg(&json!({"modifiers": ["enter"]})).is_err());
+    }
+
+    #[test]
+    fn held_keys_and_buttons_are_listed_and_left_alone() {
+        local(async {
+            let mut s = session("hold");
+            let r = call_tool(&mut s, 2, "hold", json!({"key": "shift"})).await;
+            assert_eq!(reply_text(&r), "holding shift in fake; held: shift");
+            let r = call_tool(&mut s, 3, "hold", json!({"button": "left"})).await;
+            assert_eq!(reply_text(&r), "holding left in fake; held: shift, left");
+            // A held modifier is not pressed or released again by a click,
+            // nor a held key by a chord.
+            let r = call_tool(
+                &mut s,
+                4,
+                "mouse",
+                json!({"x": 1, "y": 1, "button": "right", "modifiers": ["shift", "ctrl"]}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "pointer at (1,1) in fake with shift+ctrl; held: shift, left"
+            );
+            let r = call_tool(&mut s, 5, "key", json!({"combo": "shift+a"})).await;
+            assert!(reply_text(&r).starts_with("sent shift+a x1 to fake"), "{r}");
+            assert!(reply_text(&r).ends_with("; held: shift, left"), "{r}");
+            // Moving with the button held drags; read-only tools say it too.
+            let r = call_tool(&mut s, 6, "mouse", json!({"x": 9, "y": 9, "clicks": 0})).await;
+            assert_eq!(
+                reply_text(&r),
+                "pointer at (9,9) in fake; held: shift, left"
+            );
+            let r = call_tool(&mut s, 7, "cursor_position", json!({})).await;
+            assert_eq!(reply_text(&r), "cursor at (12,34); held: shift, left");
+            let r = call_tool(&mut s, 8, "hold", json!({"key": "shift", "down": false})).await;
+            assert_eq!(reply_text(&r), "released shift; held: left");
+            let r = call_tool(&mut s, 9, "hold", json!({"down": false})).await;
+            assert_eq!(reply_text(&r), "released left; nothing held");
+            let r = call_tool(&mut s, 10, "hold", json!({"down": false})).await;
+            assert_eq!(reply_text(&r), "nothing was held");
+            assert_eq!(
+                log(&s),
+                [
+                    "keydown shift",
+                    "press left",
+                    "keydown ctrl",
+                    "click right x1",
+                    "keyup ctrl",
+                    "down a",
+                    "up a",
+                    "keyup shift",
+                    "release left"
+                ]
+            );
+        });
+    }
+
+    #[test]
+    fn hold_presses_only_into_an_allowed_window_but_always_releases() {
+        local(async {
+            let mut s = session("hold-allow");
+            let r = call_tool(&mut s, 2, "hold", json!({"key": "ctrl+alt"})).await;
+            assert_eq!(reply_text(&r), "holding ctrl+alt in fake; held: ctrl, alt");
+            set_active(&s, 0);
+            let r = call_tool(&mut s, 3, "hold", json!({"key": "meta"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            // The failure released what was held.
+            assert!(reply_text(&r).ends_with("; released alt, ctrl"), "{r}");
+            let r = call_tool(&mut s, 4, "hold", json!({"key": "alt", "down": false})).await;
+            assert_eq!(reply_text(&r), "released alt; nothing held");
+            assert_eq!(
+                log(&s),
+                [
+                    "keydown ctrl",
+                    "keydown alt",
+                    "keyup alt",
+                    "keyup ctrl",
+                    "keyup alt"
+                ]
+            );
+            for bad in [
+                json!({}),
+                json!({"key": "a", "button": "left"}),
+                json!({"button": "x"}),
+            ] {
+                let r = call_tool(&mut s, 5, "hold", bad).await;
+                assert_eq!(r["result"]["isError"], true, "{r}");
+            }
+        });
+    }
+
+    #[test]
+    fn a_failed_call_releases_its_modifiers_and_everything_held() {
+        local(async {
+            let mut s = session("hold-fail");
+            call_tool(&mut s, 2, "hold", json!({"key": "ctrl"})).await;
+            let r = call_tool(
+                &mut s,
+                3,
+                "mouse",
+                json!({"x": FAIL_X, "y": 0, "modifiers": ["alt"]}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "Error executing tool mouse: pointer failed; released ctrl"
+            );
+            assert_eq!(
+                log(&s),
+                ["keydown ctrl", "keydown alt", "keyup alt", "keyup ctrl"]
+            );
+            // Clicking a held button would release it: refused, and the
+            // failure releases it.
+            call_tool(&mut s, 4, "hold", json!({"button": "left"})).await;
+            let r = call_tool(&mut s, 5, "mouse", json!({"x": 1, "y": 1})).await;
+            assert!(
+                reply_text(&r).contains("the left button is held; release it with hold"),
+                "{r}"
+            );
+            assert!(reply_text(&r).ends_with("; released left"), "{r}");
+            let r = call_tool(&mut s, 6, "cursor_position", json!({})).await;
+            assert_eq!(reply_text(&r), "cursor at (12,34)");
+        });
+    }
+
+    #[test]
+    fn a_cancelled_call_leaves_nothing_held() {
+        local(async {
+            let mut s = session("hold-cancel");
+            call_tool(&mut s, 2, "hold", json!({"key": "shift"})).await;
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+                    "name": "mouse",
+                    "arguments": {"x": SLOW_X, "y": 0, "modifiers": ["ctrl"]}}}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            assert_eq!(log(&s), ["keydown shift", "keydown ctrl"]);
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                       "params": {"requestId": 3}}),
+            )
+            .await;
+            let r = call_tool(&mut s, 4, "cursor_position", json!({})).await;
+            assert_eq!(r["id"], 4, "{r}");
+            assert_eq!(reply_text(&r), "cursor at (12,34)");
+            assert_eq!(
+                log(&s),
+                ["keydown shift", "keydown ctrl", "keyup ctrl", "keyup shift"]
+            );
+        });
+    }
+
+    #[test]
+    fn end_of_input_releases_what_is_held() {
+        local(async {
+            let mut s = session("hold-eof");
+            call_tool(&mut s, 2, "hold", json!({"button": "right"})).await;
+            drop(std::mem::replace(&mut s.stdin, tokio::io::duplex(1).0));
+            replies_within(&mut s, Duration::from_secs(1)).await;
+            assert_eq!(log(&s), ["press right", "release right"]);
+        });
     }
 
     #[test]
@@ -3204,7 +5875,7 @@ mod tests {
             ]
         };
         let file = PathBuf::from("/home/u/.config/desktop-mcp/allow.txt");
-        let allow = vec!["firefox".to_string()];
+        let allow = Policy::parse("firefox");
         assert_eq!(
             apps_text(list(), &allow, &file, "restart note"),
             "Firefox (allowed)\n  - frame: 'Page — Mozilla Firefox' [active]\n\
@@ -3223,7 +5894,7 @@ mod tests {
         );
         // Nothing allowed: where the allowlist is, and the note.
         assert_eq!(
-            apps_text(list(), &[], &file, "restart note"),
+            apps_text(list(), &Policy::default(), &file, "restart note"),
             "blocked: kwin, konsole, Firefox [active], plasmashell\n\
              no allowed app has a window; allowlist file: \
              /home/u/.config/desktop-mcp/allow.txt\nrestart note"
@@ -3284,7 +5955,11 @@ mod tests {
             let mut s = session("fresh");
             let id = focus_id(&mut s, 2).await;
             let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
-            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change",
+                "{r}"
+            );
             assert_eq!(actions_run(&s), 1);
         });
     }
@@ -3336,7 +6011,11 @@ mod tests {
             let entry = focus_id(&mut s, 2).await;
             s.focus.borrow_mut().name = "Search: rust".into();
             let r = call_tool(&mut s, 3, "act", json!({"id": entry})).await;
-            assert_eq!(reply_text(&r), "Activate -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Activate -> ok; effect: no visible change",
+                "{r}"
+            );
             // An unnamed element may gain a name; its role still counts.
             *s.focus.borrow_mut() = Info {
                 role: "push button".into(),
@@ -3346,7 +6025,11 @@ mod tests {
             let unnamed = focus_id(&mut s, 4).await;
             s.focus.borrow_mut().name = "Play".into();
             let r = call_tool(&mut s, 5, "act", json!({"id": unnamed})).await;
-            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change",
+                "{r}"
+            );
             assert_eq!(actions_run(&s), 2);
         });
     }
@@ -3377,7 +6060,11 @@ mod tests {
             *s.focus_app.borrow_mut() = "Fake".into();
             let id = focus_id(&mut s, 3).await;
             let r = call_tool(&mut s, 4, "act", json!({"id": id})).await;
-            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change",
+                "{r}"
+            );
         });
     }
 
@@ -3468,11 +6155,16 @@ mod tests {
             let lines: Vec<&str> = reply_text(&r).lines().collect();
             assert_eq!(lines.len(), 5, "{r}");
             let found = printed_ids(lines[0].strip_prefix("[1] find: ").unwrap())[0];
-            assert_eq!(lines[1], "[2] act: Press -> ok", "{r}");
+            assert_eq!(
+                lines[1], "[2] act: Press -> ok; effect: no visible change",
+                "{r}"
+            );
             // The query picked the same element, under the same id.
             assert_eq!(
                 lines[3],
-                format!("[4] act: [{found}] push button \"OK\": Press -> ok"),
+                format!(
+                    "[4] act: [{found}] push button \"OK\": Press -> ok; effect: no visible change"
+                ),
                 "{r}"
             );
             assert!(lines[4].starts_with("[5] get_text: "), "{r}");
@@ -3553,7 +6245,11 @@ mod tests {
             let r = call_tool(&mut s, 6, "act", json!({"id": first[0]})).await;
             assert!(reply_text(&r).contains(": stale id"), "{r}");
             let r = call_tool(&mut s, 7, "act", json!({"id": renamed[0]})).await;
-            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change",
+                "{r}"
+            );
             // A volatile name may change and keep the id.
             *s.focus.borrow_mut() = Info {
                 role: "entry".into(),
@@ -3618,6 +6314,421 @@ mod tests {
             let r = call_tool(&mut s, 3, "key", json!({"combo": "c"})).await;
             assert_eq!(r["id"], 3, "{r}");
             assert_eq!(*s.keys.borrow(), ["down a", "up a", "down c", "up c"]);
+        });
+    }
+    #[test]
+    fn input_pauses_while_the_user_is_active_and_reads_go_on() {
+        local(async {
+            let mut s = session("takeover-pause");
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Keyboard);
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("paused: the user is using the keyboard"),
+                "{text}"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                ["indicate paused while you use the keyboard"]
+            );
+            // Reading and the clipboard are not held up.
+            let r = call_tool(&mut s, 3, "find", json!({"app": "fake", "query": "OK"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            let r = call_tool(&mut s, 4, "clipboard_set", json!({"text": "x"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            // Once the window passed, input goes through.
+            let mut s = session("takeover-pause-2");
+            s.takeover.user_input(
+                Instant::now() - Duration::from_millis(1600),
+                takeover::Device::Keyboard,
+            );
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+        });
+    }
+
+    #[test]
+    fn the_stop_shortcut_holds_until_activate_window() {
+        local(async {
+            let mut s = session("takeover-stop");
+            s.takeover.stop();
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert!(
+                reply_text(&r).contains("stopped by the user (Meta+Alt+Esc)"),
+                "{r}"
+            );
+            // A batch step cannot resume.
+            let steps = json!({"steps": [
+                {"tool": "activate_window", "args": {"query": "todo"}},
+                {"tool": "key", "args": {"combo": "b"}},
+            ]});
+            let r = call_tool(&mut s, 3, "batch", steps).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("[1] activate_window failed: stopped by the user")
+                    && text.contains("1 step(s) not run"),
+                "{text}"
+            );
+            // Neither does `window` on an input tool.
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "c", "window": "todo"})).await;
+            assert!(reply_text(&r).contains("stopped by the user"), "{r}");
+            assert!(
+                s.keys
+                    .borrow()
+                    .iter()
+                    .all(|k| k.starts_with("indicate stopped")),
+                "{:?}",
+                s.keys.borrow()
+            );
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 5, "activate_window", json!({"query": "todo"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert!(
+                reply_text(&r).starts_with("resumed after the user's stop; "),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "d"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert_eq!(
+                *s.keys.borrow(),
+                ["activate todo.txt — Fake", "down d", "up d"]
+            );
+        });
+    }
+
+    #[test]
+    fn user_input_during_a_batch_stops_its_remaining_input() {
+        local(async {
+            let mut s = session("takeover-batch");
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                t.user_input(Instant::now(), takeover::Device::Pointer);
+            });
+            let steps = json!({"steps": [
+                {"tool": "key", "args": {"combo": "a"}},
+                {"tool": "pause", "args": {"ms": 300}},
+                {"tool": "key", "args": {"combo": "b"}},
+                {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+            ]});
+            let r = call_tool(&mut s, 2, "batch", steps).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("[3] key failed: interrupted: the user started using the mouse")
+                    && text.contains("stopped; 1 step(s) not run"),
+                "{text}"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                ["down a", "up a", "indicate paused while you use the mouse"]
+            );
+        });
+    }
+
+    #[test]
+    fn the_stop_shortcut_ends_a_drag_and_releases_the_button() {
+        local(async {
+            let mut s = session("takeover-drag");
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                t.stop();
+            });
+            let r = call_tool(
+                &mut s,
+                2,
+                "drag",
+                json!({"from_x": 0, "from_y": 0, "to_x": 120, "to_y": 60}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("stopped by the user"), "{r}");
+            let log = s.keys.borrow().clone();
+            assert_eq!(log[..2], ["move 0,0", "press left"]);
+            assert_eq!(log.last().unwrap(), "release left", "{log:?}");
+            assert!(log.len() < 2 + DRAG_STEPS as usize + 1, "{log:?}");
+        });
+    }
+
+    /// Replace the allowlist of the session made by `session(name)`.
+    fn set_allow(name: &str, text: &str) {
+        let file = std::env::temp_dir().join(format!(
+            "desktop-mcp-test-{}-{name}.txt",
+            std::process::id()
+        ));
+        std::fs::write(file, text).unwrap();
+    }
+
+    /// One call of each tool class against the fake app, by tool name.
+    fn tier_calls() -> Vec<(&'static str, Json)> {
+        vec![
+            ("tree", json!({"app": "fake"})),
+            ("find", json!({"app": "fake", "query": "OK"})),
+            ("get_text", json!({"app": "fake", "query": "OK"})),
+            ("screenshot", json!({"inline": false})),
+            ("clipboard_get", json!({})),
+            ("act", json!({"app": "fake", "query": "OK"})),
+            ("click", json!({"app": "fake", "query": "OK"})),
+            ("focus", json!({"app": "fake", "query": "OK"})),
+            ("scroll", json!({"app": "fake", "query": "OK"})),
+            ("mouse", json!({"x": 1, "y": 2})),
+            (
+                "drag",
+                json!({"from_x": 0, "from_y": 0, "to_x": 5, "to_y": 5}),
+            ),
+            ("key", json!({"combo": "a"})),
+            ("type_text", json!({"text": "hi"})),
+            (
+                "set_text",
+                json!({"app": "fake", "query": "OK", "text": "x"}),
+            ),
+            ("clipboard_set", json!({"text": "x"})),
+        ]
+    }
+
+    #[test]
+    fn tiers_limit_each_tool_class() {
+        let view = ["tree", "find", "get_text", "screenshot", "clipboard_get"];
+        let click = ["act", "click", "focus", "scroll", "mouse", "drag"];
+        for (tier, ok) in [
+            ("view", view.to_vec()),
+            ("click", [&view[..], &click[..]].concat()),
+            ("full", Vec::new()),
+        ] {
+            local(async move {
+                let name = format!("tier-{tier}");
+                let mut s = session(&name);
+                set_allow(&name, &format!("fake:{tier}\n"));
+                for (i, (tool, args)) in tier_calls().into_iter().enumerate() {
+                    let r = call_tool(&mut s, 10 + i as u64, tool, args).await;
+                    let text = reply_text(&r);
+                    let refused = text.contains("needs the");
+                    if tier == "full" || ok.contains(&tool) {
+                        assert!(!refused, "{tier}: {tool} refused: {text}");
+                    } else {
+                        assert!(refused, "{tier}: {tool} not refused: {text}");
+                        assert!(
+                            text.contains(&format!("'fake' is allowed with the {tier} tier")),
+                            "{text}"
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn a_view_tier_app_gets_no_input_and_nothing_is_sent() {
+        local(async {
+            let mut s = session("tier-input");
+            set_allow("tier-input", "fake:view\nkonsole\n");
+            let r = call_tool(&mut s, 2, "type_text", json!({"text": "rm -rf ~"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains("type_text needs the full tier"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "enter"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // A batch step is checked like a call of its own.
+            let r = call_tool(
+                &mut s,
+                4,
+                "batch",
+                json!({"steps": [{"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                                  {"tool": "act", "args": {"id": "$1"}}]}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("act needs the click tier"), "{r}");
+            assert_eq!(actions_run(&s), 0);
+            // apps says which tier an app has.
+            assert!(policy::Policy::parse("fake:view").tier("fake") == Some(Tier::View));
+        });
+    }
+
+    #[test]
+    fn password_fields_are_not_read_or_filled() {
+        local(async {
+            let mut s = session("password");
+            *s.focus.borrow_mut() = Info {
+                role: "password text".into(),
+                name: "Password".into(),
+                showing: true,
+                states: vec!["focused", "editable"],
+                text: Some("hunter2".into()),
+                ..Info::default()
+            };
+            let r = call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "pass"})).await;
+            assert!(!reply_text(&r).contains("hunter2"), "{r}");
+            let r = call_tool(
+                &mut s,
+                3,
+                "get_text",
+                json!({"app": "fake", "query": "Password"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("never read"), "{r}");
+            let r = call_tool(
+                &mut s,
+                4,
+                "set_text",
+                json!({"app": "fake", "query": "Password", "text": "x"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("set_text refused"), "{r}");
+            let r = call_tool(&mut s, 5, "type_text", json!({"text": "x"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("type_text refused"), "{r}");
+            // The user's opt-in for this app.
+            set_allow("password", "fake\npasswords: fake\n");
+            let r = call_tool(
+                &mut s,
+                6,
+                "set_text",
+                json!({"app": "fake", "query": "Password", "text": "x"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("cannot be read back"), "{r}");
+            let r = call_tool(&mut s, 7, "type_text", json!({"text": "x"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            // Still never read.
+            let r = call_tool(
+                &mut s,
+                8,
+                "get_text",
+                json!({"app": "fake", "query": "Password"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    #[test]
+    fn confirm_needs_confirm_true_without_elicitation() {
+        local(async {
+            let mut s = session("confirm-arg");
+            set_allow("confirm-arg", "fake\nconfirm: key:fake, tree\n");
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("confirm: true"), "{r}");
+            assert!(s.keys.borrow().is_empty());
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "a", "confirm": true})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert_eq!(*s.keys.borrow(), ["down a", "up a"]);
+            // Other tools and apps are not asked about.
+            let r = call_tool(&mut s, 4, "find", json!({"app": "fake", "query": "OK"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            // A tool that reaches no app through permit.
+            let r = call_tool(&mut s, 5, "tree", json!({"app": "fake"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    /// The next message the server writes.
+    async fn next(s: &mut Session) -> Json {
+        let line = tokio::time::timeout(Duration::from_secs(2), s.stdout.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    #[test]
+    fn confirm_asks_the_user_through_elicitation() {
+        local(async {
+            let mut s = session("elicit");
+            set_allow("elicit", "fake\nconfirm: key:fake\n");
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"elicitation": {}},
+                    "clientInfo": {"name": "test", "version": "0"}}}),
+            )
+            .await;
+            let init = replies_within(&mut s, Duration::from_millis(200)).await;
+            assert_eq!(ids(&init), vec![json!(1)]);
+            for (call, answer, pressed) in [
+                (
+                    2,
+                    json!({"action": "accept", "content": {"confirm": true}}),
+                    true,
+                ),
+                (3, json!({"action": "decline"}), false),
+                (
+                    4,
+                    json!({"action": "accept", "content": {"confirm": false}}),
+                    false,
+                ),
+                (5, json!({"action": "cancel"}), false),
+            ] {
+                s.keys.borrow_mut().clear();
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": call, "method": "tools/call",
+                    "params": {"name": "key", "arguments": {"combo": "enter", "confirm": true}}}),
+                )
+                .await;
+                let ask = next(&mut s).await;
+                assert_eq!(ask["method"], "elicitation/create", "{ask}");
+                let message = ask["params"]["message"].as_str().unwrap();
+                assert!(
+                    message.contains("key on fake {\"combo\":\"enter\"}"),
+                    "{message}"
+                );
+                assert!(s.keys.borrow().is_empty(), "sent before the answer");
+                // Other messages are answered while the user decides.
+                send(&mut s, ping(100 + call)).await;
+                assert_eq!(next(&mut s).await["id"], 100 + call);
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": ask["id"], "result": answer}),
+                )
+                .await;
+                let r = next(&mut s).await;
+                assert_eq!(r["id"], call, "{r}");
+                assert_eq!(r["result"]["isError"], !pressed, "{r}");
+                assert_eq!(s.keys.borrow().is_empty(), !pressed, "{r}");
+                if !pressed {
+                    assert!(reply_text(&r).contains("nothing was done"), "{r}");
+                }
+            }
+            // An error response refuses too.
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call",
+                "params": {"name": "key", "arguments": {"combo": "a"}}}),
+            )
+            .await;
+            let ask = next(&mut s).await;
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": ask["id"],
+                       "error": {"code": -32601, "message": "nope"}}),
+            )
+            .await;
+            let r = next(&mut s).await;
+            assert!(reply_text(&r).contains("asking failed"), "{r}");
+            // A call waiting for the user is cancelled cleanly, and end of
+            // input ends it too.
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": {"name": "key", "arguments": {"combo": "a"}}}),
+            )
+            .await;
+            let _ask = next(&mut s).await;
+            drop(std::mem::replace(&mut s.stdin, tokio::io::duplex(1).0));
+            let replies = replies_within(&mut s, Duration::from_secs(2)).await;
+            assert_eq!(ids(&replies), vec![json!(10)], "{replies:?}");
+            assert!(reply_text(&replies[0]).contains("closed"), "{replies:?}");
+            assert!(s.keys.borrow().is_empty());
         });
     }
 }
