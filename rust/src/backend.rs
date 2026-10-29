@@ -380,6 +380,11 @@ pub trait Backend {
     /// window in front when that wait already found it; None leaves it to
     /// the caller to look.
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>>;
+    /// The accessibility app name of the process behind `w` (the name the
+    /// allowlist uses), when it differs from the compositor's app id.
+    async fn window_app(&self, w: &WindowGeo) -> String {
+        w.app.clone()
+    }
     /// Windows of allowed apps whose title or app contains `query` (all when
     /// empty).
     async fn windows(&self, _query: &str, _allowed: &[String]) -> R<Vec<WindowGeo>> {

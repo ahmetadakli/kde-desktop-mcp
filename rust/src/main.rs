@@ -640,7 +640,9 @@ fn observe_arg(tool: &str, a: &Json) -> R<Option<Observe>> {
     // as before; act, menu and close_window keep their effect line (it
     // replaced their note that the active window changed).
     let default = match tool {
-        "act" | "menu" | "close_window" => Some(Observe::Nothing),
+        "act" | "close_window" => Some(Observe::Nothing),
+        // Listing the menu bar changes nothing.
+        "menu" if a.get("path").is_some_and(|p| !p.is_null()) => Some(Observe::Nothing),
         _ => None,
     };
     Ok(match a.get("observe") {
@@ -1546,6 +1548,15 @@ impl<B: Backend> Server<B> {
         Ok(r)
     }
 
+    /// The allowlist name of `w`'s app: the compositor's app id when the
+    /// allowlist names it, else the accessibility name of its process.
+    async fn window_app(&self, w: &WindowGeo) -> String {
+        match self.policy().tier(&w.app.to_lowercase()) {
+            Some(_) => w.app.clone(),
+            None => self.b.window_app(w).await,
+        }
+    }
+
     async fn app_windows(&self, name: &str) -> R<Vec<B::Id>> {
         if !self.is_allowed(name) {
             return Err(self.not_allowed(name));
@@ -1883,7 +1894,7 @@ impl<B: Backend> Server<B> {
         if let Ok(list) = self.b.windows(&query, &allowed).await
             && let Some(first) = list.first()
         {
-            self.permit(&first.app).await?;
+            self.permit(&self.window_app(first).await).await?;
         }
         let tiered = policy.names_with(policy::needed_tier("move_window", a));
         let mut w = self.b.set_window(&query, &tiered, &change).await?;
@@ -1919,9 +1930,10 @@ impl<B: Backend> Server<B> {
         };
         // Always confirmed, not only on the allowlist's confirm list:
         // unsaved work may go with it.
-        self.permit(&w.app).await?;
+        let app = self.window_app(w).await;
+        self.permit(&app).await?;
         if !GATE.try_with(|g| g.borrow().confirmed).unwrap_or(false) {
-            self.confirm("close_window", Some(&w.app), a).await?;
+            self.confirm("close_window", Some(&app), a).await?;
         }
         let closed = self.b.close_window(&query, &allowed).await?;
         let start = Instant::now();

@@ -1482,6 +1482,13 @@ impl Backend for LinuxBackend {
         Ok(None)
     }
 
+    async fn window_app(&self, w: &WindowGeo) -> String {
+        self.app_names_by_pid()
+            .await
+            .remove(&i64::from(w.pid))
+            .unwrap_or_else(|| w.app.clone())
+    }
+
     async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
         match &self.comp {
             Compositor::Kde(kwin) => {
