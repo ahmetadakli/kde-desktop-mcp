@@ -230,6 +230,12 @@ pub trait Backend {
     async fn wait_change(&self, _near: &[Self::Id], _mark: u64, timeout: std::time::Duration) {
         tokio::time::sleep(timeout.min(std::time::Duration::from_millis(50))).await;
     }
+    /// Whether the app whose windows (or elements) are `near` reported a
+    /// change after `mark`, or windows or apps came or went; None when the
+    /// backend gets no change events. Cheap: no round trip.
+    fn changed_since(&self, _near: &[Self::Id], _mark: u64) -> Option<bool> {
+        None
+    }
     /// App name owning the foreground window, "" when unknown.
     async fn active_app(&self) -> String;
 

@@ -1047,6 +1047,11 @@ impl Backend for LinuxBackend {
         self.a11y.wait_change(&buses, mark, timeout).await;
     }
 
+    fn changed_since(&self, near: &[Obj], mark: u64) -> Option<bool> {
+        let buses: Vec<&str> = near.iter().map(|o| o.bus.as_ref()).collect();
+        self.a11y.changed_since(&buses, mark)
+    }
+
     async fn active_app(&self) -> String {
         match &self.comp {
             Compositor::Kde(_) => self.a11y.active_app().await,
@@ -2008,5 +2013,51 @@ mod tests {
         ];
         let names = LinuxBackend::names_by_pid(&apps);
         assert_eq!(names, HashMap::from([(7, "kate".to_string())]));
+    }
+
+    /// Read-only timing of the reads an effect fingerprint makes, on the
+    /// live desktop: `cargo test --release -- --ignored --nocapture fingerprint_timing`.
+    #[test]
+    #[ignore]
+    fn fingerprint_timing() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let b = LinuxBackend::new().await.unwrap();
+            let time = |name: &str, t: std::time::Instant, n: u32| {
+                let ms = t.elapsed().as_secs_f64() * 1000.0 / f64::from(n);
+                println!("{name}: {ms:.2} ms");
+            };
+            let n = 20;
+            let _ = b.list_apps().await;
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(b.list_apps().await);
+            }
+            time("list_apps", t, n);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(b.active_app().await);
+            }
+            time("active_app", t, n);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(b.focused().await);
+            }
+            time("focused", t, n);
+            let t = std::time::Instant::now();
+            for _ in 0..n {
+                std::hint::black_box(tokio::join!(b.list_apps(), b.focused()));
+            }
+            time("list_apps + focused", t, n);
+            let apps = b.list_apps().await;
+            println!(
+                "{} apps, {} windows",
+                apps.len(),
+                apps.iter().map(|a| a.windows.len()).sum::<usize>()
+            );
+        });
     }
 }

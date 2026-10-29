@@ -178,8 +178,18 @@ tool; `off` turns it off). Not available on Windows yet.
   (+ `role`): the first visible element whose name equals `query`, else the
   first whose name or text contains it. Window and tab titles (frame, window,
   page tab) count only when nothing else matches or `role` names that role;
-  `wait_for` skips them unless `role` names them. `act` reports when the
-  active window changed (e.g. a dialog opened).
+  `wait_for` skips them unless `role` names them.
+- Effect and `observe` on input tools (`act`, `click`, `key`, `type_text`,
+  `mouse`, `drag`, `scroll`, `set_text`): the reply ends with an `effect:`
+  line comparing the active window before and after the input (its title, the
+  focused element, and on Linux the app's accessibility change events):
+  `changed`, `no visible change`, or `window changed to '<title>'` (a dialog
+  opened, a window closed). It waits for the app to react up to `settle_ms`
+  (default 150), returning as soon as it reported a change; the fingerprint
+  itself costs about 1 ms. A canvas that draws without accessibility events
+  may report `no visible change`. `observe` adds a view in the same reply:
+  `focus` (the focused element), `tree` (compact tree of the active window, or
+  of `app`'s, at most 6000 characters) or `screenshot` (inline image).
 - Stale ids: every use of an `id` reads the element's role and name again (one
   round trip). If the element is gone, or its role or name changed (the page
   was redrawn, the object path now belongs to another element), nothing is
@@ -244,7 +254,10 @@ tool; `off` turns it off). Not available on Windows yet.
   side is 1024 px by default (`max_size`; `inline: false` returns only the file
   path) and reports which screen area it shows; given `image_x`/`image_y`,
   `mouse` converts a pixel of the image to a screen coordinate (window position
-  and display scaling, e.g. 125 %, included).
+  and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
+  in pixels of the last screenshot captures again and returns only that part,
+  cropped before shrinking, at up to full resolution (`max_size` still
+  applies); `image_x`/`image_y` then refer to the zoomed image.
 - `batch`: runs several tools in order in one call and stops at the first
   error; reduces Claude's number of turns. A step with `"optional": true`
   (typically a `wait_for`) may fail without stopping the batch: it is reported

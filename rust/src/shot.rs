@@ -186,19 +186,89 @@ fn drop_opaque_alpha(img: Pixels) -> Pixels {
 /// Produces a backend's captured pixels; run off the event loop.
 pub type Convert = Box<dyn FnOnce() -> R<Pixels> + Send>;
 
+/// Part of a capture, as fractions of its width and height (0..=1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Frac {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+impl Frac {
+    pub const ALL: Frac = Frac {
+        x: 0.0,
+        y: 0.0,
+        w: 1.0,
+        h: 1.0,
+    };
+}
+
+/// The whole pixels of a `w` x `h` image that `f` covers, rounded outwards
+/// (a partly covered pixel is kept) and clamped to the image, at least one
+/// pixel: (x, y, width, height).
+pub fn crop_rect((w, h): (u32, u32), f: Frac) -> (u32, u32, u32, u32) {
+    let span = |start: f64, len: f64, size: u32| {
+        // Float noise (0.35 * 200 = 70.00000000000001) is no extra pixel.
+        const EPS: f64 = 1e-6;
+        let size_f = f64::from(size);
+        let a = (((start * size_f) + EPS).floor().max(0.0) as u32).min(size.saturating_sub(1));
+        let b = ((((start + len) * size_f) - EPS).ceil().min(size_f) as u32).max(a + 1);
+        (a, b - a)
+    };
+    let (x, cw) = span(f.x, f.w, w);
+    let (y, ch) = span(f.y, f.h, h);
+    (x, y, cw, ch)
+}
+
+/// The `(x, y, w, h)` pixels of `img`; the rectangle must lie inside it.
+pub fn crop(img: &Pixels, (x, y, w, h): (u32, u32, u32, u32)) -> Pixels {
+    let c = img.channels;
+    let line = img.width as usize * c;
+    let (x, w) = (x as usize * c, w as usize * c);
+    let data = img
+        .data
+        .chunks_exact(line)
+        .skip(y as usize)
+        .take(h as usize)
+        .flat_map(|row| &row[x..x + w])
+        .copied()
+        .collect();
+    Pixels {
+        width: (w / c) as u32,
+        height: h,
+        channels: c,
+        data,
+    }
+}
+
+/// What `finish` sent: the image size, the PNG, and the part of the
+/// capture it shows (exactly, after rounding `region` to whole pixels).
+pub struct Finished {
+    pub size: (u32, u32),
+    pub png: Vec<u8>,
+    pub kept: Frac,
+}
+
 /// The PNG sent back for a capture and its size: `pixels` (or, without
-/// them, the PNG an external tool wrote to `path`) shrunk to fit in `max` x
-/// `max` and encoded once. `path` ends up holding exactly that PNG, the
-/// image the screenshot's coordinates refer to; it is removed on failure.
-pub fn finish(path: &str, pixels: Option<Convert>, max: u32) -> R<((u32, u32), Vec<u8>)> {
+/// them, the PNG an external tool wrote to `path`) cropped to `region` at
+/// full resolution, shrunk to fit in `max` x `max` and encoded once. `path`
+/// ends up holding exactly that PNG, the image the screenshot's
+/// coordinates refer to; it is removed on failure.
+pub fn finish(path: &str, pixels: Option<Convert>, max: u32, region: Frac) -> R<Finished> {
+    let whole = region == Frac::ALL;
     let done = (|| {
         let img = match pixels {
             Some(convert) => convert()?,
             None => {
                 let img = read_png(path)?;
-                if fit((img.width, img.height), max, max) == (img.width, img.height) {
+                if whole && fit((img.width, img.height), max, max) == (img.width, img.height) {
                     let png = std::fs::read(path).map_err(|e| e.to_string())?;
-                    return Ok(((img.width, img.height), png));
+                    return Ok(Finished {
+                        size: (img.width, img.height),
+                        png,
+                        kept: Frac::ALL,
+                    });
                 }
                 img
             }
@@ -206,6 +276,19 @@ pub fn finish(path: &str, pixels: Option<Convert>, max: u32) -> R<((u32, u32), V
         if img.width == 0 || img.height == 0 {
             return Err("empty screenshot".into());
         }
+        let (full_w, full_h) = (f64::from(img.width), f64::from(img.height));
+        let (img, kept) = if whole {
+            (img, Frac::ALL)
+        } else {
+            let r = crop_rect((img.width, img.height), region);
+            let kept = Frac {
+                x: f64::from(r.0) / full_w,
+                y: f64::from(r.1) / full_h,
+                w: f64::from(r.2) / full_w,
+                h: f64::from(r.3) / full_h,
+            };
+            (crop(&img, r), kept)
+        };
         let (w, h) = fit((img.width, img.height), max, max);
         let img = if (w, h) == (img.width, img.height) {
             img
@@ -214,7 +297,11 @@ pub fn finish(path: &str, pixels: Option<Convert>, max: u32) -> R<((u32, u32), V
         };
         let png = write_png(&drop_opaque_alpha(img))?;
         std::fs::write(path, &png).map_err(|e| format!("{path}: {e}"))?;
-        Ok(((w, h), png))
+        Ok(Finished {
+            size: (w, h),
+            png,
+            kept,
+        })
     })();
     if done.is_err() {
         let _ = std::fs::remove_file(path);
@@ -399,22 +486,99 @@ mod tests {
         let path = temp("pixels");
         std::fs::write(&path, b"").unwrap();
         let convert: Convert = Box::new(|| Ok(noise(300, 100, 4)));
-        let ((w, h), png) = finish(&path, Some(convert), 150).unwrap();
-        assert_eq!((w, h), (150, 50));
-        assert_eq!(std::fs::read(&path).unwrap(), png);
+        let done = finish(&path, Some(convert), 150, Frac::ALL).unwrap();
+        assert_eq!(done.size, (150, 50));
+        assert_eq!(done.kept, Frac::ALL);
+        assert_eq!(std::fs::read(&path).unwrap(), done.png);
         // Another tool's PNG (the spectacle/grim fallback) is decoded.
-        let small = finish(&path, None, 60).unwrap();
-        assert_eq!(small.0, (60, 20));
+        let small = finish(&path, None, 60, Frac::ALL).unwrap();
+        assert_eq!(small.size, (60, 20));
         let back = read_png(&path).unwrap();
         assert_eq!((back.width, back.height, back.channels), (60, 20, 4));
         // Small enough already: sent as the tool wrote it.
-        let same = finish(&path, None, 100).unwrap();
-        assert_eq!((same.0, same.1), ((60, 20), small.1));
+        let same = finish(&path, None, 100, Frac::ALL).unwrap();
+        assert_eq!((same.size, same.png), ((60, 20), small.png));
         std::fs::remove_file(&path).unwrap();
         // A failed capture leaves no file behind.
         let convert: Convert = Box::new(|| Err("gone".into()));
-        assert!(finish(&path, Some(convert), 100).is_err());
+        assert!(finish(&path, Some(convert), 100, Frac::ALL).is_err());
         assert!(std::fs::metadata(&path).is_err());
+    }
+
+    #[test]
+    fn crop_rect_rounds_outwards_and_stays_inside() {
+        let f = |x, y, w, h| Frac { x, y, w, h };
+        assert_eq!(crop_rect((200, 100), Frac::ALL), (0, 0, 200, 100));
+        assert_eq!(
+            crop_rect((200, 100), f(0.25, 0.5, 0.1, 0.2)),
+            (50, 50, 20, 20)
+        );
+        // A partly covered pixel is kept.
+        assert_eq!(crop_rect((10, 10), f(0.15, 0.15, 0.1, 0.1)), (1, 1, 2, 2));
+        // Past the edges: clamped; nothing covered: still one pixel.
+        assert_eq!(crop_rect((10, 10), f(-0.5, 0.8, 1.0, 1.0)), (0, 8, 5, 2));
+        assert_eq!(crop_rect((10, 10), f(1.0, 1.0, 0.0, 0.0)), (9, 9, 1, 1));
+    }
+
+    #[test]
+    fn crop_keeps_the_pixels_of_the_rectangle() {
+        // 4x3, 2 channels: pixel (x, y) holds [10y + x, 0].
+        let img = Pixels {
+            width: 4,
+            height: 3,
+            channels: 2,
+            data: (0..3u8)
+                .flat_map(|y| (0..4u8).flat_map(move |x| [10 * y + x, 0]))
+                .collect(),
+        };
+        let c = crop(&img, (1, 1, 2, 2));
+        assert_eq!((c.width, c.height, c.channels), (2, 2, 2));
+        assert_eq!(c.data, vec![11, 0, 12, 0, 21, 0, 22, 0]);
+    }
+
+    #[test]
+    fn finish_crops_before_shrinking() {
+        let path = temp("crop");
+        std::fs::write(&path, b"").unwrap();
+        // Left half 0, right half 200: the right quarter at full size.
+        let half = || -> R<Pixels> {
+            Ok(Pixels {
+                width: 400,
+                height: 100,
+                channels: 1,
+                data: (0..100)
+                    .flat_map(|_| (0..400).map(|x| if x < 200 { 0 } else { 200 }))
+                    .collect(),
+            })
+        };
+        let region = Frac {
+            x: 0.75,
+            y: 0.0,
+            w: 0.25,
+            h: 0.5,
+        };
+        let done = finish(&path, Some(Box::new(half)), 1024, region).unwrap();
+        assert_eq!((done.size, done.kept), ((100, 50), region));
+        let back = read_png(&path).unwrap();
+        assert!(back.data.iter().all(|&p| p == 200));
+        // Still shrunk to max_size after the crop.
+        let done = finish(&path, Some(Box::new(half)), 50, region).unwrap();
+        assert_eq!(done.size, (50, 25));
+        // The PNG another tool wrote is cropped too.
+        let done = finish(
+            &path,
+            None,
+            1024,
+            Frac {
+                x: 0.0,
+                y: 0.0,
+                w: 0.5,
+                h: 1.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(done.size, (25, 25));
+        std::fs::remove_file(&path).unwrap();
     }
 
     /// `cargo test --release -- --ignored --nocapture shrink_timing`

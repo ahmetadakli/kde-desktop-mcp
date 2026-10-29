@@ -519,6 +519,158 @@ impl ShotMap {
             (self.y + (py as f64 + 0.5) * self.sy).floor() as i64,
         )
     }
+
+    /// The screen area of the image pixels (x, y, w, h).
+    fn area_of(self, (x, y, w, h): (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+        (
+            self.x + x * self.sx,
+            self.y + y * self.sy,
+            w * self.sx,
+            h * self.sy,
+        )
+    }
+}
+
+/// The part of a capture showing screen area `area` that screen area `want`
+/// covers, as fractions of the capture; None when they do not overlap.
+fn region_frac(
+    (ax, ay, aw, ah): (f64, f64, f64, f64),
+    (x, y, w, h): (f64, f64, f64, f64),
+) -> Option<shot::Frac> {
+    let (x0, y0) = (x.max(ax), y.max(ay));
+    let (x1, y1) = ((x + w).min(ax + aw), (y + h).min(ay + ah));
+    (aw > 0.0 && ah > 0.0 && x1 > x0 && y1 > y0).then(|| shot::Frac {
+        x: (x0 - ax) / aw,
+        y: (y0 - ay) / ah,
+        w: (x1 - x0) / aw,
+        h: (y1 - y0) / ah,
+    })
+}
+
+/// The screenshot's `region` argument: [x, y, w, h], None when absent.
+fn region_arg(a: &Json) -> R<Option<(f64, f64, f64, f64)>> {
+    let bad =
+        || "region must be [x, y, width, height] in pixels of the last screenshot".to_string();
+    match a.get("region") {
+        None | Some(Json::Null) => Ok(None),
+        Some(Json::Array(v)) if v.len() == 4 => {
+            let n: Vec<f64> = v
+                .iter()
+                .map(Json::as_f64)
+                .collect::<Option<_>>()
+                .ok_or_else(bad)?;
+            if n[2] <= 0.0 || n[3] <= 0.0 {
+                return Err(bad());
+            }
+            Ok(Some((n[0], n[1], n[2], n[3])))
+        }
+        Some(_) => Err(bad()),
+    }
+}
+
+/// What an input tool's `observe` asks to see after the input settled.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Observe {
+    Nothing,
+    Focus,
+    Tree,
+    Screenshot,
+}
+
+/// A tool's `observe` argument; None when the tool reports no effect
+/// (tools::OBSERVE_TOOLS).
+fn observe_arg(tool: &str, a: &Json) -> R<Option<Observe>> {
+    if !tools::OBSERVE_TOOLS.contains(&tool) {
+        return Ok(None);
+    }
+    // Without `observe` nothing is measured, so plain input stays as fast
+    // as before; `act` keeps its effect line (it replaced act's note that
+    // the active window changed).
+    let default = match tool {
+        "act" => Some(Observe::Nothing),
+        _ => None,
+    };
+    Ok(match a.get("observe") {
+        None | Some(Json::Null) => default,
+        Some(Json::String(s)) => Some(match s.trim().to_lowercase().as_str() {
+            "" | "none" => return Ok(default),
+            "effect" => Observe::Nothing,
+            "focus" => Observe::Focus,
+            "tree" => Observe::Tree,
+            "screenshot" => Observe::Screenshot,
+            other => {
+                return Err(format!(
+                    "observe '{other}': use one of {}",
+                    tools::OBSERVE_KINDS.join(", ")
+                ));
+            }
+        }),
+        Some(_) => {
+            return Err("observe must be a string (none, effect, focus, tree, screenshot)".into());
+        }
+    })
+}
+
+/// Default and longest settle before the effect line and observation.
+const SETTLE_MS: i64 = 150;
+const MAX_SETTLE_MS: i64 = 5000;
+/// Size of the tree `observe: "tree"` returns.
+const OBSERVE_TREE_NODES: i64 = 150;
+const OBSERVE_TREE_CHARS: usize = 6000;
+
+/// What an input is compared on: the active window (app, title) and the
+/// focused element (id, role, name, states). Two reads, about 1 ms.
+#[derive(Clone, Debug, PartialEq)]
+struct Fingerprint<Id> {
+    window: Option<(String, String)>,
+    focus: Option<(Id, String, String, Vec<&'static str>)>,
+}
+
+/// The effect line: how `after` differs from `before`. `events`: whether
+/// the app reported changes meanwhile (None: the backend cannot tell).
+/// Titles of windows of apps not `allowed` are not named.
+fn effect_text<Id: PartialEq>(
+    before: &Fingerprint<Id>,
+    after: &Fingerprint<Id>,
+    events: Option<bool>,
+    allowed: impl Fn(&str) -> bool,
+) -> String {
+    if before.window != after.window {
+        let same_app = matches!((&before.window, &after.window),
+            (Some((a, _)), Some((b, _))) if a == b);
+        return match &after.window {
+            Some((app, title)) if allowed(app) && same_app => {
+                format!("changed (window title now {})", render::py_repr(title))
+            }
+            Some((app, title)) if allowed(app) => {
+                format!("window changed to {}", render::py_repr(title))
+            }
+            Some((app, _)) => format!("window changed to one of '{app}' (not allowed)"),
+            None => "window changed (none active now)".into(),
+        };
+    }
+    if before.focus != after.focus || events == Some(true) {
+        "changed".into()
+    } else {
+        "no visible change".into()
+    }
+}
+
+/// `text` cut to at most `max` characters at a line end, with a note.
+fn cap_lines(text: String, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text;
+    }
+    let mut out = String::new();
+    for line in text.lines() {
+        if out.chars().count() + line.chars().count() + 1 > max {
+            break;
+        }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out.push_str(&format!("… (cut at {max} chars; call tree for the rest)"));
+    out
 }
 
 /// A tool's reply: text, plus base64 PNGs sent as MCP image blocks.
@@ -1343,20 +1495,110 @@ impl<B: Backend> Server<B> {
             .map(|w| w.title)
     }
 
-    /// Append a note when an action changed the active window (a dialog
-    /// opened, a window closed), so no tree call is needed to notice. Only
-    /// for `act`: apps run actions before replying, while keys and clicks
-    /// take effect after the call returns (use wait_for for those).
-    async fn note_active_change(&self, mut reply: String) -> String {
-        let now = self.active_title().await;
-        let mut last = self.last_active.lock().await;
-        if now != *last {
-            if let Some(title) = &now {
-                reply.push_str(&format!("; active window now {}", render::py_repr(title)));
-            }
-            *last = now;
+    /// The active window and focused element, compared before and after
+    /// an input for its effect line.
+    async fn fingerprint(&self) -> Fingerprint<B::Id> {
+        let (apps, focus) = tokio::join!(self.b.list_apps(), self.b.focused());
+        let window = apps.into_iter().find_map(|a| {
+            let name = a.name;
+            a.windows
+                .into_iter()
+                .find(|w| w.active)
+                .map(|w| (name.to_lowercase(), w.title))
+        });
+        Fingerprint {
+            window,
+            focus: focus.map(|f| (f.id, f.info.role, f.info.name, f.info.states)),
         }
-        reply
+    }
+
+    /// After an input tool ran: wait up to `settle_ms` for the app to react
+    /// (ending early once it reported a change since `mark`), then the
+    /// effect line and what `observe` asks for.
+    async fn after_input(
+        &self,
+        tool: &str,
+        a: &Json,
+        observe: Observe,
+        mark: u64,
+        before: Fingerprint<B::Id>,
+    ) -> Out {
+        let settle = arg_i(a, "settle_ms", SETTLE_MS).clamp(0, MAX_SETTLE_MS) as u64;
+        // The focused element's app is the one that reacts (its bus, on Linux).
+        let near: Vec<B::Id> = before.focus.iter().map(|f| f.0.clone()).collect();
+        if settle > 0 {
+            self.b
+                .wait_change(&near, mark, Duration::from_millis(settle))
+                .await;
+        }
+        let events = self.b.changed_since(&near, mark);
+        let after = self.fingerprint().await;
+        let allowed = self.allowed();
+        let is_allowed = |app: &str| allowed.contains(&app.to_lowercase());
+        let mut text = format!(
+            "; effect: {}",
+            effect_text(&before, &after, events, is_allowed)
+        );
+        if before.window != after.window
+            && let Some((app, title)) = &after.window
+            && is_allowed(app)
+        {
+            // Named in the next "not in the allowlist" hint.
+            *self.last_active.lock().await = Some(title.clone());
+        }
+        let mut images = Vec::new();
+        match observe {
+            Observe::Nothing => {}
+            // key and type_text name the focus in their reply already.
+            Observe::Focus if matches!(tool, "key" | "type_text") => {}
+            Observe::Focus => {
+                let note = self.focus_note(false).await;
+                match note.strip_prefix("; ") {
+                    Some(n) => text.push_str(&format!("\n{n}")),
+                    None => text.push_str("\nfocus: none reported in an allowed app"),
+                }
+            }
+            Observe::Tree => {
+                let app = a.get("app").and_then(Json::as_str).map(str::to_string);
+                match self.observe_tree(app).await {
+                    Ok(t) => text.push_str(&format!("\n{t}")),
+                    Err(e) => text.push_str(&format!("\nobserve tree failed: {e}")),
+                }
+            }
+            Observe::Screenshot => match self.screenshot(&json!({})).await {
+                Ok(o) => {
+                    text.push_str(&format!("\n{}", o.text));
+                    images = o.images;
+                }
+                Err(e) => text.push_str(&format!("\nobserve screenshot failed: {e}")),
+            },
+        }
+        Out { text, images }
+    }
+
+    /// A compact tree of the active window of `app` (else of the app in
+    /// front), cut at OBSERVE_TREE_CHARS.
+    async fn observe_tree(&self, app: Option<String>) -> R<String> {
+        let app = match app {
+            Some(a) if !a.trim().is_empty() => a,
+            _ => self.require_active_allowed().await?,
+        };
+        let windows = self.app_windows(&app).await?;
+        let title = self.active_title().await;
+        let mut root = None;
+        for w in &windows {
+            let info = self.b.info(w, 0).await;
+            // Hyprland's active window is no AT-SPI state: match the title.
+            if info.states.contains(&"active") || title.as_deref() == Some(info.name.as_str()) {
+                root = Some(self.add_ref(w, &info, &app.to_lowercase()).await);
+                break;
+            }
+        }
+        let args = match root {
+            Some(rid) => json!({"root_id": rid, "max_nodes": OBSERVE_TREE_NODES}),
+            None => json!({"app": app, "max_nodes": OBSERVE_TREE_NODES}),
+        };
+        Ok(cap_lines(self.tree(&args).await?, OBSERVE_TREE_CHARS))
     }
 
     /// The lines as text, and the id of the first element printed.
@@ -1817,12 +2059,12 @@ impl<B: Backend> Server<B> {
                 })?;
         }
         let ok = self.b.do_action(id, idx).await?;
-        let reply = t.reply(&format!(
+        // A window that opened or closed shows in the effect line.
+        Ok(t.reply(&format!(
             "{} -> {}",
             names[idx],
             if ok { "ok" } else { "failed" }
-        ));
-        Ok(self.note_active_change(reply).await)
+        )))
     }
 
     async fn set_text(&self, a: &Json) -> R<String> {
@@ -2547,30 +2789,72 @@ impl<B: Backend> Server<B> {
         ))
     }
 
+    /// Capture the active window. With `region` (pixels of the last
+    /// screenshot): capture again and keep only that part, at up to full
+    /// resolution, mapped so image_x/image_y refer to the zoomed image.
     async fn screenshot(&self, a: &Json) -> R<Out> {
+        let region = region_arg(a)?;
         self.require_active_allowed().await?;
+        // The zoom's screen area, from the map of the image it was read in.
+        let zoom = match region {
+            Some(r) => {
+                let map = (*self.last_shot.lock().await)
+                    .ok_or("region needs a screenshot taken first (its pixels)")?;
+                Some((r, map.area_of(r)))
+            }
+            None => None,
+        };
         *self.last_shot.lock().await = None;
         let Shot { path, pixels, area } = self.b.screenshot().await.ok_or("screenshot failed")?;
+        let frac = match (zoom, area) {
+            (None, _) => shot::Frac::ALL,
+            (Some((_, want)), Some(area)) => region_frac(area, want).ok_or_else(|| {
+                let _ = std::fs::remove_file(&path);
+                "region is outside the active window now; take a new screenshot".to_string()
+            })?,
+            (Some(_), None) => {
+                let _ = std::fs::remove_file(&path);
+                return Err("region: the screen area of the capture is unknown here".into());
+            }
+        };
         let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, 8192) as u32;
         let inline = arg_b(a, "inline", true);
         // Converting, shrinking and encoding take milliseconds: keep other
         // calls moving.
         let file = path.clone();
-        let (size, png) = tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max))
+        let done = tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac))
             .await
             .map_err(|e| e.to_string())??;
-        let map = area.and_then(|a| ShotMap::new(size, a));
+        // The screen area the image shows: the part of the capture kept.
+        let area = area.map(|(x, y, w, h)| {
+            let k = done.kept;
+            (x + k.x * w, y + k.y * h, k.w * w, k.h * h)
+        });
+        let map = area.and_then(|a| ShotMap::new(done.size, a));
         *self.last_shot.lock().await = map;
-        let (iw, ih) = size;
+        let (iw, ih) = done.size;
         let mut text = format!("{path}\n{iw}x{ih} px");
         if let (Some((x, y, w, h)), Some(_)) = (area, map) {
             // How to click a point in it is in the server instructions.
-            text.push_str(&format!(" of screen area at ({x},{y}), {w}x{h}"));
+            let r = |v: f64| (v * 100.0).round() / 100.0;
+            text.push_str(&format!(
+                " of screen area at ({},{}), {}x{}",
+                r(x),
+                r(y),
+                r(w),
+                r(h)
+            ));
+        }
+        if let Some(((x, y, w, h), _)) = zoom {
+            text.push_str(&format!(
+                " (zoom of region [{x}, {y}, {w}, {h}] of the previous screenshot; \
+                 image_x/image_y now refer to this image)"
+            ));
         }
         Ok(Out {
             text,
             images: if inline {
-                vec![shot::base64(&png)]
+                vec![shot::base64(&done.png)]
             } else {
                 Vec::new()
             },
@@ -2700,6 +2984,7 @@ impl<B: Backend> Server<B> {
                     self.confirm(name, app, a).await?;
                 }
             }
+            let observe = observe_arg(name, a)?;
             // A screenshot sends no input, but activating its window does. A
             // batch that holds the input lock already runs its steps `held`.
             let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
@@ -2727,6 +3012,11 @@ impl<B: Backend> Server<B> {
             }
             let activated = match &window {
                 Some(q) => self.ensure_window(q).await?,
+                None => None,
+            };
+            // Taken once the window is in front, before the input.
+            let before = match observe {
+                Some(_) => Some((self.b.change_mark(), self.fingerprint().await)),
                 None => None,
             };
             let result = match name {
@@ -2758,6 +3048,15 @@ impl<B: Backend> Server<B> {
                 "screenshot" => self.screenshot(a).await,
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
+            };
+            let result = match (result, observe, before) {
+                (Ok(mut o), Some(observe), Some((mark, before))) => {
+                    let seen = self.after_input(name, a, observe, mark, before).await;
+                    o.text.push_str(&seen.text);
+                    o.images.extend(seen.images);
+                    Ok(o)
+                }
+                (result, _, _) => result,
             };
             // What is still held, after every input step but a batch (its
             // steps say it).
@@ -3879,6 +4178,161 @@ mod tests {
     }
 
     #[test]
+    fn a_zoomed_screenshot_is_a_full_resolution_crop_and_clickable() {
+        local(async {
+            let mut s = session("zoom");
+            let r = call_tool(&mut s, 2, "screenshot", json!({"region": [0, 0, 5, 5]})).await;
+            assert!(
+                reply_text(&r).contains("needs a screenshot taken first"),
+                "{r}"
+            );
+            // 100x50 of the 400x200 area at (10, 20): 4 screen px per pixel.
+            call_tool(&mut s, 3, "screenshot", json!({"max_size": 100})).await;
+            // Pixels (25, 10)-(35, 15) are screen (110, 60), 40x20: the
+            // 2x capture's pixels (50, 20)-(70, 30), sent as they are.
+            let r = call_tool(&mut s, 4, "screenshot", json!({"region": [25, 10, 10, 5]})).await;
+            let content = &r["result"]["content"];
+            let text = content[0]["text"].as_str().unwrap();
+            assert!(
+                text.contains("20x10 px of screen area at (110,60), 40x20 (zoom of region"),
+                "{text}"
+            );
+            assert_eq!(content[1]["type"], "image", "{r}");
+            let path = text.lines().next().unwrap();
+            let img = shot::read_png(path).unwrap();
+            assert_eq!((img.width, img.height), (20, 10));
+            // image_x/image_y now map through the zoom: 2 screen px each.
+            let r = call_tool(&mut s, 5, "mouse", json!({"image_x": 5, "image_y": 5})).await;
+            assert!(
+                reply_text(&r).starts_with("pointer at (121,71) in fake"),
+                "{r}"
+            );
+            // A region is read in the zoomed image's pixels; it may reach
+            // past that image, into the rest of the window.
+            let r = call_tool(&mut s, 6, "screenshot", json!({"region": [10, 5, 50, 50]})).await;
+            assert!(
+                reply_text(&r).contains("50x50 px of screen area at (130,70), 100x100"),
+                "{r}"
+            );
+            // Off the window: refused, and the last map is gone with it.
+            let r = call_tool(&mut s, 7, "screenshot", json!({"region": [500, 0, 5, 5]})).await;
+            assert!(reply_text(&r).contains("outside the active window"), "{r}");
+            for bad in [json!([1, 2, 3]), json!([0, 0, 0, 5]), json!("x")] {
+                let r = call_tool(&mut s, 8, "screenshot", json!({ "region": bad })).await;
+                assert!(reply_text(&r).contains("region must be"), "{r}");
+            }
+            let _ = std::fs::remove_file(path);
+        });
+    }
+
+    #[test]
+    fn region_maps_back_to_the_capture_it_lies_in() {
+        let map = ShotMap::new((100, 50), (10.0, 20.0, 400.0, 200.0)).unwrap();
+        let want = map.area_of((25.0, 10.0, 10.0, 5.0));
+        assert_eq!(want, (110.0, 60.0, 40.0, 20.0));
+        let f = region_frac((10.0, 20.0, 400.0, 200.0), want).unwrap();
+        assert_eq!(
+            (f.x, f.y, f.w, f.h),
+            (0.25, 0.2, 0.1, 0.1),
+            "fractions of the capture"
+        );
+        // Clipped to the capture; outside it: None.
+        let f = region_frac((0.0, 0.0, 100.0, 100.0), (90.0, -10.0, 20.0, 20.0)).unwrap();
+        assert_eq!((f.x, f.y, f.w, f.h), (0.9, 0.0, 0.1, 0.1));
+        assert_eq!(
+            region_frac((0.0, 0.0, 100.0, 100.0), (100.0, 0.0, 5.0, 5.0)),
+            None
+        );
+    }
+
+    #[test]
+    fn effect_names_window_focus_and_event_changes() {
+        let fp = |window: Option<(&str, &str)>, focus: Option<&str>| Fingerprint {
+            window: window.map(|(a, t)| (a.to_string(), t.to_string())),
+            focus: focus.map(|n| (1u32, "push button".to_string(), n.to_string(), vec![])),
+        };
+        let allowed = |app: &str| app != "secret";
+        let kate = Some(("kate", "a.txt — Kate"));
+        let before = fp(kate, Some("OK"));
+        let effect =
+            |after: &Fingerprint<u32>, events| effect_text(&before, after, events, allowed);
+        assert_eq!(effect(&fp(kate, Some("OK")), None), "no visible change");
+        assert_eq!(
+            effect(&fp(kate, Some("OK")), Some(false)),
+            "no visible change"
+        );
+        assert_eq!(effect(&fp(kate, Some("OK")), Some(true)), "changed");
+        assert_eq!(effect(&fp(kate, Some("Cancel")), Some(false)), "changed");
+        assert_eq!(
+            effect(&fp(Some(("kate", "Save As — Kate")), None), None),
+            "changed (window title now 'Save As — Kate')"
+        );
+        assert_eq!(
+            effect(&fp(Some(("dolphin", "Home")), None), None),
+            "window changed to 'Home'"
+        );
+        // Titles of windows of apps not allowed are not shown.
+        assert_eq!(
+            effect(&fp(Some(("secret", "Bank — Secret")), None), None),
+            "window changed to one of 'secret' (not allowed)"
+        );
+        assert_eq!(
+            effect(&fp(None, None), None),
+            "window changed (none active now)"
+        );
+    }
+
+    #[test]
+    fn observe_adds_a_view_after_the_input() {
+        local(async {
+            let mut s = session("observe");
+            let r = call_tool(
+                &mut s,
+                2,
+                "click",
+                json!({"app": "fake", "query": "OK", "observe": "screenshot", "settle_ms": 0}),
+            )
+            .await;
+            let content = &r["result"]["content"];
+            let text = content[0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with(
+                    "[1] push button \"OK\": clicked left x1 at 0,0; effect: no visible change\n"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains("200x100 px of screen area at (10,20)"),
+                "{text}"
+            );
+            assert_eq!(content[1]["type"], "image", "{r}");
+            let _ = std::fs::remove_file(text.lines().nth(1).unwrap());
+            let r = call_tool(&mut s, 3, "act", json!({"id": 1, "observe": "focus"})).await;
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change\nfocus: [1] push button \"OK\"",
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "mouse",
+                json!({"x": 1, "y": 2, "observe": "tree"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r)
+                    .starts_with("pointer at (1,2) in fake; effect: no visible change\nfake"),
+                "{r}"
+            );
+            // A bad value fails before any input.
+            let r = call_tool(&mut s, 5, "key", json!({"combo": "a", "observe": "all"})).await;
+            assert!(reply_text(&r).contains("observe 'all': use one of"), "{r}");
+            assert!(s.keys.borrow().iter().all(|k| !k.contains("down a")));
+        });
+    }
+
+    #[test]
     fn clipboard_round_trips_and_needs_an_allowed_window() {
         local(async {
             let mut s = session("clipboard");
@@ -3927,7 +4381,7 @@ mod tests {
                 "{text}"
             );
             assert!(
-                text.ends_with("(not an editable field: check where the text went)"),
+                text.contains("(not an editable field: check where the text went)"),
                 "{text}"
             );
             let r = call_tool(&mut s, 3, "key", json!({"combo": "a"})).await;
@@ -4418,7 +4872,11 @@ mod tests {
             let mut s = session("fresh");
             let id = focus_id(&mut s, 2).await;
             let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
-            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change",
+                "{r}"
+            );
             assert_eq!(actions_run(&s), 1);
         });
     }
@@ -4470,7 +4928,11 @@ mod tests {
             let entry = focus_id(&mut s, 2).await;
             s.focus.borrow_mut().name = "Search: rust".into();
             let r = call_tool(&mut s, 3, "act", json!({"id": entry})).await;
-            assert_eq!(reply_text(&r), "Activate -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Activate -> ok; effect: no visible change",
+                "{r}"
+            );
             // An unnamed element may gain a name; its role still counts.
             *s.focus.borrow_mut() = Info {
                 role: "push button".into(),
@@ -4480,7 +4942,11 @@ mod tests {
             let unnamed = focus_id(&mut s, 4).await;
             s.focus.borrow_mut().name = "Play".into();
             let r = call_tool(&mut s, 5, "act", json!({"id": unnamed})).await;
-            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change",
+                "{r}"
+            );
             assert_eq!(actions_run(&s), 2);
         });
     }
@@ -4511,7 +4977,11 @@ mod tests {
             *s.focus_app.borrow_mut() = "Fake".into();
             let id = focus_id(&mut s, 3).await;
             let r = call_tool(&mut s, 4, "act", json!({"id": id})).await;
-            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change",
+                "{r}"
+            );
         });
     }
 
@@ -4602,11 +5072,16 @@ mod tests {
             let lines: Vec<&str> = reply_text(&r).lines().collect();
             assert_eq!(lines.len(), 5, "{r}");
             let found = printed_ids(lines[0].strip_prefix("[1] find: ").unwrap())[0];
-            assert_eq!(lines[1], "[2] act: Press -> ok", "{r}");
+            assert_eq!(
+                lines[1], "[2] act: Press -> ok; effect: no visible change",
+                "{r}"
+            );
             // The query picked the same element, under the same id.
             assert_eq!(
                 lines[3],
-                format!("[4] act: [{found}] push button \"OK\": Press -> ok"),
+                format!(
+                    "[4] act: [{found}] push button \"OK\": Press -> ok; effect: no visible change"
+                ),
                 "{r}"
             );
             assert!(lines[4].starts_with("[5] get_text: "), "{r}");
@@ -4687,7 +5162,11 @@ mod tests {
             let r = call_tool(&mut s, 6, "act", json!({"id": first[0]})).await;
             assert!(reply_text(&r).contains(": stale id"), "{r}");
             let r = call_tool(&mut s, 7, "act", json!({"id": renamed[0]})).await;
-            assert_eq!(reply_text(&r), "Press -> ok", "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "Press -> ok; effect: no visible change",
+                "{r}"
+            );
             // A volatile name may change and keep the id.
             *s.focus.borrow_mut() = Info {
                 role: "entry".into(),
