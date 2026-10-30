@@ -4081,6 +4081,10 @@ async fn main() {
         eprintln!("desktop-mcp: {e}");
         std::process::exit(1);
     }
+    // Exit now: after a signal, tokio's stdin reader is still blocked in a
+    // read on a pipe the client keeps open, and dropping the runtime would
+    // wait for it forever.
+    std::process::exit(0);
 }
 
 #[cfg(test)]
