@@ -605,12 +605,10 @@ Hyprland:
   it stays floating afterwards.
 - Hyprland 0.57 takes only Lua dispatchers over its socket (`hyprctl
   dispatch X` became `hl.dispatch(X)`). The server notices the first Lua
-  error and then sends Lua forms (`hl.dsp.window.move`,
-  `hl.dsp.window.close`) for moving windows between workspaces (including
-  minimize) and closing them; its other dispatchers (focus, floating,
-  geometry, fullscreen, cursor) have no Lua form yet and fail there with a
-  message saying so. Named workspaces have no number there; `windows` lists
-  them by name.
+  error and from then on sends the Lua form of every dispatcher it uses
+  (`hl.dsp.focus`, `hl.dsp.window.move`/`resize`/`float`/`fullscreen_state`/
+  `close`, `hl.dsp.cursor.move`); verified against a nested Hyprland 0.57.
+  Named workspaces have no number there; `windows` lists them by name.
 
 Windows:
 - Input cannot be sent to windows running as administrator from a server that

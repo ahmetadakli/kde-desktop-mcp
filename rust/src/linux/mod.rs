@@ -1442,16 +1442,26 @@ impl Backend for LinuxBackend {
                 let (clients, apps) = tokio::join!(h.json("clients"), self.apps_with_pids());
                 let clients = clients?;
                 let names = Self::names_by_pid(&apps);
+                // Allowed as `windows` allows them: by pid, else by class.
+                let allow = Self::allow_of(allowed, &apps);
                 let found = clients.as_array().into_iter().flatten().find(|c| {
                     if !c["mapped"].as_bool().unwrap_or(true)
                         || c["hidden"].as_bool().unwrap_or(false)
                     {
                         return false;
                     }
-                    let app = Self::client_app_name(&names, c);
-                    if !allowed.contains(&app) {
+                    let pid = c["pid"]
+                        .as_i64()
+                        .and_then(|p| u32::try_from(p).ok())
+                        .unwrap_or(0);
+                    let classes = [
+                        c["class"].as_str().unwrap_or(""),
+                        c["initialClass"].as_str().unwrap_or(""),
+                    ];
+                    if !allow.permits(pid, &classes) {
                         return false;
                     }
+                    let app = Self::client_app_name(&names, c);
                     let title = c["title"].as_str().unwrap_or("").to_lowercase();
                     let class = c["class"].as_str().unwrap_or("").to_lowercase();
                     title.contains(&q) || app.contains(&q) || class.contains(&q)

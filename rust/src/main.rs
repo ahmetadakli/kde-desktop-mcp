@@ -1548,13 +1548,27 @@ impl<B: Backend> Server<B> {
         Ok(r)
     }
 
-    /// The allowlist name of `w`'s app: the compositor's app id when the
-    /// allowlist names it, else the accessibility name of its process.
+    /// The allowlist name of `w`'s app, found as the window list allows
+    /// windows: the compositor's app id when the allowlist names it, else
+    /// the accessibility name of its process, else the longest entry its
+    /// app id contains (Hyprland's `org.kde.konsole` for `konsole` when the
+    /// app is not in the accessibility tree).
     async fn window_app(&self, w: &WindowGeo) -> String {
-        match self.policy().tier(&w.app.to_lowercase()) {
-            Some(_) => w.app.clone(),
-            None => self.b.window_app(w).await,
+        let policy = self.policy();
+        if policy.tier(&w.app.to_lowercase()).is_some() {
+            return w.app.clone();
         }
+        let name = self.b.window_app(w).await;
+        if policy.tier(&name.to_lowercase()).is_some() {
+            return name;
+        }
+        let class = w.app.to_lowercase();
+        policy
+            .names()
+            .into_iter()
+            .filter(|n| class.contains(n.as_str()))
+            .max_by_key(String::len)
+            .unwrap_or(name)
     }
 
     async fn app_windows(&self, name: &str) -> R<Vec<B::Id>> {
