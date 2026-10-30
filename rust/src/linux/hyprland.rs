@@ -201,12 +201,60 @@ fn lua_str(s: &str) -> String {
     out
 }
 
-/// The Lua form (Hyprland 0.57+) of the classic dispatchers this server
-/// sends to move windows between workspaces and close them; None for the
-/// others.
+/// A number as a Lua literal; None unless `s` is one.
+fn lua_num(s: &str) -> Option<String> {
+    let n: f64 = s.trim().parse().ok()?;
+    n.is_finite().then(|| n.to_string())
+}
+
+/// `<a> <b>,<window>` (after `exact` for the pixel dispatchers): two
+/// numbers and the window selector.
+fn pair_and_window(args: &str) -> Option<(String, String, String)> {
+    let (nums, window) = args.split_once(',')?;
+    let mut it = nums.split_whitespace();
+    let (a, b) = (lua_num(it.next()?)?, lua_num(it.next()?)?);
+    it.next().is_none().then(|| (a, b, lua_str(window.trim())))
+}
+
+/// The Lua form (Hyprland 0.57+) of every classic dispatcher this server
+/// sends (see Hyprland's src/config/lua/bindings/LuaBindingsDispatchers.cpp);
+/// None for others or malformed ones.
 pub fn lua_dispatch(cmd: &str) -> Option<String> {
     let (name, args) = cmd.split_once(' ').unwrap_or((cmd, ""));
     match name {
+        "focuswindow" => Some(format!(
+            "hl.dsp.focus({{window = {}}})",
+            lua_str(args.trim())
+        )),
+        // On the focused window, as the classic one; `set` is the default.
+        "fullscreenstate" => {
+            let mut it = args.split_whitespace();
+            let (internal, client) = (lua_num(it.next()?)?, lua_num(it.next()?)?);
+            Some(format!(
+                "hl.dsp.window.fullscreen_state({{internal = {internal}, client = {client}}})"
+            ))
+        }
+        // "enable": the Lua toggle actions are toggle/enable/disable.
+        "setfloating" => Some(format!(
+            "hl.dsp.window.float({{action = \"enable\", window = {}}})",
+            lua_str(args.trim())
+        )),
+        "resizewindowpixel" | "movewindowpixel" => {
+            let (x, y, window) = pair_and_window(args.strip_prefix("exact ")?)?;
+            let f = if name == "resizewindowpixel" {
+                "resize"
+            } else {
+                "move"
+            };
+            Some(format!(
+                "hl.dsp.window.{f}({{x = {x}, y = {y}, window = {window}}})"
+            ))
+        }
+        "movecursor" => {
+            let mut it = args.split_whitespace();
+            let (x, y) = (lua_num(it.next()?)?, lua_num(it.next()?)?);
+            Some(format!("hl.dsp.cursor.move({{x = {x}, y = {y}}})"))
+        }
         "movetoworkspacesilent" => {
             let (ws, window) = args.split_once(',')?;
             let ws = match ws.parse::<i64>() {
@@ -754,6 +802,20 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        // Hyprland 0.57+ takes only Lua: every one of them has a Lua form.
+        let asks = [
+            ask(Some(10.0), Some(500.4), None),
+            ask(None, None, Some("minimize")),
+            ask(None, None, Some("restore")),
+            ask(None, None, Some("maximize")),
+        ];
+        for c in [k, a, b, &floating] {
+            for q in &asks {
+                for cmd in change_commands(c, q, Some(2), None).unwrap() {
+                    assert!(lua_dispatch(&cmd).is_some(), "{cmd}");
+                }
+            }
+        }
     }
 
     #[test]
@@ -827,7 +889,39 @@ mod tests {
             lua_dispatch("closewindow address:0x1").unwrap(),
             "hl.dsp.window.close({window = \"address:0x1\"})"
         );
-        assert_eq!(lua_dispatch("setfloating address:0x1"), None);
+        assert_eq!(
+            lua_dispatch("focuswindow address:0x1").unwrap(),
+            "hl.dsp.focus({window = \"address:0x1\"})"
+        );
+        assert_eq!(
+            lua_dispatch("fullscreenstate 1 1").unwrap(),
+            "hl.dsp.window.fullscreen_state({internal = 1, client = 1})"
+        );
+        assert_eq!(
+            lua_dispatch("setfloating address:0x1").unwrap(),
+            "hl.dsp.window.float({action = \"enable\", window = \"address:0x1\"})"
+        );
+        assert_eq!(
+            lua_dispatch("resizewindowpixel exact 500 678,address:0x1").unwrap(),
+            "hl.dsp.window.resize({x = 500, y = 678, window = \"address:0x1\"})"
+        );
+        assert_eq!(
+            lua_dispatch("movewindowpixel exact -21 10.5,address:0x1").unwrap(),
+            "hl.dsp.window.move({x = -21, y = 10.5, window = \"address:0x1\"})"
+        );
+        assert_eq!(
+            lua_dispatch("movecursor 10 20").unwrap(),
+            "hl.dsp.cursor.move({x = 10, y = 20})"
+        );
+        // Malformed ones and dispatchers the server never sends have none.
+        for cmd in [
+            "movewindowpixel 1 2,address:0x1",
+            "movecursor 1",
+            "fullscreenstate a b",
+        ] {
+            assert_eq!(lua_dispatch(cmd), None, "{cmd}");
+        }
+        assert_eq!(lua_dispatch("pin address:0x1"), None);
         assert!(wants_lua(
             "error: 3 [string \"return hl.dispatch(closewindow address:0x1)\"]:1: ')' expected"
         ));
@@ -913,7 +1007,7 @@ mod tests {
         // instead, and from then on right away.
         h.dispatch("closewindow address:0x1").await.unwrap();
         h.dispatch("closewindow address:0x2").await.unwrap();
-        let err = h.dispatch("setfloating address:0x1").await.unwrap_err();
+        let err = h.dispatch("pin address:0x1").await.unwrap_err();
         assert!(err.contains("no Lua form"), "{err}");
         assert_eq!(
             server.await.unwrap(),
