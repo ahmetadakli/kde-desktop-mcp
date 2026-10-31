@@ -59,7 +59,33 @@ const BORING: &[&str] = &[
     "grouping",
 ];
 const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
+/// Toolkits (AT-SPI ToolkitName, lower case) whose apps send every
+/// registered change event: reads of them may be kept before any was
+/// heard. Others (GTK 4, Java...) only once they sent one.
+const EVENT_TOOLKITS: [&str; 3] = ["qt", "gecko", "chromium"];
+
 const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
+
+/// Screen centre of an element from its extents in window coordinates
+/// and the active window's origin, once its window is known to be active.
+fn screen_center(
+    frame_active: bool,
+    ext: R<(i32, i32, i32, i32)>,
+    origin: &R<(f64, f64)>,
+) -> R<(i32, i32)> {
+    if !frame_active {
+        return Err(NOT_ACTIVE.into());
+    }
+    let (x, y, w, h) = ext?;
+    if w <= 0 || h <= 0 {
+        return Err("element has no on-screen area".into());
+    }
+    let (gx, gy) = origin.clone()?;
+    Ok((
+        (gx + x as f64 + w as f64 / 2.0) as i32,
+        (gy + y as f64 + h as f64 / 2.0) as i32,
+    ))
+}
 /// How old the active-app check before `type_text` may be for the
 /// accessibility insert to trust it.
 const INSERT_ACTIVE_AGE: Duration = Duration::from_secs(1);
@@ -472,11 +498,17 @@ impl LinuxBackend {
         // without it `type_text` also falls back to pasting more often).
         // The others let `act` return as soon as a menu or dialog opened,
         // and `wait_for` wait for the app to change rather than poll it.
-        let _ = tokio::join!(
+        // With all but focus (state changes cover it) listened to, a read
+        // of an app's tree is reused while the app sends none.
+        let (_, actions, changes, reads) = tokio::join!(
             a11y.track_focus(),
             a11y.track_actions(),
-            a11y.track_changes()
+            a11y.track_changes(),
+            a11y.track_reads()
         );
+        if actions.is_ok() && changes.is_ok() && reads.is_ok() {
+            a11y.set_reads_live();
+        }
         Ok(LinuxBackend {
             session,
             a11y,
@@ -1047,6 +1079,40 @@ impl Backend for LinuxBackend {
         self.a11y.changed_since(&buses, mark)
     }
 
+    fn read_mark(&self) -> Option<u64> {
+        self.a11y.read_mark()
+    }
+
+    fn unchanged_since(&self, near: &[Obj], mark: u64) -> bool {
+        let mut buses: Vec<&str> = near.iter().map(|o| o.bus.as_ref()).collect();
+        buses.sort_unstable();
+        buses.dedup();
+        self.a11y.reads_unchanged(&buses, mark)
+    }
+
+    /// Apps known to send change events: they did since we listen, or
+    /// their toolkit always does for registered events. No document of
+    /// theirs may be loading (a page waiting for the network sends none).
+    async fn may_keep(&self, near: &[Obj]) -> bool {
+        let mut buses: Vec<&str> = near.iter().map(|o| o.bus.as_ref()).collect();
+        buses.sort_unstable();
+        buses.dedup();
+        let (loading, sends) = tokio::join!(
+            self.loading(near),
+            futures_util::future::join_all(buses.iter().map(|bus| async move {
+                self.a11y.reads_heard(bus) || {
+                    let toolkit = self.toolkit(bus).await.to_lowercase();
+                    EVENT_TOOLKITS.contains(&toolkit.as_str())
+                }
+            }))
+        );
+        !buses.is_empty() && !loading && sends.into_iter().all(|s| s)
+    }
+
+    async fn still_there(&self, id: &Obj) -> bool {
+        self.a11y.still_there(id).await
+    }
+
     async fn active_app(&self) -> String {
         match &self.comp {
             Compositor::Kde(_) => self.a11y.active_app().await,
@@ -1253,6 +1319,19 @@ impl Backend for LinuxBackend {
             .unwrap_or_else(|| Err("element has no on-screen area".into()))
     }
 
+    async fn element_center_in(&self, id: &Obj, frame: &Obj) -> R<(i32, i32)> {
+        let Compositor::Kde(kwin) = &self.comp else {
+            return self.element_center(id).await;
+        };
+        // As `element_centers`, with the frame known: no walk up to it.
+        let (origin, frame_active, ext) = tokio::join!(
+            kwin.active_window_origin(),
+            self.a11y.has_state(frame, atspi::ACTIVE),
+            self.a11y.extents(id, atspi::COORD_WINDOW)
+        );
+        screen_center(frame_active, ext, &origin)
+    }
+
     async fn element_centers(&self, ids: &[Obj]) -> Vec<R<(i32, i32)>> {
         let kwin = match &self.comp {
             Compositor::Kde(kwin) => kwin,
@@ -1280,20 +1359,7 @@ impl Backend for LinuxBackend {
         );
         parts
             .into_iter()
-            .map(|(frame_active, ext)| {
-                if !frame_active {
-                    return Err(NOT_ACTIVE.into());
-                }
-                let (x, y, w, h) = ext?;
-                if w <= 0 || h <= 0 {
-                    return Err("element has no on-screen area".into());
-                }
-                let (gx, gy) = origin.clone()?;
-                Ok((
-                    (gx + x as f64 + w as f64 / 2.0) as i32,
-                    (gy + y as f64 + h as f64 / 2.0) as i32,
-                ))
-            })
+            .map(|(frame_active, ext)| screen_center(frame_active, ext, &origin))
             .collect()
     }
 
@@ -1356,8 +1422,8 @@ impl Backend for LinuxBackend {
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {
         input::button_code(button)?;
-        self.move_pointer(x, y).await?;
-        self.input.buttons(button, clicks, scroll).await
+        crate::trace::time("move_pointer", self.move_pointer(x, y)).await?;
+        crate::trace::time("buttons", self.input.buttons(button, clicks, scroll)).await
     }
 
     async fn indicate(&self, label: &str) {
@@ -1376,14 +1442,14 @@ impl Backend for LinuxBackend {
         if let Ok(mut ind) = self.indicator.try_lock()
             && ind.child.is_some()
         {
-            ind.send(&format!("point {x} {y}"), true).await;
+            crate::trace::time("indicator point", ind.send(&format!("point {x} {y}"), true)).await;
         }
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let (x0, y0, x1, y1) = kwin.screen_box().await;
+                let (x0, y0, x1, y1) = crate::trace::time("screen_box", kwin.screen_box()).await;
                 let ax = ((x - x0 as i64) * input::ABS_MAX as i64 / (x1 - x0).max(1) as i64) as i32;
                 let ay = ((y - y0 as i64) * input::ABS_MAX as i64 / (y1 - y0).max(1) as i64) as i32;
-                self.input.move_abs(ax, ay).await?;
+                crate::trace::time("move_abs", self.input.move_abs(ax, ay)).await?;
             }
             Compositor::Hyprland(h) => {
                 // Hyprland places the cursor exactly; uinput only supplies

@@ -14,6 +14,7 @@ mod render;
 mod shot;
 mod takeover;
 mod tools;
+mod trace;
 #[cfg(windows)]
 mod windows;
 // The Windows backend's pure helpers, so their tests also run on Linux.
@@ -46,6 +47,20 @@ const TREE_MAX_CHARS: i64 = 20_000;
 const CONTINUATION_CHARS: usize = 150;
 /// Nodes fetched ahead when rendering reaches an unfetched part of the tree.
 const PREFETCH_MORE: usize = 500;
+/// Off-screen matches or close names a missed search offers.
+const MISS_SUGGESTIONS: usize = 5;
+/// Nodes of a web page fetched when looking for matches scrolled out of
+/// view (see `Server::miss_report`).
+const OFFSCREEN_FETCH: usize = 3000;
+
+/// What `Server::locate` found: the element, or the windows searched; with
+/// the nodes fetched.
+enum Located<Id> {
+    /// The element, the nodes read, and whether they came from a kept read.
+    Found(Id, Cache<Id>, bool),
+    /// The windows searched and the nodes read there.
+    Missed(Vec<Id>, Cache<Id>),
+}
 
 /// How searches (find, locate, the active document) fetch: showing nodes,
 /// without action names, which only the nodes they return need.
@@ -56,7 +71,145 @@ fn search_fetch(text_limit: usize, limit: usize) -> Fetch {
         limit,
         actions: false,
         stop_roles: &[],
+        offscreen: false,
     }
+}
+
+/// How long a read of an app's tree is reused at most, even when the app
+/// reported no change: a safety net for changes no event announces.
+const READ_MAX_AGE: Duration = Duration::from_secs(2);
+/// Reads kept at once (one per app and `ReadKey`).
+const READS_KEPT: usize = 4;
+
+/// How a read of an app's tree fetched: kept reads are reused only by
+/// reads that fetch the same way. Reads with `stop_roles` are not kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ReadKey {
+    only_showing: bool,
+    text_limit: usize,
+    limit: usize,
+    actions: bool,
+}
+
+impl ReadKey {
+    fn of(f: &Fetch) -> Option<Self> {
+        f.stop_roles.is_empty().then_some(ReadKey {
+            only_showing: f.only_showing,
+            text_limit: f.text_limit,
+            limit: f.limit,
+            actions: f.actions,
+        })
+    }
+}
+
+/// Taken before a read that may be kept: the backend's change mark, the
+/// input generation (`Reads::generation`) and the time.
+#[derive(Clone, Copy, Debug)]
+struct ReadStart {
+    mark: u64,
+    generation: u64,
+    at: Instant,
+}
+
+/// A read of an app's windows kept for reuse (`Server::kept_read`).
+struct KeptRead<Id> {
+    app: String,
+    key: ReadKey,
+    windows: Vec<Id>,
+    cache: Cache<Id>,
+    start: ReadStart,
+}
+
+/// Reads of apps' trees kept for the next calls, and what invalidates them.
+struct Reads<Id> {
+    /// Bumped when a call that may change what apps show (input) starts
+    /// and when it ends: reads that began before are never reused.
+    generation: u64,
+    /// Such calls running now: meanwhile no read is kept or reused.
+    inputs: u32,
+    kept: Vec<KeptRead<Id>>,
+}
+
+impl<Id> Reads<Id> {
+    fn new() -> Self {
+        Reads {
+            generation: 0,
+            inputs: 0,
+            kept: Vec::new(),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.generation += 1;
+        self.kept.clear();
+    }
+}
+
+/// Marks a call that may change what apps show as running, for as long as
+/// it lives: kept reads are dropped when it starts and when it ends.
+struct InputRun<'a, Id>(&'a std::sync::Mutex<Reads<Id>>);
+
+impl<'a, Id> InputRun<'a, Id> {
+    fn start(reads: &'a std::sync::Mutex<Reads<Id>>) -> Self {
+        let mut r = reads.lock().unwrap_or_else(|e| e.into_inner());
+        r.inputs += 1;
+        r.invalidate();
+        InputRun(reads)
+    }
+}
+
+impl<Id> Drop for InputRun<'_, Id> {
+    fn drop(&mut self) {
+        let mut r = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        r.inputs = r.inputs.saturating_sub(1);
+        r.invalidate();
+    }
+}
+
+/// Tools that change nothing an app shows (without `window`, which may
+/// activate one): they keep and reuse reads. A batch's steps count one by
+/// one. Every other tool drops the kept reads.
+const READ_ONLY_TOOLS: [&str; 12] = [
+    "apps",
+    "tree",
+    "find",
+    "get_text",
+    "wait_for",
+    "wait_idle",
+    "pause",
+    "windows",
+    "doctor",
+    "cursor_position",
+    "screenshot",
+    "batch",
+];
+
+/// The nearest frame, window or dialog at or above `id` in `cache` (what
+/// the backend would walk up to); None when the way up is not known for
+/// sure (a node listed by two parents).
+fn frame_in<Id: Clone + Eq + std::hash::Hash>(cache: &Cache<Id>, id: &Id) -> Option<Id> {
+    let mut parents: HashMap<&Id, Option<&Id>> = HashMap::new();
+    for (p, info) in cache {
+        for c in &info.children {
+            parents
+                .entry(c)
+                .and_modify(|seen| {
+                    if *seen != Some(p) {
+                        *seen = None;
+                    }
+                })
+                .or_insert(Some(p));
+        }
+    }
+    let mut cur = id;
+    for _ in 0..=cache.len() {
+        let info = cache.get(cur)?;
+        if matches!(info.role.as_str(), "frame" | "window" | "dialog") {
+            return Some(cur.clone());
+        }
+        cur = (*parents.get(cur)?)?;
+    }
+    None
 }
 
 struct Refs<Id> {
@@ -195,6 +348,8 @@ struct Server<B: Backend> {
     allow_file: PathBuf,
     /// Title of the active window as last reported, to mention changes.
     last_active: Mutex<Option<String>>,
+    /// The window in front after the last input, for `window_change_note`.
+    seen_active: Mutex<Option<String>>,
     /// Maps pixels of the last screenshot to screen coordinates.
     last_shot: Mutex<Option<ShotMap>>,
     /// Held by tools that send keyboard or pointer input, so two concurrent
@@ -217,6 +372,9 @@ struct Server<B: Backend> {
     /// The way back to the client, for requests the server sends it
     /// (elicitation); see `Server::request`.
     link: std::cell::RefCell<ClientLink>,
+    /// Reads of apps' trees kept for the next calls (`Server::read_app`).
+    /// Never locked across an await.
+    reads: std::sync::Mutex<Reads<B::Id>>,
 }
 
 /// A key or mouse button the server pressed and has not released.
@@ -1124,6 +1282,7 @@ impl<B: Backend> Server<B> {
             }),
             allow_file,
             last_active: Mutex::new(None),
+            seen_active: Mutex::new(None),
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
@@ -1131,6 +1290,7 @@ impl<B: Backend> Server<B> {
             takeover: b_takeover,
             run_start: std::sync::Mutex::new(None),
             link: Default::default(),
+            reads: std::sync::Mutex::new(Reads::new()),
         }
     }
 
@@ -1581,21 +1741,200 @@ impl<B: Backend> Server<B> {
             .ok_or_else(|| format!("app '{name}' not found in the accessibility tree"))
     }
 
+    // ------------------------------------------------------------ kept reads
+
+    fn reads(&self) -> std::sync::MutexGuard<'_, Reads<B::Id>> {
+        self.reads.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Taken before a read that may be kept; None when it may not be: the
+    /// backend cannot tell that an app did not change, or input runs.
+    fn read_start(&self) -> Option<ReadStart> {
+        let mark = self.b.read_mark()?;
+        let r = self.reads();
+        (r.inputs == 0).then(|| ReadStart {
+            mark,
+            generation: r.generation,
+            at: Instant::now(),
+        })
+    }
+
+    /// Whether a read of `windows` that began at `start` still shows them
+    /// as they are: no input of ours since, the app provably sent no change
+    /// (`Backend::unchanged_since`), the user did not use the keyboard or
+    /// mouse (scrolling shows other elements without an event), and it is
+    /// younger than READ_MAX_AGE.
+    fn read_current(&self, r: &Reads<B::Id>, windows: &[B::Id], start: &ReadStart) -> bool {
+        r.inputs == 0
+            && r.generation == start.generation
+            && start.at.elapsed() < READ_MAX_AGE
+            && self.b.unchanged_since(windows, start.mark)
+            && !self
+                .takeover
+                .as_ref()
+                .is_some_and(|t| t.user_input_since(start.at))
+    }
+
+    /// The kept read of `app`'s `windows` fetched as `key`, while it is
+    /// current (`read_current`), and when it began; else it is dropped.
+    fn kept_read(
+        &self,
+        app: &str,
+        key: ReadKey,
+        windows: &[B::Id],
+    ) -> Option<(Cache<B::Id>, ReadStart)> {
+        let mut r = self.reads();
+        let i = r.kept.iter().position(|k| k.app == app && k.key == key)?;
+        let k = &r.kept[i];
+        if k.windows == windows && self.read_current(&r, windows, &k.start) {
+            return Some((k.cache.clone(), k.start));
+        }
+        if trace::on() {
+            let why = if k.windows != windows {
+                "windows differ"
+            } else if r.inputs > 0 || r.generation != k.start.generation {
+                "input since"
+            } else if k.start.at.elapsed() >= READ_MAX_AGE {
+                "too old"
+            } else if !self.b.unchanged_since(windows, k.start.mark) {
+                "app changed"
+            } else {
+                "user input"
+            };
+            eprintln!("trace          kept read dropped: {why}");
+        }
+        r.kept.remove(i);
+        None
+    }
+
+    /// Keep a read of `app`'s `windows` that began at `start`, unless
+    /// something changed meanwhile.
+    fn keep_read(
+        &self,
+        app: &str,
+        key: ReadKey,
+        windows: &[B::Id],
+        cache: &Cache<B::Id>,
+        start: ReadStart,
+    ) {
+        let mut r = self.reads();
+        r.kept.retain(|k| !(k.app == app && k.key == key));
+        if !self.read_current(&r, windows, &start) {
+            return;
+        }
+        if r.kept.len() >= READS_KEPT {
+            r.kept.remove(0);
+        }
+        r.kept.push(KeptRead {
+            app: app.to_string(),
+            key,
+            windows: windows.to_vec(),
+            cache: cache.clone(),
+            start,
+        });
+    }
+
+    /// Drop the kept reads of `app`.
+    fn forget_reads(&self, app: &str) {
+        self.reads().kept.retain(|k| k.app != app);
+    }
+
+    /// Fetch below `roots` into `cache` with `first`, then with `more`
+    /// until `pick` has all it needs; `pick`'s result and the nodes read.
+    /// With `app` (lower case; `roots` are its windows, `cache` empty), a
+    /// read of the same windows kept from an earlier call is used instead
+    /// while it is current (`read_current`), and this read is kept for the
+    /// next calls. The flag tells whether the nodes came from a kept read.
+    async fn read_app<T>(
+        &self,
+        app: Option<&str>,
+        roots: &[B::Id],
+        mut cache: Cache<B::Id>,
+        first: Fetch,
+        more: Fetch,
+        mut pick: impl FnMut(&Cache<B::Id>) -> Result<T, Vec<B::Id>>,
+    ) -> (T, Cache<B::Id>, bool) {
+        let keep = match (app.filter(|_| cache.is_empty()), ReadKey::of(&first)) {
+            (Some(app), Some(key)) => Some((app, key)),
+            _ => None,
+        };
+        let kept = keep.and_then(|(app, key)| self.kept_read(app, key, roots));
+        let cached = kept.is_some();
+        let start = match kept {
+            Some((nodes, start)) => {
+                if trace::on() {
+                    eprintln!("trace          kept read of {} nodes", nodes.len());
+                }
+                cache = nodes;
+                Some(start)
+            }
+            None => {
+                let start = keep.and_then(|_| self.read_start());
+                let (_, may_keep) = trace::time("prefetch", async {
+                    tokio::join!(
+                        self.b.prefetch_with(&mut cache, roots.to_vec(), &first),
+                        async { start.is_some() && self.b.may_keep(roots).await }
+                    )
+                })
+                .await;
+                if trace::on() {
+                    eprintln!("trace          prefetched {} nodes", cache.len());
+                }
+                start.filter(|_| may_keep)
+            }
+        };
+        let read = cache.len();
+        let out = loop {
+            match pick(&cache) {
+                Ok(out) => break out,
+                Err(missing) => {
+                    trace::time(
+                        "prefetch more",
+                        self.b.prefetch_with(&mut cache, missing, &more),
+                    )
+                    .await;
+                }
+            }
+        };
+        if let (Some((app, key)), Some(start)) = (keep, start)
+            && (!cached || cache.len() > read)
+        {
+            self.keep_read(app, key, roots, &cache, start);
+        }
+        (out, cache, cached)
+    }
+
     /// Fetch the visible part of `app` and pick the element `query` names;
     /// window and tab titles only with `titles` (see render::TITLE_ROLES).
-    /// The cache holds no action names: `fill_actions` before describing.
+    /// `kept`: a kept read of `app` may serve. The cache holds no action
+    /// names: `fill_actions` before describing.
     async fn locate(
         &self,
         app: &str,
         query: &str,
         role: &str,
         titles: bool,
-    ) -> R<Option<(B::Id, Cache<B::Id>)>> {
-        let windows = self.app_windows(app).await?;
-        Ok(self.locate_in(windows, query, role, titles).await)
+        kept: bool,
+    ) -> R<Located<B::Id>> {
+        let windows = trace::time("app_windows", self.app_windows(app)).await?;
+        let app = app.to_lowercase();
+        let (found, cache, cached) = self
+            .read_app(
+                kept.then_some(app.as_str()),
+                &windows,
+                Cache::new(),
+                search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
+                search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
+                |c| render::locate(c, &windows, query, role, titles),
+            )
+            .await;
+        Ok(match found {
+            Some(id) => Located::Found(id, cache, cached),
+            None => Located::Missed(windows, cache),
+        })
     }
 
-    /// `locate` in the app windows `windows`.
+    /// `locate` in the app windows `windows`, read afresh.
     async fn locate_in(
         &self,
         windows: Vec<B::Id>,
@@ -1603,44 +1942,93 @@ impl<B: Backend> Server<B> {
         role: &str,
         titles: bool,
     ) -> Option<(B::Id, Cache<B::Id>)> {
-        let mut cache = Cache::new();
-        self.b
-            .prefetch_with(
-                &mut cache,
-                windows.clone(),
-                &search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
+        let (found, cache, _) = self
+            .read_app(
+                None,
+                &windows,
+                Cache::new(),
+                search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
+                search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
+                |c| render::locate(c, &windows, query, role, titles),
             )
             .await;
-        loop {
-            match render::locate(&cache, &windows, query, role, titles) {
-                Ok(found) => return found.map(|id| (id, cache)),
-                Err(missing) => {
-                    self.b
-                        .prefetch_with(
-                            &mut cache,
-                            missing,
-                            &search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                        )
-                        .await;
-                }
+        found.map(|id| (id, cache))
+    }
+
+    /// What to offer when nothing visible in `windows` matches `query`:
+    /// matches scrolled out of view in the page (web documents only), else
+    /// the visible elements with the closest names, with their ids; empty
+    /// when there are none. `cache` holds the visible part of `windows`.
+    async fn miss_report(
+        &self,
+        windows: &[B::Id],
+        cache: &mut Cache<B::Id>,
+        app: &str,
+        query: &str,
+        role: &str,
+    ) -> String {
+        let as_lines = |ids: Vec<B::Id>| -> Vec<Line<B::Id>> {
+            ids.into_iter()
+                .map(|id| Line::Node { depth: 0, id })
+                .collect()
+        };
+        let docs = render::showing_documents(cache, windows);
+        if !docs.is_empty() {
+            let mut off = Cache::new();
+            let fetch = Fetch {
+                offscreen: true,
+                ..search_fetch(render::FIND_TEXT_LIMIT, OFFSCREEN_FETCH)
+            };
+            trace::time(
+                "prefetch offscreen",
+                self.b.prefetch_with(&mut off, docs.clone(), &fetch),
+            )
+            .await;
+            let hits = render::find_offscreen(&off, &docs, query, role, MISS_SUGGESTIONS);
+            if !hits.is_empty() {
+                self.b.fill_actions(&mut off, &hits).await;
+                let (text, _) = self.print(as_lines(hits), &off, app).await;
+                return format!(
+                    "\noff-screen, scrolled out of view (act and get_text work on them; \
+                     scroll before click):\n{text}"
+                );
             }
         }
+        let near = render::closest(cache, windows, query, MISS_SUGGESTIONS);
+        if near.is_empty() {
+            return String::new();
+        }
+        self.b.fill_actions(cache, &near).await;
+        let (text, _) = self.print(as_lines(near), cache, app).await;
+        format!("; closest:\n{text}")
     }
 
     /// The element a tool call names: `id`, or `app` + `query` (+ `role`).
     /// The tool's tier (and confirmation, `permit`) is checked against the
     /// element's app before anything is looked up there.
     async fn target(&self, a: &Json) -> R<Target<B::Id>> {
+        Ok(self.target_and_center(a, false).await?.0)
+    }
+
+    /// `target`, and with `center` the element's centre when it was cheap
+    /// to measure alongside the last lookups (found by query); None then
+    /// to measure it after.
+    async fn target_and_center(
+        &self,
+        a: &Json,
+        center: bool,
+    ) -> R<(Target<B::Id>, Option<R<(i32, i32)>>)> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
-            let r = self.resolve_ref(rid).await?;
-            self.permit(&r.app).await?;
+            let r = trace::time("resolve_ref", self.resolve_ref(rid)).await?;
+            trace::time("permit", self.permit(&r.app)).await?;
             note_step_element(rid as u64, true);
-            return Ok(Target {
+            let t = Target {
                 id: r.id,
                 found: None,
                 app: r.app,
                 role: r.role,
-            });
+            };
+            return Ok((t, None));
         }
         let (Some(app), Some(query)) = (
             a.get("app").and_then(Json::as_str),
@@ -1651,30 +2039,106 @@ impl<B: Backend> Server<B> {
         if !self.is_allowed(app) {
             return Err(self.not_allowed(app));
         }
-        self.permit(app).await?;
-        self.b.enable().await;
+        trace::time("permit", self.permit(app)).await?;
+        trace::time("enable", self.b.enable()).await;
         let role = arg_s(a, "role", "");
-        let (id, mut cache) = self.locate(app, query, &role, true).await?.ok_or_else(|| {
-            let role = if role.is_empty() {
-                String::new()
-            } else {
-                format!(" with role '{role}'")
+        let app_key = app.to_lowercase();
+        let mut kept = true;
+        let (id, cache, at) = loop {
+            let located = trace::time("locate", self.locate(app, query, &role, true, kept)).await?;
+            let (id, mut cache, cached) = match located {
+                Located::Found(id, cache, cached) => (id, cache, cached),
+                Located::Missed(windows, mut cache) => {
+                    let with_role = if role.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" with role '{role}'")
+                    };
+                    let report = self
+                        .miss_report(&windows, &mut cache, &app_key, query, &role)
+                        .await;
+                    return Err(format!(
+                        "no visible element in '{app}' matches '{query}'{with_role}{report}"
+                    ));
+                }
             };
-            format!("no visible element in '{app}' matches '{query}'{role}")
-        })?;
-        self.b
-            .fill_actions(&mut cache, std::slice::from_ref(&id))
-            .await;
-        let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
+            // The window it is in, from the nodes read: no walk up to it.
+            let frame = if center { frame_in(&cache, &id) } else { None };
+            // An element from a kept read is checked to be still there, in
+            // the same round trip as its actions (and centre).
+            let (there, _, at) = tokio::join!(
+                async { !cached || trace::time("still_there", self.b.still_there(&id)).await },
+                trace::time(
+                    "fill_actions",
+                    self.b.fill_actions(&mut cache, std::slice::from_ref(&id))
+                ),
+                async {
+                    if !center {
+                        return None;
+                    }
+                    let c = async {
+                        match &frame {
+                            Some(f) => self.b.element_center_in(&id, f).await,
+                            None => self.b.element_center(&id).await,
+                        }
+                    };
+                    Some(trace::time("element_center", c).await)
+                }
+            );
+            if there {
+                break (id, cache, at);
+            }
+            // Gone or hidden without an event: read afresh.
+            self.forget_reads(&app_key);
+            kept = false;
+        };
+        let rid = trace::time("add_ref", self.add_ref(&id, &cache[&id], &app_key)).await;
         note_step_element(rid, true);
         let found = Some(render::describe(&cache[&id], rid));
         let role = cache[&id].role.clone();
-        Ok(Target {
+        let t = Target {
             id,
             found,
-            app: app.to_lowercase(),
+            app: app_key,
             role,
-        })
+        };
+        Ok((t, at))
+    }
+
+    /// What is on screen, for a reply that found nothing or failed: the
+    /// active window and the focused element, so the next call can be
+    /// planned without a screenshot. Windows of apps not allowed are not
+    /// named.
+    async fn where_note(&self) -> String {
+        let (print, focus) = tokio::join!(self.fingerprint(), self.focus_note(false));
+        let window = match print.window {
+            Some((app, title)) if self.is_allowed(&app) => {
+                format!("active window {} [{app}]", render::py_repr(&title))
+            }
+            Some((app, _)) => format!("active window of '{app}' (not allowed)"),
+            None => "no active window".into(),
+        };
+        format!("\nnow: {window}{focus}")
+    }
+
+    /// "; active window now '…'" when the window in front is not the one
+    /// last seen (after an input that was not asked to `observe`): the
+    /// cheap part of the effect line, without waiting.
+    async fn window_change_note(&self) -> String {
+        let Some(now) = self.active_title().await else {
+            return String::new();
+        };
+        let mut last = self.seen_active.lock().await;
+        let first = last.is_none();
+        if last.as_deref() == Some(now.as_str()) {
+            return String::new();
+        }
+        *last = Some(now.clone());
+        // Nothing seen before to compare with: no change to report.
+        if first {
+            return String::new();
+        }
+        format!("; active window now {}", render::py_repr(&now))
     }
 
     /// Title of the active window, if any.
@@ -2139,6 +2603,8 @@ impl<B: Backend> Server<B> {
         };
         let max_chars = arg_i(a, "max_chars", TREE_MAX_CHARS).max(0) as usize;
         let mut cache = Cache::new();
+        // Only a tree of the app's windows reuses and keeps reads.
+        let whole_app = root_id == 0 && !arg_b(a, "document", false);
         let (header, roots, app) = if root_id != 0 {
             let (id, app) = self.resolve_with_app(root_id).await?;
             let info = self.b.info(&id, TREE_TEXT_LIMIT).await;
@@ -2173,37 +2639,32 @@ impl<B: Backend> Server<B> {
         } else {
             None
         };
-        let first = (opts.budget * 4).max(1000);
-        self.b
-            .prefetch(
-                &mut cache,
-                roots.clone(),
-                opts.only_showing,
-                TREE_TEXT_LIMIT,
-                first,
-            )
-            .await;
+        let fetch = |limit| Fetch {
+            only_showing: opts.only_showing,
+            text_limit: TREE_TEXT_LIMIT,
+            limit,
+            actions: true,
+            stop_roles: &[],
+            offscreen: false,
+        };
         let header = match after_rid {
             0 => header,
             rid => format!("{header} (continued after [{rid}])"),
         };
-        let (lines, walked) = loop {
-            let mut lines = vec![Line::Raw(header.clone())];
-            match render::walk(&cache, &roots, 1, &opts, after.as_ref(), &mut lines) {
-                Ok(walked) => break (lines, walked),
-                Err(missing) => {
-                    self.b
-                        .prefetch(
-                            &mut cache,
-                            missing,
-                            opts.only_showing,
-                            TREE_TEXT_LIMIT,
-                            PREFETCH_MORE,
-                        )
-                        .await;
-                }
-            }
-        };
+        let ((lines, walked), cache, _) = self
+            .read_app(
+                whole_app.then_some(app.as_str()),
+                &roots,
+                cache,
+                fetch((opts.budget * 4).max(1000)),
+                fetch(PREFETCH_MORE),
+                |c| {
+                    let mut lines = vec![Line::Raw(header.clone())];
+                    render::walk(c, &roots, 1, &opts, after.as_ref(), &mut lines)
+                        .map(|walked| (lines, walked))
+                },
+            )
+            .await;
         if !walked.after_found {
             return Err(format!(
                 "`after` id {after_rid} is not in this tree (any more); call tree without `after`"
@@ -2320,31 +2781,27 @@ impl<B: Backend> Server<B> {
         let app = req_s(a, "app")?;
         let role = arg_s(a, "role", "");
         let max_results = arg_i(a, "max_results", 30).max(0) as usize;
-        let windows = self.app_windows(&app).await?;
-        let mut cache = Cache::new();
-        self.b
-            .prefetch_with(
-                &mut cache,
-                windows.clone(),
-                &search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
+        let windows = trace::time("app_windows", self.app_windows(&app)).await?;
+        let (hits, mut cache, _) = self
+            .read_app(
+                Some(&app.to_lowercase()),
+                &windows,
+                Cache::new(),
+                search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
+                search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
+                |c| render::find(c, &windows, &query, &role, max_results),
             )
             .await;
-        let hits = loop {
-            match render::find(&cache, &windows, &query, &role, max_results) {
-                Ok(h) => break h,
-                Err(missing) => {
-                    self.b
-                        .prefetch_with(
-                            &mut cache,
-                            missing,
-                            &search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                        )
-                        .await;
-                }
-            }
-        };
         if hits.is_empty() {
-            return Ok("no matches".into());
+            let report = self
+                .miss_report(&windows, &mut cache, &app.to_lowercase(), &query, &role)
+                .await;
+            let head = if report.starts_with("\noff-screen") {
+                "no visible matches"
+            } else {
+                "no matches"
+            };
+            return Ok(format!("{head}{report}"));
         }
         self.b.fill_actions(&mut cache, &hits).await;
         let lines = hits
@@ -2500,6 +2957,7 @@ impl<B: Backend> Server<B> {
             limit,
             actions: false,
             stop_roles: &render::MENU_BAR_STOP,
+            offscreen: false,
         };
         self.b
             .prefetch_with(cache, windows.to_vec(), &fetch(1))
@@ -2545,6 +3003,7 @@ impl<B: Backend> Server<B> {
             limit: PREFETCH_MORE,
             actions: false,
             stop_roles: &[],
+            offscreen: false,
         };
         for _ in 0..MENU_FETCH_ROUNDS {
             match render::menu_items(cache, node) {
@@ -2712,7 +3171,7 @@ impl<B: Backend> Server<B> {
             return Err(t.reply("a password field: its text is never read"));
         }
         let limit = arg_i(a, "limit", 20000).max(0) as usize;
-        let mut text = self.b.full_text(&t.id, limit).await?;
+        let mut text = trace::time("full_text", self.b.full_text(&t.id, limit)).await?;
         if render::has_embedded_objects(&text) {
             text = self.container_text(&t.id, limit).await;
         }
@@ -2911,23 +3370,44 @@ impl<B: Backend> Server<B> {
         let start = Instant::now();
         let mut since = Instant::now();
         let mut print = None;
+        let mut loading = false;
         loop {
-            if since.elapsed() >= quiet && self.b.loading(&windows).await {
-                // Quiet only because the page waits for the network.
-                since = Instant::now();
+            if since.elapsed() >= quiet {
+                loading = self.b.loading(&windows).await;
+                if loading {
+                    // Quiet only because the page waits for the network.
+                    since = Instant::now();
+                }
             }
             if since.elapsed() >= quiet {
                 let ms = start.elapsed().as_millis();
+                // Which page it settled on, so no find is needed to check:
+                // the app's active window, else its first.
+                let key = app.to_lowercase();
+                let title = self
+                    .b
+                    .list_apps()
+                    .await
+                    .into_iter()
+                    .filter(|a| a.name.to_lowercase() == key)
+                    .flat_map(|a| a.windows)
+                    .min_by_key(|w| !w.active)
+                    .map(|w| format!("; window {}", render::py_repr(&w.title)))
+                    .unwrap_or_default();
                 return Ok(format!(
-                    "idle after {ms} ms (no change for {} ms){note}",
+                    "idle after {ms} ms (no change for {} ms){title}{note}",
                     quiet.as_millis()
                 ));
             }
             if start.elapsed() >= limit {
                 let ms = start.elapsed().as_millis();
+                let why = if loading {
+                    "a page is still loading".to_string()
+                } else {
+                    format!("never quiet for {} ms", quiet.as_millis())
+                };
                 return Err(format!(
-                    "'{app}' still changing after {ms} ms (never quiet for {} ms){note}",
-                    quiet.as_millis()
+                    "'{app}' still changing after {ms} ms ({why}){note}"
                 ));
             }
             let left = limit
@@ -2970,7 +3450,7 @@ impl<B: Backend> Server<B> {
     async fn focus(&self, a: &Json) -> R<String> {
         let t = self.target(a).await?;
         let id = &t.id;
-        if let Some(method) = self.b.try_focus(id).await? {
+        if let Some(method) = trace::time("try_focus", self.b.try_focus(id)).await? {
             return Ok(t.reply(&format!("ok ({method})")));
         }
         let (x, y) = self.active_center(id).await?;
@@ -3016,11 +3496,17 @@ impl<B: Backend> Server<B> {
     /// keep the order of doing it step by step: the target, the active
     /// window, then the centre.
     async fn target_center(&self, a: &Json) -> R<(Target<B::Id>, (i32, i32))> {
-        let (active, found) = tokio::join!(self.require_active_allowed(), async {
-            let t = self.target(a).await?;
-            let center = self.b.element_center(&t.id).await;
-            Ok::<_, String>((t, center))
-        });
+        let (active, found) = tokio::join!(
+            trace::time("require_active_allowed", self.require_active_allowed()),
+            async {
+                let (t, center) = trace::time("target", self.target_and_center(a, true)).await?;
+                let center = match center {
+                    Some(c) => c,
+                    None => trace::time("element_center", self.b.element_center(&t.id)).await,
+                };
+                Ok::<_, String>((t, center))
+            }
+        );
         let (t, center) = found?;
         active?;
         Ok((t, center?))
@@ -3479,7 +3965,7 @@ impl<B: Backend> Server<B> {
     /// resolution, mapped so image_x/image_y refer to the zoomed image.
     async fn screenshot(&self, a: &Json) -> R<Out> {
         let region = region_arg(a)?;
-        self.require_active_allowed().await?;
+        trace::time("require_active_allowed", self.require_active_allowed()).await?;
         // The zoom's screen area, from the map of the image it was read in.
         let zoom = match region {
             Some(r) => {
@@ -3490,7 +3976,9 @@ impl<B: Backend> Server<B> {
             None => None,
         };
         *self.last_shot.lock().await = None;
-        let Shot { path, pixels, area } = self.b.screenshot().await.ok_or("screenshot failed")?;
+        let Shot { path, pixels, area } = trace::time("capture", self.b.screenshot())
+            .await
+            .ok_or("screenshot failed")?;
         let frac = match (zoom, area) {
             (None, _) => shot::Frac::ALL,
             (Some((_, want)), Some(area)) => region_frac(area, want).ok_or_else(|| {
@@ -3507,9 +3995,12 @@ impl<B: Backend> Server<B> {
         // Converting, shrinking and encoding take milliseconds: keep other
         // calls moving.
         let file = path.clone();
-        let done = tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac))
-            .await
-            .map_err(|e| e.to_string())??;
+        let done = trace::time(
+            "convert+encode",
+            tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac)),
+        )
+        .await
+        .map_err(|e| e.to_string())??;
         // The screen area the image shows: the part of the capture kept.
         let area = area.map(|(x, y, w, h)| {
             let k = done.kept;
@@ -3612,14 +4103,22 @@ impl<B: Backend> Server<B> {
                     if i + 1 < steps.len() {
                         out.push(format!("stopped; {} step(s) not run", steps.len() - i - 1));
                     }
-                    return Err(out.join("\n"));
+                    return Err(format!("{}{}", out.join("\n"), self.where_note().await));
                 }
             }
         }
-        Ok(Out {
-            text: out.join("\n"),
-            images,
-        })
+        let mut text = out.join("\n");
+        // A step failed or found nothing: say what is on screen once, unless
+        // the batch ends with a look at it.
+        let failed = done.iter().any(|(_, e)| matches!(e, StepElement::Failed))
+            || out.iter().any(|l| l.ends_with(": no matches"));
+        let looked = steps
+            .last()
+            .is_some_and(|s| ["screenshot", "tree"].contains(&tool_of(s)));
+        if failed && !looked {
+            text.push_str(&self.where_note().await);
+        }
+        Ok(Out { text, images })
     }
 
     /// Run a tool. When it fails, everything held is released (keys and
@@ -3631,8 +4130,8 @@ impl<B: Backend> Server<B> {
         a: &'a Json,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         Box::pin(async move {
-            let result = self.call_inner(name, a, false).await;
-            match result {
+            let result = trace::time(name, self.call_inner(name, a, false)).await;
+            let result = match result {
                 Err(e) if !self.held_names().is_empty() => {
                     let (names, released) = self.release_all().await;
                     let failed = match released {
@@ -3640,6 +4139,21 @@ impl<B: Backend> Server<B> {
                         Err(r) => format!(" (release failed: {r})"),
                     };
                     Err(format!("{e}; released {}{failed}", names.join(", ")))
+                }
+                r => r,
+            };
+            // What is on screen when it failed or found nothing, so the next
+            // call needs no screenshot to see why.
+            match result {
+                Err(e)
+                    if CONTEXT_TOOLS.contains(&name)
+                        && wants_context(&e, &self.allow_file.display().to_string()) =>
+                {
+                    Err(format!("{e}{}", self.where_note().await))
+                }
+                Ok(mut o) if name == "find" && o.text.starts_with("no matches") => {
+                    o.text.push_str(&self.where_note().await);
+                    Ok(o)
                 }
                 r => r,
             }
@@ -3670,10 +4184,14 @@ impl<B: Backend> Server<B> {
                 }
             }
             let observe = observe_arg(name, a)?;
+            // Reads kept from before are not reused once this may have
+            // changed what an app shows, nor while it runs.
+            let _changes = (!READ_ONLY_TOOLS.contains(&name) || window.is_some())
+                .then(|| InputRun::start(&self.reads));
             // A screenshot sends no input, but activating its window does. A
             // batch that holds the input lock already runs its steps `held`.
             let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
-                let guard = self.input.lock().await;
+                let guard = trace::time("input lock", self.input.lock()).await;
                 self.start_run();
                 Some(guard)
             } else {
@@ -3686,23 +4204,34 @@ impl<B: Backend> Server<B> {
                 && !held
                 && self.takeover.as_ref().is_some_and(|t| t.resume());
             if gated {
-                self.gate(held).await?;
+                trace::time("gate", self.gate(held)).await?;
             }
             let _ours = match &self.takeover {
                 Some(t) if gated => Some(t.ours()),
                 _ => None,
             };
             if let Some(label) = indicator_label(name, a) {
-                self.b.indicate(&label).await;
+                trace::time("indicate", self.b.indicate(&label)).await;
             }
             let activated = match &window {
-                Some(q) => self.ensure_window(q).await?,
+                Some(q) => trace::time("ensure_window", self.ensure_window(q)).await?,
                 None => None,
             };
             // Taken once the window is in front, before the input.
             let before = match observe {
-                Some(_) => Some((self.b.change_mark(), self.fingerprint().await)),
+                Some(_) => Some((
+                    self.b.change_mark(),
+                    trace::time("fingerprint before", self.fingerprint()).await,
+                )),
                 None => None,
+            };
+            // A window that came to the front since the last input (a dialog
+            // that opened after its reply): said before this input's result.
+            let pre_note = match observe {
+                None if WINDOW_NOTE_TOOLS.contains(&name) && window.is_none() => {
+                    self.window_change_note().await
+                }
+                _ => String::new(),
             };
             let result = match name {
                 "apps" => self.apps().await.map(Out::from),
@@ -3739,9 +4268,23 @@ impl<B: Backend> Server<B> {
             };
             let result = match (result, observe, before) {
                 (Ok(mut o), Some(observe), Some((mark, before))) => {
-                    let seen = self.after_input(name, a, observe, mark, before).await;
+                    let seen = trace::time(
+                        "after_input",
+                        self.after_input(name, a, observe, mark, before),
+                    )
+                    .await;
                     o.text.push_str(&seen.text);
                     o.images.extend(seen.images);
+                    Ok(o)
+                }
+                // Without `observe`, still say when another window came to
+                // the front (a dialog, a new browser window).
+                (Ok(mut o), None, _) if WINDOW_NOTE_TOOLS.contains(&name) => {
+                    if let Some(before) = pre_note.strip_prefix("; active window now ") {
+                        o.text
+                            .push_str(&format!("; before it, {before} had come to the front"));
+                    }
+                    o.text.push_str(&self.window_change_note().await);
                     Ok(o)
                 }
                 (result, _, _) => result,
@@ -3779,6 +4322,49 @@ impl<B: Backend> Server<B> {
         }))
     }
 }
+
+/// Tools whose failure reply ends with what is on screen (`where_note`).
+const CONTEXT_TOOLS: [&str; 14] = [
+    "act",
+    "click",
+    "focus",
+    "get_text",
+    "set_text",
+    "scroll",
+    "drag",
+    "wait_for",
+    "wait_idle",
+    "menu",
+    "key",
+    "type_text",
+    "mouse",
+    "find",
+];
+
+/// Whether a failure is about the screen (worth `where_note`), not the
+/// setup, the allowlist (`allow_file` named) or the user taking over.
+fn wants_context(e: &str, allow_file: &str) -> bool {
+    !(e.starts_with("paused")
+        || e.starts_with("interrupted")
+        || e.contains("stopped by the user")
+        || e.contains(allow_file)
+        || e.contains("confirmation"))
+}
+
+/// Input tools that, without `observe`, note when another window came to
+/// the front. activate_window says so itself; act, menu and close_window
+/// report the effect line by default.
+const WINDOW_NOTE_TOOLS: [&str; 9] = [
+    "click",
+    "focus",
+    "key",
+    "type_text",
+    "mouse",
+    "set_text",
+    "scroll",
+    "drag",
+    "file_dialog",
+];
 
 /// Tools that never call `Server::permit` (they reach no app, or only read
 /// with a tier every allowed app has); `call_inner` handles their
@@ -4107,7 +4693,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use backend::{AppEntry, Info};
+    use backend::{AppEntry, Info, WindowEntry};
     use tokio::io::DuplexStream;
 
     /// An app "fake" whose one window is the focused element `focus` (a
@@ -4133,6 +4719,26 @@ mod tests {
         /// "menu" fills it with entry 99 "Opened", as Firefox shows a
         /// submenu's entries only once it is open.
         nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
+        /// What kept reads see: see `FakeReads`.
+        reads: Rc<FakeReads>,
+    }
+
+    /// The fake's change events, for kept reads: off unless a test turns
+    /// them on.
+    #[derive(Default)]
+    struct FakeReads {
+        /// Change events are listened to and the app sends them.
+        live: std::cell::Cell<bool>,
+        /// Bumped by a test for each change the app reports.
+        changes: std::cell::Cell<u64>,
+        /// A document of the app is loading.
+        loading: std::cell::Cell<bool>,
+        /// Elements of kept reads are gone (`still_there` false).
+        gone: std::cell::Cell<bool>,
+        /// `prefetch` calls so far: reads that were not reused.
+        prefetches: std::cell::Cell<u32>,
+        /// `still_there` calls so far.
+        checks: std::cell::Cell<u32>,
     }
 
     /// Windows on the fake desktop: (app, title).
@@ -4166,7 +4772,22 @@ mod tests {
             }
         }
         async fn list_apps(&self) -> Vec<AppEntry> {
-            Vec::new()
+            // Only `fake`'s windows: the others belong to apps the fake
+            // accessibility tree does not have.
+            let (app, title) = self.active.borrow().clone();
+            let windows = FAKE_WINDOWS
+                .iter()
+                .filter(|(a, _)| *a == "fake")
+                .map(|(_, t)| WindowEntry {
+                    kind: "frame".into(),
+                    title: t.to_string(),
+                    active: app == "fake" && *t == title,
+                })
+                .collect();
+            vec![AppEntry {
+                name: "fake".into(),
+                windows,
+            }]
         }
         async fn app_windows(&self, app: &str) -> Option<Vec<u32>> {
             (app == "fake").then(|| vec![FAKE_FOCUS])
@@ -4179,6 +4800,19 @@ mod tests {
                 FAKE_FOCUS => self.focus.borrow().clone(),
                 _ => self.nodes.borrow().get(id).cloned().unwrap_or_default(),
             }
+        }
+        fn read_mark(&self) -> Option<u64> {
+            self.reads.live.get().then(|| self.reads.changes.get())
+        }
+        fn unchanged_since(&self, _: &[u32], mark: u64) -> bool {
+            self.reads.live.get() && self.reads.changes.get() == mark
+        }
+        async fn may_keep(&self, _: &[u32]) -> bool {
+            self.reads.live.get() && !self.reads.loading.get()
+        }
+        async fn still_there(&self, _: &u32) -> bool {
+            self.reads.checks.set(self.reads.checks.get() + 1);
+            !self.reads.gone.get()
         }
         async fn focused(&self) -> Option<Focused<u32>> {
             Some(Focused {
@@ -4195,6 +4829,7 @@ mod tests {
             _: usize,
             _: usize,
         ) {
+            self.reads.prefetches.set(self.reads.prefetches.get() + 1);
             for id in roots {
                 let info = self.info(&id, 0).await;
                 cache.insert(id, info);
@@ -4388,6 +5023,7 @@ mod tests {
         active: Rc<RefCell<(String, String)>>,
         takeover: std::sync::Arc<takeover::Takeover>,
         nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
+        reads: Rc<FakeReads>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -4416,7 +5052,9 @@ mod tests {
             Some("meta+alt+esc"),
         ));
         let nodes = Rc::new(RefCell::new(HashMap::new()));
+        let reads = Rc::new(FakeReads::default());
         let server = Rc::new(Server::new(FakeBackend {
+            reads: reads.clone(),
             takeover: takeover.clone(),
             allow_file,
             keys: keys.clone(),
@@ -4440,6 +5078,7 @@ mod tests {
             active,
             takeover,
             nodes,
+            reads,
         }
     }
 
@@ -5181,13 +5820,15 @@ mod tests {
             let r = call_tool(&mut s, 2, "batch", batch_steps(true)).await;
             assert_eq!(r["result"]["isError"], false, "{r}");
             let lines: Vec<&str> = reply_text(&r).lines().collect();
-            assert_eq!(lines.len(), 3, "{r}");
+            assert_eq!(lines.len(), 4, "{r}");
             assert!(lines[0].starts_with("[1] key: "), "{r}");
             assert!(
                 lines[1].starts_with("[2] wait_for failed (optional): "),
                 "{r}"
             );
             assert!(lines[2].starts_with("[3] key: "), "{r}");
+            // A step failed: what is on screen, once.
+            assert!(lines[3].starts_with("now: "), "{r}");
             assert_eq!(*s.keys.borrow(), ["down a", "up a", "down b", "up b"]);
         });
     }
@@ -5199,7 +5840,8 @@ mod tests {
             let r = call_tool(&mut s, 2, "batch", batch_steps(false)).await;
             assert_eq!(r["result"]["isError"], true, "{r}");
             let lines: Vec<&str> = reply_text(&r).lines().collect();
-            assert_eq!(lines.len(), 3, "{r}");
+            assert_eq!(lines.len(), 4, "{r}");
+            assert!(lines[3].starts_with("now: "), "{r}");
             assert!(
                 lines[0].starts_with("Error executing tool batch: [1] key: "),
                 "{r}"
@@ -5694,7 +6336,7 @@ mod tests {
             )
             .await;
             assert_eq!(
-                reply_text(&r),
+                reply_text(&r).lines().next().unwrap(),
                 "Error executing tool mouse: pointer failed; released ctrl"
             );
             assert_eq!(
@@ -5709,7 +6351,14 @@ mod tests {
                 reply_text(&r).contains("the left button is held; release it with hold"),
                 "{r}"
             );
-            assert!(reply_text(&r).ends_with("; released left"), "{r}");
+            assert!(
+                reply_text(&r)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .ends_with("; released left"),
+                "{r}"
+            );
             let r = call_tool(&mut s, 6, "cursor_position", json!({})).await;
             assert_eq!(reply_text(&r), "cursor at (12,34)");
         });
@@ -5983,6 +6632,41 @@ mod tests {
     }
 
     #[test]
+    fn no_matches_and_failures_say_what_is_on_screen() {
+        local(async {
+            let mut s = session("where");
+            let r = call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "zzz"})).await;
+            let text = reply_text(&r);
+            assert!(text.starts_with("no matches\nnow: "), "{text}");
+            assert!(text.contains("focus: [1] push button \"OK\""), "{text}");
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "zzz"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("\nnow: "), "{r}");
+            // Not for the allowlist: that is the user's setup, not the screen.
+            let r = call_tool(&mut s, 4, "find", json!({"app": "nope", "query": "x"})).await;
+            assert!(!reply_text(&r).contains("\nnow: "), "{r}");
+        });
+    }
+
+    #[test]
+    fn input_notes_a_window_that_came_to_the_front() {
+        local(async {
+            let mut s = session("window-note");
+            // The first input only learns which window is in front.
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert!(!reply_text(&r).contains("active window now"), "{r}");
+            *s.active.borrow_mut() = (FAKE_WINDOWS[2].0.to_string(), FAKE_WINDOWS[2].1.to_string());
+            // It came to the front between two inputs (a dialog opening
+            // after a reply): the next input says so.
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "b"})).await;
+            let want = format!("; before it, '{}' had come to the front", FAKE_WINDOWS[2].1);
+            assert!(reply_text(&r).ends_with(&want), "{r}");
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "c"})).await;
+            assert!(!reply_text(&r).contains("active window now"), "{r}");
+        });
+    }
+
+    #[test]
     fn a_renamed_or_changed_element_is_stale_and_not_acted_on() {
         local(async {
             let mut s = session("stale");
@@ -5991,12 +6675,13 @@ mod tests {
             let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
             assert_eq!(r["result"]["isError"], true, "{r}");
             assert_eq!(
-                reply_text(&r),
+                reply_text(&r).lines().next().unwrap(),
                 format!(
                     "Error executing tool act: stale id {id} (was push button \"OK\", \
                      now push button \"Cancel\"); call tree/find again"
                 )
             );
+            assert!(reply_text(&r).contains("\nnow: "), "{r}");
             // Reads and pointer tools check too.
             for (n, tool) in [(4, "get_text"), (5, "click"), (6, "focus")] {
                 let r = call_tool(&mut s, n, tool, json!({"id": id})).await;
@@ -6240,6 +6925,32 @@ mod tests {
             assert_eq!(lines[8], "stopped; 1 step(s) not run");
             assert_eq!(actions_run(&s), 0);
             assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_missed_query_offers_the_closest_names_with_ids() {
+        local(async {
+            let mut s = session("closest");
+            let r = call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "okk"})).await;
+            let text = reply_text(&r);
+            assert!(text.starts_with("no matches; closest:\n["), "{r}");
+            assert!(text.contains("push button \"OK\""), "{r}");
+            let r = call_tool(&mut s, 3, "find", json!({"app": "fake", "query": "zzz"})).await;
+            assert!(reply_text(&r).starts_with("no matches\nnow: "), "{r}");
+            // A tool given `query` fails, naming the candidates.
+            let r = call_tool(
+                &mut s,
+                4,
+                "get_text",
+                json!({"app": "fake", "query": "okk"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("matches 'okk'; closest:\n[") && text.contains("\"OK\""),
+                "{r}"
+            );
         });
     }
 
@@ -6748,5 +7459,204 @@ mod tests {
             assert!(reply_text(&replies[0]).contains("closed"), "{replies:?}");
             assert!(s.keys.borrow().is_empty());
         });
+    }
+
+    /// The fake window as a frame with two buttons, "Save" and "Open",
+    /// and change events on.
+    fn fake_reads(s: &Session) {
+        *s.focus.borrow_mut() = Info {
+            role: "frame".into(),
+            name: "notes.txt — Fake".into(),
+            showing: true,
+            children: vec![30, 31],
+            ..Info::default()
+        };
+        let mut nodes = s.nodes.borrow_mut();
+        nodes.insert(30, fake_node("push button", "Save", &[]));
+        nodes.insert(31, fake_node("push button", "Open", &[]));
+        s.reads.live.set(true);
+    }
+
+    fn prefetches(s: &Session) -> u32 {
+        s.reads.prefetches.get()
+    }
+
+    #[test]
+    fn a_read_is_reused_while_the_app_reports_no_change() {
+        local(async {
+            let mut s = session("reads-reuse");
+            fake_reads(&s);
+            let find = json!({"app": "fake", "query": "Save"});
+            let first = reply_text(&call_tool(&mut s, 2, "find", find.clone()).await).to_string();
+            assert_eq!(first, "[1] push button \"Save\"");
+            let read = prefetches(&s);
+            assert!(read > 0);
+            // Nothing changed: same answer, nothing read.
+            let r = call_tool(&mut s, 3, "find", find.clone()).await;
+            assert_eq!(reply_text(&r), first);
+            let r = call_tool(&mut s, 4, "get_text", find.clone()).await;
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Save\""),
+                "{r}"
+            );
+            let tree = json!({"app": "fake"});
+            let t1 = reply_text(&call_tool(&mut s, 5, "tree", tree.clone()).await).to_string();
+            let tree_read = prefetches(&s);
+            let t2 = reply_text(&call_tool(&mut s, 6, "tree", tree.clone()).await).to_string();
+            assert_eq!(t1, t2);
+            assert_eq!(prefetches(&s), tree_read, "the tree was read again");
+            // The app reported a change: read afresh, and it shows.
+            s.nodes.borrow_mut().get_mut(&31).unwrap().name = "Save as".into();
+            s.reads.changes.set(1);
+            let r = call_tool(&mut s, 7, "find", find.clone()).await;
+            assert!(reply_text(&r).contains("push button \"Save as\""), "{r}");
+            assert!(prefetches(&s) > tree_read);
+            let t3 = reply_text(&call_tool(&mut s, 8, "tree", tree).await).to_string();
+            assert!(t3.contains("Save as"), "{t3}");
+        });
+    }
+
+    #[test]
+    fn input_and_user_activity_drop_kept_reads() {
+        local(async {
+            let mut s = session("reads-input");
+            fake_reads(&s);
+            let find = json!({"app": "fake", "query": "Save"});
+            call_tool(&mut s, 2, "find", find.clone()).await;
+            let read = prefetches(&s);
+            call_tool(&mut s, 3, "find", find.clone()).await;
+            assert_eq!(prefetches(&s), read);
+            // Any tool that may change what the app shows.
+            let mut call = 4;
+            for (tool, args) in [
+                ("key", json!({"combo": "a"})),
+                ("act", json!({"app": "fake", "query": "Open"})),
+                ("activate_window", json!({"query": "notes"})),
+                (
+                    "batch",
+                    json!({"steps": [{"tool": "key", "args": {"combo": "b"}}]}),
+                ),
+                ("screenshot", json!({"window": "notes"})),
+            ] {
+                let r = call_tool(&mut s, call, tool, args).await;
+                assert_ne!(r["result"]["isError"], true, "{tool}: {r}");
+                let before = prefetches(&s);
+                call_tool(&mut s, call + 1, "find", find.clone()).await;
+                assert!(prefetches(&s) > before, "kept read reused after {tool}");
+                call += 2;
+            }
+            // Read-only tools keep it.
+            let before = prefetches(&s);
+            call_tool(&mut s, call, "get_text", find.clone()).await;
+            call_tool(&mut s, call + 1, "find", find.clone()).await;
+            assert_eq!(prefetches(&s), before);
+            // The user used the keyboard or mouse: scrolling shows other
+            // elements without an event.
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Pointer);
+            call_tool(&mut s, call + 2, "find", find.clone()).await;
+            assert!(prefetches(&s) > before);
+        });
+    }
+
+    #[test]
+    fn reads_are_not_kept_without_events_or_while_loading() {
+        local(async {
+            let mut s = session("reads-off");
+            fake_reads(&s);
+            s.reads.live.set(false);
+            let find = json!({"app": "fake", "query": "Save"});
+            call_tool(&mut s, 2, "find", find.clone()).await;
+            let read = prefetches(&s);
+            call_tool(&mut s, 3, "find", find.clone()).await;
+            assert!(prefetches(&s) > read, "reused without change events");
+            s.reads.live.set(true);
+            s.reads.loading.set(true);
+            call_tool(&mut s, 4, "find", find.clone()).await;
+            let read = prefetches(&s);
+            call_tool(&mut s, 5, "find", find.clone()).await;
+            assert!(prefetches(&s) > read, "reused while loading");
+            s.reads.loading.set(false);
+            call_tool(&mut s, 6, "find", find.clone()).await;
+            let read = prefetches(&s);
+            call_tool(&mut s, 7, "find", find.clone()).await;
+            assert_eq!(prefetches(&s), read);
+        });
+    }
+
+    #[test]
+    fn kept_reads_expire() {
+        local(async {
+            let mut s = session("reads-age");
+            fake_reads(&s);
+            let find = json!({"app": "fake", "query": "Save"});
+            call_tool(&mut s, 2, "find", find.clone()).await;
+            let read = prefetches(&s);
+            tokio::time::sleep(READ_MAX_AGE + Duration::from_millis(50)).await;
+            call_tool(&mut s, 3, "find", find).await;
+            assert!(prefetches(&s) > read);
+        });
+    }
+
+    #[test]
+    fn an_element_from_a_kept_read_is_checked_before_use() {
+        local(async {
+            let mut s = session("reads-check");
+            fake_reads(&s);
+            let open = json!({"app": "fake", "query": "Open"});
+            call_tool(&mut s, 2, "get_text", open.clone()).await;
+            // Fresh reads need no check.
+            assert_eq!(s.reads.checks.get(), 0);
+            let read = prefetches(&s);
+            let r = call_tool(&mut s, 3, "act", open.clone()).await;
+            // `act` dropped the kept read: read afresh, no check either.
+            assert!(reply_text(&r).contains("Press -> ok"), "{r}");
+            assert!(prefetches(&s) > read);
+            assert_eq!(s.reads.checks.get(), 0);
+            call_tool(&mut s, 4, "get_text", open.clone()).await;
+            let read = prefetches(&s);
+            let r = call_tool(&mut s, 5, "get_text", open.clone()).await;
+            assert_eq!(prefetches(&s), read);
+            assert_eq!(s.reads.checks.get(), 1);
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Open\""),
+                "{r}"
+            );
+            // Gone without an event: the check fails, read afresh.
+            s.reads.gone.set(true);
+            let r = call_tool(&mut s, 6, "get_text", open).await;
+            assert_eq!(s.reads.checks.get(), 2);
+            assert!(prefetches(&s) > read);
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Open\""),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn frame_in_finds_the_window_from_the_nodes_read() {
+        let mut cache: Cache<u32> = Cache::new();
+        let node = |role: &str, kids: &[u32]| Info {
+            role: role.into(),
+            children: kids.to_vec(),
+            ..Info::default()
+        };
+        cache.insert(1, node("frame", &[2]));
+        cache.insert(2, node("panel", &[3, 4]));
+        cache.insert(3, node("dialog", &[5]));
+        cache.insert(5, node("push button", &[]));
+        cache.insert(4, node("push button", &[]));
+        assert_eq!(frame_in(&cache, &5), Some(3));
+        assert_eq!(frame_in(&cache, &4), Some(1));
+        assert_eq!(frame_in(&cache, &1), Some(1));
+        assert_eq!(frame_in(&cache, &9), None);
+        // Listed by two parents: not known for sure.
+        cache.insert(6, node("panel", &[4]));
+        assert_eq!(frame_in(&cache, &4), None);
+        // A cycle ends.
+        cache.insert(7, node("panel", &[8]));
+        cache.insert(8, node("panel", &[7]));
+        assert_eq!(frame_in(&cache, &8), None);
     }
 }
