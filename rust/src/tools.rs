@@ -86,11 +86,11 @@ pub const OBSERVE_KINDS: [&str; 5] = ["none", "effect", "focus", "tree", "screen
 /// carries the workflow and the targeting rules that every tool shares. It
 /// costs context in every session: keep it short.
 pub const INSTRUCTIONS: &str = "\
-Controls GUI apps on the user's desktop (KDE Plasma; also Hyprland, Windows) through the \
+Controls GUI apps on the user's desktop (KDE Plasma, Hyprland, Windows) through the \
 accessibility tree, with real keyboard and mouse input.
 
 Workflow:
-- apps lists running apps and marks the allowed ones. find (app + query) locates elements; \
+- apps lists running apps, marking the allowed ones. find (app + query) locates elements; \
 act, click, focus, get_text, set_text and scroll take the target themselves, so find-and-act \
 is one call. tree shows structure; find is cheaper.
 - Target: `id` from tree/find, or `app` + `query` (+ `role`): the first visible element whose \
@@ -98,38 +98,36 @@ name equals `query` (case-insensitive) wins, else the first whose name or text c
 Window and tab titles count only when nothing else matches or `role` names that role. The \
 reply starts with the element picked.
 - batch runs steps in one round trip when later steps don't depend on reading a result. \
-Mark waits \"optional\": true and end with an observation step. A later \
-step's `id` (or root_id/from_id/to_id) may be \"$N\": the element step N found or acted on \
+Mark waits \"optional\": true and end with an observation step, or give the last input \
+`observe`. A later step's `id` (or root_id/from_id/to_id) may be \"$N\": the element step N found or acted on \
 (find: its first hit).
 - Input tools (key, type_text, click, mouse, scroll, focus, drag, set_text, act, screenshot) \
-take `window` (title or app substring): pass it instead of a separate activate_window \
-step; it activates that window only when it isn't in front. Without it, input fails while \
+take `window` (title or app substring) instead of a separate activate_window step; it \
+activates that window only when it isn't in front. Without it, input fails while \
 the user's terminal is in front.
-- click, mouse and scroll take `modifiers` (e.g. [\"ctrl\"]); hold keeps a key or button \
-down across calls.
-- If the user takes over the keyboard and mouse, input fails with \"paused\" (or \
+- click, mouse and scroll take `modifiers` (e.g. [\"ctrl\"]); hold keeps keys down.
+- If the user takes over keyboard and mouse, input fails with \"paused\" (or \
 \"interrupted\" mid-batch) without acting: pause ~2 s and retry. \"stopped by the user\": \
 stop and ask them; once they agree, a standalone activate_window call resumes input.
-- pause for a fixed wait; wait_for for something that appears or goes away (gone=true), a \
-state (state=enabled…) or a window (window=…), never as a sleep; wait_idle until an app \
-stops changing. tree(interactive=true) for large pages.
+- After opening a page, wait_idle(app) waits for it to load (not pause). wait_for: something \
+that appears or goes away (gone=true), a state or a window; never as a sleep. \
+tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
-view after the input settled: no separate call.
-- menu (app + path, e.g. \"File > Save As\") runs a menu bar entry; without path it lists \
-the entries.
-- screenshot is a last resort (inline image: don't Read the file). To click \
-something seen only in it, pass its pixel position to mouse as image_x/image_y; \
-`region`=[x, y, w, h] zooms in.
+view after the input settled, instead of a separate look. Failures and \
+\"no matches\" end with the active window and focus.
+- menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
+- screenshot is a last resort (inline image: don't Read the file). To click something seen \
+only in it, pass its pixels to mouse as image_x/image_y; `region`=[x, y, w, h] zooms in.
 
 Allowlist: only apps in the user's allowlist file can be read, activated or sent input, and \
 input only goes to an allowed active window. An app may be limited to a tier: view \
 (read only) or click (no typing or keys). When a refusal says to, ask the user and retry with \
 confirm: true only if they agree. Password fields are never read, and filled in only if the \
-user allowed it. Errors name the file; changing it is the user's decision. When tools fail as if the setup \
-were broken (AT-SPI, virtual input, KWin, screenshots), run doctor.
+user allowed it. Errors name the file; changing it is the user's decision. When tools fail \
+as if the setup were broken (AT-SPI, virtual input, KWin, screenshots), run doctor.
 
 Clients that load tool schemas on demand: load the common ones in one search: batch, find, \
-act, activate_window, key, type_text, wait_for, screenshot, tree, apps.";
+act, activate_window, key, type_text, wait_for, wait_idle, screenshot, apps.";
 
 /// The `confirm` argument of tools that change something.
 const CONFIRM: &str =
@@ -275,7 +273,7 @@ pub fn tools() -> Json {
         ),
         t(
             "wait_idle",
-            "Wait until `app` stops changing: no change in its accessibility tree\n(elements added or removed, names, text) for `quiet_ms`, e.g. after a page\nload or an animation; at most `timeout_ms` (fails when it never settles).\nCheaper than polling with tree or screenshots.",
+            "Wait until `app` stops changing: no change in its accessibility tree\n(elements added or removed, names, text) for `quiet_ms`, and no page still\nloading from the network; at most `timeout_ms` (fails when it never\nsettles). After opening a URL or a link, use it instead of a fixed pause or\nwaiting for a title: it returns as soon as the page is loaded, with the\nactive window's title. Cheaper than polling with tree or screenshots.",
             schema(&[
                 ("app", "string", None),
                 ("quiet_ms", "integer", Some(json!(300))),

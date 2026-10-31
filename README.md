@@ -191,14 +191,26 @@ tool; `off` turns it off). Not available on Windows yet.
   first whose name or text contains it. Window and tab titles (frame, window,
   page tab) count only when nothing else matches or `role` names that role;
   `wait_for` skips them unless `role` names them.
-- Effect and `observe` on input tools (`act`, `click`, `key`, `type_text`,
-  `mouse`, `drag`, `scroll`, `set_text`): the reply ends with an `effect:`
-  line comparing the active window before and after the input (its title, the
-  focused element, and on Linux the app's accessibility change events):
-  `changed`, `no visible change`, or `window changed to '<title>'` (a dialog
-  opened, a window closed). It waits for the app to react up to `settle_ms`
-  (default 150), returning as soon as it reported a change; the fingerprint
-  itself costs about 1 ms. A canvas that draws without accessibility events
+- Effect and `observe` on input tools (`act`, `menu`, `close_window`, `click`,
+  `key`, `type_text`, `mouse`, `drag`, `scroll`, `set_text`): with
+  `observe` (and by default for `act`, `menu` and `close_window`) the reply
+  ends with an `effect:` line comparing the active window before and after the
+  input (its title, the focused element, and on Linux the app's accessibility
+  change events): `changed`, `no visible change`, or `window changed to
+  '<title>'` (a dialog opened, a window closed). It waits for the app to react
+  up to `settle_ms` (default 150), returning as soon as it reported a change;
+  the fingerprint itself costs about 1 ms. Without `observe`, the other input
+  tools still note, without waiting, when another window is in front after
+  the input (`; active window now '<title>'`) or came to the front since the
+  previous input (`; before it, '<title>' had come to the front`: a dialog
+  that opened after that reply); about 3 ms per input.
+- Failures say what is on screen: when `find` finds nothing, or `act`,
+  `click`, `focus`, `get_text`, `set_text`, `scroll`, `drag`, `wait_for`,
+  `wait_idle`, `menu`, `key`, `type_text` or `mouse` fails (or a `batch` step
+  fails and the batch does not end with `screenshot` or `tree`), the reply
+  ends with `now: active window '<title>' [app]; focus: <element>`, so the
+  next call needs no screenshot to see why. Not for refusals by the
+  allowlist, confirmations or the user taking over. A canvas that draws without accessibility events
   may report `no visible change`. `observe` adds a view in the same reply:
   `focus` (the focused element), `tree` (compact tree of the active window, or
   of `app`'s, at most 6000 characters) or `screenshot` (inline image).
@@ -218,10 +230,10 @@ tool; `off` turns it off). Not available on Windows yet.
   contains it to open, or with `gone` to close (KDE and Hyprland window
   lists, re-read when AT-SPI reports a window change).
 - `wait_idle`: waits until an app's accessibility tree has not changed for
-  `quiet_ms` (default 300), e.g. after a page load; a browser page still
-  marked busy does not count as quiet. A page waiting for the network sends
-  nothing, so after a click that loads a page raise `quiet_ms` or use
-  `wait_for` on content of the new page.
+  `quiet_ms` (default 300) and no browser page is still marked busy (loading
+  from the network): after opening a URL or a link, use it instead of a fixed
+  `pause`. The reply names the app's window title (a browser's page title);
+  a timeout says when a page was still loading.
 - `pause`: waits a fixed time (`ms`, at most 10 minutes); for waiting on time
   only, not on a visible change.
 - `windows`: lists windows of allowed apps with position, size, state (active,

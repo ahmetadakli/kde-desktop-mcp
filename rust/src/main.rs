@@ -196,6 +196,8 @@ struct Server<B: Backend> {
     allow_file: PathBuf,
     /// Title of the active window as last reported, to mention changes.
     last_active: Mutex<Option<String>>,
+    /// The window in front after the last input, for `window_change_note`.
+    seen_active: Mutex<Option<String>>,
     /// Maps pixels of the last screenshot to screen coordinates.
     last_shot: Mutex<Option<ShotMap>>,
     /// Held by tools that send keyboard or pointer input, so two concurrent
@@ -1125,6 +1127,7 @@ impl<B: Backend> Server<B> {
             }),
             allow_file,
             last_active: Mutex::new(None),
+            seen_active: Mutex::new(None),
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
@@ -1690,6 +1693,42 @@ impl<B: Backend> Server<B> {
             app: app.to_lowercase(),
             role,
         })
+    }
+
+    /// What is on screen, for a reply that found nothing or failed: the
+    /// active window and the focused element, so the next call can be
+    /// planned without a screenshot. Windows of apps not allowed are not
+    /// named.
+    async fn where_note(&self) -> String {
+        let (print, focus) = tokio::join!(self.fingerprint(), self.focus_note(false));
+        let window = match print.window {
+            Some((app, title)) if self.is_allowed(&app) => {
+                format!("active window {} [{app}]", render::py_repr(&title))
+            }
+            Some((app, _)) => format!("active window of '{app}' (not allowed)"),
+            None => "no active window".into(),
+        };
+        format!("\nnow: {window}{focus}")
+    }
+
+    /// "; active window now '…'" when the window in front is not the one
+    /// last seen (after an input that was not asked to `observe`): the
+    /// cheap part of the effect line, without waiting.
+    async fn window_change_note(&self) -> String {
+        let Some(now) = self.active_title().await else {
+            return String::new();
+        };
+        let mut last = self.seen_active.lock().await;
+        let first = last.is_none();
+        if last.as_deref() == Some(now.as_str()) {
+            return String::new();
+        }
+        *last = Some(now.clone());
+        // Nothing seen before to compare with: no change to report.
+        if first {
+            return String::new();
+        }
+        format!("; active window now {}", render::py_repr(&now))
     }
 
     /// Title of the active window, if any.
@@ -2928,23 +2967,44 @@ impl<B: Backend> Server<B> {
         let start = Instant::now();
         let mut since = Instant::now();
         let mut print = None;
+        let mut loading = false;
         loop {
-            if since.elapsed() >= quiet && self.b.loading(&windows).await {
-                // Quiet only because the page waits for the network.
-                since = Instant::now();
+            if since.elapsed() >= quiet {
+                loading = self.b.loading(&windows).await;
+                if loading {
+                    // Quiet only because the page waits for the network.
+                    since = Instant::now();
+                }
             }
             if since.elapsed() >= quiet {
                 let ms = start.elapsed().as_millis();
+                // Which page it settled on, so no find is needed to check:
+                // the app's active window, else its first.
+                let key = app.to_lowercase();
+                let title = self
+                    .b
+                    .list_apps()
+                    .await
+                    .into_iter()
+                    .filter(|a| a.name.to_lowercase() == key)
+                    .flat_map(|a| a.windows)
+                    .min_by_key(|w| !w.active)
+                    .map(|w| format!("; window {}", render::py_repr(&w.title)))
+                    .unwrap_or_default();
                 return Ok(format!(
-                    "idle after {ms} ms (no change for {} ms){note}",
+                    "idle after {ms} ms (no change for {} ms){title}{note}",
                     quiet.as_millis()
                 ));
             }
             if start.elapsed() >= limit {
                 let ms = start.elapsed().as_millis();
+                let why = if loading {
+                    "a page is still loading".to_string()
+                } else {
+                    format!("never quiet for {} ms", quiet.as_millis())
+                };
                 return Err(format!(
-                    "'{app}' still changing after {ms} ms (never quiet for {} ms){note}",
-                    quiet.as_millis()
+                    "'{app}' still changing after {ms} ms ({why}){note}"
                 ));
             }
             let left = limit
@@ -3637,14 +3697,22 @@ impl<B: Backend> Server<B> {
                     if i + 1 < steps.len() {
                         out.push(format!("stopped; {} step(s) not run", steps.len() - i - 1));
                     }
-                    return Err(out.join("\n"));
+                    return Err(format!("{}{}", out.join("\n"), self.where_note().await));
                 }
             }
         }
-        Ok(Out {
-            text: out.join("\n"),
-            images,
-        })
+        let mut text = out.join("\n");
+        // A step failed or found nothing: say what is on screen once, unless
+        // the batch ends with a look at it.
+        let failed = done.iter().any(|(_, e)| matches!(e, StepElement::Failed))
+            || out.iter().any(|l| l.ends_with(": no matches"));
+        let looked = steps
+            .last()
+            .is_some_and(|s| ["screenshot", "tree"].contains(&tool_of(s)));
+        if failed && !looked {
+            text.push_str(&self.where_note().await);
+        }
+        Ok(Out { text, images })
     }
 
     /// Run a tool. When it fails, everything held is released (keys and
@@ -3657,7 +3725,7 @@ impl<B: Backend> Server<B> {
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         Box::pin(async move {
             let result = trace::time(name, self.call_inner(name, a, false)).await;
-            match result {
+            let result = match result {
                 Err(e) if !self.held_names().is_empty() => {
                     let (names, released) = self.release_all().await;
                     let failed = match released {
@@ -3665,6 +3733,21 @@ impl<B: Backend> Server<B> {
                         Err(r) => format!(" (release failed: {r})"),
                     };
                     Err(format!("{e}; released {}{failed}", names.join(", ")))
+                }
+                r => r,
+            };
+            // What is on screen when it failed or found nothing, so the next
+            // call needs no screenshot to see why.
+            match result {
+                Err(e)
+                    if CONTEXT_TOOLS.contains(&name)
+                        && wants_context(&e, &self.allow_file.display().to_string()) =>
+                {
+                    Err(format!("{e}{}", self.where_note().await))
+                }
+                Ok(mut o) if name == "find" && o.text.starts_with("no matches") => {
+                    o.text.push_str(&self.where_note().await);
+                    Ok(o)
                 }
                 r => r,
             }
@@ -3732,6 +3815,14 @@ impl<B: Backend> Server<B> {
                 )),
                 None => None,
             };
+            // A window that came to the front since the last input (a dialog
+            // that opened after its reply): said before this input's result.
+            let pre_note = match observe {
+                None if WINDOW_NOTE_TOOLS.contains(&name) && window.is_none() => {
+                    self.window_change_note().await
+                }
+                _ => String::new(),
+            };
             let result = match name {
                 "apps" => self.apps().await.map(Out::from),
                 "tree" => self.tree(a).await,
@@ -3776,6 +3867,16 @@ impl<B: Backend> Server<B> {
                     o.images.extend(seen.images);
                     Ok(o)
                 }
+                // Without `observe`, still say when another window came to
+                // the front (a dialog, a new browser window).
+                (Ok(mut o), None, _) if WINDOW_NOTE_TOOLS.contains(&name) => {
+                    if let Some(before) = pre_note.strip_prefix("; active window now ") {
+                        o.text
+                            .push_str(&format!("; before it, {before} had come to the front"));
+                    }
+                    o.text.push_str(&self.window_change_note().await);
+                    Ok(o)
+                }
                 (result, _, _) => result,
             };
             // What is still held, after every input step but a batch (its
@@ -3811,6 +3912,49 @@ impl<B: Backend> Server<B> {
         }))
     }
 }
+
+/// Tools whose failure reply ends with what is on screen (`where_note`).
+const CONTEXT_TOOLS: [&str; 14] = [
+    "act",
+    "click",
+    "focus",
+    "get_text",
+    "set_text",
+    "scroll",
+    "drag",
+    "wait_for",
+    "wait_idle",
+    "menu",
+    "key",
+    "type_text",
+    "mouse",
+    "find",
+];
+
+/// Whether a failure is about the screen (worth `where_note`), not the
+/// setup, the allowlist (`allow_file` named) or the user taking over.
+fn wants_context(e: &str, allow_file: &str) -> bool {
+    !(e.starts_with("paused")
+        || e.starts_with("interrupted")
+        || e.contains("stopped by the user")
+        || e.contains(allow_file)
+        || e.contains("confirmation"))
+}
+
+/// Input tools that, without `observe`, note when another window came to
+/// the front. activate_window says so itself; act, menu and close_window
+/// report the effect line by default.
+const WINDOW_NOTE_TOOLS: [&str; 9] = [
+    "click",
+    "focus",
+    "key",
+    "type_text",
+    "mouse",
+    "set_text",
+    "scroll",
+    "drag",
+    "file_dialog",
+];
 
 /// Tools that never call `Server::permit` (they reach no app, or only read
 /// with a tier every allowed app has); `call_inner` handles their
@@ -4139,7 +4283,7 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
-    use backend::{AppEntry, Info};
+    use backend::{AppEntry, Info, WindowEntry};
     use tokio::io::DuplexStream;
 
     /// An app "fake" whose one window is the focused element `focus` (a
@@ -4198,7 +4342,22 @@ mod tests {
             }
         }
         async fn list_apps(&self) -> Vec<AppEntry> {
-            Vec::new()
+            // Only `fake`'s windows: the others belong to apps the fake
+            // accessibility tree does not have.
+            let (app, title) = self.active.borrow().clone();
+            let windows = FAKE_WINDOWS
+                .iter()
+                .filter(|(a, _)| *a == "fake")
+                .map(|(_, t)| WindowEntry {
+                    kind: "frame".into(),
+                    title: t.to_string(),
+                    active: app == "fake" && *t == title,
+                })
+                .collect();
+            vec![AppEntry {
+                name: "fake".into(),
+                windows,
+            }]
         }
         async fn app_windows(&self, app: &str) -> Option<Vec<u32>> {
             (app == "fake").then(|| vec![FAKE_FOCUS])
@@ -5213,13 +5372,15 @@ mod tests {
             let r = call_tool(&mut s, 2, "batch", batch_steps(true)).await;
             assert_eq!(r["result"]["isError"], false, "{r}");
             let lines: Vec<&str> = reply_text(&r).lines().collect();
-            assert_eq!(lines.len(), 3, "{r}");
+            assert_eq!(lines.len(), 4, "{r}");
             assert!(lines[0].starts_with("[1] key: "), "{r}");
             assert!(
                 lines[1].starts_with("[2] wait_for failed (optional): "),
                 "{r}"
             );
             assert!(lines[2].starts_with("[3] key: "), "{r}");
+            // A step failed: what is on screen, once.
+            assert!(lines[3].starts_with("now: "), "{r}");
             assert_eq!(*s.keys.borrow(), ["down a", "up a", "down b", "up b"]);
         });
     }
@@ -5231,7 +5392,8 @@ mod tests {
             let r = call_tool(&mut s, 2, "batch", batch_steps(false)).await;
             assert_eq!(r["result"]["isError"], true, "{r}");
             let lines: Vec<&str> = reply_text(&r).lines().collect();
-            assert_eq!(lines.len(), 3, "{r}");
+            assert_eq!(lines.len(), 4, "{r}");
+            assert!(lines[3].starts_with("now: "), "{r}");
             assert!(
                 lines[0].starts_with("Error executing tool batch: [1] key: "),
                 "{r}"
@@ -5726,7 +5888,7 @@ mod tests {
             )
             .await;
             assert_eq!(
-                reply_text(&r),
+                reply_text(&r).lines().next().unwrap(),
                 "Error executing tool mouse: pointer failed; released ctrl"
             );
             assert_eq!(
@@ -5741,7 +5903,14 @@ mod tests {
                 reply_text(&r).contains("the left button is held; release it with hold"),
                 "{r}"
             );
-            assert!(reply_text(&r).ends_with("; released left"), "{r}");
+            assert!(
+                reply_text(&r)
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .ends_with("; released left"),
+                "{r}"
+            );
             let r = call_tool(&mut s, 6, "cursor_position", json!({})).await;
             assert_eq!(reply_text(&r), "cursor at (12,34)");
         });
@@ -6015,6 +6184,41 @@ mod tests {
     }
 
     #[test]
+    fn no_matches_and_failures_say_what_is_on_screen() {
+        local(async {
+            let mut s = session("where");
+            let r = call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "zzz"})).await;
+            let text = reply_text(&r);
+            assert!(text.starts_with("no matches\nnow: "), "{text}");
+            assert!(text.contains("focus: [1] push button \"OK\""), "{text}");
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "zzz"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("\nnow: "), "{r}");
+            // Not for the allowlist: that is the user's setup, not the screen.
+            let r = call_tool(&mut s, 4, "find", json!({"app": "nope", "query": "x"})).await;
+            assert!(!reply_text(&r).contains("\nnow: "), "{r}");
+        });
+    }
+
+    #[test]
+    fn input_notes_a_window_that_came_to_the_front() {
+        local(async {
+            let mut s = session("window-note");
+            // The first input only learns which window is in front.
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert!(!reply_text(&r).contains("active window now"), "{r}");
+            *s.active.borrow_mut() = (FAKE_WINDOWS[2].0.to_string(), FAKE_WINDOWS[2].1.to_string());
+            // It came to the front between two inputs (a dialog opening
+            // after a reply): the next input says so.
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "b"})).await;
+            let want = format!("; before it, '{}' had come to the front", FAKE_WINDOWS[2].1);
+            assert!(reply_text(&r).ends_with(&want), "{r}");
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "c"})).await;
+            assert!(!reply_text(&r).contains("active window now"), "{r}");
+        });
+    }
+
+    #[test]
     fn a_renamed_or_changed_element_is_stale_and_not_acted_on() {
         local(async {
             let mut s = session("stale");
@@ -6023,12 +6227,13 @@ mod tests {
             let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
             assert_eq!(r["result"]["isError"], true, "{r}");
             assert_eq!(
-                reply_text(&r),
+                reply_text(&r).lines().next().unwrap(),
                 format!(
                     "Error executing tool act: stale id {id} (was push button \"OK\", \
                      now push button \"Cancel\"); call tree/find again"
                 )
             );
+            assert!(reply_text(&r).contains("\nnow: "), "{r}");
             // Reads and pointer tools check too.
             for (n, tool) in [(4, "get_text"), (5, "click"), (6, "focus")] {
                 let r = call_tool(&mut s, n, tool, json!({"id": id})).await;
