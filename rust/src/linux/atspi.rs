@@ -81,6 +81,24 @@ const CHANGE_EVENTS: [(&str, &str, &str, Option<&str>); 3] = [
         None,
     ),
 ];
+/// Events that change what a read of an app's tree sees besides
+/// CHANGE_EVENTS and EFFECT_EVENTS: any state (checked, selected,
+/// expanded, enabled, focused, active...), and content scrolled into view.
+/// Only kept reads (`A11y::reads_unchanged`) listen to them.
+const READ_EVENTS: [(&str, &str, &str, Option<&str>); 2] = [
+    (
+        "object:state-changed",
+        "org.a11y.atspi.Event.Object",
+        "StateChanged",
+        None,
+    ),
+    (
+        "object:visible-data-changed",
+        "org.a11y.atspi.Event.Object",
+        "VisibleDataChanged",
+        None,
+    ),
+];
 /// How long `wait_change` lets a burst of events (a dialog building its
 /// widgets, a page loading) go on before the waiter re-checks once.
 const CHANGE_SETTLE: std::time::Duration = std::time::Duration::from_millis(15);
@@ -96,6 +114,7 @@ const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
 pub const ACTIVE: u32 = 1;
 pub const BUSY: u32 = 3;
 pub const CHECKED: u32 = 4;
+pub const DEFUNCT: u32 = 6;
 pub const EDITABLE: u32 = 7;
 pub const ENABLED: u32 = 8;
 pub const EXPANDABLE: u32 = 9;
@@ -185,6 +204,9 @@ pub struct A11y {
     /// Which apps changed lately (CHANGE_EVENTS, EFFECT_EVENTS, an app
     /// leaving the bus), for `wait_change`.
     changes: Changes,
+    /// Which apps changed in any way a read sees (all the events above and
+    /// READ_EVENTS), for reusing a read of an app's tree.
+    reads: Changes,
 }
 
 impl A11y {
@@ -213,6 +235,7 @@ impl A11y {
             views: tokio::sync::Mutex::new(HashMap::new()),
             effects: tokio::sync::broadcast::channel(64).0,
             changes: Changes::default(),
+            reads: Changes::default(),
         })
     }
 
@@ -325,6 +348,7 @@ impl A11y {
             Some("focused"),
             |a11y, sender, path, msg| {
                 a11y.note_effect(sender);
+                a11y.reads.note(sender, false);
                 let gained = msg
                     .body()
                     .deserialize::<(String, i32, i32, OwnedValue)>()
@@ -358,6 +382,7 @@ impl A11y {
             self.listen(event, iface, member, arg0, move |a11y, sender, _, _| {
                 a11y.note_effect(sender);
                 a11y.changes.note(sender, window);
+                a11y.reads.note(sender, window);
             })
         });
         futures_util::future::join_all(all)
@@ -437,6 +462,7 @@ impl A11y {
                 // desktop (same path), an app.
                 let windows = path.as_str() == APP_ROOT;
                 a11y.changes.note(sender, windows);
+                a11y.reads.note(sender, windows);
             })
         });
         let gone = async {
@@ -459,6 +485,7 @@ impl A11y {
                     && new.is_empty()
                 {
                     a11y.changes.forget(&name);
+                    a11y.reads.forget(&name);
                 }
             });
             R::Ok(())
@@ -470,6 +497,59 @@ impl A11y {
             .live
             .store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Listen for READ_EVENTS, which with the events of `track_actions`
+    /// and `track_changes` cover all that a read of an app's tree sees.
+    /// Once all three listen, `set_reads_live` lets reads be reused.
+    pub async fn track_reads(self: &Arc<Self>) -> R<()> {
+        let all = READ_EVENTS.map(|(event, iface, member, arg0)| {
+            self.listen(event, iface, member, arg0, |a11y, sender, _, _| {
+                a11y.reads.note(sender, false);
+            })
+        });
+        futures_util::future::join_all(all)
+            .await
+            .into_iter()
+            .collect()
+    }
+
+    /// All events a read sees are listened to (see `track_reads`).
+    pub fn set_reads_live(&self) {
+        self.reads
+            .live
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A mark for `reads_unchanged`; None while not all the events a read
+    /// sees are listened to.
+    pub fn read_mark(&self) -> Option<u64> {
+        self.reads
+            .live
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| self.reads.mark())
+    }
+
+    /// Whether the apps on `buses` sent no event a read sees after `mark`
+    /// (`read_mark`), and no app or window came or went.
+    pub fn reads_unchanged(&self, buses: &[&str], mark: u64) -> bool {
+        self.reads.live.load(std::sync::atomic::Ordering::SeqCst)
+            && !buses.is_empty()
+            && !self.reads.since(buses, mark)
+    }
+
+    /// Whether the app on `bus` sent one of the events a read sees since
+    /// it joined the bus (or since this server listens).
+    pub fn reads_heard(&self, bus: &str) -> bool {
+        self.reads.heard(bus)
+    }
+
+    /// Whether `o` still exists, is not defunct and is visible: one call.
+    pub async fn still_there(&self, o: &Obj) -> bool {
+        match self.states(o).await {
+            Some(st) => !has(st, DEFUNCT) && (has(st, SHOWING) || has(st, VISIBLE)),
+            None => false,
+        }
     }
 
     /// A mark for `wait_change`, taken before a check so that changes
@@ -1039,6 +1119,12 @@ impl Changes {
             tx.send_replace(n);
         }
         self.windows.0.send_replace(n);
+    }
+
+    /// Whether the app on `bus` sent an event since it joined (only for
+    /// a `Changes` no waiter adds entries to).
+    fn heard(&self, bus: &str) -> bool {
+        self.buses.lock().unwrap().contains_key(bus)
     }
 
     /// See `A11y::changed_since`.

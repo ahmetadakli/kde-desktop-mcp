@@ -74,6 +74,17 @@ Why it is fast:
   are left out with their children lifted, as are empty nameless leaves
   (separators, images inside buttons) and labels around a same-named button.
   A Google results page in Firefox went from 6,976 to 5,702 characters.
+- On Linux, a `find`, `tree` of an app, or element picked by `app` + `query`
+  reuses the app's tree read by an earlier call while the app provably did not
+  change: it sent no AT-SPI change event since (children, name, text, any
+  state, visible data, windows), no app or window came or went, no tool sent
+  input or activated a window, the user did not touch the keyboard or mouse,
+  and the read is under 2 s old. Only apps known to send these events (Qt,
+  Firefox, Chromium, or any app once it sent one) and no page still loading.
+  An element taken from such a read is checked to still be there (one call)
+  before it is used. A `get_text` by query in Firefox went from 8.7 ms to
+  1.1 ms. Clicking by query also measures the element in the same round trip
+  as the lookup, from the window found in the read.
 - `apps` lists blocked apps by name on one line and skips untitled windows.
 - An AT-SPI call waits at most 2 s; an app that does not answer cannot lock
   the server. Actions that open a menu (Qt does not reply until the menu
