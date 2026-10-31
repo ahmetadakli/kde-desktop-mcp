@@ -47,6 +47,18 @@ const TREE_MAX_CHARS: i64 = 20_000;
 const CONTINUATION_CHARS: usize = 150;
 /// Nodes fetched ahead when rendering reaches an unfetched part of the tree.
 const PREFETCH_MORE: usize = 500;
+/// Off-screen matches or close names a missed search offers.
+const MISS_SUGGESTIONS: usize = 5;
+/// Nodes of a web page fetched when looking for matches scrolled out of
+/// view (see `Server::miss_report`).
+const OFFSCREEN_FETCH: usize = 3000;
+
+/// What `Server::locate` found: the element, or the windows searched; with
+/// the nodes fetched.
+enum Located<Id> {
+    Found(Id, Cache<Id>),
+    Missed(Vec<Id>, Cache<Id>),
+}
 
 /// How searches (find, locate, the active document) fetch: showing nodes,
 /// without action names, which only the nodes they return need.
@@ -57,6 +69,7 @@ fn search_fetch(text_limit: usize, limit: usize) -> Fetch {
         limit,
         actions: false,
         stop_roles: &[],
+        offscreen: false,
     }
 }
 
@@ -1588,15 +1601,13 @@ impl<B: Backend> Server<B> {
     /// Fetch the visible part of `app` and pick the element `query` names;
     /// window and tab titles only with `titles` (see render::TITLE_ROLES).
     /// The cache holds no action names: `fill_actions` before describing.
-    async fn locate(
-        &self,
-        app: &str,
-        query: &str,
-        role: &str,
-        titles: bool,
-    ) -> R<Option<(B::Id, Cache<B::Id>)>> {
+    async fn locate(&self, app: &str, query: &str, role: &str, titles: bool) -> R<Located<B::Id>> {
         let windows = trace::time("app_windows", self.app_windows(app)).await?;
-        Ok(self.locate_in(windows, query, role, titles).await)
+        let (found, cache) = self.searched(windows.clone(), query, role, titles).await;
+        Ok(match found {
+            Some(id) => Located::Found(id, cache),
+            None => Located::Missed(windows, cache),
+        })
     }
 
     /// `locate` in the app windows `windows`.
@@ -1607,6 +1618,18 @@ impl<B: Backend> Server<B> {
         role: &str,
         titles: bool,
     ) -> Option<(B::Id, Cache<B::Id>)> {
+        let (found, cache) = self.searched(windows, query, role, titles).await;
+        found.map(|id| (id, cache))
+    }
+
+    /// `locate_in`, with the nodes fetched for it also on a miss.
+    async fn searched(
+        &self,
+        windows: Vec<B::Id>,
+        query: &str,
+        role: &str,
+        titles: bool,
+    ) -> (Option<B::Id>, Cache<B::Id>) {
         let mut cache = Cache::new();
         trace::time(
             "prefetch",
@@ -1622,7 +1645,7 @@ impl<B: Backend> Server<B> {
         }
         loop {
             match render::locate(&cache, &windows, query, role, titles) {
-                Ok(found) => return found.map(|id| (id, cache)),
+                Ok(found) => return (found, cache),
                 Err(missing) => {
                     trace::time(
                         "prefetch more",
@@ -1636,6 +1659,54 @@ impl<B: Backend> Server<B> {
                 }
             }
         }
+    }
+
+    /// What to offer when nothing visible in `windows` matches `query`:
+    /// matches scrolled out of view in the page (web documents only), else
+    /// the visible elements with the closest names, with their ids; empty
+    /// when there are none. `cache` holds the visible part of `windows`.
+    async fn miss_report(
+        &self,
+        windows: &[B::Id],
+        cache: &mut Cache<B::Id>,
+        app: &str,
+        query: &str,
+        role: &str,
+    ) -> String {
+        let as_lines = |ids: Vec<B::Id>| -> Vec<Line<B::Id>> {
+            ids.into_iter()
+                .map(|id| Line::Node { depth: 0, id })
+                .collect()
+        };
+        let docs = render::showing_documents(cache, windows);
+        if !docs.is_empty() {
+            let mut off = Cache::new();
+            let fetch = Fetch {
+                offscreen: true,
+                ..search_fetch(render::FIND_TEXT_LIMIT, OFFSCREEN_FETCH)
+            };
+            trace::time(
+                "prefetch offscreen",
+                self.b.prefetch_with(&mut off, docs.clone(), &fetch),
+            )
+            .await;
+            let hits = render::find_offscreen(&off, &docs, query, role, MISS_SUGGESTIONS);
+            if !hits.is_empty() {
+                self.b.fill_actions(&mut off, &hits).await;
+                let (text, _) = self.print(as_lines(hits), &off, app).await;
+                return format!(
+                    "\noff-screen, scrolled out of view (act and get_text work on them; \
+                     scroll before click):\n{text}"
+                );
+            }
+        }
+        let near = render::closest(cache, windows, query, MISS_SUGGESTIONS);
+        if near.is_empty() {
+            return String::new();
+        }
+        self.b.fill_actions(cache, &near).await;
+        let (text, _) = self.print(as_lines(near), cache, app).await;
+        format!("; closest:\n{text}")
     }
 
     /// The element a tool call names: `id`, or `app` + `query` (+ `role`).
@@ -1666,14 +1737,22 @@ impl<B: Backend> Server<B> {
         trace::time("enable", self.b.enable()).await;
         let role = arg_s(a, "role", "");
         let located = trace::time("locate", self.locate(app, query, &role, true)).await?;
-        let (id, mut cache) = located.ok_or_else(|| {
-            let role = if role.is_empty() {
-                String::new()
-            } else {
-                format!(" with role '{role}'")
-            };
-            format!("no visible element in '{app}' matches '{query}'{role}")
-        })?;
+        let (id, mut cache) = match located {
+            Located::Found(id, cache) => (id, cache),
+            Located::Missed(windows, mut cache) => {
+                let with_role = if role.is_empty() {
+                    String::new()
+                } else {
+                    format!(" with role '{role}'")
+                };
+                let report = self
+                    .miss_report(&windows, &mut cache, &app.to_lowercase(), query, &role)
+                    .await;
+                return Err(format!(
+                    "no visible element in '{app}' matches '{query}'{with_role}{report}"
+                ));
+            }
+        };
         trace::time(
             "fill_actions",
             self.b.fill_actions(&mut cache, std::slice::from_ref(&id)),
@@ -2400,7 +2479,15 @@ impl<B: Backend> Server<B> {
             }
         };
         if hits.is_empty() {
-            return Ok("no matches".into());
+            let report = self
+                .miss_report(&windows, &mut cache, &app.to_lowercase(), &query, &role)
+                .await;
+            let head = if report.starts_with("\noff-screen") {
+                "no visible matches"
+            } else {
+                "no matches"
+            };
+            return Ok(format!("{head}{report}"));
         }
         self.b.fill_actions(&mut cache, &hits).await;
         let lines = hits
@@ -2556,6 +2643,7 @@ impl<B: Backend> Server<B> {
             limit,
             actions: false,
             stop_roles: &render::MENU_BAR_STOP,
+            offscreen: false,
         };
         self.b
             .prefetch_with(cache, windows.to_vec(), &fetch(1))
@@ -2601,6 +2689,7 @@ impl<B: Backend> Server<B> {
             limit: PREFETCH_MORE,
             actions: false,
             stop_roles: &[],
+            offscreen: false,
         };
         for _ in 0..MENU_FETCH_ROUNDS {
             match render::menu_items(cache, node) {
@@ -6477,6 +6566,32 @@ mod tests {
             assert_eq!(lines[8], "stopped; 1 step(s) not run");
             assert_eq!(actions_run(&s), 0);
             assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_missed_query_offers_the_closest_names_with_ids() {
+        local(async {
+            let mut s = session("closest");
+            let r = call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "okk"})).await;
+            let text = reply_text(&r);
+            assert!(text.starts_with("no matches; closest:\n["), "{r}");
+            assert!(text.contains("push button \"OK\""), "{r}");
+            let r = call_tool(&mut s, 3, "find", json!({"app": "fake", "query": "zzz"})).await;
+            assert!(reply_text(&r).starts_with("no matches\nnow: "), "{r}");
+            // A tool given `query` fails, naming the candidates.
+            let r = call_tool(
+                &mut s,
+                4,
+                "get_text",
+                json!({"app": "fake", "query": "okk"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("matches 'okk'; closest:\n[") && text.contains("\"OK\""),
+                "{r}"
+            );
         });
     }
 

@@ -84,9 +84,23 @@ Why it is fast:
   pointer input still run one at a time, so keystrokes never interleave.
 - Popup menus and overlays of web pages are part of `tree`/`find` output.
   Firefox does not mark these layers as SHOWING; containers that are visible
-  and lie inside the window are entered as well, while content scrolled out of
-  view is still skipped. Example: Gemini's upload menu ("Dosya yükleyin") is
-  now found without a screenshot.
+  and lie inside the window are entered as well, and so are elements without
+  a layout box (`display: contents`, -1 extents): YouTube wraps its whole page
+  in one, which hid every element of the page from `find` and `query`.
+  Content scrolled out of view is skipped. Example: Gemini's upload menu
+  ("Dosya yükleyin") is now found without a screenshot.
+- Matching (`find`, `query`, `wait_for`) compares names and text case-folded
+  (Turkish İ/ı as i), with whitespace runs, no-break spaces and the
+  placeholders of web containers as one space and soft hyphens and zero-width
+  characters left out; up to 1000 characters of an element's text are
+  searched. When nothing matches that way, an element whose name or text holds
+  every word of the query, in any order and accents aside, does ("cozum
+  yontemleri" for "Çözüm Yöntemleri"). When still nothing visible matches,
+  `find` (and the error of a tool given `query`) lists up to five matches
+  scrolled out of view in the web page, with ids (`act` and `get_text` work
+  on them as they are), else up to five visible elements with the closest
+  names (`no matches; closest: …`), so the next call can use an id instead of
+  a screenshot.
 - Read tools (`apps`, `tree`, `find`, `get_text`, `wait_for`, `wait_idle`,
   `screenshot`, `pause`, `clipboard_get`, `windows`, `doctor`) carry MCP's
   `readOnlyHint`;
@@ -188,9 +202,10 @@ tool; `off` turns it off). Not available on Windows yet.
 - `act`, `set_text`, `focus`, `click`: act on an element. The element is picked
   by its `tree`/`find` number (`id`) or in one call by `app` + `query`
   (+ `role`): the first visible element whose name equals `query`, else the
-  first whose name or text contains it. Window and tab titles (frame, window,
-  page tab) count only when nothing else matches or `role` names that role;
-  `wait_for` skips them unless `role` names them.
+  first whose name or text contains it. Window, tab and page titles (frame,
+  window, page tab, and a web page's document) count only when nothing else
+  matches or `role` names that role; `wait_for` skips them unless `role` names
+  them. Last come elements holding every word of the query, accents aside.
 - Effect and `observe` on input tools (`act`, `menu`, `close_window`, `click`,
   `key`, `type_text`, `mouse`, `drag`, `scroll`, `set_text`): with
   `observe` (and by default for `act`, `menu` and `close_window`) the reply
@@ -199,21 +214,23 @@ tool; `off` turns it off). Not available on Windows yet.
   change events): `changed`, `no visible change`, or `window changed to
   '<title>'` (a dialog opened, a window closed). It waits for the app to react
   up to `settle_ms` (default 150), returning as soon as it reported a change;
-  the fingerprint itself costs about 1 ms. Without `observe`, the other input
-  tools still note, without waiting, when another window is in front after
-  the input (`; active window now '<title>'`) or came to the front since the
-  previous input (`; before it, '<title>' had come to the front`: a dialog
-  that opened after that reply); about 3 ms per input.
+  the fingerprint itself costs about 1 ms. A canvas that draws without
+  accessibility events may report `no visible change`. `observe` adds a view
+  in the same reply: `focus` (the focused element), `tree` (compact tree of
+  the active window, or of `app`'s, at most 6000 characters) or `screenshot`
+  (inline image). Without `observe`, the other input tools still note,
+  without waiting, when another window is in front after the input (`; active
+  window now '<title>'`) or came to the front since the previous input (`;
+  before it, '<title>' had come to the front`: a dialog that opened after
+  that reply); about 3 ms per input.
 - Failures say what is on screen: when `find` finds nothing, or `act`,
   `click`, `focus`, `get_text`, `set_text`, `scroll`, `drag`, `wait_for`,
   `wait_idle`, `menu`, `key`, `type_text` or `mouse` fails (or a `batch` step
   fails and the batch does not end with `screenshot` or `tree`), the reply
   ends with `now: active window '<title>' [app]; focus: <element>`, so the
   next call needs no screenshot to see why. Not for refusals by the
-  allowlist, confirmations or the user taking over. A canvas that draws without accessibility events
-  may report `no visible change`. `observe` adds a view in the same reply:
-  `focus` (the focused element), `tree` (compact tree of the active window, or
-  of `app`'s, at most 6000 characters) or `screenshot` (inline image).
+  allowlist, confirmations or the user taking over. A miss by `query` also
+  lists off-screen matches or the closest names with ids (see `find`).
 - Stale ids: every use of an `id` reads the element's role and name again (one
   round trip). If the element is gone, or its role or name changed (the page
   was redrawn, the object path now belongs to another element), nothing is

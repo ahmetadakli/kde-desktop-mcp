@@ -60,6 +60,10 @@ pub struct Fetch {
     pub actions: bool,
     /// Do not descend below nodes of these roles.
     pub stop_roles: &'static [&'static str],
+    /// With `only_showing`, also fetch the visible elements scrolled out of
+    /// view, and what they hold (still not showing); hidden ones are left
+    /// out of the cache. Backends that cannot tell them apart ignore it.
+    pub offscreen: bool,
 }
 
 /// Window management the desktop does not offer (KDE and Hyprland do).

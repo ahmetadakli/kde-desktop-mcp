@@ -93,11 +93,11 @@ Workflow:
 - apps lists running apps, marking the allowed ones. find (app + query) locates elements; \
 act, click, focus, get_text, set_text and scroll take the target themselves, so find-and-act \
 is one call. tree shows structure; find is cheaper.
-- Target: `id` from tree/find, or `app` + `query` (+ `role`): the first visible element whose \
-name equals `query` (case-insensitive) wins, else the first whose name or text contains it. \
-Window and tab titles count only when nothing else matches or `role` names that role. The \
-reply starts with the element picked.
-- batch runs steps in one round trip when later steps don't depend on reading a result. \
+- Target: `id` from tree/find, or `app` + `query` (+ `role`): the first visible element named \
+`query` (case-insensitive) wins, else the first whose name or text contains it. \
+Titles (window, tab, page) count only when nothing else does or `role` names them. The \
+reply starts with the element picked. A miss lists near or off-screen matches with ids.
+- batch runs steps in one round trip when later steps don't need a result. \
 Mark waits \"optional\": true and end with an observation step, or give the last input \
 `observe`. A later step's `id` (or root_id/from_id/to_id) may be \"$N\": the element step N found or acted on \
 (find: its first hit).
@@ -113,8 +113,8 @@ stop and ask them; once they agree, a standalone activate_window call resumes in
 that appears or goes away (gone=true), a state or a window; never as a sleep. \
 tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
-view after the input settled, instead of a separate look. Failures and \
-\"no matches\" end with the active window and focus.
+view after the input settled, instead of a separate look. Failures end with the active \
+window and focus.
 - menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
 - screenshot is a last resort (inline image: don't Read the file). To click something seen \
 only in it, pass its pixels to mouse as image_x/image_y; `region`=[x, y, w, h] zooms in.
@@ -126,7 +126,7 @@ confirm: true only if they agree. Password fields are never read, and filled in 
 user allowed it. Errors name the file; changing it is the user's decision. When tools fail \
 as if the setup were broken (AT-SPI, virtual input, KWin, screenshots), run doctor.
 
-Clients that load tool schemas on demand: load the common ones in one search: batch, find, \
+Clients loading schemas on demand: load the common ones in one search: batch, find, \
 act, activate_window, key, type_text, wait_for, wait_idle, screenshot, apps.";
 
 /// The `confirm` argument of tools that change something.
@@ -187,7 +187,7 @@ pub fn tools() -> Json {
         ),
         t(
             "find",
-            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree; with\n`role`, the role name is searched too. Window and tab titles (frame, window,\npage tab) are listed after all other matches. Lines read as in tree (actions\nthe role implies omitted). Usually cheaper than tree.",
+            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree; with\n`role`, the role name is searched too. Window, tab and page titles (frame,\nwindow, page tab, document web) are listed after all other matches. Without\nany, elements holding every word of `query` (any order, accents aside) are.\nWith no visible match, lists matches scrolled out of the page's view (act\nand get_text work on them), else the elements with the closest names.\nLines read as in tree (actions the role implies omitted). Usually cheaper\nthan tree.",
             schema(&[
                 ("query", "string", None),
                 ("app", "string", None),
@@ -260,7 +260,7 @@ pub fn tools() -> Json {
         ),
         t(
             "wait_for",
-            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). Matches like act's `query`, except that window and\ntab titles (frame, window, page tab), which name a page before it has loaded,\nmatch only when `role` names that role. `state` (enabled, focused, checked,\nselected): the element must also have it (with `gone`: until it no longer\ndoes). `window` instead of `query`: wait for a window of an allowed app\n(`app`, if given) whose title or app name contains it to open, or with\n`gone` to close. To just wait a fixed time, use pause, not a query that\nnever matches.",
+            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). Matches like act's `query`, except that window, tab\nand page titles (frame, window, page tab, document web), which name a page\nbefore it has loaded, match only when `role` names that role. `state` (enabled, focused, checked,\nselected): the element must also have it (with `gone`: until it no longer\ndoes). `window` instead of `query`: wait for a window of an allowed app\n(`app`, if given) whose title or app name contains it to open, or with\n`gone` to close. To just wait a fixed time, use pause, not a query that\nnever matches.",
             schema(&[
                 ("app", "string", Some(Json::Null)),
                 ("query", "string", Some(Json::Null)),
