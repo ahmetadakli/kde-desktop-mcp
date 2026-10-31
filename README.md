@@ -84,9 +84,23 @@ Why it is fast:
   pointer input still run one at a time, so keystrokes never interleave.
 - Popup menus and overlays of web pages are part of `tree`/`find` output.
   Firefox does not mark these layers as SHOWING; containers that are visible
-  and lie inside the window are entered as well, while content scrolled out of
-  view is still skipped. Example: Gemini's upload menu ("Dosya yükleyin") is
-  now found without a screenshot.
+  and lie inside the window are entered as well, and so are elements without
+  a layout box (`display: contents`, -1 extents): YouTube wraps its whole page
+  in one, which hid every element of the page from `find` and `query`.
+  Content scrolled out of view is skipped. Example: Gemini's upload menu
+  ("Dosya yükleyin") is now found without a screenshot.
+- Matching (`find`, `query`, `wait_for`) compares names and text case-folded
+  (Turkish İ/ı as i), with whitespace runs, no-break spaces and the
+  placeholders of web containers as one space and soft hyphens and zero-width
+  characters left out; up to 1000 characters of an element's text are
+  searched. When nothing matches that way, an element whose name or text holds
+  every word of the query, in any order and accents aside, does ("cozum
+  yontemleri" for "Çözüm Yöntemleri"). When still nothing visible matches,
+  `find` (and the error of a tool given `query`) lists up to five matches
+  scrolled out of view in the web page, with ids (`act` and `get_text` work
+  on them as they are), else up to five visible elements with the closest
+  names (`no matches; closest: …`), so the next call can use an id instead of
+  a screenshot.
 - Read tools (`apps`, `tree`, `find`, `get_text`, `wait_for`, `wait_idle`,
   `screenshot`, `pause`, `clipboard_get`, `windows`, `doctor`) carry MCP's
   `readOnlyHint`;
@@ -188,9 +202,10 @@ tool; `off` turns it off). Not available on Windows yet.
 - `act`, `set_text`, `focus`, `click`: act on an element. The element is picked
   by its `tree`/`find` number (`id`) or in one call by `app` + `query`
   (+ `role`): the first visible element whose name equals `query`, else the
-  first whose name or text contains it. Window and tab titles (frame, window,
-  page tab) count only when nothing else matches or `role` names that role;
-  `wait_for` skips them unless `role` names them.
+  first whose name or text contains it. Window, tab and page titles (frame,
+  window, page tab, and a web page's document) count only when nothing else
+  matches or `role` names that role; `wait_for` skips them unless `role` names
+  them. Last come elements holding every word of the query, accents aside.
 - Effect and `observe` on input tools (`act`, `click`, `key`, `type_text`,
   `mouse`, `drag`, `scroll`, `set_text`): the reply ends with an `effect:`
   line comparing the active window before and after the input (its title, the

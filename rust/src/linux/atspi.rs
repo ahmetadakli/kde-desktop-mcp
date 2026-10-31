@@ -803,6 +803,7 @@ impl A11y {
             limit,
             actions: true,
             stop_roles: &[],
+            offscreen: false,
         };
         self.prefetch_with(cache, roots, &f).await
     }
@@ -817,30 +818,38 @@ impl A11y {
         while !level.is_empty() && fetched < f.limit {
             level.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
             level.dedup();
-            let infos: Vec<(Obj, Info)> = stream::iter(level)
+            let infos: Vec<(Obj, Info, bool)> = stream::iter(level)
                 .map(|o| async move {
                     let (mut info, hidden_visible) =
                         self.info_flagged(&o, f.text_limit, f.actions).await;
                     // A visible node that is not showing yet lies inside the
                     // window holds an overlay (a web page's popup menu): treat
-                    // it as showing so its showing children are reached. Only
-                    // a walk over showing nodes needs to know.
+                    // it as showing so its showing children are reached. So is
+                    // one without a layout box (`boxless`). Only a walk over
+                    // showing nodes needs to know.
                     if f.only_showing
                         && hidden_visible
                         && let Some((vw, vh)) = self.viewport(&o.bus).await
-                        && let Ok((x, y, w, h)) = self.extents(&o, COORD_WINDOW).await
+                        && let Ok(b) = self.extents(&o, COORD_WINDOW).await
                     {
-                        info.showing = overlaps((x, y, w, h), (vw, vh));
+                        info.showing =
+                            overlaps(b, (vw, vh)) || (boxless(b) && !info.children.is_empty());
                     }
-                    (o, info)
+                    let offscreen = f.offscreen && hidden_visible && !info.showing;
+                    (o, info, offscreen)
                 })
                 .buffered(IN_FLIGHT)
                 .collect()
                 .await;
             fetched += infos.len();
             let mut next = Vec::new();
-            for (o, info) in infos {
-                if (!f.only_showing || info.showing) && !f.stop_roles.contains(&info.role.as_str())
+            for (o, info, offscreen) in infos {
+                // Hidden: nothing an off-screen search could report.
+                if f.offscreen && !info.showing && !offscreen {
+                    continue;
+                }
+                if (!f.only_showing || info.showing || offscreen)
+                    && !f.stop_roles.contains(&info.role.as_str())
                 {
                     next.extend(
                         info.children
@@ -956,6 +965,14 @@ const OVERLAY_EXCLUDED_ROLES: [&str; 9] = [
     "dialog",
     "application",
 ];
+
+/// Whether a box is Firefox's "no layout box" (-1 extents): an element
+/// styled `display: contents`, such as YouTube's whole `ytd-app` wrapper.
+/// It is never marked showing, yet its children are laid out and showing,
+/// so a walk over showing nodes has to pass through it.
+fn boxless((_, _, w, h): (i32, i32, i32, i32)) -> bool {
+    w < 0 && h < 0
+}
 
 /// Whether a box in window coordinates has area inside a `w`×`h` window.
 fn overlaps((x, y, bw, bh): (i32, i32, i32, i32), (w, h): (i32, i32)) -> bool {
@@ -1132,6 +1149,13 @@ mod tests {
         assert!(!overlaps((0, -200, 300, 40), window));
         assert!(!overlaps((10, 10, 0, 40), window));
         assert!(!overlaps((-1, -1, -1, -1), window));
+    }
+
+    #[test]
+    fn only_unknown_extents_are_boxless() {
+        assert!(boxless((-1, -1, -1, -1)));
+        assert!(!boxless((10, 10, 0, 0)));
+        assert!(!boxless((0, 2000, 300, 40)));
     }
 
     /// `await_action` on a reply that comes after `reply_ms` with `value`,

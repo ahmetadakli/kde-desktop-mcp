@@ -12,7 +12,9 @@ use serde_json::Value as Json;
 use crate::backend::{Cache, Info};
 
 pub const TRUNCATED: &str = "… truncated; narrow with find or a deeper root id";
-pub const FIND_TEXT_LIMIT: usize = 200;
+/// Characters of an element's text a search reads (a paragraph's first few
+/// sentences).
+pub const FIND_TEXT_LIMIT: usize = 1000;
 pub const FIND_MAX_SEEN: usize = 20000;
 
 /// A rendered line: either a node (gets an id when printed) or plain text.
@@ -693,48 +695,176 @@ fn echoes_only_child<Id: Clone + Eq + Hash>(st: &Walk<'_, Id>, at: usize, info: 
     }
 }
 
-/// Roles whose name is a window or tab title. A title names the page or
-/// document as soon as it starts loading, so it would satisfy a query meant
-/// for the content (`wait_for "Inbox"` returning on the tab title before
-/// the page is there). Elements of these roles match a query only when no
-/// other element does, or when `role` names their role.
-pub const TITLE_ROLES: [&str; 3] = ["frame", "window", "page tab"];
+/// Roles whose name is a window, tab or page title. A title names the page
+/// or document as soon as it starts loading, so it would satisfy a query
+/// meant for the content (`wait_for "Inbox"` returning on the tab title
+/// before the page is there). Elements of these roles match a query only
+/// when no other element does, or when `role` names their role. A web
+/// page's document is named after the page, as its tab is.
+pub const TITLE_ROLES: [&str; 6] = [
+    "frame",
+    "window",
+    "page tab",
+    "document web",
+    "document frame",
+    "document",
+];
 
-/// How an element matches a query.
-#[derive(Clone, Copy, PartialEq)]
+/// How an element matches a query, best first.
+#[derive(Clone, Copy, PartialEq, PartialOrd)]
 enum Hit {
-    /// The name equals the query (case-insensitive, trimmed).
+    /// The name equals the query (`fold`ed).
     Exact,
     /// Name or text contains the query; with `role` given, the role too.
     Partial,
+    /// Without accents, name or text contain every word of the query, in
+    /// any order ("cozum yontemleri" for "Çözüm Yöntemleri"). Counts only
+    /// when nothing matches otherwise.
+    Loose,
 }
 
-/// Whether `info` matches lower-cased query `q` and the exact `role`
-/// filter. The role name is searched only when `role` is given: otherwise
-/// a short query ("a") would match every frame, panel and alert.
-fn matches<Id>(info: &Info<Id>, q: &str, role: &str) -> Option<Hit> {
+/// Text as searches compare it: lower case (Turkish İ and ı as i),
+/// whitespace runs (no-break spaces, newlines, the U+FFFC a web container
+/// has for each child) as one space, trimmed, invisible characters (soft
+/// hyphens, zero-width spaces) dropped, curly quotes as straight ones.
+pub fn fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut space = false;
+    for c in s.chars() {
+        if c.is_whitespace() || c == EMBEDDED_OBJECT {
+            space = true;
+            continue;
+        }
+        if matches!(
+            c,
+            '\u{AD}' | '\u{200B}'..='\u{200D}' | '\u{2060}' | '\u{FEFF}' | '\u{307}'
+        ) {
+            continue;
+        }
+        if space && !out.is_empty() {
+            out.push(' ');
+        }
+        space = false;
+        let c = match c {
+            '\u{2018}' | '\u{2019}' | '\u{02BC}' => '\'',
+            '\u{201C}' | '\u{201D}' => '"',
+            c => c,
+        };
+        for l in c.to_lowercase() {
+            match l {
+                '\u{307}' => {}
+                'ı' => out.push('i'),
+                l => out.push(l),
+            }
+        }
+    }
+    out
+}
+
+/// `fold`ed text without accents: "çözüm" reads "cozum".
+fn unaccent(folded: &str) -> String {
+    const MAP: [(&str, char); 20] = [
+        ("àáâãäåāăą", 'a'),
+        ("çćĉċč", 'c'),
+        ("ďđ", 'd'),
+        ("èéêëēĕėęě", 'e'),
+        ("ĝğġģ", 'g'),
+        ("ĥħ", 'h'),
+        ("ìíîïĩīĭį", 'i'),
+        ("ĵ", 'j'),
+        ("ķ", 'k'),
+        ("ĺļľŀł", 'l'),
+        ("ñńņň", 'n'),
+        ("òóôõöøōŏő", 'o'),
+        ("ŕŗř", 'r'),
+        ("śŝşšș", 's'),
+        ("ţťŧț", 't'),
+        ("ùúûüũūŭůűų", 'u'),
+        ("ŵ", 'w'),
+        ("ýÿŷ", 'y'),
+        ("źżž", 'z'),
+        ("ß", 's'),
+    ];
+    folded
+        .chars()
+        .map(|c| {
+            if c.is_ascii() {
+                return c;
+            }
+            MAP.iter()
+                .find(|(from, _)| from.contains(c))
+                .map_or(c, |(_, to)| *to)
+        })
+        .collect()
+}
+
+/// A query as the matching compares it.
+struct Query {
+    /// `fold`ed.
+    text: String,
+    /// The words of `text`, `unaccent`ed, for `Hit::Loose`.
+    words: Vec<String>,
+}
+
+impl Query {
+    fn new(query: &str) -> Self {
+        let text = fold(query);
+        let words = unaccent(&text)
+            .split(' ')
+            .filter(|w| !w.is_empty())
+            .map(str::to_string)
+            .collect();
+        Query { text, words }
+    }
+}
+
+/// Whether `info` matches query `q` and the exact `role` filter. The role
+/// name is searched only when `role` is given: otherwise a short query
+/// ("a") would match every frame, panel and alert.
+fn matches<Id>(info: &Info<Id>, q: &Query, role: &str) -> Option<Hit> {
     if !role.is_empty() && info.role != role {
         return None;
     }
-    if info.name.trim().to_lowercase() == q {
+    let name = fold(&info.name);
+    if name == q.text {
         return Some(Hit::Exact);
     }
-    let mut hay = format!("{} {}", info.name, text_preview(info, FIND_TEXT_LIMIT));
+    let mut hay = name;
+    hay.push(' ');
+    hay.push_str(&fold(&text_preview(info, FIND_TEXT_LIMIT)));
     if !role.is_empty() {
         hay.push(' ');
         hay.push_str(&info.role);
     }
-    hay.to_lowercase().contains(q).then_some(Hit::Partial)
+    if hay.contains(&q.text) {
+        return Some(Hit::Partial);
+    }
+    let hay = unaccent(&hay);
+    (!q.words.is_empty() && q.words.iter().all(|w| hay.contains(w.as_str()))).then_some(Hit::Loose)
 }
 
-/// A window or tab title, which ranks below every other element.
+/// A window, tab or page title, which ranks below every other element.
 fn is_title<Id>(info: &Info<Id>, role: &str) -> bool {
     role.is_empty() && TITLE_ROLES.contains(&info.role.as_str())
 }
 
+/// Rank of a match, lower first: exact and partial matches of other
+/// elements, then of titles, then loose ones (other elements first).
+fn rank(hit: Hit, title: bool) -> u8 {
+    match (hit, title) {
+        (Hit::Exact, false) => 0,
+        (Hit::Partial, false) => 1,
+        (Hit::Exact, true) => 2,
+        (Hit::Partial, true) => 3,
+        (Hit::Loose, false) => 4,
+        (Hit::Loose, true) => 5,
+    }
+}
+
 /// Python `find`: depth-first, hidden subtrees skipped, case-insensitive
 /// substring match over name and text (and role, when `role` is given).
-/// Window and tab titles come after all other hits.
+/// Window and tab titles come after all other hits; loose matches
+/// (`Hit::Loose`) only when there is nothing else.
 pub fn find<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     roots: &[Id],
@@ -742,15 +872,15 @@ pub fn find<Id: Clone + Eq + Hash>(
     role: &str,
     max_results: usize,
 ) -> Result<Vec<Id>, Vec<Id>> {
-    let q = query.to_lowercase();
-    let mut hits = Vec::new();
-    let mut titles = Vec::new();
+    let q = Query::new(query);
+    // Hits by rank: exact or partial ones, titles, loose ones, loose titles.
+    let mut tiers: [Vec<Id>; 4] = Default::default();
     let mut missing = Vec::new();
     // None is the synthetic root whose children are `roots`.
     let mut stack: Vec<Option<&Id>> = vec![None];
     let mut seen = 0;
     while let Some(node) = stack.pop() {
-        if hits.len() >= max_results || seen >= FIND_MAX_SEEN {
+        if tiers[0].len() >= max_results || seen >= FIND_MAX_SEEN {
             break;
         }
         seen += 1;
@@ -763,17 +893,22 @@ pub fn find<Id: Clone + Eq + Hash>(
                 continue;
             }
             stack.push(Some(c));
-            if matches(info, &q, role).is_some() {
-                if is_title(info, role) {
-                    titles.push(c.clone());
-                } else {
-                    hits.push(c.clone());
-                }
+            if let Some(hit) = matches(info, &q, role) {
+                let tier = match rank(hit, is_title(info, role)) {
+                    0 | 1 => 0,
+                    2 | 3 => 1,
+                    r => r as usize - 2,
+                };
+                tiers[tier].push(c.clone());
             }
         }
     }
+    let [mut hits, titles, loose, loose_titles] = tiers;
     let room = max_results.saturating_sub(hits.len());
     hits.extend(titles.into_iter().take(room));
+    if hits.is_empty() {
+        hits.extend(loose.into_iter().chain(loose_titles).take(max_results));
+    }
     done(hits, missing)
 }
 
@@ -795,11 +930,12 @@ fn push_showing<'a, Id: Clone + Eq + Hash>(
 }
 
 /// The element a query names: depth-first in document order over visible
-/// elements, the first whose name equals `query` (case-insensitive) wins,
-/// else the first whose name or text contains it (or role, when `role` is
-/// given). Window and tab titles (TITLE_ROLES) count only when nothing else
-/// matches, and with `titles` false not at all. Ok(None) when nothing
-/// matches.
+/// elements, the first whose name equals `query` (`fold`ed: case, Turkish
+/// i, whitespace) wins, else the first whose name or text contains it (or
+/// role, when `role` is given). Window, tab and page titles (TITLE_ROLES)
+/// count only when nothing else matches, and with `titles` false not at
+/// all. Last, the first whose name or text has every word of the query,
+/// accents aside. Ok(None) when nothing matches.
 pub fn locate<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     roots: &[Id],
@@ -807,10 +943,9 @@ pub fn locate<Id: Clone + Eq + Hash>(
     role: &str,
     titles: bool,
 ) -> Result<Option<Id>, Vec<Id>> {
-    let q = query.trim().to_lowercase();
-    let mut first_partial = None;
-    let mut title_exact = None;
-    let mut title_partial = None;
+    let q = Query::new(query);
+    // The first element of each rank.
+    let mut best: [Option<&Id>; 6] = Default::default();
     let mut missing = Vec::new();
     let mut stack: Vec<&Id> = Vec::new();
     push_showing(cache, roots, &mut stack, &mut missing);
@@ -821,23 +956,173 @@ pub fn locate<Id: Clone + Eq + Hash>(
             break;
         }
         let info = &cache[id];
-        match (matches(info, &q, role), is_title(info, role)) {
-            (Some(Hit::Exact), false) => return done(Some(id.clone()), missing),
-            (Some(Hit::Exact), true) if titles => {
-                title_exact.get_or_insert(id);
+        let title = is_title(info, role);
+        if let Some(hit) = matches(info, &q, role)
+            && (titles || !title)
+        {
+            let r = rank(hit, title);
+            if r == 0 {
+                return done(Some(id.clone()), missing);
             }
-            (Some(Hit::Partial), false) => {
-                first_partial.get_or_insert(id);
-            }
-            (Some(Hit::Partial), true) if titles => {
-                title_partial.get_or_insert(id);
-            }
-            _ => {}
+            best[r as usize].get_or_insert(id);
         }
         push_showing(cache, &info.children, &mut stack, &mut missing);
     }
-    let best = first_partial.or(title_exact).or(title_partial);
-    done(best.cloned(), missing)
+    let found = best.into_iter().flatten().next();
+    done(found.cloned(), missing)
+}
+
+/// Elements of `roots` that match `query` (and `role`) but are not
+/// showing: scrolled out of view. Depth-first in document order over
+/// what is in `cache` (nodes not fetched are skipped), best rank first.
+pub fn find_offscreen<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+    query: &str,
+    role: &str,
+    max_results: usize,
+) -> Vec<Id> {
+    let q = Query::new(query);
+    let mut hits: Vec<(u8, usize, &Id)> = Vec::new();
+    let mut stack: Vec<&Id> = roots.iter().rev().collect();
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        let Some(info) = cache.get(id) else { continue };
+        if !info.showing
+            && let Some(hit) = matches(info, &q, role)
+        {
+            hits.push((rank(hit, is_title(info, role)), hits.len(), id));
+        }
+        stack.extend(info.children.iter().rev());
+    }
+    // Loose matches only when there is nothing better.
+    let best = hits.iter().map(|h| h.0.min(4)).min();
+    hits.retain(|h| Some(h.0.min(4)) == best);
+    hits.sort_by_key(|h| (h.0, h.1));
+    hits.into_iter()
+        .take(max_results)
+        .map(|(_, _, id)| id.clone())
+        .collect()
+}
+
+/// The showing documents (DOCUMENT_ROLES) below `roots`, among the nodes
+/// in `cache`.
+pub fn showing_documents<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id]) -> Vec<Id> {
+    let mut out = Vec::new();
+    let mut stack: Vec<&Id> = roots.iter().rev().collect();
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        let Some(info) = cache.get(id) else { continue };
+        if !info.showing {
+            continue;
+        }
+        if DOCUMENT_ROLES.contains(&info.role.as_str()) {
+            out.push(id.clone());
+            continue;
+        }
+        stack.extend(info.children.iter().rev());
+    }
+    out
+}
+
+/// Similarity of two words, 0 to 1: one minus their edit distance over the
+/// longer length.
+fn word_similarity(a: &str, b: &str) -> f32 {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let longest = a.len().max(b.len());
+    if longest == 0 {
+        return 1.0;
+    }
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut diag = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let next = (diag + usize::from(ca != cb))
+                .min(row[j] + 1)
+                .min(row[j + 1] + 1);
+            diag = row[j + 1];
+            row[j + 1] = next;
+        }
+    }
+    1.0 - row[b.len()] as f32 / longest as f32
+}
+
+/// How close `hay` (`fold`ed and `unaccent`ed) comes to the query words:
+/// the mean over the words of the best similarity to a word of `hay`.
+fn closeness(words: &[String], hay: &str) -> f32 {
+    if words.is_empty() {
+        return 0.0;
+    }
+    let hay: Vec<&str> = hay.split(' ').filter(|w| w.chars().count() > 1).collect();
+    let total: f32 = words
+        .iter()
+        .map(|w| {
+            hay.iter()
+                .map(|h| word_similarity(w, h))
+                .fold(0.0, f32::max)
+        })
+        .sum();
+    total / words.len() as f32
+}
+
+/// Characters of an unnamed element's text `closest` compares.
+const CLOSEST_TEXT: usize = 200;
+
+/// Lowest `closeness` worth suggesting: one typo in a five-letter word.
+const CLOSE_ENOUGH: f32 = 0.6;
+
+/// For a query nothing matches: the visible elements whose name (or text,
+/// for elements without one) comes closest, best first, at most `n`.
+/// `role` is not applied, so an element of another role than the one asked
+/// for is offered too. Window, tab and page titles are left out.
+pub fn closest<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+    query: &str,
+    n: usize,
+) -> Vec<Id> {
+    let words = Query::new(query).words;
+    let mut scored: Vec<(f32, usize, &Id)> = Vec::new();
+    let mut stack: Vec<&Id> = Vec::new();
+    let mut missing = Vec::new();
+    push_showing(cache, roots, &mut stack, &mut missing);
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        let info = &cache[id];
+        push_showing(cache, &info.children, &mut stack, &mut missing);
+        if is_title(info, "") {
+            continue;
+        }
+        let label = if info.name.trim().is_empty() {
+            text_preview(info, CLOSEST_TEXT)
+        } else {
+            info.name.clone()
+        };
+        let score = closeness(&words, &unaccent(&fold(&label)));
+        if score >= CLOSE_ENOUGH {
+            scored.push((score, scored.len(), id));
+        }
+    }
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+    scored
+        .into_iter()
+        .take(n)
+        .map(|(_, _, id)| id.clone())
+        .collect()
 }
 
 /// A hash of the visible elements below `roots` (role, name, states,
@@ -1701,6 +1986,170 @@ mod tests {
             find(&cache, &["/w"], "butt", "", 10).unwrap(),
             Vec::<&str>::new()
         );
+    }
+
+    /// A web page: the window holds a document named after the page, a
+    /// heading, a link whose name has a no-break space, a paragraph with
+    /// text only and a button scrolled out of view.
+    fn page() -> Cache<&'static str> {
+        let mut c = Cache::new();
+        c.insert(
+            "/w",
+            node("frame", "Çözüm Yöntemleri — Firefox", true, &[], &["/d"]),
+        );
+        c.insert(
+            "/d",
+            node(
+                "document web",
+                "Çözüm Yöntemleri",
+                true,
+                &[],
+                &["/h", "/l", "/para", "/off"],
+            ),
+        );
+        c.insert(
+            "/h",
+            node("heading", "İKİNCİ Derece Denklemler", true, &[], &[]),
+        );
+        c.insert(
+            "/l",
+            node("link", "\u{a0}Sık Sorulan\u{a0} Sorular ", true, &[], &[]),
+        );
+        let mut para = node("paragraph", "", true, &[], &[]);
+        para.text = Some("Bu bölümde \u{fffc} ikinci  dereceden\u{ad} denklemlerin çözümü".into());
+        c.insert("/para", para);
+        c.insert("/off", node("push button", "13 yanıt", false, &[], &[]));
+        c
+    }
+
+    #[test]
+    fn fold_ignores_case_turkish_i_whitespace_and_invisible_characters() {
+        assert_eq!(fold("  İKİNCİ\u{a0}\u{a0}Derece\n"), "ikinci derece");
+        assert_eq!(fold("Işık"), "işik");
+        assert_eq!(
+            fold("a\u{fffc}b soft\u{ad}hy\u{200b}phen"),
+            "a b softhyphen"
+        );
+        assert_eq!(fold("Don\u{2019}t \u{201c}x\u{201d}"), "don't \"x\"");
+        assert_eq!(
+            unaccent(&fold("Çözüm Yöntemleri ĞÜŞ")),
+            "cozum yontemleri gus"
+        );
+    }
+
+    #[test]
+    fn web_names_match_across_case_turkish_i_and_no_break_spaces() {
+        let cache = page();
+        // Turkish İ lower-cases to i plus a combining dot: still "ikinci".
+        assert_eq!(
+            locate(&cache, &["/w"], "ikinci derece", "", true).unwrap(),
+            Some("/h")
+        );
+        // No-break spaces and padding do not keep a name from being exact.
+        assert_eq!(
+            locate(&cache, &["/w"], "sık sorulan sorular", "link", true).unwrap(),
+            Some("/l")
+        );
+        assert_eq!(
+            find(&cache, &["/w"], "SIK SORULAN", "", 10).unwrap(),
+            vec!["/l"]
+        );
+        // Text of a paragraph, past its child placeholders and soft hyphens.
+        assert_eq!(
+            find(&cache, &["/w"], "ikinci dereceden denklemlerin", "", 10).unwrap(),
+            vec!["/para"]
+        );
+    }
+
+    #[test]
+    fn page_documents_rank_as_titles() {
+        let cache = page();
+        // The document is named after the page, like its tab: content first.
+        assert_eq!(
+            find(&cache, &["/w"], "çözüm", "", 10).unwrap(),
+            vec!["/para", "/w", "/d"]
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "çözüm yöntemleri", "", true).unwrap(),
+            Some("/d")
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "çözüm yöntemleri", "", false).unwrap(),
+            None
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "çözüm", "document web", false).unwrap(),
+            Some("/d")
+        );
+    }
+
+    #[test]
+    fn loose_matches_count_only_when_nothing_else_does() {
+        let cache = page();
+        // Words in any order, accents aside (siblings come reversed, see
+        // find_is_depth_first_with_reversed_siblings).
+        assert_eq!(
+            find(&cache, &["/w"], "denklemler ikinci", "", 10).unwrap(),
+            vec!["/para", "/h"]
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "cozumu", "", true).unwrap(),
+            Some("/para")
+        );
+        // A title's plain match beats a loose match of content.
+        assert_eq!(
+            find(&cache, &["/w"], "yöntemleri", "", 10).unwrap(),
+            vec!["/w", "/d"]
+        );
+        assert_eq!(
+            locate(&cache, &["/w"], "yontemleri", "", true).unwrap(),
+            Some("/w")
+        );
+        // An empty word list matches nothing loosely.
+        assert_eq!(
+            find(&cache, &["/w"], "zzz", "", 10).unwrap(),
+            Vec::<&str>::new()
+        );
+    }
+
+    #[test]
+    fn offscreen_search_reports_only_elements_out_of_view() {
+        let mut cache = page();
+        assert_eq!(locate(&cache, &["/w"], "13 yanıt", "", true).unwrap(), None);
+        // "/gone" was never fetched (hidden): skipped, not asked for.
+        cache.get_mut("/d").unwrap().children.push("/gone");
+        assert_eq!(
+            find_offscreen(&cache, &["/d"], "13 yanit", "", 5),
+            vec!["/off"]
+        );
+        assert_eq!(
+            find_offscreen(&cache, &["/d"], "yanıt", "push button", 5),
+            vec!["/off"]
+        );
+        assert!(find_offscreen(&cache, &["/d"], "yanıt", "link", 5).is_empty());
+        // Showing matches are not off-screen ones.
+        assert!(find_offscreen(&cache, &["/d"], "ikinci", "", 5).is_empty());
+        assert_eq!(showing_documents(&cache, &["/w"]), vec!["/d"]);
+    }
+
+    #[test]
+    fn closest_offers_similar_names_best_first() {
+        assert_eq!(
+            word_similarity("diferansyel", "diferansiyel"),
+            1.0 - 1.0 / 12.0
+        );
+        assert_eq!(word_similarity("", ""), 1.0);
+        let cache = page();
+        // Typos: the heading comes closest; titles are left out.
+        assert_eq!(
+            closest(&cache, &["/w"], "ikinci dereceli denklemlr", 5),
+            vec!["/h", "/para"]
+        );
+        // `role` is not applied: a link offered to a query for a button.
+        assert_eq!(closest(&cache, &["/w"], "sorular", 5), vec!["/l"]);
+        // Nothing similar: nothing offered.
+        assert!(closest(&cache, &["/w"], "watch later", 5).is_empty());
+        assert_eq!(closest(&cache, &["/w"], "", 5), Vec::<&str>::new());
     }
 
     #[test]
