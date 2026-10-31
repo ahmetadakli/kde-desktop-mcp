@@ -280,6 +280,31 @@ pub trait Backend {
     fn changed_since(&self, _near: &[Self::Id], _mark: u64) -> Option<bool> {
         None
     }
+    /// A mark for `unchanged_since`, taken before a read that may be kept
+    /// and reused; None when the backend cannot tell that an app's tree
+    /// stayed the same (no events for all that a read sees), so reads are
+    /// never reused.
+    fn read_mark(&self) -> Option<u64> {
+        None
+    }
+    /// Whether the app whose windows are `near` sent no change event
+    /// since `mark` (`read_mark`), and no app or window came or went.
+    /// Cheap: no round trip.
+    fn unchanged_since(&self, _near: &[Self::Id], _mark: u64) -> bool {
+        false
+    }
+    /// Whether a read of the windows `near` may be kept at all: their app
+    /// is known to send change events (`unchanged_since` means something),
+    /// and no document there is still loading.
+    async fn may_keep(&self, _near: &[Self::Id]) -> bool {
+        false
+    }
+    /// Whether an element taken from a kept read still exists and is
+    /// visible, as cheaply as the platform allows (one round trip).
+    async fn still_there(&self, id: &Self::Id) -> bool {
+        let info = self.info(id, 0).await;
+        !info.role.is_empty() && info.showing
+    }
     /// App name owning the foreground window, "" when unknown.
     async fn active_app(&self) -> String;
 
@@ -355,6 +380,12 @@ pub trait Backend {
     async fn try_focus(&self, id: &Self::Id) -> R<Option<String>>;
     /// Centre of the element in the coordinate space `pointer` accepts.
     async fn element_center(&self, id: &Self::Id) -> R<(i32, i32)>;
+    /// `element_center` of an element whose window (its nearest frame,
+    /// window or dialog ancestor, or itself) is known to be `frame`, so it
+    /// need not be looked up.
+    async fn element_center_in(&self, id: &Self::Id, _frame: &Self::Id) -> R<(i32, i32)> {
+        self.element_center(id).await
+    }
     /// `element_center` of several elements at once (a drag's two ends), so
     /// what they share (the active window's origin) is looked up once.
     async fn element_centers(&self, ids: &[Self::Id]) -> Vec<R<(i32, i32)>> {

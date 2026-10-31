@@ -262,6 +262,12 @@ impl Takeover {
         last
     }
 
+    /// Whether the user used the keyboard or mouse after `at`, as far as
+    /// it is watched.
+    pub fn user_input_since(&self, at: Instant) -> bool {
+        self.last_user(Instant::now()).is_some_and(|(t, _)| t > at)
+    }
+
     /// Whether an input tool may start now.
     #[cfg(test)]
     pub fn check(&self, now: Instant) -> Result<(), Block> {
