@@ -14,6 +14,7 @@ mod render;
 mod shot;
 mod takeover;
 mod tools;
+mod trace;
 #[cfg(windows)]
 mod windows;
 // The Windows backend's pure helpers, so their tests also run on Linux.
@@ -1591,7 +1592,7 @@ impl<B: Backend> Server<B> {
         role: &str,
         titles: bool,
     ) -> R<Option<(B::Id, Cache<B::Id>)>> {
-        let windows = self.app_windows(app).await?;
+        let windows = trace::time("app_windows", self.app_windows(app)).await?;
         Ok(self.locate_in(windows, query, role, titles).await)
     }
 
@@ -1604,24 +1605,31 @@ impl<B: Backend> Server<B> {
         titles: bool,
     ) -> Option<(B::Id, Cache<B::Id>)> {
         let mut cache = Cache::new();
-        self.b
-            .prefetch_with(
+        trace::time(
+            "prefetch",
+            self.b.prefetch_with(
                 &mut cache,
                 windows.clone(),
                 &search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
-            )
-            .await;
+            ),
+        )
+        .await;
+        if trace::on() {
+            eprintln!("trace          prefetched {} nodes", cache.len());
+        }
         loop {
             match render::locate(&cache, &windows, query, role, titles) {
                 Ok(found) => return found.map(|id| (id, cache)),
                 Err(missing) => {
-                    self.b
-                        .prefetch_with(
+                    trace::time(
+                        "prefetch more",
+                        self.b.prefetch_with(
                             &mut cache,
                             missing,
                             &search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                        )
-                        .await;
+                        ),
+                    )
+                    .await;
                 }
             }
         }
@@ -1632,8 +1640,8 @@ impl<B: Backend> Server<B> {
     /// element's app before anything is looked up there.
     async fn target(&self, a: &Json) -> R<Target<B::Id>> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
-            let r = self.resolve_ref(rid).await?;
-            self.permit(&r.app).await?;
+            let r = trace::time("resolve_ref", self.resolve_ref(rid)).await?;
+            trace::time("permit", self.permit(&r.app)).await?;
             note_step_element(rid as u64, true);
             return Ok(Target {
                 id: r.id,
@@ -1651,10 +1659,11 @@ impl<B: Backend> Server<B> {
         if !self.is_allowed(app) {
             return Err(self.not_allowed(app));
         }
-        self.permit(app).await?;
-        self.b.enable().await;
+        trace::time("permit", self.permit(app)).await?;
+        trace::time("enable", self.b.enable()).await;
         let role = arg_s(a, "role", "");
-        let (id, mut cache) = self.locate(app, query, &role, true).await?.ok_or_else(|| {
+        let located = trace::time("locate", self.locate(app, query, &role, true)).await?;
+        let (id, mut cache) = located.ok_or_else(|| {
             let role = if role.is_empty() {
                 String::new()
             } else {
@@ -1662,10 +1671,16 @@ impl<B: Backend> Server<B> {
             };
             format!("no visible element in '{app}' matches '{query}'{role}")
         })?;
-        self.b
-            .fill_actions(&mut cache, std::slice::from_ref(&id))
-            .await;
-        let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
+        trace::time(
+            "fill_actions",
+            self.b.fill_actions(&mut cache, std::slice::from_ref(&id)),
+        )
+        .await;
+        let rid = trace::time(
+            "add_ref",
+            self.add_ref(&id, &cache[&id], &app.to_lowercase()),
+        )
+        .await;
         note_step_element(rid, true);
         let found = Some(render::describe(&cache[&id], rid));
         let role = cache[&id].role.clone();
@@ -2333,13 +2348,15 @@ impl<B: Backend> Server<B> {
             match render::find(&cache, &windows, &query, &role, max_results) {
                 Ok(h) => break h,
                 Err(missing) => {
-                    self.b
-                        .prefetch_with(
+                    trace::time(
+                        "prefetch more",
+                        self.b.prefetch_with(
                             &mut cache,
                             missing,
                             &search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                        )
-                        .await;
+                        ),
+                    )
+                    .await;
                 }
             }
         };
@@ -2712,7 +2729,7 @@ impl<B: Backend> Server<B> {
             return Err(t.reply("a password field: its text is never read"));
         }
         let limit = arg_i(a, "limit", 20000).max(0) as usize;
-        let mut text = self.b.full_text(&t.id, limit).await?;
+        let mut text = trace::time("full_text", self.b.full_text(&t.id, limit)).await?;
         if render::has_embedded_objects(&text) {
             text = self.container_text(&t.id, limit).await;
         }
@@ -2970,7 +2987,7 @@ impl<B: Backend> Server<B> {
     async fn focus(&self, a: &Json) -> R<String> {
         let t = self.target(a).await?;
         let id = &t.id;
-        if let Some(method) = self.b.try_focus(id).await? {
+        if let Some(method) = trace::time("try_focus", self.b.try_focus(id)).await? {
             return Ok(t.reply(&format!("ok ({method})")));
         }
         let (x, y) = self.active_center(id).await?;
@@ -3016,11 +3033,14 @@ impl<B: Backend> Server<B> {
     /// keep the order of doing it step by step: the target, the active
     /// window, then the centre.
     async fn target_center(&self, a: &Json) -> R<(Target<B::Id>, (i32, i32))> {
-        let (active, found) = tokio::join!(self.require_active_allowed(), async {
-            let t = self.target(a).await?;
-            let center = self.b.element_center(&t.id).await;
-            Ok::<_, String>((t, center))
-        });
+        let (active, found) = tokio::join!(
+            trace::time("require_active_allowed", self.require_active_allowed()),
+            async {
+                let t = trace::time("target", self.target(a)).await?;
+                let center = trace::time("element_center", self.b.element_center(&t.id)).await;
+                Ok::<_, String>((t, center))
+            }
+        );
         let (t, center) = found?;
         active?;
         Ok((t, center?))
@@ -3479,7 +3499,7 @@ impl<B: Backend> Server<B> {
     /// resolution, mapped so image_x/image_y refer to the zoomed image.
     async fn screenshot(&self, a: &Json) -> R<Out> {
         let region = region_arg(a)?;
-        self.require_active_allowed().await?;
+        trace::time("require_active_allowed", self.require_active_allowed()).await?;
         // The zoom's screen area, from the map of the image it was read in.
         let zoom = match region {
             Some(r) => {
@@ -3490,7 +3510,9 @@ impl<B: Backend> Server<B> {
             None => None,
         };
         *self.last_shot.lock().await = None;
-        let Shot { path, pixels, area } = self.b.screenshot().await.ok_or("screenshot failed")?;
+        let Shot { path, pixels, area } = trace::time("capture", self.b.screenshot())
+            .await
+            .ok_or("screenshot failed")?;
         let frac = match (zoom, area) {
             (None, _) => shot::Frac::ALL,
             (Some((_, want)), Some(area)) => region_frac(area, want).ok_or_else(|| {
@@ -3507,9 +3529,12 @@ impl<B: Backend> Server<B> {
         // Converting, shrinking and encoding take milliseconds: keep other
         // calls moving.
         let file = path.clone();
-        let done = tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac))
-            .await
-            .map_err(|e| e.to_string())??;
+        let done = trace::time(
+            "convert+encode",
+            tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac)),
+        )
+        .await
+        .map_err(|e| e.to_string())??;
         // The screen area the image shows: the part of the capture kept.
         let area = area.map(|(x, y, w, h)| {
             let k = done.kept;
@@ -3631,7 +3656,7 @@ impl<B: Backend> Server<B> {
         a: &'a Json,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         Box::pin(async move {
-            let result = self.call_inner(name, a, false).await;
+            let result = trace::time(name, self.call_inner(name, a, false)).await;
             match result {
                 Err(e) if !self.held_names().is_empty() => {
                     let (names, released) = self.release_all().await;
@@ -3673,7 +3698,7 @@ impl<B: Backend> Server<B> {
             // A screenshot sends no input, but activating its window does. A
             // batch that holds the input lock already runs its steps `held`.
             let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
-                let guard = self.input.lock().await;
+                let guard = trace::time("input lock", self.input.lock()).await;
                 self.start_run();
                 Some(guard)
             } else {
@@ -3686,22 +3711,25 @@ impl<B: Backend> Server<B> {
                 && !held
                 && self.takeover.as_ref().is_some_and(|t| t.resume());
             if gated {
-                self.gate(held).await?;
+                trace::time("gate", self.gate(held)).await?;
             }
             let _ours = match &self.takeover {
                 Some(t) if gated => Some(t.ours()),
                 _ => None,
             };
             if let Some(label) = indicator_label(name, a) {
-                self.b.indicate(&label).await;
+                trace::time("indicate", self.b.indicate(&label)).await;
             }
             let activated = match &window {
-                Some(q) => self.ensure_window(q).await?,
+                Some(q) => trace::time("ensure_window", self.ensure_window(q)).await?,
                 None => None,
             };
             // Taken once the window is in front, before the input.
             let before = match observe {
-                Some(_) => Some((self.b.change_mark(), self.fingerprint().await)),
+                Some(_) => Some((
+                    self.b.change_mark(),
+                    trace::time("fingerprint before", self.fingerprint()).await,
+                )),
                 None => None,
             };
             let result = match name {
@@ -3739,7 +3767,11 @@ impl<B: Backend> Server<B> {
             };
             let result = match (result, observe, before) {
                 (Ok(mut o), Some(observe), Some((mark, before))) => {
-                    let seen = self.after_input(name, a, observe, mark, before).await;
+                    let seen = trace::time(
+                        "after_input",
+                        self.after_input(name, a, observe, mark, before),
+                    )
+                    .await;
                     o.text.push_str(&seen.text);
                     o.images.extend(seen.images);
                     Ok(o)

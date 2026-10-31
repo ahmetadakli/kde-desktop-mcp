@@ -1356,8 +1356,8 @@ impl Backend for LinuxBackend {
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {
         input::button_code(button)?;
-        self.move_pointer(x, y).await?;
-        self.input.buttons(button, clicks, scroll).await
+        crate::trace::time("move_pointer", self.move_pointer(x, y)).await?;
+        crate::trace::time("buttons", self.input.buttons(button, clicks, scroll)).await
     }
 
     async fn indicate(&self, label: &str) {
@@ -1376,14 +1376,14 @@ impl Backend for LinuxBackend {
         if let Ok(mut ind) = self.indicator.try_lock()
             && ind.child.is_some()
         {
-            ind.send(&format!("point {x} {y}"), true).await;
+            crate::trace::time("indicator point", ind.send(&format!("point {x} {y}"), true)).await;
         }
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let (x0, y0, x1, y1) = kwin.screen_box().await;
+                let (x0, y0, x1, y1) = crate::trace::time("screen_box", kwin.screen_box()).await;
                 let ax = ((x - x0 as i64) * input::ABS_MAX as i64 / (x1 - x0).max(1) as i64) as i32;
                 let ay = ((y - y0 as i64) * input::ABS_MAX as i64 / (y1 - y0).max(1) as i64) as i32;
-                self.input.move_abs(ax, ay).await?;
+                crate::trace::time("move_abs", self.input.move_abs(ax, ay)).await?;
             }
             Compositor::Hyprland(h) => {
                 // Hyprland places the cursor exactly; uinput only supplies
