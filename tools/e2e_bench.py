@@ -126,14 +126,31 @@ def pid_cmdline(pid: int) -> str:
         return ""
 
 
+def naming_dir(task_dir: Path) -> list[int]:
+    """PIDs of this user's processes whose command line names task_dir (a
+    unique temp dir: only processes this run started), e.g. a
+    `dolphin --new-window` that did not hand over to a running instance."""
+    pids = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit() and int(entry.name) != os.getpid():
+            try:
+                if entry.stat().st_uid == os.getuid() and str(task_dir) in pid_cmdline(int(entry.name)):
+                    pids.append(int(entry.name))
+            except OSError:
+                continue
+    return pids
+
+
 def kill_recorded(task_dir: Path) -> list[str]:
-    """Stop the processes setup recorded, only while they still name task_dir."""
+    """Stop the processes setup recorded, and any left naming task_dir,
+    only while they still name task_dir."""
     notes = []
     pidfile = task_dir / ".pids"
-    if not pidfile.exists():
-        return notes
-    for word in pidfile.read_text().split():
-        pid = int(word)
+    recorded = [int(w) for w in pidfile.read_text().split()] if pidfile.exists() else []
+    stray = [p for p in naming_dir(task_dir) if p not in recorded]
+    if stray:
+        notes.append(f"stopped processes naming the run's dir: {stray}")
+    for pid in recorded + stray:
         if str(task_dir) not in pid_cmdline(pid):
             continue  # exited (or the PID was reused): nothing of ours to stop
         os.kill(pid, signal.SIGTERM)
@@ -183,14 +200,23 @@ def bring_to_front(mcp: Mcp, title: str) -> bool:
 
 
 def close_windows(mcp: Mcp, titles: list[str]) -> list[str]:
+    """Close the task's windows of single-instance apps; retried for a few
+    seconds (a window just opened may not be listed as an allowed app's
+    yet, its app not registered with AT-SPI)."""
     notes = []
     for title in titles:
-        ok, text = mcp.call("windows", query=title)
-        if not (ok and title in text):
-            continue
-        ok, text = mcp.call("close_window", query=title, confirm=True)
-        if not ok or not text.startswith("closed"):
-            notes.append(f"close_window {title!r}: {text.strip()}")
+        deadline = time.monotonic() + 5
+        while True:
+            ok, text = mcp.call("windows", query=title)
+            if not (ok and title in text):
+                break  # gone (or never opened)
+            ok, text = mcp.call("close_window", query=title, confirm=True)
+            if ok and text.startswith("closed"):
+                break
+            if time.monotonic() >= deadline:
+                notes.append(f"close_window {title!r}: {text.strip()}")
+                break
+            time.sleep(0.5)
     return notes
 
 
@@ -448,6 +474,13 @@ def one_run(task: dict, model: str, label: str, binary: str, args, work: Path,
            "tag": tag, "dir": str(task_dir), "ok": False, "notes": []}
     mcp = Mcp(binary)
     try:
+        # Before setup: a skipped run must open nothing.
+        if args.exclusive:
+            others = other_windows(mcp, task.get("app", ""), tag)
+            if others:
+                row["notes"] += [f"other {task['app']} windows open: {others}",
+                                 "--exclusive: not run"]
+                return row
         run_shell(task.get("setup", []), env, task_dir, "setup")
         if "wait_window" in task:
             title = fill(task["wait_window"], subs)
