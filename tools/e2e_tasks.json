@@ -1,9 +1,10 @@
 {
-  "_doc": "Tasks for tools/e2e_bench.py. Placeholders {dir} (fresh temp dir of the run), {tag} (unique per run, in every window title) and {num} (random number) are replaced in files, prompt, wait_window and close_windows; shell steps get them as $TASK_DIR, $TAG and $NUM. A setup step that appends a PID to $TASK_DIR/.pids gets exactly that process killed afterwards (only while its command line still names $TASK_DIR). close_windows closes the window whose title contains the text through desktop-mcp's close_window (single-instance apps). check.python is an expression over dir, tag, num, result (the agent's final text) and read(path), exists(path), lines(path), mcp(tool, **args) (read-only desktop-mcp tools only).",
+  "_doc": "Tasks for tools/e2e_bench.py. Placeholders {dir} (fresh temp dir of the run), {tag} (unique per run, in every window title) and {num} (random number) are replaced in files, prompt, wait_window and close_windows; shell steps get them as $TASK_DIR, $TAG and $NUM. A setup step that appends a PID to $TASK_DIR/.pids gets exactly that process killed afterwards (only while its command line still names $TASK_DIR). app (the app name as windows lists it) is used to note other windows of that app open during the run (--exclusive skips the run then); the window of wait_window is made active before the agent starts. close_windows closes the window whose title contains the text through desktop-mcp's close_window (single-instance apps). check.python is an expression over dir, tag, num, result (the agent's final text) and read(path), exists(path), lines(path), mcp(tool, **args) (read-only desktop-mcp tools only).",
   "tasks": [
     {
       "id": "kate_append",
       "summary": "type a line at the end of an open Kate document and save",
+      "app": "kate",
       "files": {
         "notes-{tag}.txt": "Shopping list\nmilk\nbread\n"
       },
@@ -19,6 +20,7 @@
     {
       "id": "kate_save_as",
       "summary": "Save As the Kate document under a new path (file dialog)",
+      "app": "kate",
       "files": {
         "report-{tag}.txt": "Quarterly report\nrevenue: 120\ncosts: 80\n"
       },
@@ -34,6 +36,7 @@
     {
       "id": "kate_replace",
       "summary": "search and replace a word in Kate, then save",
+      "app": "kate",
       "files": {
         "style-{tag}.txt": "The colour of the header is blue.\nPick a colour for the footer.\nNo other changes.\nThe default colour is grey.\n"
       },
@@ -49,6 +52,7 @@
     {
       "id": "kate_read",
       "summary": "read a value from a Kate document and answer it",
+      "app": "kate",
       "files": {
         "service-{tag}.ini": "[server]\nhost = 10.0.0.7\nport = 8080\nconnect_timeout_ms = 250\n\n[client]\nretries = 3\ntimeout_ms = {num}\nuser_agent = probe/1.2\n"
       },
@@ -64,6 +68,7 @@
     {
       "id": "firefox_form",
       "summary": "fill two fields of a local web form in Firefox and submit it",
+      "app": "firefox",
       "files": {
         "form-{tag}.html": "<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>Sign-up {tag}</title></head>\n<body>\n<h1>Event sign-up</h1>\n<form id=\"f\">\n<p><label for=\"name\">Full name</label> <input id=\"name\" name=\"name\" type=\"text\"></p>\n<p><label for=\"city\">City</label> <input id=\"city\" name=\"city\" type=\"text\"></p>\n<p><label for=\"note\">Note</label> <input id=\"note\" name=\"note\" type=\"text\"></p>\n<p><button type=\"submit\">Submit</button></p>\n</form>\n<p id=\"out\"></p>\n<script>\ndocument.getElementById('f').addEventListener('submit', function (e) {\n  e.preventDefault();\n  var n = document.getElementById('name').value.trim();\n  var c = document.getElementById('city').value.trim();\n  document.title = 'Submitted {tag}: ' + n + ' / ' + c;\n  document.getElementById('out').textContent = 'Thanks, ' + n + '!';\n});\n</script>\n</body></html>\n"
       },
@@ -80,13 +85,14 @@
     {
       "id": "dolphin_mkdir",
       "summary": "create a folder in the folder Dolphin shows",
+      "app": "dolphin",
       "setup": [
         "mkdir -p \"$TASK_DIR/box-$TAG\"",
         "setsid dolphin --new-window \"$TASK_DIR/box-$TAG\" >/dev/null 2>&1 &"
       ],
       "wait_window": "box-{tag}",
       "close_windows": ["{tag}"],
-      "prompt": "The desktop tools are available. Dolphin shows the folder box-{tag}. Create a new folder named archive-{tag} inside it.",
+      "prompt": "The desktop tools are available. The Dolphin window titled \"box-{tag}\" shows the folder box-{tag}. Create a new folder named archive-{tag} inside it.",
       "check": {
         "python": "os.path.isdir(f'{dir}/box-{tag}/archive-{tag}')"
       }

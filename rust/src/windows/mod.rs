@@ -101,7 +101,7 @@ impl WindowsBackend {
             None if p.wants_document_text() => self
                 .uia
                 .document_text(el, text_limit)
-                .map(|t| logic::one_line(&t, text_limit)),
+                .map(|t| logic::preview(&t, text_limit)),
             None => None,
         };
         Info {
