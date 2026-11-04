@@ -511,6 +511,35 @@ python3 tools/mcp_bench.py --app kate --window notes.txt \
     --server "Rust=rust/target/release/desktop-mcp"
 ```
 
+### End-to-end task benchmark
+
+Tool calls take milliseconds; what makes a desktop task slow is the number of
+model turns and the size of what the model reads. `tools/e2e_bench.py` measures
+that on real tasks: it runs Claude Code headless (`claude -p`, only this
+server's tools, built-in tools removed) once per task × model × server binary
+and records model turns, desktop tool calls, wall time split into startup,
+model and tool time, reply characters and images, tokens, and whether the task
+got done. The tasks in `tools/e2e_tasks.json` each open their own window on a
+fresh temp file (Kate: append a line and save, Save As to a new path, search
+and replace, read a value; Firefox: fill and submit a local form in a new
+window; Dolphin: create a folder), state the goal as a user would, check the
+outcome on disk, in the final answer or with a read-only query, and close only
+what they opened (the PID their setup recorded, or the one window carrying the
+run's unique tag).
+
+```bash
+python3 tools/e2e_bench.py --list
+python3 tools/e2e_bench.py --tasks kate_append,kate_replace --models default,claude-haiku-5-5 \
+    --server "old=/path/to/old/desktop-mcp" \
+    --server "new=rust/target/release/desktop-mcp" --repeat 3 --results /tmp/e2e
+```
+
+It prints a Markdown table of medians and writes `results.json` (with every
+tool call, its time and reply size), `table.md` and each run's raw stream to
+`--results` (default: a new temp dir; never inside the repository). The agent
+types into the windows the tasks open: do not use the keyboard or mouse while
+it runs.
+
 ## Measurements: KDE speed-up
 
 `tools/mcp_bench.py`, KDE Plasma 6.8, Kate; median of 5 rounds (ms). "Before"
