@@ -86,9 +86,11 @@ pub fn text_preview<Id>(info: &Info<Id>, limit: usize) -> String {
 /// Actions that say nothing about the element itself, so listing them only
 /// costs tokens (and would keep unnamed containers from being lifted). Qt
 /// gives nearly every widget "Set Focus", which the `focus` tool uses on its
-/// own; Firefox gives every element inside a clickable one "clickAncestor".
-/// `act` still runs them by name.
-const UNLISTED_ACTIONS: [&str; 2] = ["set focus", "clickancestor"];
+/// own; Firefox gives every element inside a clickable one "clickAncestor";
+/// Chromium and Electron give every element "showContextMenu" (it made
+/// nameless panels nest six deep in a Ferdium tree). `act` still runs them
+/// by name.
+pub const UNLISTED_ACTIONS: [&str; 3] = ["set focus", "clickancestor", "showcontextmenu"];
 
 /// Actions worth listing.
 pub fn shown_actions<Id>(info: &Info<Id>) -> Vec<&str> {
@@ -158,7 +160,8 @@ const IMPLIED_ACTIONS: [Implied; 8] = [
             "page tab list",
             "menu",
         ],
-        actions: &["click"],
+        // Chromium's containers (its frame, panels, pages) say doDefault.
+        actions: &["click", "dodefault"],
         expected: false,
     },
 ];
@@ -194,6 +197,18 @@ fn short_name<Id>(info: &Info<Id>) -> String {
     first_chars(&info.name.replace('\n', " "), 80)
 }
 
+/// A window title in a status note ("now: active window '…'", "activated
+/// '…'"): quoted as `py_repr` does, cut at 80 characters like element
+/// names (a cut one ends `'…`); the window's app is named beside it where
+/// it matters.
+pub fn short_title(title: &str) -> String {
+    let t = first_chars(title, 80);
+    // The mark goes outside the quotes, so the quoted part can be passed
+    // back as `window`, which matches a substring of the title.
+    let cut = if t.len() < title.len() { "…" } else { "" };
+    format!("{}{cut}", py_repr(&t))
+}
+
 /// `role "name"` as `describe` shows it, for messages about an element.
 pub fn role_and_name(role: &str, name: &str) -> String {
     let role = if role.is_empty() { "?" } else { role };
@@ -206,6 +221,16 @@ pub fn role_and_name(role: &str, name: &str) -> String {
 }
 
 pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
+    describe_but(info, id, None)
+}
+
+/// `describe` for the element holding focus: its `focused` state goes
+/// without saying ("focus: [3] entry \"To\" {editable}").
+pub fn describe_focused<Id>(info: &Info<Id>, id: u64) -> String {
+    describe_but(info, id, Some("focused"))
+}
+
+fn describe_but<Id>(info: &Info<Id>, id: u64, implied_state: Option<&str>) -> String {
     let name = short_name(info);
     let role = if info.role.is_empty() {
         "?"
@@ -222,14 +247,56 @@ pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
         out.push_str(" text=");
         out.push_str(&json_str(&txt));
     }
-    if !info.states.is_empty() {
-        out.push_str(&format!(" {{{}}}", info.states.join(",")));
+    let states: Vec<&str> = info
+        .states
+        .iter()
+        .copied()
+        .filter(|s| Some(*s) != implied_state)
+        .collect();
+    if !states.is_empty() {
+        out.push_str(&format!(" {{{}}}", states.join(",")));
     }
     let actions = listed_actions(info);
     if !actions.is_empty() {
         out.push_str(&format!(" actions={}", actions.join(",")));
     }
     out
+}
+
+/// Whether `info` is a static text or label leaf that only repeats what
+/// the line of `parent` (the element printed above it) already shows: a
+/// heading's or link's own text node, a status bar's "3". Such lines cost
+/// a twentieth of a web page's tree and add nothing one could act on.
+/// Matching is `fold`ed; only the parts the parent's line shows count.
+pub fn echoes_parent<Id>(info: &Info<Id>, parent: &Info<Id>) -> bool {
+    if !LABEL_ROLES.contains(&info.role.as_str())
+        || !info.states.is_empty()
+        || !shown_actions(info).is_empty()
+    {
+        return false;
+    }
+    let own = [fold(&short_name(info)), fold(&text_preview(info, 80))];
+    if own.iter().all(String::is_empty) {
+        return false;
+    }
+    let shown = format!(
+        "{} {}",
+        fold(&short_name(parent)),
+        fold(&text_preview(parent, 80))
+    );
+    own.iter().all(|o| contains_whole(&shown, o))
+}
+
+/// Whether `hay` holds `needle` with no letter or digit right before or
+/// after it: "3" is in "sohbetler 3" but not in "13 mesaj".
+fn contains_whole(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    hay.match_indices(needle).any(|(at, _)| {
+        !word(hay[..at].chars().next_back()) && !word(hay[at + needle.len()..].chars().next())
+    })
 }
 
 /// An element described by its role, name and actions alone: no text or
@@ -420,7 +487,7 @@ pub fn walk<Id: Clone + Eq + Hash>(
         start: None,
         truncated: false,
     };
-    walk_into(&mut st, children, depth);
+    walk_into(&mut st, children, depth, None);
     let after_found = after.is_none() || st.start.is_some();
     match st.start {
         Some(start) => drop(st.lines.drain(base..start)),
@@ -591,9 +658,18 @@ fn bare<Id>(info: &Info<Id>) -> bool {
     info.name.trim().is_empty() && info.states.is_empty() && text_preview(info, 80).is_empty()
 }
 
+/// Whether the element has an action of its own: one worth listing other
+/// than Chromium's generic doDefault, which its frame and every nameless
+/// panel of its window carry (six nested panels in an Electron app).
+fn acts_on_its_own<Id>(info: &Info<Id>) -> bool {
+    shown_actions(info)
+        .iter()
+        .any(|a| !a.eq_ignore_ascii_case("dodefault"))
+}
+
 fn shape<Id: Clone + Eq + Hash>(cache: &Cache<Id>, info: &Info<Id>, opts: &WalkOpts) -> Shape {
     let role = info.role.as_str();
-    let acts = !shown_actions(info).is_empty();
+    let acts = acts_on_its_own(info);
     if acts {
         return Shape::Line;
     }
@@ -623,7 +699,13 @@ fn shape<Id: Clone + Eq + Hash>(cache: &Cache<Id>, info: &Info<Id>, opts: &WalkO
 /// `walk`, going on past missing nodes (the lines are then incomplete and
 /// get thrown away) to collect all of them. In an interactive walk, true
 /// when a line it kept still wants its nearest named ancestor printed.
-fn walk_into<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, children: &[Id], depth: usize) -> bool {
+/// `parent`: the element printed above `children` (lifted ones skipped).
+fn walk_into<'c, Id: Clone + Eq + Hash>(
+    st: &mut Walk<'c, Id>,
+    children: &'c [Id],
+    depth: usize,
+    parent: Option<&'c Info<Id>>,
+) -> bool {
     let (cache, opts) = (st.cache, st.opts);
     let mut wants_context = false;
     if st.truncated || depth > opts.max_depth {
@@ -641,7 +723,7 @@ fn walk_into<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, children: &[Id], dept
             continue;
         }
         if shape(cache, info, opts) == Shape::Lift {
-            wants_context |= walk_into(st, &info.children, depth);
+            wants_context |= walk_into(st, &info.children, depth, parent);
             continue;
         }
         let at = st.lines.len();
@@ -654,7 +736,7 @@ fn walk_into<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, children: &[Id], dept
         }
         // Whether the children were looked at, not cut by budget or depth.
         let walked = st.counted() < opts.budget && depth < opts.max_depth;
-        let kids_want = walk_into(st, &info.children, depth + 1);
+        let kids_want = walk_into(st, &info.children, depth + 1, Some(info));
         if opts.interactive {
             if interactive(info) {
                 wants_context = true;
@@ -665,9 +747,10 @@ fn walk_into<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, children: &[Id], dept
             }
         } else if st.lines.len() == at + 1
             && (info.children.is_empty() || walked)
-            && EMPTY_LEAF_ROLES.contains(&info.role.as_str())
-            && bare(info)
-            && shown_actions(info).is_empty()
+            && ((EMPTY_LEAF_ROLES.contains(&info.role.as_str())
+                && bare(info)
+                && !acts_on_its_own(info))
+                || parent.is_some_and(|p| echoes_parent(info, p)))
         {
             st.remove(at, false);
         }
@@ -884,22 +967,31 @@ pub fn find<Id: Clone + Eq + Hash>(
             break;
         }
         seen += 1;
-        let kids: &[Id] = match node {
-            None => roots,
-            Some(o) => &cache[o].children,
+        let tier_of = |info: &Info<Id>| {
+            matches(info, &q, role).map(|hit| match rank(hit, is_title(info, role)) {
+                0 | 1 => 0,
+                2 | 3 => 1,
+                r => r as usize - 2,
+            })
+        };
+        let (kids, parent_tier): (&[Id], _) = match node {
+            None => (roots, None),
+            Some(o) => (&cache[o].children, tier_of(&cache[o])),
         };
         for (c, info) in get(cache, kids, &mut missing).into_iter().rev() {
             if !info.showing {
                 continue;
             }
             stack.push(Some(c));
-            if let Some(hit) = matches(info, &q, role) {
-                let tier = match rank(hit, is_title(info, role)) {
-                    0 | 1 => 0,
-                    2 | 3 => 1,
-                    r => r as usize - 2,
-                };
-                tiers[tier].push(c.clone());
+            if let Some(tier) = tier_of(info) {
+                // A text leaf repeating its parent, which is listed as
+                // high: the parent's line says it all.
+                let echo = parent_tier.is_some_and(|t| t <= tier)
+                    && info.children.is_empty()
+                    && node.is_some_and(|o| echoes_parent(info, &cache[o]));
+                if !echo {
+                    tiers[tier].push(c.clone());
+                }
             }
         }
     }
@@ -1234,8 +1326,11 @@ pub fn container_text<Id: Clone + Eq + Hash>(
     let mut out = String::new();
     let mut missing = Vec::new();
     let mut seen = 0;
+    // Reading stops past twice the limit: tidying below drops blank runs,
+    // and a text cut at the limit must still be seen to go on.
+    let stop = limit.saturating_mul(2);
     match cache.get(root) {
-        Some(info) => read_into(cache, info, limit, &mut out, &mut missing, &mut seen),
+        Some(info) => read_into(cache, info, stop, &mut out, &mut missing, &mut seen),
         None => missing.push(root.clone()),
     }
     // Tidy: no blank runs, no spaces at line ends, no empty lines.
@@ -1290,21 +1385,56 @@ fn read_into<Id: Clone + Eq + Hash>(
     };
     match info.text.as_deref() {
         Some(text) if !text.is_empty() => {
-            let mut after_child = false;
+            // Chromium writes its text leaves' words into the parent's text
+            // and gives only the other children a U+FFFC; Firefox gives
+            // every child one. A text leaf whose words the text already
+            // holds is not read again, and takes no U+FFFC while there are
+            // fewer of them than children (a row's name, avatar and time
+            // read "Arda ￼03:05": the U+FFFC is the avatar's).
+            let folded = fold(text);
+            let given = |id: &Id| {
+                cache.get(id).is_some_and(|k| {
+                    k.children.is_empty() && LABEL_ROLES.contains(&k.role.as_str()) && {
+                        let own = fold(k.text.as_deref().unwrap_or(&k.name));
+                        !own.is_empty() && folded.contains(&own)
+                    }
+                })
+            };
+            let inline =
+                text.chars().filter(|&c| c == EMBEDDED_OBJECT).count() < info.children.len();
+            // An object read as its name (an image's alt text) is a word of
+            // its own, even where the text has no space around it.
+            let name_only = |id: &Id| {
+                cache.get(id).is_some_and(|k| {
+                    k.children.is_empty() && k.text.as_deref().is_none_or(str::is_empty)
+                })
+            };
+            let word_end = |out: &String| out.ends_with(char::is_alphanumeric);
+            let (mut after_child, mut pad) = (false, false);
             for ch in text.chars() {
                 if ch == EMBEDDED_OBJECT {
-                    if let Some(id) = kids.next() {
+                    if let Some(id) = kids.by_ref().find(|id| !(inline && given(id))) {
+                        pad = name_only(id);
+                        if pad && word_end(out) {
+                            out.push(' ');
+                        }
                         child(out, id, after_child);
                     }
                     after_child = true;
                 } else {
+                    if pad && ch.is_alphanumeric() && word_end(out) {
+                        out.push(' ');
+                    }
                     out.push(ch);
-                    after_child = false;
+                    (after_child, pad) = (false, false);
                 }
             }
-            // Children the text did not place (it was cut at the limit).
+            // Children the text did not place: it was cut at the limit, or
+            // (Chromium) it holds their words itself.
             for id in kids {
-                child(out, id, true);
+                if !given(id) {
+                    child(out, id, true);
+                }
             }
         }
         _ if info.children.is_empty() => out.push_str(info.name.trim()),
@@ -2290,6 +2420,155 @@ mod tests {
         assert_eq!(describe(&named, 10), "[10] section \"Player\"");
     }
 
+    #[test]
+    fn text_leaves_repeating_their_parent_are_left_out() {
+        let mut c = Cache::new();
+        c.insert(
+            "/d",
+            node(
+                "document web",
+                "Page",
+                true,
+                &[],
+                &["/h", "/l", "/bar", "/n", "/s"],
+            ),
+        );
+        c.insert("/h", node("heading", "Ölüm Gemisi", true, &[], &["/hs"]));
+        let mut hs = node("static", "", true, &[], &[]);
+        hs.text = Some("ölüm  gemisi".into());
+        c.insert("/hs", hs);
+        // A link named after its title and duration: the title node goes.
+        c.insert(
+            "/l",
+            node("link", "MIXXY 1 saat 5 dakika", true, &[], &["/ls"]),
+        );
+        c.insert("/ls", node("static", "MIXXY", true, &[], &[]));
+        // A status bar's count, through a nameless panel the walk lifts.
+        let mut bar = node("status bar", "", true, &[], &["/p"]);
+        bar.text = Some("3".into());
+        c.insert("/bar", bar);
+        c.insert("/p", node("panel", "", true, &[], &["/3"]));
+        c.insert("/3", node("static", "3", true, &[], &[]));
+        // A number inside a longer one is not a repeat; nor is a label
+        // with states or actions.
+        c.insert("/n", node("button", "13 mesaj", true, &[], &["/1", "/st"]));
+        c.insert("/1", node("static", "3", true, &[], &[]));
+        c.insert("/st", node("label", "mesaj", true, &["selected"], &[]));
+        c.insert("/s", node("section", "Kanal", true, &[], &["/k"]));
+        c.insert(
+            "/k",
+            with_actions(node("static", "Kanal", true, &[], &[]), &["jump"]),
+        );
+        let got: Vec<&str> = walked(&c, &["/d"], &opts(300))
+            .iter()
+            .map(|l| l.1)
+            .collect();
+        assert_eq!(
+            got,
+            vec!["/d", "/h", "/l", "/bar", "/n", "/1", "/st", "/s", "/k"]
+        );
+        // find lists the parent alone when both match.
+        assert_eq!(find(&c, &["/d"], "ölüm", "", 10).unwrap(), vec!["/h"]);
+        assert_eq!(find(&c, &["/d"], "mixxy", "", 10).unwrap(), vec!["/l"]);
+        // Asked for by role, the text node is what was asked for.
+        assert_eq!(
+            find(&c, &["/d"], "mixxy", "static", 10).unwrap(),
+            vec!["/ls"]
+        );
+        // A title parent ranks below other hits: its text node stays.
+        let mut c = Cache::new();
+        c.insert("/t", node("page tab", "Tümü", true, &[], &["/ts"]));
+        c.insert("/ts", node("static", "Tümü", true, &[], &[]));
+        assert_eq!(
+            find(&c, &["/t"], "tümü", "", 10).unwrap(),
+            vec!["/ts", "/t"]
+        );
+    }
+
+    #[test]
+    fn chromium_context_menus_and_do_default_do_not_bloat_the_tree() {
+        let mut c = Cache::new();
+        let chrome = |n: Info<&'static str>, a: &[&str]| {
+            let mut a = a.to_vec();
+            a.push("showContextMenu");
+            with_actions(n, &a)
+        };
+        c.insert(
+            "/f",
+            chrome(node("frame", "App", true, &[], &["/p1"]), &["doDefault"]),
+        );
+        c.insert(
+            "/p1",
+            chrome(node("panel", "", true, &[], &["/p2"]), &["doDefault"]),
+        );
+        c.insert(
+            "/p2",
+            chrome(node("panel", "", true, &[], &["/d"]), &["doDefault"]),
+        );
+        c.insert(
+            "/d",
+            chrome(
+                node("document web", "Chat", true, &[], &["/s", "/b"]),
+                &["doDefault"],
+            ),
+        );
+        c.insert("/s", chrome(node("section", "", true, &[], &["/t"]), &[]));
+        c.insert(
+            "/t",
+            chrome(
+                node("toggle button", "Kanallar", true, &[], &[]),
+                &["check"],
+            ),
+        );
+        c.insert(
+            "/b",
+            chrome(node("button", "Menü", true, &[], &[]), &["press"]),
+        );
+        // Nameless sections are boring on Linux too.
+        let o = WalkOpts {
+            boring_roles: &["filler", "panel", "section"],
+            ..opts(300)
+        };
+        assert_eq!(
+            walked(&c, &["/f"], &o),
+            vec![(1, "/f"), (2, "/d"), (3, "/t"), (3, "/b")]
+        );
+        assert_eq!(describe(&c["/f"], 1), "[1] frame \"App\"");
+        assert_eq!(describe(&c["/d"], 2), "[2] document web \"Chat\"");
+        assert_eq!(
+            describe(&c["/t"], 3),
+            "[3] toggle button \"Kanallar\" actions=check"
+        );
+        assert_eq!(describe(&c["/b"], 4), "[4] button \"Menü\"");
+    }
+
+    #[test]
+    fn focus_lines_leave_out_the_focused_state() {
+        let n = node("entry", "To", true, &["focused", "editable"], &[]);
+        assert_eq!(describe_focused(&n, 3), "[3] entry \"To\" {editable}");
+        assert_eq!(describe(&n, 3), "[3] entry \"To\" {focused,editable}");
+        let only = node("document web", "Page", true, &["focused"], &[]);
+        assert_eq!(describe_focused(&only, 4), "[4] document web \"Page\"");
+    }
+
+    #[test]
+    fn long_titles_are_cut_in_notes() {
+        assert_eq!(short_title("Kate"), "'Kate'");
+        let long = "x".repeat(100);
+        assert_eq!(short_title(&long), format!("'{}'…", "x".repeat(80)));
+        // The quoted part of a cut title is a substring of it, so it can
+        // be passed back as `window`.
+        let title = format!("{} — Mozilla Firefox", "Jahrein ChatGPT ".repeat(6));
+        let note = short_title(&title);
+        let quoted = note.strip_suffix('…').unwrap();
+        let quoted = &quoted[1..quoted.len() - 1];
+        assert!(title.to_lowercase().contains(&quoted.to_lowercase()));
+        assert_eq!(
+            short_title(&"ı".repeat(80)),
+            format!("'{}'", "ı".repeat(80))
+        );
+    }
+
     /// (depth, id) of the walk's node lines.
     fn walked(
         cache: &Cache<&'static str>,
@@ -2535,6 +2814,70 @@ mod tests {
         assert_eq!(
             container_text(&cache, &"/ul", 1000).unwrap(),
             "• one\n• two"
+        );
+    }
+
+    #[test]
+    fn chromium_text_leaves_its_text_already_holds_are_read_once() {
+        let mut c = Cache::new();
+        let mut row = node("section", "", true, &[], &["/name", "/time"]);
+        // Chromium puts its text leaves' words in the parent's text.
+        row.text = Some("Arda Atlı 03:05".into());
+        c.insert("/row", row);
+        let mut name = node("static", "", true, &[], &[]);
+        name.text = Some("Arda Atlı".into());
+        c.insert("/name", name);
+        c.insert("/time", node("static", "03:05", true, &[], &[]));
+        assert_eq!(
+            container_text(&c, &"/row", 1000).unwrap(),
+            "Arda Atlı 03:05"
+        );
+        // A leaf the text does not hold is still read.
+        c.get_mut("/time").unwrap().name = "04:10".into();
+        assert_eq!(
+            container_text(&c, &"/row", 1000).unwrap(),
+            "Arda Atlı 03:05 04:10"
+        );
+    }
+
+    #[test]
+    fn chromium_objects_take_the_embedded_characters_text_leaves_do_not() {
+        // Chromium: the leaves' words are in the row's text, the avatar is
+        // the one U+FFFC.
+        let mut c = Cache::new();
+        c.insert(
+            "/row",
+            texted(
+                "section",
+                "",
+                Some("Arda Atl\u{FFFC}03:05"),
+                &["/name", "/img", "/time"],
+            ),
+        );
+        c.insert("/name", texted("static", "", Some("Arda Atl"), &[]));
+        c.insert("/img", node("image", "avatar", true, &[], &[]));
+        c.insert("/time", texted("static", "", Some("03:05"), &[]));
+        assert_eq!(
+            container_text(&c, &"/row", 1000).unwrap(),
+            "Arda Atl avatar 03:05"
+        );
+        // Firefox: one U+FFFC per child, a label among them; its words
+        // appearing in the text elsewhere do not move the others.
+        let mut c = Cache::new();
+        c.insert(
+            "/p",
+            texted(
+                "paragraph",
+                "",
+                Some("Pass \u{FFFC} \u{FFFC}"),
+                &["/l", "/e"],
+            ),
+        );
+        c.insert("/l", texted("label", "", Some("Pass"), &[]));
+        c.insert("/e", texted("entry", "", Some("secret-ish"), &[]));
+        assert_eq!(
+            container_text(&c, &"/p", 1000).unwrap(),
+            "Pass Pass secret-ish"
         );
     }
 

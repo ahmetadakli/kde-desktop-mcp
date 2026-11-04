@@ -119,6 +119,7 @@ pub const EDITABLE: u32 = 7;
 pub const ENABLED: u32 = 8;
 pub const EXPANDABLE: u32 = 9;
 pub const EXPANDED: u32 = 10;
+pub const FOCUSABLE: u32 = 11;
 pub const FOCUSED: u32 = 12;
 pub const MULTI_LINE: u32 = 17;
 pub const SELECTABLE: u32 = 22;
@@ -134,6 +135,19 @@ pub const RELATION_EMBEDS: u32 = 13;
 // AtspiCoordType.
 pub const COORD_SCREEN: u32 = 0;
 pub const COORD_WINDOW: u32 = 1;
+
+/// Roles whose elements count as operable when focusable and named: a web
+/// app's rows and cells with a tabindex and a click handler higher up (a
+/// WhatsApp chat row says only clickAncestor and showContextMenu, neither
+/// listed). Nameless ones (a chat's message rows) stay out.
+/// (Chromium maps ARIA rows, grid cells and tree items to these.)
+const FOCUS_OPERABLE_ROLES: [&str; 4] = ["table row", "table cell", "list item", "tree item"];
+
+/// Whether a focusable element of `role` named `name` counts as operable
+/// (`Info::operable`) for `tree(interactive=true)`.
+fn focus_marks_operable(role: &str, name: &str) -> bool {
+    FOCUS_OPERABLE_ROLES.contains(&role) && !name.trim().is_empty()
+}
 
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
@@ -823,6 +837,10 @@ impl A11y {
             && has(raw, VISIBLE)
             && !OVERLAY_EXCLUDED_ROLES.contains(&role.as_str())
             && has_iface("org.a11y.atspi.Component");
+        let operable = [SELECTABLE, CHECKABLE, EXPANDABLE]
+            .iter()
+            .any(|s| has(raw, *s))
+            || (has(raw, FOCUSABLE) && focus_marks_operable(&role, &name));
         let info = Info {
             role,
             name,
@@ -831,9 +849,7 @@ impl A11y {
             actions,
             text,
             children,
-            operable: [SELECTABLE, CHECKABLE, EXPANDABLE]
-                .iter()
-                .any(|s| has(raw, *s)),
+            operable,
         };
         (info, hidden_visible)
     }
@@ -1224,6 +1240,16 @@ async fn await_action(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focusable_named_rows_and_cells_are_operable() {
+        assert!(focus_marks_operable("table cell", "Babam 01:16 İyi"));
+        assert!(focus_marks_operable("list item", "Inbox"));
+        // A message row without a name, or a focusable page or section.
+        assert!(!focus_marks_operable("table row", " "));
+        assert!(!focus_marks_operable("document web", "WhatsApp"));
+        assert!(!focus_marks_operable("section", "Chats"));
+    }
 
     #[test]
     fn overlay_boxes_must_have_area_inside_the_window() {
