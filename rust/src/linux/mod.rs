@@ -26,7 +26,8 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    Layout, NO_AREA, NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    Layout, NO_AREA, NO_FILE_DIALOG, R, Screen, Shot, Toggles, WindowChange, WindowEntry,
+    WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -63,6 +64,76 @@ const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
 /// registered change event: reads of them may be kept before any was
 /// heard. Others (GTK 4, Java...) only once they sent one.
 const EVENT_TOOLKITS: [&str; 3] = ["qt", "gecko", "chromium"];
+
+/// Levels `scroll_into_view` tries ScrollTo on: the element and its
+/// nearest ancestors.
+const SCROLL_TO_LEVELS: usize = 3;
+/// Levels `scroll_container` walks up looking for a scrollable ancestor.
+const SCROLL_CONTAINER_LEVELS: usize = 40;
+/// Roles of what scrolls under the wheel.
+const SCROLL_ROLES: [&str; 8] = [
+    "scroll pane",
+    "viewport",
+    "list",
+    "list box",
+    "tree",
+    "tree table",
+    "table",
+    "document web",
+];
+/// Item views: in Qt they scroll themselves, and the rows scrolled out of
+/// them read neither SHOWING nor VISIBLE. In a web page they are plain
+/// <ul> and <table> elements that do not scroll.
+const ITEM_VIEW_ROLES: [&str; 5] = ["list", "list box", "tree", "tree table", "table"];
+
+/// Of the ancestors `chain` (role, showing), nearest first, which one the
+/// wheel scrolls the element in: the nearest showing one of SCROLL_ROLES,
+/// except that an item view inside a web page gives way to the page (or
+/// a scroll pane between them).
+fn pick_scroll_container(chain: &[(String, bool)]) -> Option<usize> {
+    let first = chain
+        .iter()
+        .position(|(role, showing)| *showing && SCROLL_ROLES.contains(&role.as_str()))?;
+    if !ITEM_VIEW_ROLES.contains(&chain[first].0.as_str()) {
+        return Some(first);
+    }
+    let web = chain.iter().position(|(role, _)| role == "document web");
+    match web {
+        Some(web) if web > first => chain[first + 1..=web]
+            .iter()
+            .position(|(role, showing)| {
+                *showing && matches!(role.as_str(), "scroll pane" | "viewport" | "document web")
+            })
+            .map(|i| first + 1 + i),
+        _ => Some(first),
+    }
+}
+
+/// Whether an element that is not SHOWING is scrolled out of view rather
+/// than hidden: still VISIBLE, or (Qt marks rows scrolled out of an item
+/// view invisible) a row of an item view that is showing (`parent`: its
+/// parent's role and SHOWING). A closed combo box's list is not showing.
+fn scrolled_away(visible: bool, parent: Option<(&str, bool)>) -> bool {
+    visible || parent.is_some_and(|(role, showing)| showing && ITEM_VIEW_ROLES.contains(&role))
+}
+
+/// The centre of the part of `pane` that lies inside `window` (both in
+/// the same coordinates), moved from `pane`'s own centre: what to add to
+/// that centre on screen. None when no part of it is inside.
+fn clip_offset(pane: (i32, i32, i32, i32), window: (i32, i32, i32, i32)) -> Option<(i32, i32)> {
+    let (px, py, pw, ph) = pane;
+    let (wx, wy, ww, wh) = window;
+    let (x0, y0) = (px.max(wx), py.max(wy));
+    let (x1, y1) = ((px + pw).min(wx + ww), (py + ph).min(wy + wh));
+    if x1 <= x0 || y1 <= y0 {
+        return None;
+    }
+    let mid = |a: i32, b: i32| (a as i64 + b as i64) / 2;
+    Some((
+        (mid(x0, x1) - mid(px, px + pw)) as i32,
+        (mid(y0, y1) - mid(py, py + ph)) as i32,
+    ))
+}
 
 const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
 
@@ -1229,6 +1300,132 @@ impl Backend for LinuxBackend {
         self.a11y.do_action(id, index as i32).await
     }
 
+    async fn toggles(&self, id: &Obj) -> Toggles {
+        let st = self.a11y.states(id).await.unwrap_or(0);
+        let has = |bit| atspi::has(st, bit);
+        let showing = has(atspi::SHOWING);
+        let offscreen = !showing && {
+            let parent = match has(atspi::VISIBLE) {
+                true => None,
+                false => match self.a11y.parent(id).await {
+                    Some(p) => {
+                        let (role, pst) = tokio::join!(self.a11y.role(&p), self.a11y.states(&p));
+                        Some((role, pst.is_some_and(|s| atspi::has(s, atspi::SHOWING))))
+                    }
+                    None => None,
+                },
+            };
+            scrolled_away(
+                has(atspi::VISIBLE),
+                parent.as_ref().map(|(r, s)| (r.as_str(), *s)),
+            )
+        };
+        Toggles {
+            checkable: has(atspi::CHECKABLE),
+            checked: has(atspi::CHECKED) || has(atspi::PRESSED),
+            expandable: has(atspi::EXPANDABLE),
+            expanded: has(atspi::EXPANDED),
+            selected: has(atspi::SELECTED),
+            popup: has(atspi::HAS_POPUP),
+            showing,
+            offscreen,
+            disabled: !has(atspi::ENABLED),
+        }
+    }
+
+    /// SelectChild adds to a multi-selection list's selection: cleared
+    /// first there, so the entry ends up the only one selected.
+    async fn select_item(&self, item: &Obj) -> R<bool> {
+        let parent = self
+            .a11y
+            .parent(item)
+            .await
+            .ok_or("the entry has no parent to select it in")?;
+        let (ifaces, index, st) = tokio::join!(
+            self.a11y.interfaces(&parent),
+            self.a11y.index_in_parent(item),
+            self.a11y.states(&parent)
+        );
+        if !ifaces.iter().any(|i| i == "org.a11y.atspi.Selection") {
+            return Err("its list offers no accessibility selection".into());
+        }
+        let index = index?;
+        if st.is_some_and(|s| atspi::has(s, atspi::MULTISELECTABLE)) {
+            self.a11y.clear_selection(&parent).await?;
+        }
+        self.a11y.select_child(&parent, index).await
+    }
+
+    /// ScrollTo on the element, else on its nearest ancestors (an element
+    /// without a Component, a text leaf, lives in one that has it).
+    async fn scroll_into_view(&self, id: &Obj) -> R<bool> {
+        let mut cur = Some(id.clone());
+        let mut first_err = None;
+        for _ in 0..SCROLL_TO_LEVELS {
+            let Some(o) = cur else { break };
+            match self.a11y.scroll_to(&o).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+            cur = self.a11y.parent(&o).await;
+        }
+        match first_err {
+            Some(e) => Err(format!("ScrollTo: {e}")),
+            None => Ok(false),
+        }
+    }
+
+    async fn scroll_container(&self, id: &Obj) -> Option<Obj> {
+        // Ancestors up to the window (or the first that is not an item
+        // view, which `pick_scroll_container` takes without looking on).
+        let mut chain: Vec<(String, bool)> = Vec::new();
+        let mut objs: Vec<Obj> = Vec::new();
+        let mut cur = self.a11y.parent(id).await;
+        for _ in 0..SCROLL_CONTAINER_LEVELS {
+            let Some(o) = cur else { break };
+            let (role, st) = tokio::join!(self.a11y.role(&o), self.a11y.states(&o));
+            let showing = st.is_some_and(|st| atspi::has(st, atspi::SHOWING));
+            let done = matches!(
+                role.as_str(),
+                "frame" | "window" | "dialog" | "document web"
+            ) || (showing
+                && SCROLL_ROLES.contains(&role.as_str())
+                && !ITEM_VIEW_ROLES.contains(&role.as_str()));
+            chain.push((role, showing));
+            cur = self.a11y.parent(&o).await;
+            objs.push(o);
+            if done {
+                break;
+            }
+        }
+        pick_scroll_container(&chain).map(|i| objs[i].clone())
+    }
+
+    async fn wheel_point(&self, pane: &Obj) -> R<(i32, i32)> {
+        let (center, frame, ext) = tokio::join!(
+            self.element_center(pane),
+            self.a11y.frame_of(pane),
+            self.a11y.extents(pane, atspi::COORD_WINDOW)
+        );
+        let (x, y) = center?;
+        let (Some(frame), Ok(ext)) = (frame, ext) else {
+            return Ok((x, y));
+        };
+        let Ok(win) = self.a11y.extents(&frame, atspi::COORD_WINDOW).await else {
+            return Ok((x, y));
+        };
+        let (dx, dy) = clip_offset(ext, win)
+            .ok_or("its scrollable container lies outside its window; no wheel turned")?;
+        Ok((x + dx, y + dy))
+    }
+
+    async fn toolkit_of(&self, id: &Obj) -> String {
+        self.toolkit(&id.bus).await.to_lowercase()
+    }
+
     async fn full_text(&self, id: &Obj, limit: usize) -> R<String> {
         if self
             .a11y
@@ -2091,6 +2288,52 @@ impl Backend for LinuxBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn chain(list: &[(&str, bool)]) -> Vec<(String, bool)> {
+        list.iter().map(|(r, s)| (r.to_string(), *s)).collect()
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_page_not_a_list_in_it() {
+        // Qt: the list view scrolls itself.
+        let qt = chain(&[("list", true), ("filler", true), ("frame", true)]);
+        assert_eq!(pick_scroll_container(&qt), Some(0));
+        // Firefox: a <ul> in the page; the page scrolls.
+        let web = chain(&[("list", true), ("section", true), ("document web", true)]);
+        assert_eq!(pick_scroll_container(&web), Some(2));
+        // A scroll pane (a scrolling <div>) between them.
+        let div = chain(&[
+            ("table", true),
+            ("scroll pane", true),
+            ("document web", true),
+        ]);
+        assert_eq!(pick_scroll_container(&div), Some(1));
+        // A closed popup's list is not showing: the next one that is.
+        let gtk = chain(&[("list", false), ("scroll pane", true), ("frame", true)]);
+        assert_eq!(pick_scroll_container(&gtk), Some(1));
+        assert_eq!(pick_scroll_container(&chain(&[("frame", true)])), None);
+    }
+
+    #[test]
+    fn a_qt_row_scrolled_away_is_not_hidden() {
+        assert!(scrolled_away(true, None));
+        // Qt: invisible, in a list that shows.
+        assert!(scrolled_away(false, Some(("tree", true))));
+        // A closed combo box's list, a collapsed group.
+        assert!(!scrolled_away(false, Some(("list", false))));
+        assert!(!scrolled_away(false, Some(("group", true))));
+        assert!(!scrolled_away(false, None));
+    }
+
+    #[test]
+    fn the_wheel_point_stays_inside_the_window() {
+        let win = (0, 0, 800, 600);
+        // Inside: its own centre.
+        assert_eq!(clip_offset((100, 100, 200, 200), win), Some((0, 0)));
+        // A page 3000 high from y=50: the middle of 50..600.
+        assert_eq!(clip_offset((0, 50, 800, 3000), win), Some((0, 325 - 1550)));
+        assert_eq!(clip_offset((0, 700, 800, 100), win), None);
+    }
 
     #[test]
     fn an_element_without_an_area_says_so_in_a_background_window() {
