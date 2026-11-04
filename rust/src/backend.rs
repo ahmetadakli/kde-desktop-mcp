@@ -21,8 +21,8 @@ pub struct Info<Id> {
     pub states: Vec<&'static str>,
     pub showing: bool,
     pub actions: Vec<String>,
-    /// Single-line text preview (newlines already turned into spaces), up to
-    /// the limit asked for; None when the element has no text.
+    /// The element's text, up to the limit asked for, with its line breaks
+    /// ("\n"); None when the element has no text.
     pub text: Option<String>,
     pub children: Vec<Id>,
     /// The platform marks it selectable, checkable or expandable (a list

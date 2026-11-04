@@ -220,6 +220,20 @@ pub fn role_and_name(role: &str, name: &str) -> String {
     }
 }
 
+/// Characters of an element's text a tree/find line shows. Fetches for
+/// lines read one more, so a cut shows (`text="…"…`).
+pub const PREVIEW_CHARS: usize = 80;
+
+/// The text a line shows, and whether it was cut.
+fn line_text<Id>(info: &Info<Id>) -> (String, bool) {
+    let txt = text_preview(info, PREVIEW_CHARS + 1);
+    if txt.chars().count() > PREVIEW_CHARS {
+        (first_chars(&txt, PREVIEW_CHARS), true)
+    } else {
+        (txt, false)
+    }
+}
+
 pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
     describe_but(info, id, None)
 }
@@ -242,10 +256,13 @@ fn describe_but<Id>(info: &Info<Id>, id: u64, implied_state: Option<&str>) -> St
         out.push(' ');
         out.push_str(&json_str(&name));
     }
-    let txt = text_preview(info, 80);
+    let (txt, cut) = line_text(info);
     if !txt.is_empty() && txt != name {
         out.push_str(" text=");
         out.push_str(&json_str(&txt));
+        if cut {
+            out.push('…');
+        }
     }
     let states: Vec<&str> = info
         .states
@@ -302,7 +319,7 @@ fn contains_whole(hay: &str, needle: &str) -> bool {
 /// An element described by its role, name and actions alone: no text or
 /// states. Such siblings with the same role and actions share one line.
 fn plain<Id>(info: &Info<Id>) -> bool {
-    let txt = text_preview(info, 80);
+    let (txt, _) = line_text(info);
     info.states.is_empty() && (txt.is_empty() || txt == short_name(info))
 }
 
@@ -2035,6 +2052,31 @@ mod tests {
                 after_found: true
             }
         );
+    }
+
+    #[test]
+    fn text_keeps_lines_and_marks_a_cut() {
+        // Kate's document: the lines and the final newline stay visible.
+        let mut doc = node("text", "notes.txt", true, &["editable"], &[]);
+        doc.text = Some("Shopping list\nmilk\nbread\n".into());
+        assert_eq!(
+            describe(&doc, 3),
+            "[3] text \"notes.txt\" text=\"Shopping list\\nmilk\\nbread\\n\" {editable}"
+        );
+        // Searches still see the lines as words.
+        let mut c = Cache::new();
+        c.insert("/d", doc.clone());
+        assert_eq!(find(&c, &["/d"], "milk bread", "", 5).unwrap(), vec!["/d"]);
+        // Exactly PREVIEW_CHARS characters: complete, no mark.
+        doc.text = Some("x".repeat(PREVIEW_CHARS));
+        assert!(describe(&doc, 3).ends_with(&format!("text=\"{}\" {{editable}}", "x".repeat(80))));
+        // One more (as a tree fetch reads at most): cut, marked after the quote.
+        doc.text = Some(format!("{}yz", "x".repeat(PREVIEW_CHARS)));
+        assert!(describe(&doc, 3).ends_with(&format!("text=\"{}\"… {{editable}}", "x".repeat(80))));
+        // A text that only repeats the (cut) name adds nothing: still plain.
+        doc.states.clear();
+        doc.name = "x".repeat(PREVIEW_CHARS);
+        assert!(plain(&doc));
     }
 
     #[test]

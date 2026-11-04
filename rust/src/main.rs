@@ -41,7 +41,9 @@ use policy::{Policy, Tier};
 use render::{Line, Printed, WalkOpts};
 
 const MAX_REFS: usize = 20000;
-const TREE_TEXT_LIMIT: usize = 80;
+/// Text read per element for tree lines: one more character than they
+/// show, so a cut is visible.
+const TREE_TEXT_LIMIT: usize = render::PREVIEW_CHARS + 1;
 /// Longest `tree` reply by default, in characters (about 5k tokens).
 const TREE_MAX_CHARS: i64 = 20_000;
 /// Characters kept free in a capped tree for the line saying how to go on.

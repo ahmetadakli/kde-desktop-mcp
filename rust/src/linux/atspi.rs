@@ -819,12 +819,7 @@ impl A11y {
             async {
                 if has_iface("org.a11y.atspi.Text") {
                     let limit = text_limit.min(i32::MAX as usize) as i32;
-                    Some(
-                        self.text(o, limit)
-                            .await
-                            .unwrap_or_default()
-                            .replace('\n', " "),
-                    )
+                    Some(self.text(o, limit).await.unwrap_or_default())
                 } else {
                     None
                 }

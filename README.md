@@ -199,6 +199,10 @@ tool; `off` turns it off). Not available on Windows yet.
   from `offset` (default 0); a cut reply ends with `… cut at character N;
   get_text with offset=N reads on`. Whole web pages used to come back as
   20,000 characters while the part wanted was near the top.
+  A `tree`/`find` line shows up to 80 characters of an element's text with its
+  line breaks (`text="Shopping list\nmilk\nbread\n"`), so a short document's
+  lines and final newline are visible without `get_text`; `…` after the
+  closing quote marks a text that goes on.
 - Large trees: `tree(interactive: true)` lists only elements one can operate
   (actions, editable/checkable/selectable/expandable, and on Linux focusable
   named table rows, cells, list and tree items: a web app's chat list whose
@@ -623,6 +627,44 @@ prints a table of median ms (the window must be open):
 python3 tools/mcp_bench.py --app kate --window notes.txt \
     --server "Rust=rust/target/release/desktop-mcp"
 ```
+
+### End-to-end task benchmark
+
+Tool calls take milliseconds; what makes a desktop task slow is the number of
+model turns and the size of what the model reads. `tools/e2e_bench.py` measures
+that on real tasks: it runs Claude Code headless (`claude -p`, only this
+server's tools; built-in tools, the user's settings, plugins, hooks and skills
+left out) once per task × model × server binary and records model turns,
+desktop tool calls, wall time up to the final result split into startup,
+model and tool time (calls of one turn that run at once count once), the
+exit after the result on its own, reply characters and images, tokens, the
+model actually used, and whether the task got done. `default` in `--models`
+means Claude Code's own default model, not the one in your settings. The tasks
+in `tools/e2e_tasks.json` each open their own window on a fresh temp file
+(Kate: append a line and save, Save As to a new path, search and replace, read
+a value; Firefox: fill and submit a local form in a new window; Dolphin:
+create a folder), state the goal as a user would, check the
+outcome on disk, in the final answer or with a read-only query, and close only
+what they opened (the PID their setup recorded, or the one window carrying the
+run's unique tag).
+
+```bash
+python3 tools/e2e_bench.py --list
+python3 tools/e2e_bench.py --tasks kate_append,kate_replace --models default,claude-haiku-5-5 \
+    --server "old=/path/to/old/desktop-mcp" \
+    --server "new=rust/target/release/desktop-mcp" --repeat 3 --results /tmp/e2e
+```
+
+It prints a Markdown table of medians and writes `results.json` (with every
+tool call, its time and reply size), `table.md` and each run's raw stream to
+`--results` (default: a new temp dir; never inside the repository). The agent
+types into the windows the tasks open (each run makes its window the active
+one first): do not use the keyboard or mouse while it runs. Firefox and
+Dolphin open the task's window in their running instance; close your own
+windows of them first, or pass `--exclusive` to skip those runs (each run
+notes other open windows of its app). Ctrl+C stops the agent with its whole
+process group before cleanup. `python3 -m unittest tools/test_e2e_bench.py`
+tests the measuring and the process handling without a desktop.
 
 ## Measurements: KDE speed-up
 
