@@ -572,6 +572,9 @@ tokio::task_local! {
     /// references in later steps (see `Server::batch`). Only set inside a
     /// batch step; tools note it through `note_step_element`.
     static STEP_ELEMENT: std::cell::Cell<Option<u64>>;
+    /// The focus a step of the running batch reported last, so later steps
+    /// with the same focus say "(unchanged)" instead of describing it again.
+    static BATCH_FOCUS: std::cell::RefCell<Option<String>>;
 }
 
 /// Record `rid` as the element the running batch step produced: the one a
@@ -889,7 +892,8 @@ fn cap_lines(text: String, max: usize) -> String {
 /// A tool's reply: text, plus base64 PNGs sent as MCP image blocks.
 struct Out {
     text: String,
-    images: Vec<String>,
+    /// Inline images: base64 data and media type.
+    images: Vec<(String, &'static str)>,
 }
 
 impl From<String> for Out {
@@ -905,6 +909,11 @@ impl From<String> for Out {
 /// Image tokens grow with the area: 1024 costs about 0.64 of 1280 and
 /// still shows a 1536 px wide window's text legibly.
 const SHOT_MAX_SIZE: i64 = 1024;
+
+/// Characters `get_text` returns unless `limit` says otherwise. A whole
+/// web page read 20,000 (5,000 tokens, re-read on every later turn) where
+/// the part wanted was near the top; a cut reply says where to go on.
+const GET_TEXT_LIMIT: i64 = 10000;
 
 /// How long set_text waits for the field to show what was written.
 const SET_TEXT_VERIFY: Duration = Duration::from_millis(300);
@@ -2113,7 +2122,7 @@ impl<B: Backend> Server<B> {
         let (print, focus) = tokio::join!(self.fingerprint(), self.focus_note(false));
         let window = match print.window {
             Some((app, title)) if self.is_allowed(&app) => {
-                format!("active window {} [{app}]", render::py_repr(&title))
+                format!("active window {} [{app}]", render::short_title(&title))
             }
             Some((app, _)) => format!("active window of '{app}' (not allowed)"),
             None => "no active window".into(),
@@ -2138,7 +2147,7 @@ impl<B: Backend> Server<B> {
         if first {
             return String::new();
         }
-        format!("; active window now {}", render::py_repr(&now))
+        format!("; active window now {}", render::short_title(&now))
     }
 
     /// Title of the active window, if any.
@@ -2823,7 +2832,12 @@ impl<B: Backend> Server<B> {
         if names.is_empty() {
             return Err("element has no actions; try click, or focus + key".into());
         }
-        let mut idx = 0;
+        // Chromium lists showContextMenu on every element: never the
+        // default while there is another action.
+        let mut idx = names
+            .iter()
+            .position(|n| !n.eq_ignore_ascii_case("showcontextmenu"))
+            .unwrap_or(0);
         if !action.is_empty() {
             let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
             idx = lowered
@@ -3170,10 +3184,21 @@ impl<B: Backend> Server<B> {
         if t.protected() {
             return Err(t.reply("a password field: its text is never read"));
         }
-        let limit = arg_i(a, "limit", 20000).max(0) as usize;
-        let mut text = trace::time("full_text", self.b.full_text(&t.id, limit)).await?;
+        let limit = arg_i(a, "limit", GET_TEXT_LIMIT).max(0) as usize;
+        let offset = arg_i(a, "offset", 0).max(0) as usize;
+        // One character more than asked for tells whether there is more.
+        let want = offset.saturating_add(limit).saturating_add(1);
+        let mut text = trace::time("full_text", self.b.full_text(&t.id, want)).await?;
         if render::has_embedded_objects(&text) {
-            text = self.container_text(&t.id, limit).await;
+            text = self.container_text(&t.id, want).await;
+        }
+        let more = text.chars().count() > offset + limit;
+        let mut text: String = text.chars().skip(offset).take(limit).collect();
+        if more {
+            let next = offset + limit;
+            text.push_str(&format!(
+                "\n… cut at character {next}; get_text with offset={next} reads on"
+            ));
         }
         Ok(match t.found {
             Some(d) => format!("{d}:\n{text}"),
@@ -3699,7 +3724,16 @@ impl<B: Backend> Server<B> {
         }
         let rid = self.add_ref(&id, &info, &app.to_lowercase()).await;
         note_step_element(rid, false);
-        let mut note = format!("; focus: {}", render::describe(&info, rid));
+        let desc = render::describe_focused(&info, rid);
+        // In a batch, focus that stayed put is not described again.
+        let same = BATCH_FOCUS
+            .try_with(|last| last.replace(Some(desc.clone())).as_deref() == Some(desc.as_str()))
+            .unwrap_or(false);
+        let mut note = if same {
+            format!("; focus: [{rid}] (unchanged)")
+        } else {
+            format!("; focus: {desc}")
+        };
         if typing && !info.states.contains(&"editable") && !TEXT_SINKS.contains(&info.role.as_str())
         {
             note.push_str(" (not an editable field: check where the text went)");
@@ -3997,7 +4031,7 @@ impl<B: Backend> Server<B> {
         let file = path.clone();
         let done = trace::time(
             "convert+encode",
-            tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac)),
+            tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac, inline)),
         )
         .await
         .map_err(|e| e.to_string())??;
@@ -4009,7 +4043,15 @@ impl<B: Backend> Server<B> {
         let map = area.and_then(|a| ShotMap::new(done.size, a));
         *self.last_shot.lock().await = map;
         let (iw, ih) = done.size;
-        let mut text = format!("{path}\n{iw}x{ih} px");
+        // The image inline is all the agent sees (it is told not to read
+        // the file): no path to read, no file left behind. Only
+        // inline=false keeps the file and names it.
+        let mut text = if inline {
+            let _ = std::fs::remove_file(&path);
+            format!("{iw}x{ih} px")
+        } else {
+            format!("{path}\n{iw}x{ih} px")
+        };
         if let (Some((x, y, w, h)), Some(_)) = (area, map) {
             // How to click a point in it is in the server instructions.
             let r = |v: f64| (v * 100.0).round() / 100.0;
@@ -4030,7 +4072,8 @@ impl<B: Backend> Server<B> {
         Ok(Out {
             text,
             images: if inline {
-                vec![shot::base64(&done.png)]
+                let (bytes, mime) = done.inline();
+                vec![(shot::base64(bytes), mime)]
             } else {
                 Vec::new()
             },
@@ -4067,6 +4110,7 @@ impl<B: Backend> Server<B> {
         let mut out = Vec::new();
         let mut images = Vec::new();
         let mut done: Vec<(String, StepElement)> = Vec::new();
+        let mut last_focus: Option<String> = None;
         for (i, step) in steps.iter().enumerate() {
             let tool = tool_of(step);
             let mut args = step.get("args").cloned().unwrap_or_else(|| json!({}));
@@ -4075,12 +4119,20 @@ impl<B: Backend> Server<B> {
             let optional = step.get("optional").and_then(Json::as_bool) == Some(true);
             let result = match resolve_step_refs(&mut args, i + 1, &done) {
                 Ok(()) => {
-                    STEP_ELEMENT
-                        .scope(std::cell::Cell::new(None), async {
-                            let r = self.call_inner(tool, &args, input).await;
-                            (r, STEP_ELEMENT.with(|e| e.get()))
+                    let focus = std::cell::RefCell::new(last_focus.take());
+                    let (r, element, focus) = BATCH_FOCUS
+                        .scope(focus, async {
+                            let (r, element) = STEP_ELEMENT
+                                .scope(std::cell::Cell::new(None), async {
+                                    let r = self.call_inner(tool, &args, input).await;
+                                    (r, STEP_ELEMENT.with(|e| e.get()))
+                                })
+                                .await;
+                            (r, element, BATCH_FOCUS.with(|f| f.take()))
                         })
-                        .await
+                        .await;
+                    last_focus = focus;
+                    (r, element)
                 }
                 Err(e) => (Err(e), None),
             };
@@ -4302,7 +4354,7 @@ impl<B: Backend> Server<B> {
             });
             let result = match activated {
                 Some(title) => {
-                    let done = format!("activated {}; ", render::py_repr(&title));
+                    let done = format!("activated {}; ", render::short_title(&title));
                     result
                         .map(|mut o| {
                             o.text.insert_str(0, &done);
@@ -4391,49 +4443,48 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
     let id = msg.get("id")?.clone();
     let method = msg.get("method").and_then(Json::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(Json::Null);
-    let result = match method {
-        "initialize" => {
-            let asked = params["protocolVersion"].as_str().unwrap_or("");
-            server.link.borrow_mut().elicitation = params
-                .pointer("/capabilities/elicitation")
-                .is_some_and(Json::is_object);
-            let version = if PROTOCOL_VERSIONS.contains(&asked) {
-                asked
-            } else {
-                PROTOCOL_VERSIONS[0]
-            };
-            json!({
-                "protocolVersion": version,
-                "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": { "name": "desktop", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": tools::INSTRUCTIONS,
-            })
-        }
-        "ping" => json!({}),
-        "tools/list" => json!({ "tools": tools::tools() }),
-        "tools/call" => {
-            let name = params["name"].as_str().unwrap_or("");
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let (out, is_error) = match server.call(name, &args).await {
-                Ok(o) => (o, false),
-                Err(e) => (Out::from(format!("Error executing tool {name}: {e}")), true),
-            };
-            let mut content = vec![json!({ "type": "text", "text": out.text })];
-            content.extend(
-                out.images
-                    .into_iter()
-                    .map(|data| json!({ "type": "image", "data": data, "mimeType": "image/png" })),
-            );
-            json!({ "content": content, "isError": is_error })
-        }
-        _ => {
-            return Some(json!({ "jsonrpc": "2.0", "id": id,
+    let result =
+        match method {
+            "initialize" => {
+                let asked = params["protocolVersion"].as_str().unwrap_or("");
+                server.link.borrow_mut().elicitation = params
+                    .pointer("/capabilities/elicitation")
+                    .is_some_and(Json::is_object);
+                let version = if PROTOCOL_VERSIONS.contains(&asked) {
+                    asked
+                } else {
+                    PROTOCOL_VERSIONS[0]
+                };
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": "desktop", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": tools::INSTRUCTIONS,
+                })
+            }
+            "ping" => json!({}),
+            "tools/list" => json!({ "tools": tools::tools() }),
+            "tools/call" => {
+                let name = params["name"].as_str().unwrap_or("");
+                let args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let (out, is_error) = match server.call(name, &args).await {
+                    Ok(o) => (o, false),
+                    Err(e) => (Out::from(format!("Error executing tool {name}: {e}")), true),
+                };
+                let mut content = vec![json!({ "type": "text", "text": out.text })];
+                content.extend(out.images.into_iter().map(
+                    |(data, mime)| json!({ "type": "image", "data": data, "mimeType": mime }),
+                ));
+                json!({ "content": content, "isError": is_error })
+            }
+            _ => {
+                return Some(json!({ "jsonrpc": "2.0", "id": id,
                 "error": { "code": -32601, "message": format!("Method not found: {method}") } }));
-        }
-    };
+            }
+        };
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
@@ -5899,23 +5950,25 @@ mod tests {
                     .unwrap()
                     .starts_with("iVBORw0KGgo")
             );
-            // The file on disk is the shrunk image the coordinates refer to.
-            let path = text.lines().next().unwrap();
-            let img = shot::read_png(path).unwrap();
-            assert_eq!((img.width, img.height), (100, 50));
-            std::fs::remove_file(path).unwrap();
+            // Inline, the reply names no file and leaves none behind.
+            assert!(text.starts_with("100x50 px"), "{text}");
             // Pixel (50, 25) of a 4x-scaled image of an area at (10, 20).
             let r = call_tool(&mut s, 3, "mouse", json!({"image_x": 50, "image_y": 25})).await;
             let text = r["result"]["content"][0]["text"].as_str().unwrap();
             assert_eq!(text, "pointer at (212,122) in fake");
             let r = call_tool(&mut s, 4, "screenshot", json!({"inline": false})).await;
             assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1, "{r}");
+            // Not inline: the file on disk is the shrunk image the
+            // coordinates refer to.
             let path = r["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
                 .lines()
                 .next()
                 .unwrap();
+            let img = shot::read_png(path).unwrap();
+            let size = format!("\n{}x{} px", img.width, img.height);
+            assert!(reply_text(&r).contains(&size), "{r}");
             std::fs::remove_file(path).unwrap();
         });
     }
@@ -5933,14 +5986,19 @@ mod tests {
             call_tool(&mut s, 3, "screenshot", json!({"max_size": 100})).await;
             // Pixels (25, 10)-(35, 15) are screen (110, 60), 40x20: the
             // 2x capture's pixels (50, 20)-(70, 30), sent as they are.
-            let r = call_tool(&mut s, 4, "screenshot", json!({"region": [25, 10, 10, 5]})).await;
+            let r = call_tool(
+                &mut s,
+                4,
+                "screenshot",
+                json!({"region": [25, 10, 10, 5], "inline": false}),
+            )
+            .await;
             let content = &r["result"]["content"];
             let text = content[0]["text"].as_str().unwrap();
             assert!(
                 text.contains("20x10 px of screen area at (110,60), 40x20 (zoom of region"),
                 "{text}"
             );
-            assert_eq!(content[1]["type"], "image", "{r}");
             let path = text.lines().next().unwrap();
             let img = shot::read_png(path).unwrap();
             assert_eq!((img.width, img.height), (20, 10));
@@ -6132,6 +6190,98 @@ mod tests {
             // The same element again: the same id.
             assert!(text.contains("; focus: [1] push button \"OK\""), "{text}");
             assert!(!text.contains("not an editable"), "{text}");
+        });
+    }
+
+    #[test]
+    fn batch_steps_do_not_repeat_an_unchanged_focus() {
+        local(async {
+            let mut s = session("batch-focus");
+            s.focus.borrow_mut().states = vec!["focused", "editable"];
+            let r = call_tool(
+                &mut s,
+                2,
+                "batch",
+                json!({"steps": [
+                    {"tool": "key", "args": {"combo": "a"}},
+                    {"tool": "pause", "args": {"ms": 0}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                    {"tool": "type_text", "args": {"text": "x"}},
+                ]}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            let lines: Vec<&str> = reply_text(&r).lines().collect();
+            // Described once, without the state every focus has.
+            assert_eq!(
+                lines[0], "[1] key: sent a x1 to fake; focus: [1] push button \"OK\" {editable}",
+                "{r}"
+            );
+            assert_eq!(
+                lines[2],
+                "[3] key: sent b x1 to fake; focus: [1] (unchanged)"
+            );
+            assert!(lines[3].contains("; focus: [1] (unchanged)"), "{r}");
+            // Once focus moves, it is described again.
+            s.focus.borrow_mut().name = "Cancel".into();
+            let r = call_tool(
+                &mut s,
+                3,
+                "batch",
+                json!({"steps": [
+                    {"tool": "key", "args": {"combo": "a"}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                ]}),
+            )
+            .await;
+            let lines: Vec<&str> = reply_text(&r).lines().collect();
+            assert!(
+                lines[0].ends_with("push button \"Cancel\" {editable}"),
+                "{r}"
+            );
+            assert!(lines[1].ends_with("(unchanged)"), "{r}");
+            // A call of its own always describes it.
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "a"})).await;
+            assert!(reply_text(&r).ends_with("\"Cancel\" {editable}"), "{r}");
+        });
+    }
+
+    #[test]
+    fn get_text_says_where_a_cut_reply_goes_on() {
+        local(async {
+            let mut s = session("get-text-cut");
+            *s.field.borrow_mut() = Some("çağ 0123456789".into());
+            let args = |extra: Json| {
+                let mut a = json!({"app": "fake", "query": "OK"});
+                a.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                a
+            };
+            let r = call_tool(&mut s, 2, "get_text", args(json!({"limit": 6}))).await;
+            let text = reply_text(&r);
+            assert!(
+                text.ends_with(":\nçağ 01\n… cut at character 6; get_text with offset=6 reads on"),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                3,
+                "get_text",
+                args(json!({"limit": 6, "offset": 6})),
+            )
+            .await;
+            assert!(
+                reply_text(&r).ends_with(
+                    ":\n234567\n… cut at character 12; get_text with offset=12 reads on"
+                ),
+                "{r}"
+            );
+            // The rest fits: no note.
+            let r = call_tool(&mut s, 4, "get_text", args(json!({"offset": 12}))).await;
+            assert!(reply_text(&r).ends_with(":\n89"), "{r}");
+            let r = call_tool(&mut s, 5, "get_text", args(json!({"limit": 14}))).await;
+            assert!(reply_text(&r).ends_with(":\nçağ 0123456789"), "{r}");
         });
     }
 

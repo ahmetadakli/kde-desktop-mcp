@@ -116,7 +116,7 @@ tree(interactive=true) for large pages.
 view after the input settled, instead of a separate look. Failures end with the active \
 window and focus.
 - menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
-- screenshot is a last resort (inline image: don't Read the file). To click something seen \
+- screenshot is a last resort (the image comes inline). To click something seen \
 only in it, pass its pixels to mouse as image_x/image_y; `region`=[x, y, w, h] zooms in.
 
 Allowlist: only apps in the user's allowlist file can be read, activated or sent input, and \
@@ -171,7 +171,7 @@ pub fn tools() -> Json {
         ),
         t(
             "tree",
-            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. Actions the role implies (a link's jump, a\nbutton's press, a tab's switch, a section's click) are omitted;\n`actions=none` marks a button or link without any. Nameless wrappers are left\nout (their children lifted). Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nWith `document`=true only the page of `app`'s active window is listed: in a\nbrowser, the current tab's web page without the tabs and toolbars.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.\n`interactive`=true lists only what can be operated (actions, editable,\nselectable, checkable, expandable), each under its nearest named ancestor.\nA reply over `max_chars` (0 = no cap) or `max_nodes` ends with\n`… N more nodes; continue with tree(…, after=ID)`: repeat that call for the\nnext part. `screenshot`=true also returns the image of the app's window\nwhen it is the active one.",
+            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. Actions the role implies (a link's jump, a\nbutton's press, a tab's switch, a section's click) are omitted;\n`actions=none` marks a button or link without any. Nameless wrappers are left\nout (their children lifted), as are text nodes repeating their parent's line. Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nWith `document`=true only the page of `app`'s active window is listed: in a\nbrowser, the current tab's web page without the tabs and toolbars.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.\n`interactive`=true lists only what can be operated (actions, editable,\nselectable, checkable, expandable), each under its nearest named ancestor.\nA reply over `max_chars` (0 = no cap) or `max_nodes` ends with\n`… N more nodes; continue with tree(…, after=ID)`: repeat that call for the\nnext part. `screenshot`=true also returns the image of the app's window\nwhen it is the active one.",
             schema(&[
                 ("app", "string", Some(json!(""))),
                 ("root_id", "integer", Some(json!(0))),
@@ -212,9 +212,12 @@ pub fn tools() -> Json {
         t(
             "get_text",
             &d(
-                "Read the full text of an element (documents, fields, labels). A web page or\nother container gives the text of everything in it, in reading order.\nPassword fields are never read (tree and find show no text for them either)."
+                "Read the text of an element (documents, fields, labels). A web page or\nother container gives the text of everything in it, in reading order.\nAt most `limit` characters from `offset`; a cut reply ends saying which\noffset reads on. To locate one thing on a long page, find is cheaper.\nPassword fields are never read (tree and find show no text for them either)."
             ),
-            target(&[("limit", "integer", Some(json!(20000)))])
+            target(&[
+                ("limit", "integer", Some(json!(10000))),
+                ("offset", "integer", Some(json!(0))),
+            ])
         ),
         t(
             "focus",
@@ -400,7 +403,7 @@ pub fn tools() -> Json {
         ),
         t(
             "screenshot",
-            "Last resort only: capture the active window. The image comes back in the\nreply (no need to Read the file), shrunk so its longer side is at most\n`max_size` px; `inline`=false returns only the file path. Also says which\nscreen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution; image_x/image_y then refer to the zoomed image.",
+            "Last resort only: capture the active window. The image comes back in the\nreply (JPEG when much smaller than PNG), shrunk so its longer side is at\nmost `max_size` px; `inline`=false instead saves a PNG and returns only\nits path. Also says which screen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution; image_x/image_y then refer to the zoomed image.",
             schema(&[
                 ("max_size", "integer", Some(json!(1024))),
                 ("inline", "boolean", Some(json!(true))),

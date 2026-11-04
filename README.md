@@ -68,12 +68,26 @@ Why it is fast:
   `tree(document=true)` shows only the active tab's page (found in one call
   through the window's EMBEDS relation). The same Firefox page went from 5,943
   to 1,421 characters.
+- In Chromium and Electron apps, the `showContextMenu` action every element
+  carries is not listed either, and the generic `doDefault` of their frame,
+  panels and pages counts as implied: it no longer keeps nameless panels as
+  lines. A Ferdium (WhatsApp) tree went from 19,906 characters, cut at 300
+  nodes behind six nested panels, to 7,759 for the whole window; with
+  `interactive: true` from 19,924 to 2,059. `act` without `action` never
+  picks `showContextMenu` while the element has another action.
 - Actions a role implies are left out (a link's jump, a button's press, a
   tab's switch, a web section's click); a button or link without any says
   `actions=none`. Nameless, text-free wrappers (landmarks, forms, scroll panes)
   are left out with their children lifted, as are empty nameless leaves
   (separators, images inside buttons) and labels around a same-named button.
   A Google results page in Firefox went from 6,976 to 5,702 characters.
+  A static text or label leaf that only repeats what its parent's line
+  shows (a heading's or link's own text node, a status bar's count) is left
+  out of `tree`, and of `find` when the parent is listed as high; asked for
+  with `role`, it is listed. A YouTube page's `tree(document=true)` went
+  from 3,792 to 3,327 characters. `get_text` in Chromium no longer reads
+  such leaves a second time after the text of the element that holds them
+  (a WhatsApp page: 3,035 instead of 5,010 characters, the same text).
 - On Linux, a `find`, `tree` of an app, or element picked by `app` + `query`
   reuses the app's tree read by an earlier call while the app provably did not
   change: it sent no AT-SPI change event since (children, name, text, any
@@ -175,7 +189,11 @@ tool; `off` turns it off). Not available on Windows yet.
   `document: true`, `tree` lists only the document of the active window (in a
   browser, that tab's page without tabs and toolbars). `get_text` on a web page
   or another container returns the text of everything in it in reading order
-  (web containers' own text is only a placeholder per child element).
+  (web containers' own text is only a placeholder per child element). It
+  returns at most `limit` characters (default 10,000, about 2,500 tokens)
+  from `offset` (default 0); a cut reply ends with `… cut at character N;
+  get_text with offset=N reads on`. Whole web pages used to come back as
+  20,000 characters while the part wanted was near the top.
 - Large trees: `tree(interactive: true)` lists only elements one can operate
   (actions, editable/checkable/selectable/expandable) under their nearest
   named ancestor; on a GitHub issues page in Firefox it was 15,339 instead of
@@ -239,7 +257,10 @@ tool; `off` turns it off). Not available on Windows yet.
   `wait_idle`, `menu`, `key`, `type_text` or `mouse` fails (or a `batch` step
   fails and the batch does not end with `screenshot` or `tree`), the reply
   ends with `now: active window '<title>' [app]; focus: <element>`, so the
-  next call needs no screenshot to see why. Not for refusals by the
+  next call needs no screenshot to see why. Titles in such notes
+  (`now:`, `activated '…'`, `active window now '…'`) are cut at 80
+  characters like element names, and a focus line leaves out the `focused`
+  state. Not for refusals by the
   allowlist, confirmations or the user taking over. A miss by `query` also
   lists off-screen matches or the closest names with ids (see `find`).
 - Stale ids: every use of an `id` reads the element's role and name again (one
@@ -320,6 +341,8 @@ tool; `off` turns it off). Not available on Windows yet.
   scripting, screens and the screenshot path.
 - `key`, `type_text`: keyboard. The reply names the element that has focus
   afterwards; `type_text` warns when focus is not on an editable field (KDE).
+  In a `batch`, a step whose focus is the one the previous report described
+  says `focus: [id] (unchanged)` instead of describing it again.
 - `activate_window`: brings a window to the front; fails when no window of an
   allowed app matches.
 - `window` on input tools (`key`, `type_text`, `click`, `mouse`, `scroll`,
@@ -337,9 +360,16 @@ tool; `off` turns it off). Not available on Windows yet.
   rather than text, it only names the types, and it does not read content a
   password manager marked as a password (`x-kde-passwordManagerHint`).
 - `mouse`, `screenshot`: fallback only. `screenshot` returns the image inside
-  the reply (no need to read the file separately), shrinks it so its longer
-  side is 1024 px by default (`max_size`; `inline: false` returns only the file
-  path) and reports which screen area it shows; given `image_x`/`image_y`,
+  the reply, shrinks it so its longer side is 1024 px by default (`max_size`)
+  and reports which screen area it shows. The inline image is a JPEG
+  (quality 80, full colour resolution, so small text stays sharp) when that
+  takes at most three quarters of the PNG's bytes, else a PNG: a 1024x576
+  YouTube window took 132 KB instead of 670 KB, a Confluence page 94 KB
+  instead of 246 KB; flat windows stay PNG. Image tokens depend on the size
+  only (about width x height / 750: 786 at 1024x576), so the default size
+  stays: at 896 px a 1080p window's 13 px text shrinks to 6 px. An inline
+  screenshot leaves no file behind and names none; `inline: false` saves a
+  PNG and returns only its path; given `image_x`/`image_y`,
   `mouse` converts a pixel of the image to a screen coordinate (window position
   and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
   in pixels of the last screenshot captures again and returns only that part,
@@ -671,3 +701,6 @@ file manager or system settings to the list.
 ## License
 
 MIT
+
+Inline screenshots are encoded with the `jpeg-encoder` crate; this software
+is based in part on the work of the Independent JPEG Group.
