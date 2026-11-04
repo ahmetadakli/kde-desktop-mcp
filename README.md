@@ -288,6 +288,35 @@ tool; `off` turns it off). Not available on Windows yet.
   window now '<title>'`) or came to the front since the previous input (`;
   before it, '<title>' had come to the front`: a dialog that opened after
   that reply); about 3 ms per input.
+- What an input opened: after `act`, `menu`, `close_window` and the input
+  tools given `observe`, and after `click`, `key`, `mouse` and `type_text`
+  without it, the reply lists the menus, popup menus, combo box lists,
+  dialogs and alerts of allowed apps that opened, one line each, with their
+  entries' ids, so the next call acts on them directly:
+  ```
+  opened: popup menu (8 entries): [51] "Kopyala" [52] "Yapıştır" [53] check menu item "Satır Sarma" {checked} …
+  opened: dialog 'Değişiklikleri kaydet?': "Belge değiştirildi." [60] push button "Kaydet" [61] "Kaydetme" [62] "İptal"
+  ```
+  A role is named where it changes (a menu's `menu item`s and a list's `list
+  item`s go without); a dialog's buttons come first, after its first label
+  (the question it asks), then its other controls. At most 12 entries and
+  about 600 characters a line (the rest is counted: `… +5 more`), 3
+  surfaces a reply; a surface listed once in a call (by `close_window`) is
+  not listed again in its effect line. On Linux the AT-SPI events
+  `object:state-changed:showing` and `window:create` say what showed since
+  the input: when none came, this costs nothing (no round trip); otherwise
+  the role of each shown element is read (one round trip for all of them),
+  and only menus, dialogs and lists under a combo box are read further. A
+  right click (`click`, `mouse`), a click on a combo box or menu entry, and
+  keys that usually open a menu or dialog (`menu`, `shift+f10`, `f10`,
+  `alt`+a letter, `alt+down`, `alt+f4`, `ctrl+o/s/p/w/q`, `ctrl+shift+s`)
+  wait up to 150 ms for something to show, ending as soon as it did; other
+  inputs only list what showed already. Without such events (Windows, or
+  when registering them failed), those likely openers and `act`, `menu` and
+  `close_window` look at the active app's top-level windows instead, and a
+  surface one such look listed is not listed again while it stays open.
+  Only menus already open are read: nothing here opens a menu through
+  accessibility (Firefox can crash when one does).
 - Failures say what is on screen: when `find` finds nothing, or `act`,
   `click`, `focus`, `get_text`, `set_text`, `scroll`, `drag`, `wait_for`,
   `wait_idle`, `menu`, `key`, `type_text` or `mouse` fails (or a `batch` step
@@ -336,7 +365,9 @@ tool; `off` turns it off). Not available on Windows yet.
 - `close_window`: closes the one window whose title or app name contains
   `query` (several matches: an error listing them) as its close button does
   (KWin `closeWindow()`, Hyprland `closewindow`), so an app with unsaved
-  changes still asks; the reply then says the window is still open. Always
+  changes still asks; the reply then says the window is still open and
+  lists the app's dialog (the save prompt) with its buttons' ids
+  (`showing dialog '…': [60] push button "Save" [61] "Discard" …`). Always
   needs the user's consent, as tools on the `confirm:` list do (see
   [Tiers, confirmation and password fields](#tiers-confirmation-and-password-fields)).
 - `menu`: runs a menu bar entry by its labels in one call: `path` is a list
@@ -379,7 +410,8 @@ tool; `off` turns it off). Not available on Windows yet.
 - `key`, `type_text`: keyboard. The reply names the element that has focus
   afterwards; `type_text` warns when focus is not on an editable field (KDE).
   In a `batch`, a step whose focus is the one the previous report described
-  says `focus: [id] (unchanged)` instead of describing it again.
+  says `focus: [id] (unchanged)` instead of describing it again. A menu or
+  dialog the key opened is listed with ids (see "What an input opened").
 - `activate_window`: brings a window to the front; fails when no window of an
   allowed app matches.
 - `window` on input tools (`key`, `type_text`, `click`, `mouse`, `scroll`,

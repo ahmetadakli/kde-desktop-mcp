@@ -285,6 +285,36 @@ pub trait Backend {
     fn changed_since(&self, _near: &[Self::Id], _mark: u64) -> Option<bool> {
         None
     }
+    /// Elements that were shown or created after `mark` (`change_mark`),
+    /// oldest first, without repeats: a menu, popup, dialog or window that
+    /// opened, and often what it holds. Cheap: no round trip. None when
+    /// the backend hears of no such events (callers look at the active
+    /// app's windows instead).
+    fn shown_since(&self, _mark: u64) -> Option<Vec<Self::Id>> {
+        None
+    }
+    /// Wait until `shown_since(mark)` names something of the app whose
+    /// elements are `near` (none: of any app) and the burst of events
+    /// settled, or `timeout` passed; false when nothing was shown. The
+    /// default (no such events) waits one poll interval.
+    async fn wait_shown(
+        &self,
+        _near: &[Self::Id],
+        _mark: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
+        tokio::time::sleep(timeout.min(std::time::Duration::from_millis(50))).await;
+        true
+    }
+    /// Name of the app `id` belongs to, as `list_apps` names it; None when
+    /// the backend cannot tell (callers take the active app).
+    async fn app_name(&self, _id: &Self::Id) -> Option<String> {
+        None
+    }
+    /// The element holding `id`; None at the top or when unknown.
+    async fn parent(&self, _id: &Self::Id) -> Option<Self::Id> {
+        None
+    }
     /// A mark for `unchanged_since`, taken before a read that may be kept
     /// and reused; None when the backend cannot tell that an app's tree
     /// stayed the same (no events for all that a read sees), so reads are

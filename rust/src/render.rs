@@ -1822,6 +1822,221 @@ pub fn menu_path(path: Option<&Json>) -> Result<Vec<String>, String> {
     }
 }
 
+// ---------------------------------------------------------------- surfaces
+
+/// What an input opened that the reply lists with its entries: a menu or
+/// popup menu, a combo box's list, or a dialog or alert.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Surface {
+    Menu,
+    List,
+    Dialog,
+}
+
+/// Roles of a list that is a surface only when a combo box holds it.
+pub const SURFACE_LIST_ROLES: [&str; 2] = ["list", "list box"];
+
+/// The kind of surface an element of `role` is, if any. A list only
+/// counts under a combo box: the caller checks its parent.
+pub fn surface_kind(role: &str) -> Option<Surface> {
+    match role {
+        "menu" | "popup menu" => Some(Surface::Menu),
+        r if SURFACE_LIST_ROLES.contains(&r) => Some(Surface::List),
+        r if DIALOG_ROLES.contains(&r) => Some(Surface::Dialog),
+        _ => None,
+    }
+}
+
+/// Roles of a list's entries.
+const LIST_ENTRY_ROLES: [&str; 6] = [
+    "list item",
+    "menu item",
+    "check menu item",
+    "radio menu item",
+    "tree item",
+    "table cell",
+];
+
+/// Roles of a dialog's buttons, listed before its other controls.
+const DIALOG_BUTTON_ROLES: [&str; 2] = ["push button", "toggle button"];
+
+/// Roles of a dialog's other controls listed after its buttons.
+const DIALOG_CONTROL_ROLES: [&str; 10] = [
+    "check box",
+    "radio button",
+    "combo box",
+    "text",
+    "entry",
+    "password text",
+    "spin button",
+    "link",
+    "page tab",
+    "slider",
+];
+
+/// What a surface lists: its entries (a dialog's buttons first), and for
+/// a dialog the first label that is not its title (the question it asks).
+pub struct SurfaceEntries<Id> {
+    pub entries: Vec<Id>,
+    pub message: Option<String>,
+}
+
+/// The entries of the surface `root` of `kind`, in document order (a
+/// dialog's buttons first), from the showing nodes below it, and the nodes
+/// still to fetch for the rest. An entry's own children are not looked
+/// into (a submenu's entries), nor are hidden nodes'.
+pub fn surface_entries<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    root: &Id,
+    kind: Surface,
+) -> (SurfaceEntries<Id>, Vec<Id>) {
+    let mut missing = Vec::new();
+    let Some(info) = cache.get(root) else {
+        let none = SurfaceEntries {
+            entries: Vec::new(),
+            message: None,
+        };
+        return (none, vec![root.clone()]);
+    };
+    let title = fold(&info.name);
+    let mut buttons = Vec::new();
+    let mut others = Vec::new();
+    let mut message = None;
+    let mut stack: Vec<&Id> = get(cache, &info.children, &mut missing)
+        .into_iter()
+        .map(|(c, _)| c)
+        .rev()
+        .collect();
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        let info = &cache[id];
+        if !info.showing {
+            continue;
+        }
+        let role = info.role.as_str();
+        let named = !info.name.trim().is_empty();
+        let entry = match kind {
+            Surface::Menu => MENU_ITEM_ROLES.contains(&role) && named,
+            Surface::List => LIST_ENTRY_ROLES.contains(&role) && named,
+            Surface::Dialog => {
+                if DIALOG_BUTTON_ROLES.contains(&role) && named {
+                    buttons.push(id.clone());
+                    continue;
+                }
+                if message.is_none()
+                    && LABEL_ROLES.contains(&role)
+                    && named
+                    && fold(&info.name) != title
+                {
+                    message = Some(info.name.trim().to_string());
+                }
+                DIALOG_CONTROL_ROLES.contains(&role) && (named || info.states.contains(&"editable"))
+            }
+        };
+        if entry {
+            others.push(id.clone());
+            continue;
+        }
+        stack.extend(
+            get(cache, &info.children, &mut missing)
+                .into_iter()
+                .map(|(c, _)| c)
+                .rev(),
+        );
+    }
+    buttons.extend(others);
+    let listed = SurfaceEntries {
+        entries: buttons,
+        message,
+    };
+    (listed, missing)
+}
+
+/// Most entries a surface line lists, and characters it takes.
+pub const SURFACE_ENTRIES: usize = 12;
+pub const SURFACE_CHARS: usize = 600;
+
+/// The role an entry of `kind` has unless its line says otherwise.
+fn default_entry_role(kind: Surface) -> &'static str {
+    match kind {
+        Surface::Menu => "menu item",
+        Surface::List => "list item",
+        Surface::Dialog => "",
+    }
+}
+
+/// One line for a surface, after "opened: ": its role and title, the
+/// number of entries (menus, lists), a dialog's message, and the entries
+/// with their ids, `[51] "Copy" [52] check menu item "Wrap" {checked}`:
+/// a role is named where it differs from the entry before (from the
+/// usual one, for the first). At most SURFACE_ENTRIES entries and about
+/// SURFACE_CHARS characters; the rest is counted.
+pub fn surface_line<Id>(
+    root: &Info<Id>,
+    kind: Surface,
+    message: Option<&str>,
+    entries: &[(u64, &Info<Id>)],
+) -> String {
+    let mut out = root.role.clone();
+    let name = first_chars(&root.name.replace('\n', " "), 80);
+    if !name.trim().is_empty() {
+        out.push(' ');
+        out.push_str(&py_repr(name.trim()));
+    }
+    if kind != Surface::Dialog {
+        let n = entries.len();
+        out.push_str(&format!(
+            " ({n} {})",
+            if n == 1 { "entry" } else { "entries" }
+        ));
+    }
+    out.push(':');
+    if let Some(m) = message {
+        let m = m.replace('\n', " ");
+        let short = first_chars(&m, 120);
+        let cut = if short.len() < m.len() { "…" } else { "" };
+        out.push_str(&format!(" {}{cut}", json_str(&short)));
+    }
+    if entries.is_empty() {
+        out.push_str(" (no entries listed)");
+        return out;
+    }
+    let mut role = default_entry_role(kind);
+    for (i, (rid, info)) in entries.iter().enumerate() {
+        let mut item = format!(" [{rid}]");
+        if info.role != role {
+            role = info.role.as_str();
+            item.push(' ');
+            item.push_str(role);
+        }
+        let name = first_chars(&info.name.trim().replace('\n', " "), 60);
+        if !name.is_empty() {
+            item.push(' ');
+            item.push_str(&json_str(&name));
+        }
+        let states: Vec<&str> = info
+            .states
+            .iter()
+            .copied()
+            .filter(|s| ["checked", "selected", "disabled"].contains(s))
+            .collect();
+        if !states.is_empty() {
+            item.push_str(&format!(" {{{}}}", states.join(",")));
+        }
+        let left = entries.len() - i;
+        if i >= SURFACE_ENTRIES || out.chars().count() + item.chars().count() > SURFACE_CHARS {
+            out.push_str(&format!(" … +{left} more"));
+            break;
+        }
+        out.push_str(&item);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3301,5 +3516,72 @@ mod tests {
         let mut hidden = sample();
         hidden.get_mut("/h").unwrap().name = "other".into();
         assert_eq!(fp, fingerprint(&hidden, &["/w"]));
+    }
+
+    #[test]
+    fn surface_entries_skip_hidden_and_submenus_and_put_buttons_first() {
+        let mut c = Cache::new();
+        c.insert(
+            "/m",
+            node("popup menu", "", true, &[], &["/a", "/sep", "/sub", "/h"]),
+        );
+        c.insert("/a", node("menu item", "&Copy", true, &[], &[]));
+        c.insert("/sep", node("separator", "", true, &[], &[]));
+        c.insert("/sub", node("menu", "More", true, &[], &["/inner"]));
+        c.insert("/h", node("menu item", "Hidden", false, &[], &[]));
+        let (l, missing) = surface_entries(&c, &"/m", Surface::Menu);
+        assert_eq!(l.entries, vec!["/a", "/sub"]);
+        assert!(missing.is_empty());
+        c.insert(
+            "/d",
+            node("dialog", "Quit?", true, &[], &["/q", "/f", "/box"]),
+        );
+        c.insert("/q", node("label", "Really quit?", true, &[], &[]));
+        c.insert("/f", node("check box", "Don't ask again", true, &[], &[]));
+        c.insert("/box", node("panel", "", true, &[], &["/ok", "/no"]));
+        c.insert("/ok", node("push button", "Quit", true, &[], &[]));
+        let (l, missing) = surface_entries(&c, &"/d", Surface::Dialog);
+        assert_eq!(l.entries, vec!["/ok", "/f"]);
+        assert_eq!(l.message.as_deref(), Some("Really quit?"));
+        assert_eq!(missing, vec!["/no"]);
+    }
+
+    #[test]
+    fn a_surface_line_names_roles_once_and_is_capped() {
+        let root = node("popup menu", "", true, &[], &[]);
+        let items: Vec<Info<&str>> = (0..20)
+            .map(|i| node("menu item", &format!("Entry {i}"), true, &[], &[]))
+            .collect();
+        let entries: Vec<(u64, &Info<&str>)> = items
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (i as u64 + 1, n))
+            .collect();
+        let line = surface_line(&root, Surface::Menu, None, &entries);
+        assert!(
+            line.starts_with("popup menu (20 entries): [1] \"Entry 0\" [2] \"Entry 1\""),
+            "{line}"
+        );
+        assert!(line.ends_with("[12] \"Entry 11\" … +8 more"), "{line}");
+        let long: Vec<Info<&str>> = (0..10)
+            .map(|i| {
+                node(
+                    "push button",
+                    &format!("{i}{}", "x".repeat(200)),
+                    true,
+                    &[],
+                    &[],
+                )
+            })
+            .collect();
+        let entries: Vec<(u64, &Info<&str>)> = long.iter().map(|n| (1, n)).collect();
+        let dialog = node("alert", "Error", true, &[], &[]);
+        let line = surface_line(&dialog, Surface::Dialog, Some("Disk full"), &entries);
+        assert!(
+            line.starts_with("alert 'Error': \"Disk full\" [1] push button \"0x"),
+            "{line}"
+        );
+        assert!(line.chars().count() < SURFACE_CHARS + 40, "{line}");
+        assert!(line.ends_with("more"), "{line}");
     }
 }

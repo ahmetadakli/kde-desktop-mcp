@@ -359,6 +359,10 @@ struct Server<B: Backend> {
     last_active: Mutex<Option<String>>,
     /// The window in front after the last input, for `window_change_note`.
     seen_active: Mutex<Option<String>>,
+    /// Ids of the surfaces (menus, dialogs) last listed without change
+    /// events (`Server::surfaces_note` scans then), so one still open is
+    /// not listed again.
+    seen_surfaces: Mutex<Vec<u64>>,
     /// Maps pixels of the last screenshot to screen coordinates.
     last_shot: Mutex<Option<ShotMap>>,
     /// Held by tools that send keyboard or pointer input, so two concurrent
@@ -493,6 +497,13 @@ struct Gate {
     /// The change mark taken before the input of a call whose reply a
     /// batch tests, until `Server::settle` waited for it.
     settle: Option<u64>,
+    /// The input is likely to open a menu, list or dialog (a click on a
+    /// combo box or menu entry): its reply waits for one to show.
+    opener: bool,
+    /// The reply lists what opened already (`menu` listing a submenu).
+    quiet: bool,
+    /// Ids of the surfaces this call's reply listed already.
+    reported: Vec<u64>,
 }
 
 tokio::task_local! {
@@ -1347,6 +1358,7 @@ impl<B: Backend> Server<B> {
             allow_file,
             last_active: Mutex::new(None),
             seen_active: Mutex::new(None),
+            seen_surfaces: Mutex::new(Vec::new()),
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
@@ -2336,6 +2348,209 @@ impl<B: Backend> Server<B> {
         format!("; active window now {}", render::short_title(&now))
     }
 
+    /// "\nopened: …" for what an input without `observe` opened: when it is
+    /// likely to open something (`opens_surface`, a click on an
+    /// OPENER_ROLES element) it first waits up to SETTLE_MS for a menu,
+    /// list or dialog to show; otherwise only what showed already counts.
+    async fn opened_note(&self, tool: &str, a: &Json, mark: u64) -> String {
+        let opener =
+            opens_surface(tool, a) || GATE.try_with(|g| g.borrow().opener).unwrap_or(false);
+        if opener {
+            let wait = Duration::from_millis(SETTLE_MS as u64);
+            trace::time("wait_shown", self.b.wait_shown(&[], mark, wait)).await;
+        }
+        self.surfaces_note(mark, opener).await
+    }
+
+    /// "\nopened: …" lines for the menus, popups, combo box lists and
+    /// dialogs of allowed apps shown since `mark`, with their entries' ids
+    /// (`surfaces`). No round trip when nothing was shown. Without such
+    /// events (`shown_since` None), only with `scan`: the active app's
+    /// windows are looked at, and what the last scan listed is not again.
+    async fn surfaces_note(&self, mark: u64, scan: bool) -> String {
+        if GATE.try_with(|g| g.borrow().quiet).unwrap_or(false) {
+            return String::new();
+        }
+        let (candidates, scanned) = match self.b.shown_since(mark) {
+            Some(shown) if shown.is_empty() => return String::new(),
+            Some(mut shown) => {
+                if shown.len() > SURFACE_CANDIDATES {
+                    let half = SURFACE_CANDIDATES / 2;
+                    shown.drain(half..shown.len() - half);
+                }
+                (shown, false)
+            }
+            None if scan => {
+                let app = self.b.active_app().await;
+                if app.is_empty() || !self.is_allowed(&app) {
+                    return String::new();
+                }
+                match self.b.app_windows(&app.to_lowercase()).await {
+                    Some(windows) => (windows, true),
+                    None => return String::new(),
+                }
+            }
+            None => return String::new(),
+        };
+        self.surfaces(candidates, scanned, false)
+            .await
+            .iter()
+            .map(|l| format!("\nopened: {l}"))
+            .collect()
+    }
+
+    /// A line (`render::surface_line`) for each surface among `candidates`
+    /// (elements shown lately, or windows): a menu, a combo box's list or
+    /// a dialog of an allowed app, still showing, with entries (dialogs
+    /// may have none), and not listed by this call already. `scanned`:
+    /// the candidates are windows looked at without change events; one the
+    /// last scan listed is left out. `any_app`: the app the candidates
+    /// belong to is allowed already (its windows).
+    async fn surfaces(&self, candidates: Vec<B::Id>, scanned: bool, any_app: bool) -> Vec<String> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        // The app of each candidate, asked once per app.
+        let mut firsts: Vec<(Option<String>, B::Id)> = Vec::new();
+        for c in &candidates {
+            let key = self.b.app_key(c);
+            if !firsts.iter().any(|(k, _)| *k == key) {
+                firsts.push((key, c.clone()));
+            }
+        }
+        let names =
+            futures_util::future::join_all(firsts.iter().map(|(_, c)| self.b.app_name(c))).await;
+        let active = match names.iter().any(Option::is_none) {
+            true => self.b.active_app().await,
+            false => String::new(),
+        };
+        let apps: Vec<(Option<String>, String)> = firsts
+            .into_iter()
+            .zip(names)
+            .map(|((k, _), n)| (k, n.unwrap_or_else(|| active.clone()).to_lowercase()))
+            .collect();
+        let candidates: Vec<(B::Id, String)> = candidates
+            .into_iter()
+            .filter_map(|c| {
+                let key = self.b.app_key(&c);
+                let app = apps.iter().find(|(k, _)| *k == key)?.1.clone();
+                (any_app || (!app.is_empty() && self.is_allowed(&app))).then_some((c, app))
+            })
+            .collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let roles =
+            futures_util::future::join_all(candidates.iter().map(|(c, _)| self.b.identity(c)))
+                .await;
+        let mut picked: Vec<(B::Id, String, render::Surface)> = candidates
+            .into_iter()
+            .zip(roles)
+            .filter_map(|((c, app), (role, _))| Some((c, app, render::surface_kind(&role)?)))
+            .collect();
+        // A list counts only under a combo box.
+        let keep = futures_util::future::join_all(picked.iter().map(|(c, _, kind)| async move {
+            if *kind != render::Surface::List {
+                return true;
+            }
+            match self.b.parent(c).await {
+                Some(p) => self.b.identity(&p).await.0 == "combo box",
+                None => false,
+            }
+        }))
+        .await;
+        let mut keep = keep.into_iter();
+        picked.retain(|_| keep.next().unwrap_or(false));
+        // Dialogs first: what they hold is not listed again on its own.
+        picked.sort_by_key(|(_, _, kind)| match kind {
+            render::Surface::Dialog => 0,
+            render::Surface::Menu => 1,
+            render::Surface::List => 2,
+        });
+        let reported = GATE
+            .try_with(|g| g.borrow().reported.clone())
+            .unwrap_or_default();
+        let seen = match scanned {
+            true => self.seen_surfaces.lock().await.clone(),
+            false => Vec::new(),
+        };
+        let mut cache = Cache::new();
+        let mut found = Vec::new();
+        let mut lines = Vec::new();
+        for (id, app, kind) in picked {
+            if lines.len() >= SURFACE_MAX {
+                break;
+            }
+            // Inside a surface read already.
+            if cache.contains_key(&id) {
+                continue;
+            }
+            let listed = self.surface_entries(&mut cache, &id, kind).await;
+            let Some(root) = cache.get(&id) else {
+                continue;
+            };
+            if !root.showing || (kind != render::Surface::Dialog && listed.entries.is_empty()) {
+                continue;
+            }
+            let rid = self.add_ref(&id, root, &app).await;
+            found.push(rid);
+            if reported.contains(&rid) || seen.contains(&rid) {
+                continue;
+            }
+            let mut items = Vec::new();
+            for (i, e) in listed.entries.iter().enumerate() {
+                // Ids only for the entries the line can show.
+                let rid = match i < render::SURFACE_ENTRIES {
+                    true => self.add_ref(e, &cache[e], &app).await,
+                    false => 0,
+                };
+                items.push((rid, &cache[e]));
+            }
+            lines.push(render::surface_line(
+                root,
+                kind,
+                listed.message.as_deref(),
+                &items,
+            ));
+        }
+        if scanned {
+            *self.seen_surfaces.lock().await = found.clone();
+        }
+        let _ = GATE.try_with(|g| g.borrow_mut().reported.extend(found));
+        lines
+    }
+
+    /// The entries of the surface `root` (`render::surface_entries`),
+    /// reading the showing nodes below it into `cache`; after
+    /// SURFACE_ROUNDS reads, what was found.
+    async fn surface_entries(
+        &self,
+        cache: &mut Cache<B::Id>,
+        root: &B::Id,
+        kind: render::Surface,
+    ) -> render::SurfaceEntries<B::Id> {
+        let fetch = Fetch {
+            only_showing: true,
+            text_limit: 0,
+            limit: SURFACE_NODES,
+            actions: false,
+            stop_roles: &[],
+            offscreen: false,
+        };
+        self.b
+            .prefetch_with(cache, vec![root.clone()], &fetch)
+            .await;
+        let mut round = 1;
+        loop {
+            let (listed, missing) = render::surface_entries(cache, root, kind);
+            if missing.is_empty() || round >= SURFACE_ROUNDS {
+                return listed;
+            }
+            self.b.prefetch_with(cache, missing, &fetch).await;
+            round += 1;
+        }
+    }
+
     /// Title of the active window, if any.
     async fn active_title(&self) -> Option<String> {
         self.b
@@ -2391,6 +2606,7 @@ impl<B: Backend> Server<B> {
             "; effect: {}",
             effect_text(&before, &after, events, is_allowed)
         );
+        text.push_str(&trace::time("surfaces", self.surfaces_note(mark, true)).await);
         if before.window != after.window
             && let Some((app, title)) = &after.window
             && is_allowed(app)
@@ -2624,15 +2840,27 @@ impl<B: Backend> Server<B> {
             }
         };
         let what = format!("{} [{}]", render::py_repr(&closed.title), closed.app);
-        let reply = if gone {
-            format!("closed {what}")
-        } else {
+        if gone {
+            return Ok(format!("closed {what}"));
+        }
+        // The app's dialogs (a save prompt), with their buttons' ids.
+        let windows = self
+            .b
+            .app_windows(&app.to_lowercase())
+            .await
+            .unwrap_or_default();
+        let shown = self.surfaces(windows, false, true).await;
+        Ok(if shown.is_empty() {
             format!(
                 "asked {what} to close; it is still open, probably asking whether to save \
                  changes (see apps, then find/act on its dialog)"
             )
-        };
-        Ok(reply)
+        } else {
+            format!(
+                "asked {what} to close; it is still open, showing {}",
+                shown.join("; ")
+            )
+        })
     }
 
     async fn launch(&self, a: &Json) -> R<String> {
@@ -3101,6 +3329,8 @@ impl<B: Backend> Server<B> {
             .await;
         let list = trail.is_empty() || render::is_submenu(&cache, &cache[&node]);
         if list {
+            // The listing is what opened.
+            let _ = GATE.try_with(|g| g.borrow_mut().quiet = true);
             let mut items = self.menu_entries(&mut cache, &node).await;
             if items.is_empty() && !trail.is_empty() {
                 items = self
@@ -3691,6 +3921,9 @@ impl<B: Backend> Server<B> {
             self.check_button_free(&button)?;
         }
         let (t, (x, y)) = self.target_center(a).await?;
+        if clicks > 0 && OPENER_ROLES.contains(&t.role.as_str()) {
+            let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
+        }
         self.with_modifiers(
             &mods,
             self.b.pointer(x as i64, y as i64, &button, clicks, 0),
@@ -4582,6 +4815,9 @@ impl<B: Backend> Server<B> {
             args: a.clone(),
             confirmed: false,
             settle: None,
+            opener: false,
+            quiet: false,
+            reported: Vec::new(),
         };
         Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
             let window = window_arg(name, a)?;
@@ -4655,6 +4891,9 @@ impl<B: Backend> Server<B> {
                 }
                 _ => String::new(),
             };
+            // Before the input: what shows after it was opened by it.
+            let shown_mark =
+                (observe.is_none() && SURFACE_TOOLS.contains(&name)).then(|| self.b.change_mark());
             let result = match name {
                 "apps" => self.apps().await.map(Out::from),
                 "tree" => self.tree(a).await,
@@ -4705,11 +4944,18 @@ impl<B: Backend> Server<B> {
                 // Without `observe`, still say when another window came to
                 // the front (a dialog, a new browser window).
                 (Ok(mut o), None, _) if WINDOW_NOTE_TOOLS.contains(&name) => {
+                    let opened = match shown_mark {
+                        Some(mark) => {
+                            trace::time("surfaces", self.opened_note(name, a, mark)).await
+                        }
+                        None => String::new(),
+                    };
                     if let Some(before) = pre_note.strip_prefix("; active window now ") {
                         o.text
                             .push_str(&format!("; before it, {before} had come to the front"));
                     }
                     o.text.push_str(&self.window_change_note().await);
+                    o.text.push_str(&opened);
                     Ok(o)
                 }
                 (result, _, _) => result,
@@ -4780,6 +5026,47 @@ const WINDOW_NOTE_TOOLS: [&str; 9] = [
     "drag",
     "file_dialog",
 ];
+
+/// Input tools that, without `observe`, list the menus, popups and dialogs
+/// the input opened (`Server::opened_note`); act, menu and close_window do
+/// it with their effect line.
+const SURFACE_TOOLS: [&str; 4] = ["click", "mouse", "key", "type_text"];
+
+/// Roles of elements a click on likely opens a menu, list or dialog with.
+const OPENER_ROLES: [&str; 4] = ["combo box", "push button menu", "menu", "menu item"];
+
+/// Whether an input is likely to open a menu, list or dialog, so its reply
+/// waits (up to SETTLE_MS) for one to show: a right click, the menu key,
+/// F10 or alt + a letter (menus), alt+down (a combo box's list), and the
+/// shortcuts that open, save, print or close documents (dialogs).
+fn opens_surface(tool: &str, a: &Json) -> bool {
+    match tool {
+        "click" | "mouse" => {
+            arg_s(a, "button", "left").eq_ignore_ascii_case("right") && arg_i(a, "clicks", 1) > 0
+        }
+        "key" => {
+            let keys = chord_keys(&arg_s(a, "combo", ""));
+            let k: Vec<&str> = keys.iter().map(String::as_str).collect();
+            match k.as_slice() {
+                ["menu"] | ["f10"] | ["shift", "f10"] | ["alt", "down"] | ["alt", "f4"] => true,
+                ["alt", c] => c.chars().count() == 1 && c.chars().all(char::is_alphanumeric),
+                ["ctrl", c] => ["o", "s", "w", "q", "p"].contains(c),
+                ["ctrl", "shift", "s"] | ["shift", "ctrl", "s"] => true,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// Most surfaces one reply lists.
+const SURFACE_MAX: usize = 3;
+/// Shown elements whose role is looked at: the oldest and the newest half
+/// (Qt says a dialog's widgets show before the dialog itself).
+const SURFACE_CANDIDATES: usize = 48;
+/// Nodes read below a surface per round, and rounds.
+const SURFACE_NODES: usize = 300;
+const SURFACE_ROUNDS: usize = 3;
 
 /// Tools that never call `Server::permit` (they reach no app, or only read
 /// with a tier every allowed app has); `call_inner` handles their
@@ -5148,6 +5435,39 @@ mod tests {
         /// Elements' windows are not in front: as on KDE and Hyprland,
         /// `element_center` then fails for every element with an area.
         background: Rc<std::cell::Cell<bool>>,
+        /// What inputs show: see `FakeShown`.
+        shown: Rc<FakeShown>,
+    }
+
+    /// Elements the fake app shows (a menu or dialog opening) and the
+    /// events it sends for them.
+    #[derive(Default)]
+    struct FakeShown {
+        /// `shown_since` hears of them (else None: callers scan).
+        live: std::cell::Cell<bool>,
+        /// The change sequence: `change_mark`.
+        seq: std::cell::Cell<u64>,
+        /// (sequence number, element) per shown event.
+        events: RefCell<Vec<(u64, u32)>>,
+        /// Elements the next input (click, key, action) shows.
+        next: RefCell<Vec<u32>>,
+        /// Parent of an element, by id.
+        parents: RefCell<HashMap<u32, u32>>,
+        /// `close_window` leaves the window open and opens this dialog
+        /// window; without it, the fake has no window control.
+        close_opens: std::cell::Cell<Option<u32>>,
+        /// `identity` calls so far.
+        identities: std::cell::Cell<u32>,
+    }
+
+    impl FakeShown {
+        /// The elements an input shows appear, with an event each.
+        fn input(&self) {
+            for id in self.next.take() {
+                self.seq.set(self.seq.get() + 1);
+                self.events.borrow_mut().push((self.seq.get(), id));
+            }
+        }
     }
 
     /// The fake's change events, for kept reads: off unless a test turns
@@ -5232,6 +5552,45 @@ mod tests {
                 _ => self.nodes.borrow().get(id).cloned().unwrap_or_default(),
             }
         }
+        async fn identity(&self, id: &u32) -> (String, String) {
+            let s = &self.shown;
+            s.identities.set(s.identities.get() + 1);
+            let info = self.info(id, 0).await;
+            (info.role, info.name)
+        }
+        fn change_mark(&self) -> u64 {
+            self.shown.seq.get()
+        }
+        fn shown_since(&self, mark: u64) -> Option<Vec<u32>> {
+            let s = &self.shown;
+            s.live.get().then(|| {
+                let mut out: Vec<u32> = Vec::new();
+                for (n, id) in s.events.borrow().iter() {
+                    if *n > mark && !out.contains(id) {
+                        out.push(*id);
+                    }
+                }
+                out
+            })
+        }
+        async fn parent(&self, id: &u32) -> Option<u32> {
+            self.shown.parents.borrow().get(id).copied()
+        }
+        async fn close_window(&self, query: &str, allowed: &[String]) -> R<WindowGeo> {
+            let dialog = self
+                .shown
+                .close_opens
+                .get()
+                .ok_or(backend::NO_WINDOW_CONTROL)?;
+            let list = self.windows(query, allowed).await?;
+            let [w] = list.as_slice() else {
+                return Err(backend::not_one_window(query, &list));
+            };
+            self.more_windows.borrow_mut().push(dialog);
+            self.shown.next.borrow_mut().push(dialog);
+            self.shown.input();
+            Ok(w.clone())
+        }
         fn read_mark(&self) -> Option<u64> {
             self.reads.live.get().then(|| self.reads.changes.get())
         }
@@ -5295,6 +5654,7 @@ mod tests {
             self.keys
                 .borrow_mut()
                 .push(format!("action {index} on {id}"));
+            self.shown.input();
             let mut nodes = self.nodes.borrow_mut();
             if let Some(n) = nodes.get_mut(id)
                 && n.role == "menu"
@@ -5342,6 +5702,7 @@ mod tests {
         }
         async fn press_combo(&self, combo: &str) -> R<()> {
             self.keys.borrow_mut().push(format!("down {combo}"));
+            self.shown.input();
             // A list whose focused "Item N" moves down.
             let down = |focus: &RefCell<Info<u32>>| {
                 let mut focus = focus.borrow_mut();
@@ -5402,6 +5763,7 @@ mod tests {
                 self.keys
                     .borrow_mut()
                     .push(format!("click {button} x{clicks}"));
+                self.shown.input();
             }
             if scroll != 0 {
                 self.keys.borrow_mut().push(format!("scroll {scroll}"));
@@ -5527,6 +5889,7 @@ mod tests {
         more_windows: Rc<RefCell<Vec<u32>>>,
         no_area: Rc<RefCell<Vec<u32>>>,
         background: Rc<std::cell::Cell<bool>>,
+        shown: Rc<FakeShown>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -5561,7 +5924,9 @@ mod tests {
         let more_windows = Rc::new(RefCell::new(Vec::new()));
         let no_area = Rc::new(RefCell::new(Vec::new()));
         let background = Rc::new(std::cell::Cell::new(false));
+        let shown = Rc::new(FakeShown::default());
         let server = Rc::new(Server::new(FakeBackend {
+            shown: shown.clone(),
             lag: lag.clone(),
             reveal: reveal.clone(),
             more_windows: more_windows.clone(),
@@ -5597,6 +5962,7 @@ mod tests {
             more_windows,
             no_area,
             background,
+            shown,
         }
     }
 
@@ -7310,6 +7676,204 @@ mod tests {
             assert!(reply_text(&r).ends_with(&want), "{r}");
             let r = call_tool(&mut s, 4, "key", json!({"combo": "c"})).await;
             assert!(!reply_text(&r).contains("active window now"), "{r}");
+        });
+    }
+
+    /// A context menu (40) with Copy, Paste, a checked Wrap entry and a
+    /// separator; a save dialog (60) asking with Save, Discard and Cancel;
+    /// a combo box (69) whose list (70) holds two entries.
+    fn fake_surfaces(s: &Session) {
+        let mut nodes = s.nodes.borrow_mut();
+        nodes.insert(40, fake_node("popup menu", "", &[41, 42, 43, 44]));
+        nodes.insert(41, fake_node("menu item", "Copy", &[]));
+        nodes.insert(42, fake_node("menu item", "Paste", &[]));
+        let mut wrap = fake_node("check menu item", "Wrap", &[]);
+        wrap.states = vec!["checked"];
+        nodes.insert(43, wrap);
+        nodes.insert(44, fake_node("separator", "", &[]));
+        nodes.insert(60, fake_node("dialog", "Save?", &[61, 62, 63, 64]));
+        nodes.insert(61, fake_node("label", "Save changes to notes.txt?", &[]));
+        nodes.insert(62, fake_node("push button", "Save", &[]));
+        nodes.insert(63, fake_node("push button", "Discard", &[]));
+        nodes.insert(64, fake_node("push button", "Cancel", &[]));
+        nodes.insert(69, fake_node("combo box", "Encoding", &[70]));
+        nodes.insert(70, fake_node("list", "", &[71, 72]));
+        nodes.insert(71, fake_node("list item", "UTF-8", &[]));
+        nodes.insert(72, fake_node("list item", "Latin-1", &[]));
+        nodes.insert(80, fake_node("label", "Saved", &[]));
+        s.shown.parents.borrow_mut().insert(70, 69);
+        s.shown.live.set(true);
+    }
+
+    /// The id printed just before `"label"` in `text`.
+    fn id_before(text: &str, label: &str) -> i64 {
+        let at = text.find(&format!("\"{label}\"")).expect(text);
+        let open = text[..at].rfind('[').expect(text);
+        text[open + 1..].split(']').next().unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn a_right_click_lists_the_context_menu_it_opened() {
+        local(async {
+            let mut s = session("surface-menu");
+            fake_surfaces(&s);
+            let id = focus_id(&mut s, 2).await;
+            // The menu and its entries each say they show.
+            s.shown.next.borrow_mut().extend([40, 41, 42, 43]);
+            let r = call_tool(&mut s, 3, "click", json!({"id": id, "button": "right"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nopened: popup menu (3 entries): ["),
+                "{text}"
+            );
+            assert!(
+                text.contains("\"Paste\" [")
+                    && text.contains("] check menu item \"Wrap\" {checked}"),
+                "{text}"
+            );
+            assert_eq!(text.matches("opened:").count(), 1, "{text}");
+            // Its ids work as they are.
+            let copy = id_before(text, "Copy");
+            let r = call_tool(&mut s, 4, "act", json!({"id": copy})).await;
+            assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
+            assert!(s.keys.borrow().iter().any(|k| k == "action 0 on 41"));
+            // Nothing opened by the action: nothing listed.
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn act_key_and_a_combo_click_list_what_they_opened() {
+        local(async {
+            let mut s = session("surface-kinds");
+            fake_surfaces(&s);
+            let id = focus_id(&mut s, 2).await;
+            // An action that opens a menu: listed after the effect line.
+            s.shown.next.borrow_mut().push(40);
+            let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
+            let text = reply_text(&r);
+            assert!(text.contains("; effect: "), "{text}");
+            assert!(
+                text.contains("\nopened: popup menu (3 entries): "),
+                "{text}"
+            );
+            // A shortcut that opens a dialog: its question and buttons,
+            // buttons named once by role.
+            s.shown.next.borrow_mut().extend([62, 63, 64, 60]);
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "ctrl+s"})).await;
+            let text = reply_text(&r);
+            let at = text.find("\nopened: dialog 'Save?': ").expect(text);
+            let line = &text[at..];
+            assert!(
+                line.contains("\"Save changes to notes.txt?\" [")
+                    && line.contains("] push button \"Save\" [")
+                    && line.contains("] \"Discard\" [")
+                    && line.contains("] \"Cancel\""),
+                "{line}"
+            );
+            // Its buttons were not listed again on their own.
+            assert_eq!(text.matches("opened:").count(), 1, "{text}");
+            // A combo box's list, shown by a plain click on the combo box.
+            let r = call_tool(&mut s, 5, "find", json!({"app": "fake", "query": "OK"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            s.focus.borrow_mut().role = "combo box".into();
+            s.shown.next.borrow_mut().push(70);
+            let r = call_tool(&mut s, 6, "click", json!({"app": "fake", "query": "OK"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nopened: list (2 entries): [") && text.contains("\"Latin-1\""),
+                "{text}"
+            );
+            // A list outside a combo box is no surface.
+            s.shown.parents.borrow_mut().clear();
+            s.shown.next.borrow_mut().push(70);
+            let r = call_tool(&mut s, 7, "click", json!({"app": "fake", "query": "OK"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn nothing_opened_costs_no_reads_and_adds_nothing() {
+        local(async {
+            let mut s = session("surface-none");
+            fake_surfaces(&s);
+            let id = focus_id(&mut s, 2).await;
+            let (ids, reads) = (s.shown.identities.get(), s.reads.prefetches.get());
+            // No event: no read beyond the id's own check.
+            let r = call_tool(&mut s, 3, "click", json!({"id": id})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "ctrl+s"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            let r = call_tool(&mut s, 5, "type_text", json!({"text": "x"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            assert_eq!(s.shown.identities.get(), ids + 1);
+            assert_eq!(s.reads.prefetches.get(), reads);
+            // Something shown that is no menu or dialog: its role is read,
+            // nothing more.
+            s.shown.next.borrow_mut().push(80);
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "a"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            assert_eq!(s.shown.identities.get(), ids + 2);
+            assert_eq!(s.reads.prefetches.get(), reads);
+            // A menu that closed again before the reply is not listed.
+            s.nodes.borrow_mut().get_mut(&40).unwrap().showing = false;
+            s.shown.next.borrow_mut().push(40);
+            let r = call_tool(
+                &mut s,
+                7,
+                "mouse",
+                json!({"x": 5, "y": 5, "button": "right"}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn without_events_likely_openers_scan_the_app_windows_once() {
+        local(async {
+            let mut s = session("surface-scan");
+            fake_surfaces(&s);
+            s.shown.live.set(false);
+            s.more_windows.borrow_mut().push(60);
+            // A plain key looks at nothing.
+            let ids = s.shown.identities.get();
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            assert_eq!(s.shown.identities.get(), ids);
+            // One that may open a dialog looks at the app's windows.
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "ctrl+s"})).await;
+            assert!(reply_text(&r).contains("\nopened: dialog 'Save?': "), "{r}");
+            // Still open: not listed again.
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "ctrl+o"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn close_window_lists_the_save_prompt_it_left_open() {
+        local(async {
+            let mut s = session("surface-close");
+            fake_surfaces(&s);
+            s.shown.close_opens.set(Some(60));
+            let r = call_tool(
+                &mut s,
+                2,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("still open, showing dialog 'Save?': \"Save changes to notes.txt?\"")
+                    && text.contains("] push button \"Save\" ["),
+                "{text}"
+            );
+            // Listed once, not again after the effect line.
+            assert!(!text.contains("opened:"), "{text}");
+            let save = id_before(text, "Save");
+            let r = call_tool(&mut s, 3, "act", json!({"id": save})).await;
+            assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
         });
     }
 

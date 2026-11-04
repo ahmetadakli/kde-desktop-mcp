@@ -1088,6 +1088,26 @@ impl Backend for LinuxBackend {
         self.a11y.changed_since(&buses, mark)
     }
 
+    fn shown_since(&self, mark: u64) -> Option<Vec<Obj>> {
+        self.a11y.shown_since(mark)
+    }
+
+    async fn wait_shown(&self, near: &[Obj], mark: u64, timeout: Duration) -> bool {
+        let mut buses: Vec<&str> = near.iter().map(|o| o.bus.as_ref()).collect();
+        buses.sort_unstable();
+        buses.dedup();
+        self.a11y.wait_shown(&buses, mark, timeout).await
+    }
+
+    async fn app_name(&self, id: &Obj) -> Option<String> {
+        let name = self.a11y.name(&Self::app_of(id)).await;
+        (!name.is_empty()).then_some(name)
+    }
+
+    async fn parent(&self, id: &Obj) -> Option<Obj> {
+        self.a11y.parent(id).await
+    }
+
     fn read_mark(&self) -> Option<u64> {
         self.a11y.read_mark()
     }

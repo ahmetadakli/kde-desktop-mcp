@@ -114,10 +114,10 @@ stop and ask them; once they agree, a standalone activate_window call resumes in
 that appears or goes away (gone=true), a state or a window; never as a sleep. \
 tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
-view, instead of a separate look. Failures end with the active \
-window and focus.
+view. Menus, lists and dialogs an input opened come back with ids (`opened:`). Failures \
+end with the active window and focus.
 - menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
-- screenshot is a last resort (the image comes inline). To click something seen \
+- screenshot is a last resort (inline image). To click something seen \
 only in it, pass its pixels to mouse as image_x/image_y; `region`=[x, y, w, h] zooms in.
 
 Allowlist: only apps in the user's allowlist file can be read, activated or sent input, and \
@@ -125,7 +125,7 @@ input only goes to an allowed active window. An app may be limited to a tier: vi
 (read only) or click (no typing or keys). When a refusal says to, ask the user and retry with \
 confirm: true only if they agree. Password fields are never read, and filled in only if the \
 user allowed it. Errors name the file; changing it is the user's decision. When tools fail \
-as if the setup were broken (AT-SPI, virtual input, KWin, screenshots), run doctor.
+as if the setup were broken (AT-SPI, input, KWin), run doctor.
 
 Clients loading schemas on demand: load these in one search: batch, find, \
 act, activate_window, key, type_text, wait_for, wait_idle, screenshot, apps.";
@@ -274,7 +274,7 @@ pub fn tools() -> Json {
         t(
             "act",
             &d(
-                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nThe effect line says when the active window changed (e.g. a dialog opened)."
+                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nThe effect line says when the active window changed; a menu, combo box\nlist or dialog the action opened follows with its entries' ids (opened: …)."
             ),
             target(&[("action", "string", Some(json!("")))])
         ),
@@ -305,7 +305,7 @@ pub fn tools() -> Json {
         t(
             "click",
             &d(
-                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. `button`: left, right or middle;\n`clicks`: 2 = double, 3 = triple (select a line). `modifiers` are held\nduring the click, e.g. [\"ctrl\"] to add to a selection, [\"shift\"] for a\nrange. To see what the click opened, use wait_for."
+                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. `button`: left, right or middle;\n`clicks`: 2 = double, 3 = triple (select a line). `modifiers` are held\nduring the click, e.g. [\"ctrl\"] to add to a selection, [\"shift\"] for a\nrange. A menu, combo box list or dialog the click opened is listed with its\nentries' ids (opened: …); a right click, or one on a combo box or menu\nentry, waits up to 150 ms for one to show."
             ),
             target(&[
                 ("button", "string", Some(json!("left"))),
@@ -366,7 +366,7 @@ pub fn tools() -> Json {
         ),
         t(
             "key",
-            "Press a key or chord in the active window, e.g. \"ctrl+s\", \"alt+tab\", \"enter\",\n\"f5\", \"left\". Only sent when the active window belongs to an allowed app.\nThe reply names the element that has focus afterwards. To wait for what a\nkey opens or closes (a dialog), use wait_for.",
+            "Press a key or chord in the active window, e.g. \"ctrl+s\", \"alt+tab\", \"enter\",\n\"f5\", \"left\". Only sent when the active window belongs to an allowed app.\nThe reply names the element that has focus afterwards, and a menu or dialog\nit opened with its entries' ids (opened: …); keys that usually open one\n(menu, shift+f10, f10, alt+letter, alt+down, ctrl+o/s/p/w/q) wait up to\n150 ms for it. For a slower dialog use wait_for.",
             schema(&[
                 ("combo", "string", None),
                 ("repeat", "integer", Some(json!(1)))
@@ -389,7 +389,7 @@ pub fn tools() -> Json {
         ),
         t(
             "mouse",
-            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple; `button` left, right or middle) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags.",
+            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple; `button` left, right or middle) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. A right click lists the menu it opened with ids (opened: …).",
             schema(&[
                 ("x", "integer", Some(Json::Null)),
                 ("y", "integer", Some(Json::Null)),
@@ -443,7 +443,7 @@ pub fn tools() -> Json {
         ),
         t(
             "close_window",
-            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes, which the reply then says. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma and\nHyprland.",
+            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes: the reply then lists that dialog\nwith its buttons' ids. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma and\nHyprland.",
             schema(&[
                 ("query", "string", None),
                 ("confirm", "boolean", Some(json!(false))),
@@ -451,7 +451,7 @@ pub fn tools() -> Json {
         ),
         t(
             "menu",
-            "Use an app's menu bar by labels, in one call: `path` is a list\n([\"File\", \"Save As…\"]) or one string (\"File > Save As\"), in the app's\nlanguage. Labels match case-insensitively, without & or _ markers or a\ntrailing ellipsis; a unique part is enough. The last entry's action runs\n(the reply notes a dialog it opened). Without `path`, lists the top\nlevel; a path ending at a submenu lists its entries with ids instead.\nWorks on the active window's menu bar even when hidden behind a\nhamburger button (KDE apps). Firefox lists a menu's entries only while\nit is open: open it with key (e.g. alt+f) first.",
+            "Use an app's menu bar by labels, in one call: `path` is a list\n([\"File\", \"Save As…\"]) or one string (\"File > Save As\"), in the app's\nlanguage. Labels match case-insensitively, without & or _ markers or a\ntrailing ellipsis; a unique part is enough. The last entry's action runs\n(the reply lists a dialog it opened, with ids). Without `path`, lists the top\nlevel; a path ending at a submenu lists its entries with ids instead.\nWorks on the active window's menu bar even when hidden behind a\nhamburger button (KDE apps). Firefox lists a menu's entries only while\nit is open: open it with key (e.g. alt+f) first.",
             schema(&[("app", "string", None), ("path", "array", Some(Json::Null)),])
         ),
         t(
@@ -530,7 +530,7 @@ pub fn tools() -> Json {
                 "type": "string",
                 "enum": OBSERVE_KINDS,
                 "default": "none",
-                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds nothing and costs nothing; act, menu and close_window report the effect line by default."
+                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds no effect line or view (click, key, mouse and type_text still list a menu or dialog they opened, at no cost when none did); act, menu and close_window report the effect line, and what opened, by default."
             });
             props["settle_ms"] = json!({
                 "type": "integer",
