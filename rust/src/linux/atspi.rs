@@ -221,6 +221,9 @@ pub struct A11y {
     /// Which apps changed in any way a read sees (all the events above and
     /// READ_EVENTS), for reusing a read of an app's tree.
     reads: Changes,
+    /// Elements lately shown or created (a menu, popup or dialog that
+    /// opened), for reporting what an input opened.
+    shown: Shown,
 }
 
 impl A11y {
@@ -250,6 +253,7 @@ impl A11y {
             effects: tokio::sync::broadcast::channel(64).0,
             changes: Changes::default(),
             reads: Changes::default(),
+            shown: Shown::default(),
         })
     }
 
@@ -363,22 +367,7 @@ impl A11y {
             |a11y, sender, path, msg| {
                 a11y.note_effect(sender);
                 a11y.reads.note(sender, false);
-                let gained = msg
-                    .body()
-                    .deserialize::<(String, i32, i32, OwnedValue)>()
-                    .map(|(_, d1, _, _)| d1)
-                    .or_else(|_| {
-                        msg.body()
-                            .deserialize::<(
-                                String,
-                                i32,
-                                i32,
-                                OwnedValue,
-                                HashMap<String, OwnedValue>,
-                            )>()
-                            .map(|(_, d1, _, _, _)| d1)
-                    });
-                if gained == Ok(1) {
+                if state_gained(msg) {
                     a11y.note_focus(Obj::new(sender, path.clone().into()));
                 }
             },
@@ -393,16 +382,58 @@ impl A11y {
     pub async fn track_actions(self: &Arc<Self>) -> R<()> {
         let all = EFFECT_EVENTS.map(|(event, iface, member, arg0)| {
             let window = event.starts_with("window:");
-            self.listen(event, iface, member, arg0, move |a11y, sender, _, _| {
-                a11y.note_effect(sender);
-                a11y.changes.note(sender, window);
-                a11y.reads.note(sender, window);
-            })
+            let created = event == "window:create";
+            self.listen(
+                event,
+                iface,
+                member,
+                arg0,
+                move |a11y, sender, path, msg| {
+                    a11y.note_effect(sender);
+                    let n = a11y.changes.note(sender, window);
+                    a11y.reads.note(sender, window);
+                    // A window created, or an element now showing (not hidden).
+                    if created || (!window && state_gained(msg)) {
+                        a11y.shown.note(n, Obj::new(sender, path.clone().into()));
+                    }
+                },
+            )
         });
-        futures_util::future::join_all(all)
+        let done: R<()> = futures_util::future::join_all(all)
             .await
             .into_iter()
-            .collect()
+            .collect();
+        if done.is_ok() {
+            self.shown
+                .live
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+        done
+    }
+
+    /// Elements shown or created after `mark` (`change_mark`), oldest
+    /// first, without repeats; None while the events are not listened to.
+    pub fn shown_since(&self, mark: u64) -> Option<Vec<Obj>> {
+        self.shown
+            .live
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .then(|| self.shown.since(mark, None))
+    }
+
+    /// Wait until an element of an app on `buses` (empty: any app) was
+    /// shown or created after `mark`, and the burst settled, or until
+    /// `timeout`; true when one was. Without the events, one poll interval.
+    pub async fn wait_shown(
+        &self,
+        buses: &[&str],
+        mark: u64,
+        timeout: std::time::Duration,
+    ) -> bool {
+        if !self.shown.live.load(std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(timeout.min(std::time::Duration::from_millis(50))).await;
+            return true;
+        }
+        self.shown.wait(buses, mark, timeout, CHANGE_SETTLE).await
     }
 
     /// Register `event` with the AT-SPI registry and run `on` (with the
@@ -1121,8 +1152,9 @@ impl Changes {
         self.seq.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Something on `bus` changed; `windows`: its windows, or the set of apps.
-    fn note(&self, bus: &str, windows: bool) {
+    /// Something on `bus` changed; `windows`: its windows, or the set of
+    /// apps. Returns the change's sequence number.
+    fn note(&self, bus: &str, windows: bool) -> u64 {
         let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
         let mut buses = self.buses.lock().unwrap();
         match buses.get(bus) {
@@ -1137,6 +1169,7 @@ impl Changes {
         if windows {
             self.windows.0.send_replace(n);
         }
+        n
     }
 
     /// The app on `bus` left: wake its waiters (a window is gone) and
@@ -1197,6 +1230,89 @@ impl Changes {
             }
         }
         // Let the burst finish, so one check sees all of it.
+        tokio::time::sleep_until((tokio::time::Instant::now() + settle).min(deadline)).await;
+        true
+    }
+}
+
+/// Whether a state-changed signal says the state was gained (detail1 1).
+fn state_gained(msg: &zbus::Message) -> bool {
+    let d1 = msg
+        .body()
+        .deserialize::<(String, i32, i32, OwnedValue)>()
+        .map(|(_, d1, _, _)| d1)
+        .or_else(|_| {
+            msg.body()
+                .deserialize::<(String, i32, i32, OwnedValue, HashMap<String, OwnedValue>)>()
+                .map(|(_, d1, _, _, _)| d1)
+        });
+    d1 == Ok(1)
+}
+
+/// Elements kept by `Shown`: a menu with its entries, or a dialog whose
+/// widgets each say they show, fits several times.
+const SHOWN_KEEP: usize = 256;
+
+/// The elements lately shown or created, with the change sequence number
+/// (`Changes::note`) of their event, so `shown_since` compares them with
+/// a `change_mark`.
+#[derive(Default)]
+struct Shown {
+    recent: Mutex<std::collections::VecDeque<(u64, Obj)>>,
+    /// Sequence number of the last one.
+    last: WatchCell,
+    /// The events are registered and listened to.
+    live: std::sync::atomic::AtomicBool,
+}
+
+impl Shown {
+    fn note(&self, n: u64, o: Obj) {
+        let mut recent = self.recent.lock().unwrap();
+        if recent.len() >= SHOWN_KEEP {
+            recent.pop_front();
+        }
+        recent.push_back((n, o));
+        drop(recent);
+        self.last.0.send_replace(n);
+    }
+
+    /// Elements noted after `mark`, of apps on `buses` when Some, oldest
+    /// first, each once.
+    fn since(&self, mark: u64, buses: Option<&[&str]>) -> Vec<Obj> {
+        let recent = self.recent.lock().unwrap();
+        let mut out: Vec<Obj> = Vec::new();
+        for (n, o) in recent.iter() {
+            if *n > mark
+                && buses.is_none_or(|b| b.is_empty() || b.contains(&o.bus.as_ref()))
+                && !out.contains(o)
+            {
+                out.push(o.clone());
+            }
+        }
+        out
+    }
+
+    /// See `A11y::wait_shown`.
+    async fn wait(
+        &self,
+        buses: &[&str],
+        mark: u64,
+        timeout: std::time::Duration,
+        settle: std::time::Duration,
+    ) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut watch = self.last.0.subscribe();
+        loop {
+            if !self.since(mark, Some(buses)).is_empty() {
+                break;
+            }
+            if tokio::time::timeout_at(deadline, watch.changed())
+                .await
+                .is_err()
+            {
+                return false;
+            }
+        }
         tokio::time::sleep_until((tokio::time::Instant::now() + settle).min(deadline)).await;
         true
     }
@@ -1463,6 +1579,55 @@ mod tests {
         let mark = changes.mark();
         changes.note(":1.9", true);
         assert!(changes.since(&[], mark));
+    }
+
+    fn obj(bus: &str, path: &str) -> Obj {
+        Obj::new(bus, OwnedObjectPath::try_from(path).unwrap())
+    }
+
+    #[test]
+    fn shown_elements_after_a_mark_are_listed_once_and_wake_waiters() {
+        use std::time::Duration;
+        let changes = Arc::new(Changes::default());
+        let shown = Arc::new(Shown::default());
+        shown.note(changes.note(":1.5", false), obj(":1.5", "/old"));
+        let mark = changes.mark();
+        assert!(shown.since(mark, None).is_empty());
+        let menu = obj(":1.5", "/menu");
+        shown.note(changes.note(":1.5", false), menu.clone());
+        shown.note(changes.note(":1.6", true), obj(":1.6", "/w"));
+        shown.note(changes.note(":1.5", false), menu.clone());
+        assert_eq!(
+            shown.since(mark, None),
+            vec![menu.clone(), obj(":1.6", "/w")]
+        );
+        assert_eq!(shown.since(mark, Some(&[":1.5"])), vec![menu.clone()]);
+        // A waiter for one app wakes on its element, not another app's.
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let mark = changes.mark();
+            let (feed, seq) = (shown.clone(), changes.clone());
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                feed.note(seq.note(":1.6", false), obj(":1.6", "/tip"));
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                feed.note(seq.note(":1.5", false), obj(":1.5", "/popup"));
+            });
+            let start = std::time::Instant::now();
+            let wait = Duration::from_millis(300);
+            let woke = shown
+                .wait(&[":1.5"], mark, wait, Duration::from_millis(5))
+                .await;
+            let ms = start.elapsed().as_millis();
+            assert!(woke && (45..200).contains(&ms), "{woke} {ms}");
+            // Nothing more: the wait runs out.
+            let mark = changes.mark();
+            let short = Duration::from_millis(40);
+            assert!(!shown.wait(&[], mark, short, Duration::ZERO).await);
+        });
     }
 
     #[test]
