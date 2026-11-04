@@ -3370,8 +3370,8 @@ impl<B: Backend> Server<B> {
                     Ok(Written::Typed)
                 } else {
                     Err(format!(
-                        "{e}; typing into it failed too (it took no focus in an allowed \
-                         active window)"
+                        "{e}, and it would not take the focus to be typed into (not the \
+                         field itself? find it by role, e.g. role \"text\"); nothing typed"
                     ))
                 }
             }
@@ -3440,6 +3440,10 @@ impl<B: Backend> Server<B> {
             text.push_str(&format!(
                 "\n… cut at character {next}; get_text with offset={next} reads on"
             ));
+        }
+        // An empty reply reads as "no output" to a client: say it.
+        if text.is_empty() && offset == 0 {
+            text = "(empty: the element has no text)".into();
         }
         Ok(match t.found {
             Some(d) => format!("{d}:\n{text}"),
