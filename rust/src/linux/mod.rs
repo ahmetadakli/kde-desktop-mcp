@@ -26,7 +26,7 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    Layout, NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    Layout, NO_AREA, NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -78,7 +78,7 @@ fn screen_center(
     }
     let (x, y, w, h) = ext?;
     if w <= 0 || h <= 0 {
-        return Err("element has no on-screen area".into());
+        return Err(NO_AREA.into());
     }
     let (gx, gy) = origin.clone()?;
     Ok((
@@ -625,7 +625,7 @@ impl LinuxBackend {
     /// window extents (GTK3) come out off by the shadow's width.
     async fn hypr_center(&self, active: Option<&Json>, id: &Obj) -> R<(i32, i32)> {
         let a11y = &self.a11y;
-        let no_area = || "element has no on-screen area".to_string();
+        let no_area = || NO_AREA.to_string();
         let Some(aw) = active else {
             return Err(NOT_ACTIVE.into());
         };
@@ -1316,7 +1316,7 @@ impl Backend for LinuxBackend {
         self.element_centers(std::slice::from_ref(id))
             .await
             .pop()
-            .unwrap_or_else(|| Err("element has no on-screen area".into()))
+            .unwrap_or_else(|| Err(NO_AREA.into()))
     }
 
     async fn element_center_in(&self, id: &Obj, frame: &Obj) -> R<(i32, i32)> {

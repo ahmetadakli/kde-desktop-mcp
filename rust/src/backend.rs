@@ -66,6 +66,11 @@ pub struct Fetch {
     pub offscreen: bool,
 }
 
+/// The error `element_center` gives for an element without an on-screen
+/// area (zero width or height): an input tool's query that names several
+/// elements leaves such ones out.
+pub const NO_AREA: &str = "element has no on-screen area";
+
 /// Window management the desktop does not offer (KDE and Hyprland do).
 pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma and Hyprland";
 

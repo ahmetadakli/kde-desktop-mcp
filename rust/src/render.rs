@@ -929,13 +929,48 @@ fn push_showing<'a, Id: Clone + Eq + Hash>(
     );
 }
 
-/// The element a query names: depth-first in document order over visible
-/// elements, the first whose name equals `query` (`fold`ed: case, Turkish
-/// i, whitespace) wins, else the first whose name or text contains it (or
-/// role, when `role` is given). Window, tab and page titles (TITLE_ROLES)
-/// count only when nothing else matches, and with `titles` false not at
-/// all. Last, the first whose name or text has every word of the query,
-/// accents aside. Ok(None) when nothing matches.
+/// Roles of a window that is a dialog: its elements beat those of the
+/// app's other windows (see `locate_all`).
+const DIALOG_ROLES: [&str; 4] = ["dialog", "alert", "file chooser", "color chooser"];
+
+/// Whether `info` is a dialog window (DIALOG_ROLES).
+pub fn is_dialog<Id>(info: &Info<Id>) -> bool {
+    DIALOG_ROLES.contains(&info.role.as_str())
+}
+
+/// What `locate_all` found.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Matches<Id> {
+    /// The best matches the tie-breaks left, in document order, each with
+    /// the window (one of the roots) it is in; never empty. More than one:
+    /// the query is ambiguous.
+    pub picked: Vec<(Id, Id)>,
+}
+
+impl<Id> Matches<Id> {
+    /// The element a read takes: the first one picked.
+    pub fn first(&self) -> &Id {
+        &self.picked[0].0
+    }
+}
+
+/// Keep the items `keep` holds for, when it holds for any (else all).
+fn narrow<T>(items: &mut Vec<T>, keep: impl Fn(&T) -> bool) {
+    if items.iter().any(&keep) {
+        items.retain(keep);
+    }
+}
+
+/// Number of different windows among `hits` (element, root index).
+fn window_count<Id>(hits: &[(&Id, usize)]) -> usize {
+    let mut w: Vec<usize> = hits.iter().map(|h| h.1).collect();
+    w.sort_unstable();
+    w.dedup();
+    w.len()
+}
+
+/// The first element `locate_all` picks, without a window hint.
+#[cfg(test)]
 pub fn locate<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     roots: &[Id],
@@ -943,14 +978,58 @@ pub fn locate<Id: Clone + Eq + Hash>(
     role: &str,
     titles: bool,
 ) -> Result<Option<Id>, Vec<Id>> {
+    locate_all(cache, roots, query, role, titles, "").map(|m| m.map(|m| m.first().clone()))
+}
+
+/// The elements `query` names best, depth-first in document order over
+/// visible elements: those whose name equals `query` (`fold`ed: case,
+/// Turkish i, whitespace), else those whose name or text contains it (or
+/// role, when `role` is given). Window, tab and page titles (TITLE_ROLES)
+/// count only when nothing else matches, and with `titles` false not at
+/// all. Last, those whose name or text has every word of the query, accents
+/// aside. Of these, the ones left after the tie-breaks, which apply in turn
+/// while the matches are in several windows of the app (`roots`):
+/// 1. the active window's elements beat those of its other windows;
+/// 2. those in a window whose title contains `window` (the tool's
+///    `window` argument; "" for none) beat the others;
+/// 3. those in a dialog (DIALOG_ROLES) beat those in other windows, and of
+///    several dialogs the one listed last (opened last) wins;
+///
+/// and then, wherever they are:
+/// 4. an element one operates (`interactive`: a button, an entry, a list
+///    item) beats one that only shows the name (a label, a list or
+///    heading named the same).
+///
+/// Ok(None) when nothing matches.
+pub fn locate_all<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+    query: &str,
+    role: &str,
+    titles: bool,
+    window: &str,
+) -> Result<Option<Matches<Id>>, Vec<Id>> {
     let q = Query::new(query);
-    // The first element of each rank.
-    let mut best: [Option<&Id>; 6] = Default::default();
+    // Matches per rank, with the index of their root.
+    let mut best: [Vec<(&Id, usize)>; 6] = Default::default();
     let mut missing = Vec::new();
-    let mut stack: Vec<&Id> = Vec::new();
-    push_showing(cache, roots, &mut stack, &mut missing);
+    let mut stack: Vec<(&Id, usize)> = Vec::new();
+    let showing = |ids: &'_ [Id], missing: &mut Vec<Id>| -> Vec<usize> {
+        let mut out = Vec::new();
+        for (i, o) in ids.iter().enumerate() {
+            match cache.get(o) {
+                Some(info) if info.showing => out.push(i),
+                Some(_) => {}
+                None => missing.push(o.clone()),
+            }
+        }
+        out
+    };
+    for i in showing(roots, &mut missing).into_iter().rev() {
+        stack.push((&roots[i], i));
+    }
     let mut seen = 0;
-    while let Some(id) = stack.pop() {
+    while let Some((id, w)) = stack.pop() {
         seen += 1;
         if seen > FIND_MAX_SEEN {
             break;
@@ -960,16 +1039,42 @@ pub fn locate<Id: Clone + Eq + Hash>(
         if let Some(hit) = matches(info, &q, role)
             && (titles || !title)
         {
-            let r = rank(hit, title);
-            if r == 0 {
-                return done(Some(id.clone()), missing);
-            }
-            best[r as usize].get_or_insert(id);
+            best[rank(hit, title) as usize].push((id, w));
         }
-        push_showing(cache, &info.children, &mut stack, &mut missing);
+        for i in showing(&info.children, &mut missing).into_iter().rev() {
+            stack.push((&info.children[i], w));
+        }
     }
-    let found = best.into_iter().flatten().next();
-    done(found.cloned(), missing)
+    let Some(mut hits) = best.into_iter().find(|b| !b.is_empty()) else {
+        return done(None, missing);
+    };
+    // Rules on the windows (by index in `roots`), in turn.
+    let fw = fold(window);
+    let windows: Vec<Option<&Info<Id>>> = roots.iter().map(|r| cache.get(r)).collect();
+    let rule = |f: &dyn Fn(&Info<Id>) -> bool| -> Vec<bool> {
+        windows.iter().map(|w| w.is_some_and(f)).collect()
+    };
+    let window_rules = [
+        rule(&|w| w.states.contains(&"active")),
+        rule(&|w| !fw.is_empty() && fold(&w.name).contains(&fw)),
+        rule(&|w| is_dialog(w)),
+    ];
+    for holds in &window_rules {
+        if window_count(&hits) > 1 {
+            narrow(&mut hits, |h| holds[h.1]);
+        }
+    }
+    let root = |w: usize| &cache[&roots[w]];
+    if window_count(&hits) > 1 && is_dialog(root(hits[0].1)) {
+        let last = hits.iter().map(|h| h.1).max().unwrap_or(0);
+        hits.retain(|h| h.1 == last);
+    }
+    narrow(&mut hits, |h| interactive(&cache[h.0]));
+    let picked = hits
+        .into_iter()
+        .map(|(id, w)| (id.clone(), roots[w].clone()))
+        .collect();
+    done(Some(Matches { picked }), missing)
 }
 
 /// Elements of `roots` that match `query` (and `role`) but are not
@@ -1958,6 +2063,99 @@ mod tests {
             locate(&cache, &["/w"], "x", "", true).unwrap_err(),
             vec!["/b2"]
         );
+    }
+
+    /// Ids of what `locate_all` picked, with their windows.
+    fn picked(
+        cache: &Cache<&'static str>,
+        roots: &[&'static str],
+        query: &str,
+        role: &str,
+        window: &str,
+    ) -> Vec<(&'static str, &'static str)> {
+        let m = locate_all(cache, roots, query, role, true, window)
+            .unwrap()
+            .unwrap();
+        m.picked
+    }
+
+    #[test]
+    fn locate_all_returns_every_tie_of_the_best_rank() {
+        let mut cache = sample();
+        cache.insert("/b3", node("push button", "Kaydet", true, &[], &[]));
+        cache.insert("/b4", node("push button", "Farklı Kaydet", true, &[], &[]));
+        cache.get_mut("/p").unwrap().children = vec!["/b4", "/b1", "/h", "/b3"];
+        // Exact names tie; the partial match and the hidden one do not count.
+        assert_eq!(
+            picked(&cache, &["/w"], "kaydet", "", ""),
+            vec![("/b1", "/w"), ("/b3", "/w")]
+        );
+        assert_eq!(
+            picked(&cache, &["/w"], "farklı", "", ""),
+            vec![("/b4", "/w")]
+        );
+        // Partial matches tie when nothing matches exactly.
+        assert_eq!(picked(&cache, &["/w"], "kayde", "", "").len(), 3);
+    }
+
+    /// Two windows of an app, each with a push button "OK": "/w1" (`r1`)
+    /// and "/w2" (`r2`, with `states`).
+    fn two_windows(r1: &str, r2: &str, states: &[&'static str]) -> Cache<&'static str> {
+        let mut c = Cache::new();
+        c.insert("/w1", node(r1, "notes.txt — Kate", true, &[], &["/a"]));
+        c.insert("/a", node("push button", "OK", true, &[], &[]));
+        c.insert("/w2", node(r2, "todo.txt — Kate", true, states, &["/b"]));
+        c.insert("/b", node("push button", "OK", true, &[], &[]));
+        c
+    }
+
+    #[test]
+    fn the_active_window_then_the_window_hint_break_ties_between_windows() {
+        let roots = ["/w1", "/w2"];
+        let cache = two_windows("frame", "frame", &["active"]);
+        assert_eq!(picked(&cache, &roots, "ok", "", ""), vec![("/b", "/w2")]);
+        // Neither active: a tie, unless the window argument names one.
+        let cache = two_windows("frame", "frame", &[]);
+        assert_eq!(picked(&cache, &roots, "ok", "", "").len(), 2);
+        assert_eq!(
+            picked(&cache, &roots, "ok", "", "NOTES"),
+            vec![("/a", "/w1")]
+        );
+        // A hint every window matches decides nothing.
+        assert_eq!(picked(&cache, &roots, "ok", "", "kate").len(), 2);
+        // The active window beats the hint and a dialog.
+        let mut cache = two_windows("frame", "dialog", &[]);
+        cache.get_mut("/w1").unwrap().states = vec!["active"];
+        assert_eq!(
+            picked(&cache, &roots, "ok", "", "todo"),
+            vec![("/a", "/w1")]
+        );
+    }
+
+    #[test]
+    fn a_dialog_and_then_the_last_dialog_break_ties_between_windows() {
+        let roots = ["/w1", "/w2"];
+        let cache = two_windows("frame", "dialog", &[]);
+        assert_eq!(picked(&cache, &roots, "ok", "", ""), vec![("/b", "/w2")]);
+        let cache = two_windows("dialog", "frame", &[]);
+        assert_eq!(picked(&cache, &roots, "ok", "", ""), vec![("/a", "/w1")]);
+        // Stacked dialogs: the one listed (opened) last.
+        let cache = two_windows("dialog", "dialog", &[]);
+        assert_eq!(picked(&cache, &roots, "ok", "", ""), vec![("/b", "/w2")]);
+    }
+
+    #[test]
+    fn an_element_one_operates_beats_one_that_only_shows_the_name() {
+        let mut c = Cache::new();
+        c.insert("/w", node("frame", "Win", true, &[], &["/l", "/e", "/s"]));
+        c.insert("/l", node("label", "Ad", true, &[], &[]));
+        c.insert("/e", node("entry", "Ad", true, &["editable"], &[]));
+        c.insert("/s", node("section", "Ad", true, &[], &[]));
+        assert_eq!(picked(&c, &["/w"], "ad", "", ""), vec![("/e", "/w")]);
+        // Without one, they all stay.
+        c.remove("/e");
+        c.get_mut("/w").unwrap().children = vec!["/l", "/s"];
+        assert_eq!(picked(&c, &["/w"], "ad", "", "").len(), 2);
     }
 
     #[test]

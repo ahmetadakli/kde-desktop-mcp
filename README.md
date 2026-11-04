@@ -212,11 +212,33 @@ tool; `off` turns it off). Not available on Windows yet.
   coordinate, or with `image: true` a pixel of the last screenshot.
 - `act`, `set_text`, `focus`, `click`: act on an element. The element is picked
   by its `tree`/`find` number (`id`) or in one call by `app` + `query`
-  (+ `role`): the first visible element whose name equals `query`, else the
-  first whose name or text contains it. Window, tab and page titles (frame,
-  window, page tab, and a web page's document) count only when nothing else
-  matches or `role` names that role; `wait_for` skips them unless `role` names
-  them. Last come elements holding every word of the query, accents aside.
+  (+ `role`): a visible element whose name equals `query`, else one whose
+  name or text contains it. Window, tab and page titles (frame, window, page
+  tab, and a web page's document) count only when nothing else matches or
+  `role` names that role; `wait_for` skips them unless `role` names them.
+  Last come elements holding every word of the query, accents aside.
+- Ties: when several elements match equally well (the best of those tiers),
+  these tie-breaks apply in turn, while the matches are in several windows of
+  the app: (1) the app's active window beats its background windows; (2) a
+  window whose title contains the call's `window` argument beats the others;
+  (3) a dialog (dialog, alert, file chooser) beats the app's other windows,
+  and of stacked dialogs the one opened last (listed last) wins. Then,
+  wherever they are: (4) an element one operates (a button, entry, list
+  item: an interactive role or state) beats one that only shows the name (a
+  label, a heading, a list named the same); (5) for input tools, an element
+  with an on-screen area beats one without (zero size). A tie left after
+  that is refused by the input tools (`act`, `click`, `focus`, `set_text`,
+  `scroll`), which send nothing and list at most 6 candidates with ids, so the
+  next call passes one `id` (or `role`, or `window`):
+  ```
+  ambiguous: 2 elements in 'firefox' match 'Kapat'; nothing sent. pass one id:
+  [3] button "Kapat" at 3440,0
+  [4] button "Kapat" at 3440,22
+  ```
+  The window title is added when the candidates are in several windows.
+  Read tools take the first: `get_text` notes it (`[5] … (first of 2
+  matches):`), `wait_for` matches on it, `find` lists them all. Matches are
+  counted over one read of the app, made afresh for a refusal.
 - Effect and `observe` on input tools (`act`, `menu`, `close_window`, `click`,
   `key`, `type_text`, `mouse`, `drag`, `scroll`, `set_text`): with
   `observe` (and by default for `act`, `menu` and `close_window`) the reply
@@ -240,7 +262,7 @@ tool; `off` turns it off). Not available on Windows yet.
   fails and the batch does not end with `screenshot` or `tree`), the reply
   ends with `now: active window '<title>' [app]; focus: <element>`, so the
   next call needs no screenshot to see why. Not for refusals by the
-  allowlist, confirmations or the user taking over. A miss by `query` also
+  allowlist, confirmations, an ambiguous target or the user taking over. A miss by `query` also
   lists off-screen matches or the closest names with ids (see `find`).
 - Stale ids: every use of an `id` reads the element's role and name again (one
   round trip). If the element is gone, or its role or name changed (the page
@@ -351,7 +373,7 @@ tool; `off` turns it off). Not available on Windows yet.
   as `[n] tool failed (optional): …` and the remaining steps still run, so a
   final observation step (`find`, `screenshot`) is not lost.
 
-The `initialize` reply carries `instructions` (about 2.6 KB): the workflow,
+The `initialize` reply carries `instructions` (about 3 KB): the workflow,
 the targeting rules shared by the tools above, the allowlist and which tools
 to load together. Clients that load tool schemas on demand, such as Claude
 Code, show it at session start before any schema is loaded; the per-tool
