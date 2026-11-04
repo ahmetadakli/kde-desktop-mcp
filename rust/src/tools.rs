@@ -90,9 +90,10 @@ Controls GUI apps on the user's desktop (KDE Plasma, Hyprland, Windows) through 
 accessibility tree, with real keyboard and mouse input.
 
 Workflow:
-- apps lists running apps (allowed ones marked). find (app + query) locates elements; \
-act, click, focus, get_text, set_text and scroll take the target themselves. tree shows \
-structure; find is cheaper.
+- apps lists running apps. find (app + query) locates elements; act, click, focus, \
+get_text, set_text and scroll take the target themselves. tree shows structure; find is \
+cheaper. act also does check, uncheck, expand, collapse, select (+ `option`) and scroll_to, \
+verified; already so: nothing sent.
 - Target: `id` from tree/find, or `app` + `query` (+ `role`): a visible element named \
 `query` (case-insensitive), else one whose name or text has it; titles (window, tab, page) \
 only if nothing else does or `role` names them. Ties favor the active window, a dialog, an \
@@ -103,10 +104,9 @@ procedure fits in one. Mark waits \"optional\": true and end with an observation
 give the last input `observe`. A later step's `id`/`*_id` may be \"$N\": the element step \
 N found or acted on.
 - Input tools (key, type_text, click, mouse, scroll, focus, drag, set_text, act, screenshot) \
-take `window` (title or app substring) instead of a separate activate_window step; it \
-activates that window only when it isn't in front. Without it, input fails while \
-the user's terminal is in front.
-- click, mouse and scroll take `modifiers` (e.g. [\"ctrl\"]); hold keeps keys down.
+take `window` (title or app substring) to activate that window first unless it is in \
+front. Without it, input fails while the user's terminal is in front.
+- click, mouse and scroll take `modifiers`; hold keeps keys down.
 - If the user takes over keyboard and mouse, input fails with \"paused\" (or \
 \"interrupted\" mid-batch) without acting: pause ~2 s and retry. \"stopped by the user\": \
 stop and ask them; once they agree, a standalone activate_window call resumes input.
@@ -117,7 +117,7 @@ tree(interactive=true) for large pages.
 view, instead of a separate look. Failures end with the active \
 window and focus.
 - menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
-- screenshot is a last resort (the image comes inline). To click something seen \
+- screenshot is a last resort. To click something seen \
 only in it, pass its pixels to mouse as image_x/image_y; `region`=[x, y, w, h] zooms in.
 
 Allowlist: only apps in the user's allowlist file can be read, activated or sent input, and \
@@ -274,9 +274,12 @@ pub fn tools() -> Json {
         t(
             "act",
             &d(
-                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nThe effect line says when the active window changed (e.g. a dialog opened)."
+                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nVerified actions, preferred over toggling or clicking: `action` check, uncheck,\nexpand, collapse (already so: \"nothing sent\"), toggle; `option` (with action\nselect, or alone) picks the entry with that label in a combo box, list, tab list\nor menu button, without opening it where it can; scroll_to brings an element\nscrolled out of view (an id from a miss list) into view, else turns the wheel\nover its list (the pointer moves). Each reads the state back: the reply gives\nit, or fails saying what was sent and what it reads instead.\nThe effect line says when the active window changed (e.g. a dialog opened)."
             ),
-            target(&[("action", "string", Some(json!("")))])
+            target(&[
+                ("action", "string", Some(json!(""))),
+                ("option", "string", Some(Json::Null)),
+            ])
         ),
         t(
             "set_text",

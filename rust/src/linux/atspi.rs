@@ -122,6 +122,7 @@ pub const EXPANDED: u32 = 10;
 pub const FOCUSABLE: u32 = 11;
 pub const FOCUSED: u32 = 12;
 pub const MULTI_LINE: u32 = 17;
+pub const PRESSED: u32 = 20;
 pub const SELECTABLE: u32 = 22;
 pub const SELECTED: u32 = 23;
 pub const SHOWING: u32 = 25;
@@ -768,6 +769,30 @@ impl A11y {
             "org.a11y.atspi.EditableText",
             "DeleteText",
             &(start, end),
+        )
+        .await
+    }
+
+    /// Select the child at `index` of `o` through its Selection
+    /// interface; Err when it has none.
+    pub async fn select_child(&self, o: &Obj, index: i32) -> R<bool> {
+        self.call(o, "org.a11y.atspi.Selection", "SelectChild", &(index,))
+            .await
+    }
+
+    pub async fn index_in_parent(&self, o: &Obj) -> R<i32> {
+        self.call(o, ACC, "GetIndexInParent", &()).await
+    }
+
+    /// Component.ScrollTo (AT-SPI 2.28): scroll the element into view, as
+    /// little as needed (ATSPI_SCROLL_ANYWHERE).
+    pub async fn scroll_to(&self, o: &Obj) -> R<bool> {
+        const SCROLL_ANYWHERE: u32 = 6;
+        self.call(
+            o,
+            "org.a11y.atspi.Component",
+            "ScrollTo",
+            &(SCROLL_ANYWHERE,),
         )
         .await
     }

@@ -227,6 +227,53 @@ pub struct FileDialog<Id> {
     pub accept: Option<Id>,
 }
 
+/// The states `act`'s verified actions (check, expand, select, scroll_to)
+/// read before and after acting, fresh, in one call where the platform
+/// allows. `checkable`/`expandable` are false when the platform does not
+/// say; the caller then goes by role and actions.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Toggles {
+    pub checkable: bool,
+    /// Checked, or pressed (a toggle button).
+    pub checked: bool,
+    pub expandable: bool,
+    pub expanded: bool,
+    pub selected: bool,
+    pub showing: bool,
+    /// Not showing because it is scrolled out of view (visible), rather
+    /// than hidden (a closed popup, a collapsed branch).
+    pub offscreen: bool,
+    pub disabled: bool,
+}
+
+impl Toggles {
+    /// What `info` says (no checkable or expandable).
+    pub fn from_info<Id>(info: &Info<Id>) -> Self {
+        let has = |s: &str| info.states.contains(&s);
+        Toggles {
+            checkable: false,
+            checked: has("checked"),
+            expandable: false,
+            expanded: has("expanded"),
+            selected: has("selected"),
+            showing: info.showing,
+            // The platform does not say: assume scrolled out of view.
+            offscreen: !info.showing,
+            disabled: has("disabled"),
+        }
+    }
+}
+
+/// Picking a list entry through the platform's selection interface, which
+/// the desktop does not offer.
+pub const NO_SELECTION: &str = "selecting through the accessibility selection interface is not \
+     supported on this platform";
+
+/// Scrolling an element into view through accessibility, which the desktop
+/// does not offer.
+pub const NO_SCROLL_TO: &str = "scrolling an element into view through accessibility is not \
+     supported on this platform";
+
 pub struct WindowEntry {
     pub kind: String,
     pub title: String,
@@ -364,6 +411,27 @@ pub trait Backend {
 
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
+    /// The element's states as `act`'s verified actions read them, fresh.
+    async fn toggles(&self, id: &Self::Id) -> Toggles {
+        Toggles::from_info(&self.info(id, 0).await)
+    }
+    /// Select the list entry `item` through its container's selection
+    /// interface (AT-SPI Selection.SelectChild): no pointer, no focus.
+    /// Err when the platform or the container offers none.
+    async fn select_item(&self, _item: &Self::Id) -> R<bool> {
+        Err(NO_SELECTION.into())
+    }
+    /// Ask the app to scroll the element into view (AT-SPI
+    /// Component.ScrollTo, else on its parent): no pointer. Ok(false) when
+    /// the app declined.
+    async fn scroll_into_view(&self, _id: &Self::Id) -> R<bool> {
+        Err(NO_SCROLL_TO.into())
+    }
+    /// The nearest scrollable ancestor that is on screen (a scroll pane, a
+    /// list, a web page), for a wheel over it; None when unknown.
+    async fn scroll_container(&self, _id: &Self::Id) -> Option<Self::Id> {
+        None
+    }
     /// Complete text content (falls back to the name).
     async fn full_text(&self, id: &Self::Id, limit: usize) -> R<String>;
     /// Replace the contents; Err when the element is not editable.

@@ -26,7 +26,8 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    Layout, NO_AREA, NO_FILE_DIALOG, R, Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    Layout, NO_AREA, NO_FILE_DIALOG, R, Screen, Shot, Toggles, WindowChange, WindowEntry,
+    WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -63,6 +64,23 @@ const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
 /// registered change event: reads of them may be kept before any was
 /// heard. Others (GTK 4, Java...) only once they sent one.
 const EVENT_TOOLKITS: [&str; 3] = ["qt", "gecko", "chromium"];
+
+/// Levels `scroll_into_view` tries ScrollTo on: the element and its
+/// nearest ancestors.
+const SCROLL_TO_LEVELS: usize = 3;
+/// Levels `scroll_container` walks up looking for a scrollable ancestor.
+const SCROLL_CONTAINER_LEVELS: usize = 40;
+/// Roles of what scrolls under the wheel.
+const SCROLL_ROLES: [&str; 8] = [
+    "scroll pane",
+    "viewport",
+    "list",
+    "list box",
+    "tree",
+    "tree table",
+    "table",
+    "document web",
+];
 
 const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
 
@@ -1189,6 +1207,77 @@ impl Backend for LinuxBackend {
 
     async fn do_action(&self, id: &Obj, index: usize) -> R<bool> {
         self.a11y.do_action(id, index as i32).await
+    }
+
+    async fn toggles(&self, id: &Obj) -> Toggles {
+        let st = self.a11y.states(id).await.unwrap_or(0);
+        let has = |bit| atspi::has(st, bit);
+        Toggles {
+            checkable: has(atspi::CHECKABLE),
+            checked: has(atspi::CHECKED) || has(atspi::PRESSED),
+            expandable: has(atspi::EXPANDABLE),
+            expanded: has(atspi::EXPANDED),
+            selected: has(atspi::SELECTED),
+            showing: has(atspi::SHOWING),
+            offscreen: has(atspi::VISIBLE) && !has(atspi::SHOWING),
+            disabled: !has(atspi::ENABLED),
+        }
+    }
+
+    async fn select_item(&self, item: &Obj) -> R<bool> {
+        let parent = self
+            .a11y
+            .parent(item)
+            .await
+            .ok_or("the entry has no parent to select it in")?;
+        let (ifaces, index) = tokio::join!(
+            self.a11y.interfaces(&parent),
+            self.a11y.index_in_parent(item)
+        );
+        if !ifaces.iter().any(|i| i == "org.a11y.atspi.Selection") {
+            return Err("its list offers no accessibility selection".into());
+        }
+        self.a11y.select_child(&parent, index?).await
+    }
+
+    /// ScrollTo on the element, else on its nearest ancestors (an element
+    /// without a Component, a text leaf, lives in one that has it).
+    async fn scroll_into_view(&self, id: &Obj) -> R<bool> {
+        let mut cur = Some(id.clone());
+        let mut first_err = None;
+        for _ in 0..SCROLL_TO_LEVELS {
+            let Some(o) = cur else { break };
+            match self.a11y.scroll_to(&o).await {
+                Ok(true) => return Ok(true),
+                Ok(false) => {}
+                Err(e) => {
+                    first_err.get_or_insert(e);
+                }
+            }
+            cur = self.a11y.parent(&o).await;
+        }
+        match first_err {
+            Some(e) => Err(format!("ScrollTo: {e}")),
+            None => Ok(false),
+        }
+    }
+
+    async fn scroll_container(&self, id: &Obj) -> Option<Obj> {
+        let mut cur = self.a11y.parent(id).await;
+        for _ in 0..SCROLL_CONTAINER_LEVELS {
+            let o = cur?;
+            let (role, st) = tokio::join!(self.a11y.role(&o), self.a11y.states(&o));
+            if SCROLL_ROLES.contains(&role.as_str())
+                && st.is_some_and(|st| atspi::has(st, atspi::SHOWING))
+            {
+                return Some(o);
+            }
+            if matches!(role.as_str(), "frame" | "window" | "dialog") {
+                return None;
+            }
+            cur = self.a11y.parent(&o).await;
+        }
+        None
     }
 
     async fn full_text(&self, id: &Obj, limit: usize) -> R<String> {

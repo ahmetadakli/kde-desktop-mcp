@@ -128,7 +128,8 @@ Why it is fast:
   yontemleri" for "Çözüm Yöntemleri"). When still nothing visible matches,
   `find` (and the error of a tool given `query`) lists up to five matches
   scrolled out of view in the web page, with ids (`act` and `get_text` work
-  on them as they are), else up to five visible elements with the closest
+  on them as they are; `act` with `action: "scroll_to"` brings one into view
+  for `click`), else up to five visible elements with the closest
   names (`no matches; closest: …`), so the next call can use an id instead of
   a screenshot.
 - Read tools (`apps`, `tree`, `find`, `get_text`, `wait_for`, `wait_idle`,
@@ -219,6 +220,53 @@ tool; `off` turns it off). Not available on Windows yet.
   single-line text does not take, it focuses the element, selects all with
   Ctrl+A and types it. Password fields cannot be read back.
 - `scroll`: turns the wheel over an element (a list, a page, a panel).
+- Verified actions of `act` (one tool rather than new ones: `act` is loaded
+  up front, so they cost no tool-search turn, and the schema grew by about
+  570 characters instead of three new tools of 1,700 each). Each reads the
+  state back and replies with it (`Toggle -> checked (verified)`), or fails
+  saying what it sent and what it reads instead (`sent Toggle, but it reads
+  unchecked afterwards`); one already in the asked state sends nothing and
+  says so (`already checked; nothing sent`), so it is safe to repeat:
+  - `action: "check"` / `"uncheck"`: a check box, check menu item, radio
+    button (only checked: another one of its group unchecks it), toggle button
+    or switch, or anything the platform marks checkable. Runs its check,
+    uncheck, toggle, press or click action. `"toggle"` flips it (or the
+    expansion of an element that is expandable, not checkable).
+  - `action: "expand"` / `"collapse"`: a tree item, disclosure button,
+    accordion or combo box through an action named for it (`expand`,
+    `collapse`, GTK's `expand or contract`); buttons and combo boxes may use
+    their press. A list or tree row is never pressed for it (that opens a
+    file in Dolphin): an element with no such action (Qt's tree items) gets
+    focused through accessibility and sent Right or Left, which needs the
+    `full` tier; when it cannot be focused that way the reply says to click
+    it and press the key.
+  - `option: "UTF-8"` (with `action: "select"`, or alone): picks the entry
+    with that label (matched like `menu` labels: case, `&` markers, ellipses
+    aside; a unique part is enough) in a combo box, list, tab list or menu
+    button, from its entries in the tree even while it is closed. In order,
+    each only while the one before is not verified: the list's AT-SPI
+    Selection (`SelectChild`), the entry's own select/click/press action (not
+    Qt's Toggle, which only marks a row), then for a closed combo box (with the
+    `full` tier) focus through accessibility and as many Down/Up presses as
+    entries lie between the shown one and the wanted one. Verified by the
+    value a combo box is named after (Qt, GTK), else the entry's `selected`
+    state (Firefox). A menu button that lists no entries is opened through its
+    action and the entry is taken from the popup menu.
+  - `action: "scroll_to"`: brings an element scrolled out of view (an id from
+    the off-screen list of a miss) into view through AT-SPI
+    `Component.ScrollTo` (on the element, else its nearest ancestors); when
+    that is missing or does not show it, turns the wheel over its scrollable
+    container (5 notches a turn, at most 10, toward the element) until it is
+    showing, and says that the pointer moved. An element that is hidden (not
+    visible: in a closed popup or a collapsed branch) gets no wheel.
+
+  None of them opens a Firefox menu or `<select>` popup through accessibility
+  (see `menu`): such a call fails with nothing sent and says to click the
+  control. On Windows, check/uncheck/expand/collapse use the UI Automation
+  Toggle and ExpandCollapse actions and `select` the entry's SelectionItem;
+  Selection and ScrollTo are not supported there (untested on Windows).
+  Verified so far with unit tests only; not yet tried against Kate, Dolphin
+  or Firefox.
 - Modifier clicks: `click`, `mouse` and `scroll` take `modifiers` (`ctrl`,
   `shift`, `alt`, `meta`), pressed before the pointer action and released in
   reverse order afterwards, also when it fails (ctrl+click adds to a
@@ -502,7 +550,7 @@ passwords: keepassxc
 | tier | allows |
 | --- | --- |
 | `view` | `tree`, `find`, `get_text`, `wait_for`, `wait_idle`, `screenshot`, `clipboard_get`, `cursor_position` (and `activate_window`) |
-| `click` | plus `act`, `menu`, `click`, `focus`, `scroll`, `drag`, `mouse`, `move_window`, `close_window`, `launch` without `args` |
+| `click` | plus `act` (its key fallbacks need `full`), `menu`, `click`, `focus`, `scroll`, `drag`, `mouse`, `move_window`, `close_window`, `launch` without `args` |
 | `full` | plus `key`, `hold`, `type_text`, `set_text`, `clipboard_set`, `file_dialog`, `launch` with `args` |
 
 The tier is checked against the app a call reaches: the target element's app
