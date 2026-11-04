@@ -288,21 +288,28 @@ tool; `off` turns it off). Not available on Windows yet.
   window now '<title>'`) or came to the front since the previous input (`;
   before it, '<title>' had come to the front`: a dialog that opened after
   that reply); about 3 ms per input.
-- What an input opened: after `act`, `menu`, `close_window` and the input
-  tools given `observe`, and after `click`, `key`, `mouse` and `type_text`
-  without it, the reply lists the menus, popup menus, combo box lists,
-  dialogs and alerts of allowed apps that opened, one line each, with their
-  entries' ids, so the next call acts on them directly:
+- What an input opened (Linux): after `act`, `menu`, `close_window` and the
+  input tools given `observe`, and after `click`, `key`, `mouse` and
+  `type_text` without it, the reply lists the menus, popup menus, combo box
+  lists, dialogs and alerts of allowed apps that opened, one line each, with
+  their entries' ids, so the next call acts on them directly:
   ```
   opened: popup menu (8 entries): [51] "Kopyala" [52] "Yapıştır" [53] check menu item "Satır Sarma" {checked} …
   opened: dialog 'Değişiklikleri kaydet?': "Belge değiştirildi." [60] push button "Kaydet" [61] "Kaydetme" [62] "İptal"
   ```
   A role is named where it changes (a menu's `menu item`s and a list's `list
   item`s go without); a dialog's buttons come first, after its first label
-  (the question it asks), then its other controls. At most 12 entries and
-  about 600 characters a line (the rest is counted: `… +5 more`), 3
-  surfaces a reply; a surface listed once in a call (by `close_window`) is
-  not listed again in its effect line. On Linux the AT-SPI events
+  (the question it asks), those of its last button group (OK, Save, Cancel)
+  before the others, then its other controls; its lists, tables, trees,
+  documents and tool bars are not read. A KDE file dialog that `file_dialog`
+  fills is named as `opened: file dialog 'Open File' (use file_dialog)`,
+  without entries. At most 12 entries and about 600 characters a line (the
+  rest is counted: `… +5 more`), 3 surfaces a reply; a surface listed once
+  in a call (by `close_window`) is not read or listed again in its effect
+  line. What showed after a reply (a dialog a button opened a few ms after
+  the click) is listed by the next input's reply as `before it, opened: …`;
+  what one reply listed is not again. A surface is listed only when its
+  app's name reads as an allowed app's. The AT-SPI events
   `object:state-changed:showing` and `window:create` say what showed since
   the input: when none came, this costs nothing (no round trip); otherwise
   the role of each shown element is read (one round trip for all of them),
@@ -311,10 +318,12 @@ tool; `off` turns it off). Not available on Windows yet.
   keys that usually open a menu or dialog (`menu`, `shift+f10`, `f10`,
   `alt`+a letter, `alt+down`, `alt+f4`, `ctrl+o/s/p/w/q`, `ctrl+shift+s`)
   wait up to 150 ms for something to show, ending as soon as it did; other
-  inputs only list what showed already. Without such events (Windows, or
-  when registering them failed), those likely openers and `act`, `menu` and
-  `close_window` look at the active app's top-level windows instead, and a
-  surface one such look listed is not listed again while it stays open.
+  inputs only list what showed already. When registering those events
+  failed, those likely openers and `act`, `menu` and `close_window` look at
+  the active app's top-level windows instead, and a surface one such look
+  listed is not read or listed again while it stays open. Not on Windows:
+  UI Automation's roles do not name menus and dialogs this way (a dialog is
+  a `window`), so nothing is looked at or waited for there.
   Only menus already open are read: nothing here opens a menu through
   accessibility (Firefox can crash when one does).
 - Failures say what is on screen: when `find` finds nothing, or `act`,

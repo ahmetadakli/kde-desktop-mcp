@@ -1099,6 +1099,18 @@ impl Backend for LinuxBackend {
         self.a11y.wait_shown(&buses, mark, timeout).await
     }
 
+    fn names_surfaces(&self) -> bool {
+        true
+    }
+
+    async fn fills_file_dialog(&self, window: &Obj) -> bool {
+        // As `active_file_dialog` finds it: a KDE dialog with KFileWidget's
+        // file name field.
+        matches!(self.comp, Compositor::Kde(_))
+            && self.a11y.role(window).await == "dialog"
+            && self.file_dialog_parts(window).await.0.is_some()
+    }
+
     async fn app_name(&self, id: &Obj) -> Option<String> {
         let name = self.a11y.name(&Self::app_of(id)).await;
         (!name.is_empty()).then_some(name)

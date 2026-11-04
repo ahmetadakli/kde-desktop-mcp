@@ -359,10 +359,15 @@ struct Server<B: Backend> {
     last_active: Mutex<Option<String>>,
     /// The window in front after the last input, for `window_change_note`.
     seen_active: Mutex<Option<String>>,
-    /// Ids of the surfaces (menus, dialogs) last listed without change
+    /// The surfaces (menus, dialogs; `id_hash`) last listed without change
     /// events (`Server::surfaces_note` scans then), so one still open is
     /// not listed again.
     seen_surfaces: Mutex<Vec<u64>>,
+    /// The change mark taken when the last input's reply listed what it
+    /// opened, and the surfaces it listed (`id_hash`): what showed after
+    /// it (a dialog that opened after that reply) is listed by the next
+    /// input's reply (`Server::opened_before`).
+    shown_pending: Mutex<Option<(u64, Vec<u64>)>>,
     /// Maps pixels of the last screenshot to screen coordinates.
     last_shot: Mutex<Option<ShotMap>>,
     /// Held by tools that send keyboard or pointer input, so two concurrent
@@ -502,8 +507,11 @@ struct Gate {
     opener: bool,
     /// The reply lists what opened already (`menu` listing a submenu).
     quiet: bool,
-    /// Ids of the surfaces this call's reply listed already.
+    /// The surfaces (`id_hash`) this call's reply listed already.
     reported: Vec<u64>,
+    /// "before it, opened: …" lines for what showed after the previous
+    /// input's reply (`Server::opened_before`), said with this call's.
+    before: String,
 }
 
 tokio::task_local! {
@@ -1359,6 +1367,7 @@ impl<B: Backend> Server<B> {
             last_active: Mutex::new(None),
             seen_active: Mutex::new(None),
             seen_surfaces: Mutex::new(Vec::new()),
+            shown_pending: Mutex::new(None),
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
@@ -2353,6 +2362,9 @@ impl<B: Backend> Server<B> {
     /// OPENER_ROLES element) it first waits up to SETTLE_MS for a menu,
     /// list or dialog to show; otherwise only what showed already counts.
     async fn opened_note(&self, tool: &str, a: &Json, mark: u64) -> String {
+        if !self.b.names_surfaces() {
+            return String::new();
+        }
         let opener =
             opens_surface(tool, a) || GATE.try_with(|g| g.borrow().opener).unwrap_or(false);
         if opener {
@@ -2364,78 +2376,104 @@ impl<B: Backend> Server<B> {
 
     /// "\nopened: …" lines for the menus, popups, combo box lists and
     /// dialogs of allowed apps shown since `mark`, with their entries' ids
-    /// (`surfaces`). No round trip when nothing was shown. Without such
-    /// events (`shown_since` None), only with `scan`: the active app's
+    /// (`surfaces`), after this call's "before it, opened: …" lines
+    /// (`opened_before`). No round trip when nothing was shown. Without
+    /// such events (`shown_since` None), only with `scan`: the active app's
     /// windows are looked at, and what the last scan listed is not again.
+    /// What shows after this is left to the next input's reply.
     async fn surfaces_note(&self, mark: u64, scan: bool) -> String {
-        if GATE.try_with(|g| g.borrow().quiet).unwrap_or(false) {
+        if !self.b.names_surfaces() {
             return String::new();
         }
-        let (candidates, scanned) = match self.b.shown_since(mark) {
-            Some(shown) if shown.is_empty() => return String::new(),
-            Some(mut shown) => {
-                if shown.len() > SURFACE_CANDIDATES {
-                    let half = SURFACE_CANDIDATES / 2;
-                    shown.drain(half..shown.len() - half);
-                }
-                (shown, false)
-            }
+        let next = self.b.change_mark();
+        let quiet = GATE.try_with(|g| g.borrow().quiet).unwrap_or(false);
+        let lines = match quiet {
+            true => Vec::new(),
+            false => self.surfaces_since(mark, scan).await,
+        };
+        let (before, listed) = GATE
+            .try_with(|g| {
+                let mut g = g.borrow_mut();
+                (std::mem::take(&mut g.before), g.reported.clone())
+            })
+            .unwrap_or_default();
+        *self.shown_pending.lock().await = Some((next, listed));
+        let mut out = before;
+        for l in lines {
+            out.push_str(&format!("\nopened: {l}"));
+        }
+        out
+    }
+
+    /// The surface lines (`surfaces`) for what showed since `mark`, or
+    /// with `scan` and no such events, among the active app's windows.
+    async fn surfaces_since(&self, mark: u64, scan: bool) -> Vec<String> {
+        match self.b.shown_since(mark) {
+            Some(shown) if shown.is_empty() => Vec::new(),
+            Some(shown) => self.surfaces(cap_candidates(shown), false, None, &[]).await,
             None if scan => {
                 let app = self.b.active_app().await;
                 if app.is_empty() || !self.is_allowed(&app) {
-                    return String::new();
+                    return Vec::new();
                 }
-                match self.b.app_windows(&app.to_lowercase()).await {
-                    Some(windows) => (windows, true),
-                    None => return String::new(),
+                let app = app.to_lowercase();
+                match self.b.app_windows(&app).await {
+                    Some(windows) => self.surfaces(windows, true, Some(&app), &[]).await,
+                    None => Vec::new(),
                 }
             }
-            None => return String::new(),
+            None => Vec::new(),
+        }
+    }
+
+    /// "\nbefore it, opened: …" lines for the surfaces that showed after
+    /// the last input's reply listed what it opened (a dialog a button
+    /// opened a few ms after its click), but for those it listed. Taken
+    /// before this call's input; said with its own "opened:" lines. No
+    /// round trip when nothing was shown.
+    async fn opened_before(&self) -> String {
+        if !self.b.names_surfaces() {
+            return String::new();
+        }
+        let Some((mark, listed)) = self.shown_pending.lock().await.clone() else {
+            return String::new();
         };
-        self.surfaces(candidates, scanned, false)
-            .await
-            .iter()
-            .map(|l| format!("\nopened: {l}"))
-            .collect()
+        match self.b.shown_since(mark) {
+            Some(shown) if !shown.is_empty() => self
+                .surfaces(cap_candidates(shown), false, None, &listed)
+                .await
+                .iter()
+                .map(|l| format!("\nbefore it, opened: {l}"))
+                .collect(),
+            _ => String::new(),
+        }
     }
 
     /// A line (`render::surface_line`) for each surface among `candidates`
     /// (elements shown lately, or windows): a menu, a combo box's list or
     /// a dialog of an allowed app, still showing, with entries (dialogs
-    /// may have none), and not listed by this call already. `scanned`:
-    /// the candidates are windows looked at without change events; one the
-    /// last scan listed is left out. `any_app`: the app the candidates
-    /// belong to is allowed already (its windows).
-    async fn surfaces(&self, candidates: Vec<B::Id>, scanned: bool, any_app: bool) -> Vec<String> {
+    /// may have none), and neither in `skip` nor listed by this call
+    /// already (`id_hash`es): those are not read. `scanned`: the
+    /// candidates are windows looked at without change events; one the
+    /// last scan listed is left out while it shows. `app`: the (allowed)
+    /// app all candidates belong to, when known.
+    async fn surfaces(
+        &self,
+        candidates: Vec<B::Id>,
+        scanned: bool,
+        app: Option<&str>,
+        skip: &[u64],
+    ) -> Vec<String> {
         if candidates.is_empty() {
             return Vec::new();
         }
-        // The app of each candidate, asked once per app.
-        let mut firsts: Vec<(Option<String>, B::Id)> = Vec::new();
-        for c in &candidates {
-            let key = self.b.app_key(c);
-            if !firsts.iter().any(|(k, _)| *k == key) {
-                firsts.push((key, c.clone()));
-            }
-        }
-        let names =
-            futures_util::future::join_all(firsts.iter().map(|(_, c)| self.b.app_name(c))).await;
-        let active = match names.iter().any(Option::is_none) {
-            true => self.b.active_app().await,
-            false => String::new(),
+        let candidates: Vec<(B::Id, String)> = match app {
+            Some(app) => candidates.into_iter().map(|c| (c, app.into())).collect(),
+            None => self.candidate_apps(candidates).await,
         };
-        let apps: Vec<(Option<String>, String)> = firsts
-            .into_iter()
-            .zip(names)
-            .map(|((k, _), n)| (k, n.unwrap_or_else(|| active.clone()).to_lowercase()))
-            .collect();
         let candidates: Vec<(B::Id, String)> = candidates
             .into_iter()
-            .filter_map(|c| {
-                let key = self.b.app_key(&c);
-                let app = apps.iter().find(|(k, _)| *k == key)?.1.clone();
-                (any_app || (!app.is_empty() && self.is_allowed(&app))).then_some((c, app))
-            })
+            .filter(|(_, app)| !app.is_empty() && self.is_allowed(app))
             .collect();
         if candidates.is_empty() {
             return Vec::new();
@@ -2485,6 +2523,27 @@ impl<B: Backend> Server<B> {
             if cache.contains_key(&id) {
                 continue;
             }
+            let hash = id_hash(&id);
+            // Listed already: not read again.
+            if reported.contains(&hash) || skip.contains(&hash) {
+                continue;
+            }
+            if seen.contains(&hash) {
+                // Listed by the last scan: still so while it shows (its
+                // own node is enough to tell).
+                let fetch = Fetch {
+                    limit: 1,
+                    ..surface_fetch(kind)
+                };
+                let mut one = Cache::new();
+                self.b
+                    .prefetch_with(&mut one, vec![id.clone()], &fetch)
+                    .await;
+                if one.get(&id).is_some_and(|i| i.showing) {
+                    found.push(hash);
+                }
+                continue;
+            }
             let listed = self.surface_entries(&mut cache, &id, kind).await;
             let Some(root) = cache.get(&id) else {
                 continue;
@@ -2492,9 +2551,12 @@ impl<B: Backend> Server<B> {
             if !root.showing || (kind != render::Surface::Dialog && listed.entries.is_empty()) {
                 continue;
             }
-            let rid = self.add_ref(&id, root, &app).await;
-            found.push(rid);
-            if reported.contains(&rid) || seen.contains(&rid) {
+            found.push(hash);
+            if kind == render::Surface::Dialog
+                && listed.maybe_file_dialog(root)
+                && self.b.fills_file_dialog(&id).await
+            {
+                lines.push(render::file_dialog_line(root));
                 continue;
             }
             let mut items = Vec::new();
@@ -2520,6 +2582,40 @@ impl<B: Backend> Server<B> {
         lines
     }
 
+    /// Each candidate with the lower-case name of its app ("" when it
+    /// could not be read: not allowed), asked once per app. Only for a
+    /// backend that cannot tell an element's app (`app_key` None) is it
+    /// taken to be the active app's.
+    async fn candidate_apps(&self, candidates: Vec<B::Id>) -> Vec<(B::Id, String)> {
+        let mut firsts: Vec<(Option<String>, B::Id)> = Vec::new();
+        for c in &candidates {
+            let key = self.b.app_key(c);
+            if !firsts.iter().any(|(k, _)| *k == key) {
+                firsts.push((key, c.clone()));
+            }
+        }
+        let names = futures_util::future::join_all(firsts.iter().map(|(k, c)| async move {
+            match k {
+                Some(_) => self.b.app_name(c).await.unwrap_or_default(),
+                None => self.b.active_app().await,
+            }
+        }))
+        .await;
+        let apps: Vec<(Option<String>, String)> = firsts
+            .into_iter()
+            .zip(names)
+            .map(|((k, _), n)| (k, n.to_lowercase()))
+            .collect();
+        candidates
+            .into_iter()
+            .filter_map(|c| {
+                let key = self.b.app_key(&c);
+                let app = apps.iter().find(|(k, _)| *k == key)?.1.clone();
+                Some((c, app))
+            })
+            .collect()
+    }
+
     /// The entries of the surface `root` (`render::surface_entries`),
     /// reading the showing nodes below it into `cache`; after
     /// SURFACE_ROUNDS reads, what was found.
@@ -2529,14 +2625,7 @@ impl<B: Backend> Server<B> {
         root: &B::Id,
         kind: render::Surface,
     ) -> render::SurfaceEntries<B::Id> {
-        let fetch = Fetch {
-            only_showing: true,
-            text_limit: 0,
-            limit: SURFACE_NODES,
-            actions: false,
-            stop_roles: &[],
-            offscreen: false,
-        };
+        let fetch = surface_fetch(kind);
         self.b
             .prefetch_with(cache, vec![root.clone()], &fetch)
             .await;
@@ -2844,12 +2933,17 @@ impl<B: Backend> Server<B> {
             return Ok(format!("closed {what}"));
         }
         // The app's dialogs (a save prompt), with their buttons' ids.
-        let windows = self
-            .b
-            .app_windows(&app.to_lowercase())
-            .await
-            .unwrap_or_default();
-        let shown = self.surfaces(windows, false, true).await;
+        let windows = match self.b.names_surfaces() {
+            true => self
+                .b
+                .app_windows(&app.to_lowercase())
+                .await
+                .unwrap_or_default(),
+            false => Vec::new(),
+        };
+        let shown = self
+            .surfaces(windows, false, Some(&app.to_lowercase()), &[])
+            .await;
         Ok(if shown.is_empty() {
             format!(
                 "asked {what} to close; it is still open, probably asking whether to save \
@@ -4818,6 +4912,7 @@ impl<B: Backend> Server<B> {
             opener: false,
             quiet: false,
             reported: Vec::new(),
+            before: String::new(),
         };
         Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
             let window = window_arg(name, a)?;
@@ -4894,6 +4989,12 @@ impl<B: Backend> Server<B> {
             // Before the input: what shows after it was opened by it.
             let shown_mark =
                 (observe.is_none() && SURFACE_TOOLS.contains(&name)).then(|| self.b.change_mark());
+            // What showed after the last input's reply, said with this
+            // one's "opened:" lines (`surfaces_note`).
+            if observe.is_some() || shown_mark.is_some() {
+                let before = trace::time("opened before", self.opened_before()).await;
+                let _ = GATE.try_with(|g| g.borrow_mut().before = before);
+            }
             let result = match name {
                 "apps" => self.apps().await.map(Out::from),
                 "tree" => self.tree(a).await,
@@ -5057,6 +5158,39 @@ fn opens_surface(tool: &str, a: &Json) -> bool {
         }
         _ => false,
     }
+}
+
+/// How a surface of `kind` is read: its showing nodes, a dialog's not
+/// below its views, documents and tool bars (`render::DIALOG_STOP`).
+fn surface_fetch(kind: render::Surface) -> Fetch {
+    Fetch {
+        only_showing: true,
+        text_limit: 0,
+        limit: SURFACE_NODES,
+        actions: false,
+        stop_roles: match kind {
+            render::Surface::Dialog => &render::DIALOG_STOP,
+            _ => &[],
+        },
+        offscreen: false,
+    }
+}
+
+/// At most SURFACE_CANDIDATES of the elements shown: the oldest and the
+/// newest half.
+fn cap_candidates<T>(mut shown: Vec<T>) -> Vec<T> {
+    if shown.len() > SURFACE_CANDIDATES {
+        let half = SURFACE_CANDIDATES / 2;
+        shown.drain(half..shown.len() - half);
+    }
+    shown
+}
+
+/// A backend id as a number, to remember which surfaces a reply listed
+/// (`Gate::reported`, `Server::seen_surfaces`) without reading them.
+fn id_hash<I: std::hash::Hash>(id: &I) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(id)
 }
 
 /// Most surfaces one reply lists.
@@ -5458,6 +5592,13 @@ mod tests {
         close_opens: std::cell::Cell<Option<u32>>,
         /// `identity` calls so far.
         identities: std::cell::Cell<u32>,
+        /// Elements of another app (another `app_key`) whose name cannot
+        /// be read (`app_name` None).
+        nameless: RefCell<Vec<u32>>,
+        /// Roles do not name surfaces (as UIA's): `names_surfaces` false.
+        uia_roles: std::cell::Cell<bool>,
+        /// Dialogs `fills_file_dialog` takes for file dialogs.
+        file_dialogs: RefCell<Vec<u32>>,
     }
 
     impl FakeShown {
@@ -5576,6 +5717,15 @@ mod tests {
         async fn parent(&self, id: &u32) -> Option<u32> {
             self.shown.parents.borrow().get(id).copied()
         }
+        fn names_surfaces(&self) -> bool {
+            !self.shown.uia_roles.get()
+        }
+        async fn fills_file_dialog(&self, window: &u32) -> bool {
+            self.shown.file_dialogs.borrow().contains(window)
+        }
+        async fn app_name(&self, id: &u32) -> Option<String> {
+            (!self.shown.nameless.borrow().contains(id)).then(|| "fake".into())
+        }
         async fn close_window(&self, query: &str, allowed: &[String]) -> R<WindowGeo> {
             let dialog = self
                 .shown
@@ -5675,8 +5825,11 @@ mod tests {
         async fn set_text(&self, _: &u32, _: &str) -> R<bool> {
             Ok(true)
         }
-        fn app_key(&self, _: &u32) -> Option<String> {
-            Some("fake".into())
+        fn app_key(&self, id: &u32) -> Option<String> {
+            match self.shown.nameless.borrow().contains(id) {
+                true => Some(":1.99".into()),
+                false => Some("fake".into()),
+            }
         }
         async fn is_focused(&self, _: &u32) -> bool {
             self.field.borrow().is_some()
@@ -7874,6 +8027,201 @@ mod tests {
             let save = id_before(text, "Save");
             let r = call_tool(&mut s, 3, "act", json!({"id": save})).await;
             assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_surface_whose_app_name_cannot_be_read_is_not_listed() {
+        local(async {
+            let mut s = session("surface-nameless");
+            fake_surfaces(&s);
+            // Another app's menu (another bus) whose name reads empty: not
+            // taken for the active app's, so neither listed nor given ids.
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.insert(90, fake_node("popup menu", "", &[91]));
+                nodes.insert(91, fake_node("menu item", "Delete all", &[]));
+            }
+            s.shown.nameless.borrow_mut().extend([90, 91]);
+            s.shown.next.borrow_mut().extend([90, 40]);
+            let r = call_tool(
+                &mut s,
+                2,
+                "mouse",
+                json!({"x": 5, "y": 5, "button": "right"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(text.contains("\nopened: popup menu (3 entries)"), "{text}");
+            assert!(!text.contains("Delete all"), "{text}");
+            assert_eq!(text.matches("opened:").count(), 1, "{text}");
+        });
+    }
+
+    #[test]
+    fn without_surface_roles_nothing_waits_or_scans() {
+        local(async {
+            let mut s = session("surface-uia");
+            fake_surfaces(&s);
+            s.shown.live.set(false);
+            s.shown.uia_roles.set(true);
+            s.more_windows.borrow_mut().push(60);
+            let ids = s.shown.identities.get();
+            for (n, combo) in [(2, "ctrl+s"), (3, "menu")] {
+                let r = call_tool(&mut s, n, "key", json!({"combo": combo})).await;
+                assert!(!reply_text(&r).contains("opened:"), "{r}");
+            }
+            let id = focus_id(&mut s, 4).await;
+            let r = call_tool(&mut s, 5, "act", json!({"id": id})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            // No window's role read (but the act's own target check).
+            assert_eq!(s.shown.identities.get(), ids + 1);
+            // close_window gives the plain hint.
+            s.shown.close_opens.set(Some(60));
+            let r = call_tool(
+                &mut s,
+                6,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("probably asking whether to save"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_dialog_that_opened_after_a_reply_is_listed_by_the_next() {
+        local(async {
+            let mut s = session("surface-late");
+            fake_surfaces(&s);
+            let id = focus_id(&mut s, 2).await;
+            // A plain click: nothing showed before its reply.
+            let r = call_tool(&mut s, 3, "click", json!({"id": id})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            // The dialog it opened shows a few ms later.
+            s.shown.next.borrow_mut().extend([62, 63, 64, 60]);
+            s.shown.input();
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "a"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nbefore it, opened: dialog 'Save?': \"Save changes"),
+                "{text}"
+            );
+            assert_eq!(text.matches("opened:").count(), 1, "{text}");
+            // Its ids work.
+            let save = id_before(text, "Save");
+            let r = call_tool(&mut s, 5, "act", json!({"id": save})).await;
+            assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            // Listed once: an act's reply after more shows, but not again.
+            s.shown.next.borrow_mut().extend([60, 40]);
+            s.shown.input();
+            let r = call_tool(&mut s, 6, "act", json!({"id": id})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nbefore it, opened: dialog 'Save?'"),
+                "{text}"
+            );
+            assert!(text.contains("before it, opened: popup menu"), "{text}");
+            // Something shown again after the reply of a call that listed
+            // it is not listed again.
+            s.shown.next.borrow_mut().push(40);
+            s.shown.input();
+            let r = call_tool(&mut s, 7, "key", json!({"combo": "b"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_surface_listed_once_is_not_read_again() {
+        local(async {
+            let mut s = session("surface-reads");
+            fake_surfaces(&s);
+            s.shown.close_opens.set(Some(60));
+            let reads = s.reads.prefetches.get();
+            let r = call_tool(
+                &mut s,
+                2,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("showing dialog 'Save?'"), "{r}");
+            // The dialog and its children: two reads, none in the effect line.
+            assert_eq!(s.reads.prefetches.get(), reads + 2);
+            // Scanning without events: a dialog still open is checked by
+            // its own node only.
+            s.shown.live.set(false);
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "ctrl+s"})).await;
+            assert!(reply_text(&r).contains("opened: dialog 'Save?'"), "{r}");
+            let reads = s.reads.prefetches.get();
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "ctrl+o"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            assert_eq!(s.reads.prefetches.get(), reads + 1);
+            // Once hidden, it is listed again when it shows.
+            s.nodes.borrow_mut().get_mut(&60).unwrap().showing = false;
+            let r = call_tool(&mut s, 5, "key", json!({"combo": "ctrl+o"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            s.nodes.borrow_mut().get_mut(&60).unwrap().showing = true;
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "ctrl+o"})).await;
+            assert!(reply_text(&r).contains("opened: dialog 'Save?'"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_file_dialog_is_named_for_file_dialog_and_others_skip_their_views() {
+        local(async {
+            let mut s = session("surface-file");
+            fake_surfaces(&s);
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.insert(
+                    100,
+                    fake_node("dialog", "Open File", &[101, 108, 103, 104, 105]),
+                );
+                nodes.insert(101, fake_node("tool bar", "", &[102]));
+                nodes.insert(102, fake_node("push button", "Back", &[]));
+                nodes.insert(108, fake_node("panel", "", &[109, 110]));
+                nodes.insert(109, fake_node("push button", "home", &[]));
+                nodes.insert(110, fake_node("push button", "docs", &[]));
+                nodes.insert(103, fake_node("list", "", &[111]));
+                nodes.insert(111, fake_node("list item", "notes.txt", &[]));
+                let mut name = fake_node("text", "", &[]);
+                name.states = vec!["editable"];
+                nodes.insert(104, name);
+                nodes.insert(105, fake_node("panel", "", &[106, 107]));
+                nodes.insert(106, fake_node("push button", "Open", &[]));
+                nodes.insert(107, fake_node("push button", "Cancel", &[]));
+            }
+            // Not one file_dialog fills: its buttons, OK and Cancel first,
+            // without the tool bar's or the file list's.
+            s.shown.next.borrow_mut().push(100);
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "ctrl+o"})).await;
+            let text = reply_text(&r);
+            let at = text.find("\nopened: dialog 'Open File': [").expect(text);
+            let line = &text[at..];
+            assert!(
+                line.find("\"Open\"") < line.find("\"home\"")
+                    && line.find("\"Cancel\"") < line.find("\"home\""),
+                "{line}"
+            );
+            assert!(
+                !line.contains("Back") && !line.contains("notes.txt"),
+                "{line}"
+            );
+            // One it fills: named, nothing read for entries.
+            s.shown.file_dialogs.borrow_mut().push(100);
+            s.shown.next.borrow_mut().push(100);
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "ctrl+o"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nopened: file dialog 'Open File' (use file_dialog)"),
+                "{text}"
+            );
+            assert!(!text.contains("\"Open\""), "{text}");
         });
     }
 

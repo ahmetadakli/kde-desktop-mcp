@@ -1874,17 +1874,49 @@ const DIALOG_CONTROL_ROLES: [&str; 10] = [
     "slider",
 ];
 
+/// Roles below which a dialog's read and its entries stop: views (a file
+/// dialog's file list, a settings page's list), documents and tool bars
+/// (a file dialog's Back/Up/Reload). Their contents are no entries, and
+/// reading them would take most of a read's nodes.
+pub const DIALOG_STOP: [&str; 9] = [
+    "list",
+    "list box",
+    "table",
+    "tree",
+    "tree table",
+    "tool bar",
+    "document web",
+    "document frame",
+    "document",
+];
+
+/// The views among DIALOG_STOP: a dialog holding one may be a file dialog.
+const DIALOG_VIEW_ROLES: [&str; 5] = ["list", "list box", "table", "tree", "tree table"];
+
 /// What a surface lists: its entries (a dialog's buttons first), and for
 /// a dialog the first label that is not its title (the question it asks).
 pub struct SurfaceEntries<Id> {
     pub entries: Vec<Id>,
     pub message: Option<String>,
+    /// A dialog holds a showing list, table or tree view (DIALOG_VIEW_ROLES).
+    pub views: bool,
 }
 
-/// The entries of the surface `root` of `kind`, in document order (a
-/// dialog's buttons first), from the showing nodes below it, and the nodes
-/// still to fetch for the rest. An entry's own children are not looked
-/// into (a submenu's entries), nor are hidden nodes'.
+impl<Id> SurfaceEntries<Id> {
+    /// Whether the dialog `root` may be a file dialog (a file chooser, or
+    /// one with a view): the backend has the last word
+    /// (`Backend::fills_file_dialog`).
+    pub fn maybe_file_dialog(&self, root: &Info<Id>) -> bool {
+        self.views || root.role == "file chooser"
+    }
+}
+
+/// The entries of the surface `root` of `kind`, in document order, from
+/// the showing nodes below it, and the nodes still to fetch for the rest.
+/// A dialog's buttons come first, those of its last button group (the
+/// one holding the last button: OK, Save, Cancel) before the others; its
+/// DIALOG_STOP nodes are not looked into. An entry's own children are not
+/// looked into (a submenu's entries), nor are hidden nodes'.
 pub fn surface_entries<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     root: &Id,
@@ -1895,20 +1927,23 @@ pub fn surface_entries<Id: Clone + Eq + Hash>(
         let none = SurfaceEntries {
             entries: Vec::new(),
             message: None,
+            views: false,
         };
         return (none, vec![root.clone()]);
     };
     let title = fold(&info.name);
-    let mut buttons = Vec::new();
+    // Each button with the node holding it.
+    let mut buttons: Vec<(Id, &Id)> = Vec::new();
     let mut others = Vec::new();
     let mut message = None;
-    let mut stack: Vec<&Id> = get(cache, &info.children, &mut missing)
+    let mut views = false;
+    let mut stack: Vec<(&Id, &Id)> = get(cache, &info.children, &mut missing)
         .into_iter()
-        .map(|(c, _)| c)
+        .map(|(c, _)| (c, root))
         .rev()
         .collect();
     let mut seen = 0;
-    while let Some(id) = stack.pop() {
+    while let Some((id, parent)) = stack.pop() {
         seen += 1;
         if seen > FIND_MAX_SEEN {
             break;
@@ -1924,7 +1959,11 @@ pub fn surface_entries<Id: Clone + Eq + Hash>(
             Surface::List => LIST_ENTRY_ROLES.contains(&role) && named,
             Surface::Dialog => {
                 if DIALOG_BUTTON_ROLES.contains(&role) && named {
-                    buttons.push(id.clone());
+                    buttons.push((id.clone(), parent));
+                    continue;
+                }
+                if DIALOG_STOP.contains(&role) {
+                    views |= DIALOG_VIEW_ROLES.contains(&role);
                     continue;
                 }
                 if message.is_none()
@@ -1944,16 +1983,31 @@ pub fn surface_entries<Id: Clone + Eq + Hash>(
         stack.extend(
             get(cache, &info.children, &mut missing)
                 .into_iter()
-                .map(|(c, _)| c)
+                .map(|(c, _)| (c, id))
                 .rev(),
         );
     }
-    buttons.extend(others);
+    // The last button group first (stable: document order within each).
+    let last = buttons.last().map(|(_, p)| (*p).clone());
+    buttons.sort_by_key(|(_, p)| Some(*p) != last.as_ref());
+    let mut entries: Vec<Id> = buttons.into_iter().map(|(b, _)| b).collect();
+    entries.extend(others);
     let listed = SurfaceEntries {
-        entries: buttons,
+        entries,
         message,
+        views,
     };
     (listed, missing)
+}
+
+/// The line for a file dialog, which `file_dialog` fills in one call: its
+/// entries are not listed.
+pub fn file_dialog_line<Id>(root: &Info<Id>) -> String {
+    let name = first_chars(&root.name.replace('\n', " "), 80);
+    match name.trim() {
+        "" => "file dialog (use file_dialog)".into(),
+        t => format!("file dialog {} (use file_dialog)", py_repr(t)),
+    }
 }
 
 /// Most entries a surface line lists, and characters it takes.
@@ -3544,6 +3598,50 @@ mod tests {
         assert_eq!(l.entries, vec!["/ok", "/f"]);
         assert_eq!(l.message.as_deref(), Some("Really quit?"));
         assert_eq!(missing, vec!["/no"]);
+    }
+
+    #[test]
+    fn a_dialogs_last_button_group_comes_first_and_views_are_not_looked_into() {
+        let mut c = Cache::new();
+        c.insert(
+            "/d",
+            node(
+                "dialog",
+                "Open File",
+                true,
+                &[],
+                &["/tb", "/crumbs", "/files", "/name", "/box"],
+            ),
+        );
+        c.insert("/tb", node("tool bar", "", true, &[], &["/back"]));
+        c.insert("/crumbs", node("panel", "", true, &[], &["/home", "/docs"]));
+        c.insert("/home", node("push button", "home", true, &[], &[]));
+        c.insert("/docs", node("push button", "docs", true, &[], &[]));
+        c.insert("/files", node("list", "", true, &[], &["/f1", "/f2"]));
+        c.insert("/name", node("text", "", true, &["editable"], &[]));
+        c.insert("/box", node("panel", "", true, &[], &["/open", "/cancel"]));
+        c.insert("/open", node("push button", "Open", true, &[], &[]));
+        c.insert("/cancel", node("push button", "Cancel", true, &[], &[]));
+        let (l, missing) = surface_entries(&c, &"/d", Surface::Dialog);
+        // The tool bar's and the list's children are neither entries nor
+        // missing: not read.
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(
+            l.entries,
+            vec!["/open", "/cancel", "/home", "/docs", "/name"]
+        );
+        assert!(l.views && l.maybe_file_dialog(&c[&"/d"]));
+        // Without a view, no file dialog; one button group keeps its order.
+        c.get_mut("/d").unwrap().children = vec!["/box"];
+        let (l, _) = surface_entries(&c, &"/d", Surface::Dialog);
+        assert_eq!(l.entries, vec!["/open", "/cancel"]);
+        assert!(!l.maybe_file_dialog(&c[&"/d"]));
+        let chooser = node("file chooser", "Open", true, &[], &[]);
+        assert!(l.maybe_file_dialog(&chooser));
+        assert_eq!(
+            file_dialog_line(&c[&"/d"]),
+            "file dialog 'Open File' (use file_dialog)"
+        );
     }
 
     #[test]

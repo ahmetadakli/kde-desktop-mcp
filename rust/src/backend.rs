@@ -296,18 +296,28 @@ pub trait Backend {
     /// Wait until `shown_since(mark)` names something of the app whose
     /// elements are `near` (none: of any app) and the burst of events
     /// settled, or `timeout` passed; false when nothing was shown. The
-    /// default (no such events) waits one poll interval.
+    /// default (no such events, nothing listed) returns false at once.
     async fn wait_shown(
         &self,
         _near: &[Self::Id],
         _mark: u64,
-        timeout: std::time::Duration,
+        _timeout: std::time::Duration,
     ) -> bool {
-        tokio::time::sleep(timeout.min(std::time::Duration::from_millis(50))).await;
-        true
+        false
+    }
+    /// Whether roles name menus, popups and dialogs the way
+    /// `render::surface_kind` knows them (AT-SPI's), so what an input
+    /// opened can be listed. UIA's do not (a dialog is a "window").
+    fn names_surfaces(&self) -> bool {
+        false
+    }
+    /// Whether `window`, a dialog, is a file dialog `file_dialog` fills.
+    async fn fills_file_dialog(&self, _window: &Self::Id) -> bool {
+        false
     }
     /// Name of the app `id` belongs to, as `list_apps` names it; None when
-    /// the backend cannot tell (callers take the active app).
+    /// it could not be read (empty, or the call failed). Callers take the
+    /// active app only when `app_key` is None as well.
     async fn app_name(&self, _id: &Self::Id) -> Option<String> {
         None
     }
