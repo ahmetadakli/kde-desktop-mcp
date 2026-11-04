@@ -127,7 +127,7 @@ confirm: true only if they agree. Password fields are never read, and filled in 
 user allowed it. Changing the file is the user's decision. When tools fail \
 as if the setup were broken (AT-SPI, input, KWin), run doctor.
 
-Clients loading schemas on demand: load these in one search: batch, find, \
+Clients loading schemas on demand: load in one search: batch, find, \
 act, activate_window, key, type_text, wait_for, wait_idle, screenshot, apps.";
 
 /// Tools Claude Code loads with the session instead of deferring them
