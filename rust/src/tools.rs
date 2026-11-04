@@ -129,6 +129,23 @@ as if the setup were broken (AT-SPI, virtual input, KWin, screenshots), run doct
 Clients loading schemas on demand: load the common ones in one search: batch, find, \
 act, activate_window, key, type_text, wait_for, wait_idle, screenshot, apps.";
 
+/// Tools Claude Code loads with the session instead of deferring them
+/// behind a tool search (`_meta` "anthropic/alwaysLoad"): the ones nearly
+/// every desktop task starts with, so the first call needs no search turn.
+/// The rest stay deferred, keeping the per-turn context small.
+pub const ALWAYS_LOAD: [&str; 10] = [
+    "batch",
+    "find",
+    "act",
+    "activate_window",
+    "key",
+    "type_text",
+    "wait_for",
+    "wait_idle",
+    "screenshot",
+    "apps",
+];
+
 /// The `confirm` argument of tools that change something.
 const CONFIRM: &str =
     "Only when a refusal asked for the user's confirmation and the user agreed to this exact call.";
@@ -473,6 +490,9 @@ pub fn tools() -> Json {
                 "description": CONFIRM
             });
         }
+        if ALWAYS_LOAD.contains(&name) {
+            tool["_meta"] = json!({ "anthropic/alwaysLoad": true });
+        }
     }
     list
 }
@@ -480,6 +500,25 @@ pub fn tools() -> Json {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_common_tools_load_up_front() {
+        let list = tools();
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for name in ALWAYS_LOAD {
+            assert!(names.contains(&name), "{name} is no tool");
+        }
+        for tool in list.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let up = tool["_meta"]["anthropic/alwaysLoad"] == json!(true);
+            assert_eq!(up, ALWAYS_LOAD.contains(&name), "{name}");
+        }
+    }
 
     #[test]
     fn only_reading_tools_are_marked_read_only() {

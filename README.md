@@ -470,6 +470,17 @@ Building for Windows on Linux also works (`mingw-w64-gcc` and
 `rustup target add x86_64-pc-windows-gnu`, then
 `cargo build --release --target x86_64-pc-windows-gnu`).
 
+### Speed: tools loaded up front
+
+Claude Code defers MCP tools behind a tool search, which costs a model turn at
+the start of every desktop task. The server marks the ten tools nearly every
+task starts with (`batch`, `find`, `act`, `activate_window`, `key`,
+`type_text`, `wait_for`, `wait_idle`, `screenshot`, `apps`) with
+`_meta: {"anthropic/alwaysLoad": true}`, so Claude Code loads them with the
+session (about 11.5k characters of schema); the others stay deferred. To load
+every tool up front instead, add `"alwaysLoad": true` to the server's entry in
+the MCP config.
+
 ### Speed: skipping the permission prompt
 
 Claude Code sends every MCP call that is not in its allow list to a prompt or,
