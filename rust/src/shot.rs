@@ -1,5 +1,6 @@
 //! Screenshot post-processing shared by every backend: shrink a capture to
-//! a size limit and encode it once, as a PNG for an MCP image block.
+//! a size limit and encode it once as a PNG (the file), and as a JPEG for
+//! the MCP image block when that is clearly smaller.
 
 use std::io::BufReader;
 
@@ -164,6 +165,34 @@ pub fn shrink(img: &Pixels, w: u32, h: u32) -> Pixels {
     }
 }
 
+/// JPEG quality of an inline screenshot. At 80 with full colour resolution
+/// (4:4:4) small UI text reads as in the PNG; a 1024x576 Confluence page
+/// took 94 KB instead of 246, a YouTube page 130 KB instead of 660.
+const JPEG_QUALITY: u8 = 80;
+
+/// An inline image is sent as JPEG when that takes at most this share of
+/// the PNG's bytes (flat UI often compresses as well losslessly).
+const JPEG_SHARE: f64 = 0.75;
+
+/// The image as a baseline JPEG; None for images with translucent pixels
+/// or a size JPEG cannot hold.
+pub fn write_jpeg(img: &Pixels) -> Option<Vec<u8>> {
+    let color = match img.channels {
+        1 => jpeg_encoder::ColorType::Luma,
+        3 => jpeg_encoder::ColorType::Rgb,
+        _ => return None,
+    };
+    let (w, h) = (
+        u16::try_from(img.width).ok()?,
+        u16::try_from(img.height).ok()?,
+    );
+    let mut out = Vec::new();
+    let mut enc = jpeg_encoder::Encoder::new(&mut out, JPEG_QUALITY);
+    enc.set_sampling_factor(jpeg_encoder::SamplingFactor::R_4_4_4);
+    enc.encode(&img.data, w, h, color).ok()?;
+    Some(out)
+}
+
 /// RGBA whose every pixel is opaque as RGB: a smaller, faster PNG.
 fn drop_opaque_alpha(img: Pixels) -> Pixels {
     if img.channels != 4 || img.data.as_chunks::<4>().0.iter().any(|p| p[3] != 255) {
@@ -247,15 +276,35 @@ pub fn crop(img: &Pixels, (x, y, w, h): (u32, u32, u32, u32)) -> Pixels {
 pub struct Finished {
     pub size: (u32, u32),
     pub png: Vec<u8>,
+    /// The same image as a JPEG, when asked for and clearly smaller.
+    pub jpeg: Option<Vec<u8>>,
     pub kept: Frac,
+}
+
+impl Finished {
+    /// The bytes and media type of the image to send inline.
+    pub fn inline(&self) -> (&[u8], &'static str) {
+        match &self.jpeg {
+            Some(j) => (j, "image/jpeg"),
+            None => (&self.png, "image/png"),
+        }
+    }
 }
 
 /// The PNG sent back for a capture and its size: `pixels` (or, without
 /// them, the PNG an external tool wrote to `path`) cropped to `region` at
 /// full resolution, shrunk to fit in `max` x `max` and encoded once. `path`
 /// ends up holding exactly that PNG, the image the screenshot's
-/// coordinates refer to; it is removed on failure.
-pub fn finish(path: &str, pixels: Option<Convert>, max: u32, region: Frac) -> R<Finished> {
+/// coordinates refer to; it is removed on failure. With `jpeg`, the same
+/// pixels are also encoded as a JPEG, kept when it is at most JPEG_SHARE of
+/// the PNG's size.
+pub fn finish(
+    path: &str,
+    pixels: Option<Convert>,
+    max: u32,
+    region: Frac,
+    jpeg: bool,
+) -> R<Finished> {
     let whole = region == Frac::ALL;
     let done = (|| {
         let img = match pixels {
@@ -266,6 +315,9 @@ pub fn finish(path: &str, pixels: Option<Convert>, max: u32, region: Frac) -> R<
                     let png = std::fs::read(path).map_err(|e| e.to_string())?;
                     return Ok(Finished {
                         size: (img.width, img.height),
+                        jpeg: jpeg
+                            .then(|| smaller_jpeg(&drop_opaque_alpha(img), png.len()))
+                            .flatten(),
                         png,
                         kept: Frac::ALL,
                     });
@@ -295,10 +347,12 @@ pub fn finish(path: &str, pixels: Option<Convert>, max: u32, region: Frac) -> R<
         } else {
             shrink(&img, w, h)
         };
-        let png = write_png(&drop_opaque_alpha(img))?;
+        let img = drop_opaque_alpha(img);
+        let png = write_png(&img)?;
         std::fs::write(path, &png).map_err(|e| format!("{path}: {e}"))?;
         Ok(Finished {
             size: (w, h),
+            jpeg: jpeg.then(|| smaller_jpeg(&img, png.len())).flatten(),
             png,
             kept,
         })
@@ -307,6 +361,11 @@ pub fn finish(path: &str, pixels: Option<Convert>, max: u32, region: Frac) -> R<
         let _ = std::fs::remove_file(path);
     }
     done
+}
+
+/// `img` as a JPEG when that takes at most JPEG_SHARE of `png_len` bytes.
+fn smaller_jpeg(img: &Pixels, png_len: usize) -> Option<Vec<u8>> {
+    write_jpeg(img).filter(|j| (j.len() as f64) <= png_len as f64 * JPEG_SHARE)
 }
 
 pub fn base64(bytes: &[u8]) -> String {
@@ -486,22 +545,22 @@ mod tests {
         let path = temp("pixels");
         std::fs::write(&path, b"").unwrap();
         let convert: Convert = Box::new(|| Ok(noise(300, 100, 4)));
-        let done = finish(&path, Some(convert), 150, Frac::ALL).unwrap();
+        let done = finish(&path, Some(convert), 150, Frac::ALL, false).unwrap();
         assert_eq!(done.size, (150, 50));
         assert_eq!(done.kept, Frac::ALL);
         assert_eq!(std::fs::read(&path).unwrap(), done.png);
         // Another tool's PNG (the spectacle/grim fallback) is decoded.
-        let small = finish(&path, None, 60, Frac::ALL).unwrap();
+        let small = finish(&path, None, 60, Frac::ALL, false).unwrap();
         assert_eq!(small.size, (60, 20));
         let back = read_png(&path).unwrap();
         assert_eq!((back.width, back.height, back.channels), (60, 20, 4));
         // Small enough already: sent as the tool wrote it.
-        let same = finish(&path, None, 100, Frac::ALL).unwrap();
+        let same = finish(&path, None, 100, Frac::ALL, false).unwrap();
         assert_eq!((same.size, same.png), ((60, 20), small.png));
         std::fs::remove_file(&path).unwrap();
         // A failed capture leaves no file behind.
         let convert: Convert = Box::new(|| Err("gone".into()));
-        assert!(finish(&path, Some(convert), 100, Frac::ALL).is_err());
+        assert!(finish(&path, Some(convert), 100, Frac::ALL, false).is_err());
         assert!(std::fs::metadata(&path).is_err());
     }
 
@@ -557,12 +616,12 @@ mod tests {
             w: 0.25,
             h: 0.5,
         };
-        let done = finish(&path, Some(Box::new(half)), 1024, region).unwrap();
+        let done = finish(&path, Some(Box::new(half)), 1024, region, false).unwrap();
         assert_eq!((done.size, done.kept), ((100, 50), region));
         let back = read_png(&path).unwrap();
         assert!(back.data.iter().all(|&p| p == 200));
         // Still shrunk to max_size after the crop.
-        let done = finish(&path, Some(Box::new(half)), 50, region).unwrap();
+        let done = finish(&path, Some(Box::new(half)), 50, region, false).unwrap();
         assert_eq!(done.size, (50, 25));
         // The PNG another tool wrote is cropped too.
         let done = finish(
@@ -575,6 +634,7 @@ mod tests {
                 w: 0.5,
                 h: 1.0,
             },
+            false,
         )
         .unwrap();
         assert_eq!(done.size, (25, 25));
@@ -595,6 +655,41 @@ mod tests {
             let ms = start.elapsed().as_secs_f64() * 1000.0 / f64::from(runs);
             println!("shrink 1920x1080 RGBA to {w}x{h}: {ms:.2} ms");
         }
+    }
+
+    #[test]
+    fn busy_images_go_inline_as_jpeg_and_flat_ones_as_png() {
+        let path = temp("jpeg");
+        std::fs::write(&path, b"").unwrap();
+        // Noise, as busy as a photo: the JPEG is far smaller; the file
+        // stays a PNG.
+        let convert: Convert = Box::new(|| Ok(noise(320, 200, 3)));
+        let done = finish(&path, Some(convert), 1024, Frac::ALL, true).unwrap();
+        let (bytes, mime) = done.inline();
+        assert_eq!(mime, "image/jpeg");
+        assert!(bytes.starts_with(&[0xFF, 0xD8]) && bytes.ends_with(&[0xFF, 0xD9]));
+        assert!(bytes.len() * 4 <= done.png.len() * 3);
+        assert_eq!(std::fs::read(&path).unwrap(), done.png);
+        // Not asked for (inline=false): no JPEG is made.
+        let convert: Convert = Box::new(|| Ok(noise(320, 200, 3)));
+        let done = finish(&path, Some(convert), 1024, Frac::ALL, false).unwrap();
+        assert!(done.jpeg.is_none());
+        // A flat window compresses better losslessly: PNG.
+        let flat: Convert = Box::new(|| {
+            Ok(Pixels {
+                width: 320,
+                height: 200,
+                channels: 3,
+                data: vec![240; 320 * 200 * 3],
+            })
+        });
+        let done = finish(&path, Some(flat), 1024, Frac::ALL, true).unwrap();
+        assert_eq!(done.inline().1, "image/png");
+        std::fs::remove_file(&path).unwrap();
+        // Translucent pixels have no JPEG form.
+        let mut img = noise(8, 8, 4);
+        img.data[3] = 0;
+        assert!(write_jpeg(&img).is_none());
     }
 
     #[test]

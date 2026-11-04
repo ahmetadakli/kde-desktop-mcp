@@ -7,10 +7,12 @@
 //! every call). Platform code lives behind the `Backend` trait.
 
 mod backend;
+mod flow;
 #[cfg(target_os = "linux")]
 mod linux;
 mod policy;
 mod render;
+mod semantic;
 mod shot;
 mod takeover;
 mod tools;
@@ -34,30 +36,40 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::Mutex;
 
 use backend::{
-    Backend, Cache, Clip, Fetch, FileDialog, Focused, Info, R, Shot, WindowChange, WindowGeo,
+    Backend, Cache, Clip, Fetch, FileDialog, Focused, Info, R, Shot, Toggles, WindowChange,
+    WindowGeo,
 };
 use policy::{Policy, Tier};
 use render::{Line, Printed, WalkOpts};
+use semantic::Verb;
 
 const MAX_REFS: usize = 20000;
-const TREE_TEXT_LIMIT: usize = 80;
+/// Text read per element for tree lines: one more character than they
+/// show, so a cut is visible.
+const TREE_TEXT_LIMIT: usize = render::PREVIEW_CHARS + 1;
 /// Longest `tree` reply by default, in characters (about 5k tokens).
 const TREE_MAX_CHARS: i64 = 20_000;
 /// Characters kept free in a capped tree for the line saying how to go on.
 const CONTINUATION_CHARS: usize = 150;
 /// Nodes fetched ahead when rendering reaches an unfetched part of the tree.
 const PREFETCH_MORE: usize = 500;
+/// Candidates an ambiguous target lists (`Server::untie`).
+const AMBIGUOUS_SHOWN: usize = 6;
+/// Candidates of an ambiguous target measured for an on-screen area at
+/// most (`Server::untie`): more are refused as they are, as dropping the
+/// ones without would rarely leave one.
+const AREA_CHECK_MAX: usize = 2 * AMBIGUOUS_SHOWN;
 /// Off-screen matches or close names a missed search offers.
 const MISS_SUGGESTIONS: usize = 5;
 /// Nodes of a web page fetched when looking for matches scrolled out of
 /// view (see `Server::miss_report`).
 const OFFSCREEN_FETCH: usize = 3000;
 
-/// What `Server::locate` found: the element, or the windows searched; with
+/// What `Server::locate` found: the matches, or the windows searched; with
 /// the nodes fetched.
 enum Located<Id> {
-    /// The element, the nodes read, and whether they came from a kept read.
-    Found(Id, Cache<Id>, bool),
+    /// The matches, the nodes read, and whether they came from a kept read.
+    Found(render::Matches<Id>, Cache<Id>, bool),
     /// The windows searched and the nodes read there.
     Missed(Vec<Id>, Cache<Id>),
 }
@@ -350,6 +362,15 @@ struct Server<B: Backend> {
     last_active: Mutex<Option<String>>,
     /// The window in front after the last input, for `window_change_note`.
     seen_active: Mutex<Option<String>>,
+    /// The surfaces (menus, dialogs; `id_hash`) last listed without change
+    /// events (`Server::surfaces_note` scans then), so one still open is
+    /// not listed again.
+    seen_surfaces: Mutex<Vec<u64>>,
+    /// The change mark taken when the last input's reply listed what it
+    /// opened, and the surfaces it listed (`id_hash`): what showed after
+    /// it (a dialog that opened after that reply) is listed by the next
+    /// input's reply (`Server::opened_before`).
+    shown_pending: Mutex<Option<(u64, Vec<u64>)>>,
     /// Maps pixels of the last screenshot to screen coordinates.
     last_shot: Mutex<Option<ShotMap>>,
     /// Held by tools that send keyboard or pointer input, so two concurrent
@@ -481,6 +502,19 @@ struct Gate {
     tool: String,
     args: Json,
     confirmed: bool,
+    /// The change mark taken before the input of a call whose reply a
+    /// batch tests, until `Server::settle` waited for it.
+    settle: Option<u64>,
+    /// The input is likely to open a menu, list or dialog (a click on a
+    /// combo box or menu entry): its reply waits for one to show.
+    opener: bool,
+    /// The reply lists what opened already (`menu` listing a submenu).
+    quiet: bool,
+    /// The surfaces (`id_hash`) this call's reply listed already.
+    reported: Vec<u64>,
+    /// "before it, opened: …" lines for what showed after the previous
+    /// input's reply (`Server::opened_before`), said with this call's.
+    before: String,
 }
 
 tokio::task_local! {
@@ -572,6 +606,9 @@ tokio::task_local! {
     /// references in later steps (see `Server::batch`). Only set inside a
     /// batch step; tools note it through `note_step_element`.
     static STEP_ELEMENT: std::cell::Cell<Option<u64>>;
+    /// The focus a step of the running batch reported last, so later steps
+    /// with the same focus say "(unchanged)" instead of describing it again.
+    static BATCH_FOCUS: std::cell::RefCell<Option<String>>;
 }
 
 /// Record `rid` as the element the running batch step produced: the one a
@@ -585,53 +622,96 @@ fn note_step_element(rid: u64, replace: bool) {
     });
 }
 
-/// What an earlier batch step left for `"$N"` references.
-enum StepElement {
-    Element(u64),
-    NoElement,
-    Failed,
+tokio::task_local! {
+    /// The refusals made while the running call (or batch step) ran: see
+    /// `refusal` and `with_refusals`.
+    static REFUSALS: std::cell::RefCell<Vec<String>>;
 }
 
-/// Replace `"$N"` in the top-level id arguments (`id`, `*_id`) of step
-/// `step` (1-based) with the element step N produced.
-fn resolve_step_refs(args: &mut Json, step: usize, done: &[(String, StepElement)]) -> R<()> {
-    let Some(map) = args.as_object_mut() else {
-        return Ok(());
-    };
-    for (key, value) in map.iter_mut() {
-        if key != "id" && !key.ends_with("_id") {
-            continue;
-        }
-        let Some(text) = value.as_str().and_then(|v| v.strip_prefix('$')) else {
-            continue;
-        };
-        let n: usize = text
-            .parse()
-            .map_err(|_| format!("`{key}` {value}: use \"$N\" for the element step N produced"))?;
-        let (tool, produced) = match n.checked_sub(1).and_then(|i| done.get(i)) {
-            Some(d) if n < step => d,
-            _ => {
-                return Err(format!(
-                    "`{key}` \"${n}\": refer to an earlier step (1 to {})",
-                    step - 1
-                ));
-            }
-        };
-        *value = match produced {
-            StepElement::Element(rid) => json!(rid),
-            StepElement::Failed => {
-                return Err(format!("`{key}` \"${n}\": step {n} ({tool}) failed"));
-            }
-            StepElement::NoElement => {
-                return Err(format!(
-                    "`{key}` \"${n}\": step {n} ({tool}) produced no element \
-                     (find, wait_for, and tools given an element do)"
-                ));
-            }
-        };
-    }
-    Ok(())
+/// Note `e` as a refusal (by the allowlist, a tier, a confirmation the user
+/// declined or was not asked for, a password field, or the user taking
+/// over), for the batch (`with_refusals`); returns it. On_fail steps never
+/// run after one, and it ends a repeat.
+fn refusal(e: String) -> String {
+    let _ = REFUSALS.try_with(|r| r.borrow_mut().push(e.clone()));
+    e
 }
+
+/// Run `f`; its result, and whether its error is (or carries) a refusal
+/// made while it ran. A refusal a tool got past (one candidate refused,
+/// another taken) does not count: only one its error names.
+async fn with_refusals<T>(f: impl Future<Output = R<T>>) -> (R<T>, bool) {
+    REFUSALS
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            let r = f.await;
+            let refused = match &r {
+                Ok(_) => false,
+                Err(e) => REFUSALS.with(|v| v.borrow().iter().any(|m| e.contains(m.as_str()))),
+            };
+            (r, refused)
+        })
+        .await
+}
+
+/// What one tool call of a batch step left.
+struct StepResult {
+    result: R<Out>,
+    /// The element it produced (`STEP_ELEMENT`).
+    element: Option<u64>,
+    /// It failed by a refusal (`with_refusals`).
+    refused: bool,
+}
+
+/// A running batch: its reply so far and what its steps left.
+#[derive(Default)]
+struct BatchRun {
+    out: Vec<String>,
+    images: Vec<(String, &'static str)>,
+    /// Records of the top-level steps run so far, for `"$N"` and conditions.
+    done: Vec<flow::Record>,
+    /// A printed step failed.
+    failed: bool,
+}
+
+impl BatchRun {
+    /// The reply line of a call labelled `label` ("3", "2.1", "4.on_fail").
+    fn print(&mut self, label: &str, call: &flow::Call, r: &StepResult, optional: bool) {
+        let tool = &call.tool;
+        match &r.result {
+            Ok(o) => {
+                self.out.push(format!("[{label}] {tool}: {}", o.text));
+                self.images.extend(o.images.iter().cloned());
+            }
+            Err(e) => {
+                self.failed = true;
+                let opt = if optional { " (optional)" } else { "" };
+                self.out.push(format!("[{label}] {tool} failed{opt}: {e}"));
+            }
+        }
+    }
+
+    fn record(&mut self, tool: String, ok: bool, r: StepResult) {
+        let text = match r.result {
+            Ok(o) => o.text,
+            Err(e) => e,
+        };
+        let element = r.element;
+        self.done.push(flow::Record {
+            tool,
+            outcome: flow::Outcome::Ran { ok, element, text },
+        });
+    }
+
+    fn skip(&mut self, tool: &str) {
+        self.done.push(flow::Record {
+            tool: tool.into(),
+            outcome: flow::Outcome::Skipped,
+        });
+    }
+}
+
+/// Longest run of a batch's repeat: it starts no new run after this.
+const REPEAT_TIME: Duration = Duration::from_millis(MAX_WAIT_MS as u64);
 
 /// Longest `wait_for` / `pause`, in ms (10 minutes).
 const MAX_WAIT_MS: i64 = 600_000;
@@ -889,7 +969,8 @@ fn cap_lines(text: String, max: usize) -> String {
 /// A tool's reply: text, plus base64 PNGs sent as MCP image blocks.
 struct Out {
     text: String,
-    images: Vec<String>,
+    /// Inline images: base64 data and media type.
+    images: Vec<(String, &'static str)>,
 }
 
 impl From<String> for Out {
@@ -906,8 +987,28 @@ impl From<String> for Out {
 /// still shows a 1536 px wide window's text legibly.
 const SHOT_MAX_SIZE: i64 = 1024;
 
+/// Characters `get_text` returns unless `limit` says otherwise. A whole
+/// web page read 20,000 (5,000 tokens, re-read on every later turn) where
+/// the part wanted was near the top; a cut reply says where to go on.
+const GET_TEXT_LIMIT: i64 = 10000;
+
 /// How long set_text waits for the field to show what was written.
 const SET_TEXT_VERIFY: Duration = Duration::from_millis(300);
+/// How long `act`'s verified actions wait for the state they asked for to
+/// show, and the longest pause between reads meanwhile.
+const VERIFY_WAIT: Duration = Duration::from_millis(500);
+const VERIFY_POLL: Duration = Duration::from_millis(50);
+/// Nodes `act(action=select)` reads under a control for its entries.
+const OPTIONS_FETCH: usize = 2000;
+/// scroll_to's wheel fallback: notches per round, rounds, and how long
+/// each round waits for the element to show.
+const WHEEL_STEP: i64 = 5;
+const WHEEL_ROUNDS: usize = 10;
+const WHEEL_WAIT: Duration = Duration::from_millis(200);
+/// Why `act` opens no menu of Firefox's (see `Backend::may_open_menu`).
+const NO_MENU_OPEN: &str = "opening its menu through accessibility can hang or crash this app \
+     (Firefox); nothing sent: click it (or focus it and key alt+down), then act on the entry";
+
 /// Intermediate pointer moves in a drag, so apps see motion, not a jump.
 const DRAG_STEPS: i64 = 12;
 const DRAG_STEP_GAP: Duration = Duration::from_millis(12);
@@ -923,7 +1024,12 @@ fn written_matches(written: &str, now: &str) -> bool {
 /// only read.
 fn indicator_label(tool: &str, a: &Json) -> Option<String> {
     Some(match tool {
-        "click" | "act" => "clicking".into(),
+        "act" => match semantic::Verb::parse(&arg_s(a, "action", "")) {
+            Some(v) => v.label().into(),
+            None if a.get("option").is_some_and(Json::is_string) => "selecting".into(),
+            None => "clicking".into(),
+        },
+        "click" => "clicking".into(),
         "focus" => "focusing".into(),
         "key" => format!("pressing {}", arg_s(a, "combo", "a key")),
         "type_text" | "set_text" => "typing".into(),
@@ -1269,6 +1375,45 @@ where
     }
 }
 
+/// For a verified action on an element not of the kind it needs: Ok(None)
+/// when the element still has an action named `action` (it then runs as a
+/// plain action), else the error, with nothing sent.
+fn not_of_kind<Id>(info: &Info<Id>, action: &str, kind: &str) -> R<Option<String>> {
+    let want = semantic::norm(action);
+    if info.actions.iter().any(|a| semantic::norm(a) == want) {
+        return Ok(None);
+    }
+    Err(format!(
+        "it is not {kind} ({}); nothing sent{}",
+        info.role,
+        actions_hint(info)
+    ))
+}
+
+/// The error for a verified action that found no action to run.
+fn no_action<Id>(info: &Info<Id>, what: &str) -> String {
+    format!(
+        "it has no action to {what} it; nothing sent{}",
+        actions_hint(info)
+    )
+}
+
+/// ": its actions are [...]; act with one, or click" (or ": use click").
+fn actions_hint<Id>(info: &Info<Id>) -> String {
+    let list: Vec<String> = render::shown_actions(info)
+        .into_iter()
+        .map(render::py_repr)
+        .collect();
+    if list.is_empty() {
+        ": use click".into()
+    } else {
+        format!(
+            ": its actions are [{}]; act with one, or click",
+            list.join(", ")
+        )
+    }
+}
+
 impl<B: Backend> Server<B> {
     fn new(b: B) -> Self {
         let allow_file = b.allow_file();
@@ -1283,6 +1428,8 @@ impl<B: Backend> Server<B> {
             allow_file,
             last_active: Mutex::new(None),
             seen_active: Mutex::new(None),
+            seen_surfaces: Mutex::new(Vec::new()),
+            shown_pending: Mutex::new(None),
             last_shot: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
@@ -1295,6 +1442,24 @@ impl<B: Backend> Server<B> {
     }
 
     // ------------------------------------------------------------ takeover
+
+    /// For a call whose reply a batch tests (`call_inner`'s `settle`), once
+    /// per call: wait up to SETTLE_MS for the app whose elements are `near`
+    /// to report a change since the input, and its burst of events to end.
+    /// True when it waited.
+    async fn settle(&self, near: &[B::Id]) -> bool {
+        let Some(mark) = GATE
+            .try_with(|g| g.borrow_mut().settle.take())
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        self.b
+            .wait_change(near, mark, Duration::from_millis(SETTLE_MS as u64))
+            .await;
+        true
+    }
 
     /// Note that a run of input starts now (the input lock was just taken).
     fn start_run(&self) {
@@ -1319,7 +1484,7 @@ impl<B: Backend> Server<B> {
             Ok(()) => Ok(()),
             Err(block) => {
                 self.b.indicate(&block.label()).await;
-                Err(block.message(t.window()))
+                Err(refusal(block.message(t.window())))
             }
         }
     }
@@ -1492,12 +1657,12 @@ impl<B: Backend> Server<B> {
         let tier = policy.tier(&app).ok_or_else(|| self.not_allowed(&app))?;
         let need = policy::needed_tier(&tool, &args);
         if tier < need {
-            return Err(format!(
+            return Err(refusal(format!(
                 "{tool} needs the {need} tier, but '{app}' is allowed with the {tier} tier \
                  ('{app}:{tier}' in {}), which allows {}; changing it is the user's decision",
                 self.allow_file.display(),
                 tier.allows()
-            ));
+            )));
         }
         if !confirmed && policy.needs_confirm(&tool, Some(&app)) {
             self.confirm(&tool, Some(&app), &args).await?;
@@ -1530,7 +1695,9 @@ impl<B: Backend> Server<B> {
                 .request("elicitation/create", params, CONFIRM_WAIT)
                 .await
                 .map_err(|e| {
-                    format!("{what} needs the user's confirmation, but asking failed: {e}")
+                    refusal(format!(
+                        "{what} needs the user's confirmation, but asking failed: {e}"
+                    ))
                 })?;
             let accepted = answer["action"] == "accept"
                 && answer.pointer("/content/confirm") != Some(&json!(false));
@@ -1539,18 +1706,18 @@ impl<B: Backend> Server<B> {
                     Some("accept" | "decline") => "declined",
                     _ => "dismissed",
                 };
-                return Err(format!("the user {how} {what}; nothing was done"));
+                return Err(refusal(format!("the user {how} {what}; nothing was done")));
             }
         } else if !arg_b(a, "confirm", false) {
             let why = match self.policy().needs_confirm(tool, app) {
                 true => format!("confirm list in {}", self.allow_file.display()),
                 false => "it may lose unsaved work".into(),
             };
-            return Err(format!(
+            return Err(refusal(format!(
                 "{what} needs the user's confirmation ({why}), and this client cannot ask \
                  (no elicitation): ask the user, and only if they agree call again with \
                  confirm: true"
-            ));
+            )));
         }
         let _ = GATE.try_with(|g| g.borrow_mut().confirmed = true);
         Ok(())
@@ -1613,7 +1780,10 @@ impl<B: Backend> Server<B> {
     }
 
     fn not_allowed(&self, app: &str) -> String {
-        format!("app '{app}' is not in {}", self.allow_file.display())
+        refusal(format!(
+            "app '{app}' is not in {}",
+            self.allow_file.display()
+        ))
     }
 
     async fn require_active_allowed(&self) -> R<String> {
@@ -1625,12 +1795,12 @@ impl<B: Backend> Server<B> {
                 Some(t) if !t.is_empty() => format!(" (last used: '{t}')"),
                 _ => String::new(),
             };
-            return Err(format!(
+            return Err(refusal(format!(
                 "active window app '{}' is not in {}; pass window=<title or app> to \
                  activate an allowed window first{hint}",
                 if name.is_empty() { "unknown" } else { &name },
                 self.allow_file.display()
-            ));
+            )));
         }
         self.permit(&name).await?;
         Ok(name)
@@ -1904,7 +2074,8 @@ impl<B: Backend> Server<B> {
         (out, cache, cached)
     }
 
-    /// Fetch the visible part of `app` and pick the element `query` names;
+    /// Fetch the visible part of `app` and find the elements `query` names
+    /// (render::locate_all; `window` the tool's window argument or "");
     /// window and tab titles only with `titles` (see render::TITLE_ROLES).
     /// `kept`: a kept read of `app` may serve. The cache holds no action
     /// names: `fill_actions` before describing.
@@ -1915,6 +2086,7 @@ impl<B: Backend> Server<B> {
         role: &str,
         titles: bool,
         kept: bool,
+        window: &str,
     ) -> R<Located<B::Id>> {
         let windows = trace::time("app_windows", self.app_windows(app)).await?;
         let app = app.to_lowercase();
@@ -1925,16 +2097,17 @@ impl<B: Backend> Server<B> {
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::locate(c, &windows, query, role, titles),
+                |c| render::locate_all(c, &windows, query, role, titles, window),
             )
             .await;
         Ok(match found {
-            Some(id) => Located::Found(id, cache, cached),
+            Some(m) => Located::Found(m, cache, cached),
             None => Located::Missed(windows, cache),
         })
     }
 
-    /// `locate` in the app windows `windows`, read afresh.
+    /// `locate` in the app windows `windows`, read afresh: the first
+    /// element picked (a read takes the first of a tie).
     async fn locate_in(
         &self,
         windows: Vec<B::Id>,
@@ -1949,10 +2122,10 @@ impl<B: Backend> Server<B> {
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::locate(c, &windows, query, role, titles),
+                |c| render::locate_all(c, &windows, query, role, titles, ""),
             )
             .await;
-        found.map(|id| (id, cache))
+        found.map(|m| (m.first().clone(), cache))
     }
 
     /// What to offer when nothing visible in `windows` matches `query`:
@@ -1990,7 +2163,7 @@ impl<B: Backend> Server<B> {
                 let (text, _) = self.print(as_lines(hits), &off, app).await;
                 return format!(
                     "\noff-screen, scrolled out of view (act and get_text work on them; \
-                     scroll before click):\n{text}"
+                     act action=scroll_to before click):\n{text}"
                 );
             }
         }
@@ -2003,20 +2176,108 @@ impl<B: Backend> Server<B> {
         format!("; closest:\n{text}")
     }
 
-    /// The element a tool call names: `id`, or `app` + `query` (+ `role`).
-    /// The tool's tier (and confirmation, `permit`) is checked against the
-    /// element's app before anything is looked up there.
-    async fn target(&self, a: &Json) -> R<Target<B::Id>> {
-        Ok(self.target_and_center(a, false).await?.0)
+    /// For an input tool's query that names several elements (`m`, from
+    /// one fresh read in `cache`): when some have an on-screen area and
+    /// others none (a collapsed menu's entries), the ones without are left
+    /// out (up to AREA_CHECK_MAX candidates, in front or not), and one left
+    /// is the target. Else the refusal, listing the candidates with ids,
+    /// actions and (when their window is in front) where they are: nothing
+    /// is sent.
+    async fn untie(
+        &self,
+        m: &mut render::Matches<B::Id>,
+        cache: &mut Cache<B::Id>,
+        app: &str,
+        query: &str,
+        role: &str,
+    ) -> R<()> {
+        if m.picked.len() <= AREA_CHECK_MAX {
+            let ids: Vec<B::Id> = m.picked.iter().map(|(id, _)| id.clone()).collect();
+            let area = trace::time("has_area", self.b.has_area(&ids)).await;
+            let no_area = |a: &Option<bool>| *a == Some(false);
+            if area.iter().any(|a| !no_area(a)) {
+                let mut keep = area.iter().map(|a| !no_area(a));
+                m.picked.retain(|_| keep.next().unwrap_or(true));
+            }
+        }
+        if m.picked.len() == 1 {
+            return Ok(());
+        }
+        // Only the lines shown: their actions (the read has none) and
+        // positions, together.
+        let shown: Vec<(B::Id, B::Id)> = m.picked.iter().take(AMBIGUOUS_SHOWN).cloned().collect();
+        let shown_ids: Vec<B::Id> = shown.iter().map(|(id, _)| id.clone()).collect();
+        let ((), centers) = tokio::join!(
+            trace::time("fill_actions", self.b.fill_actions(cache, &shown_ids)),
+            trace::time("element_centers", self.b.element_centers_in(&shown))
+        );
+        let app_key = app.to_lowercase();
+        let mut windows: Vec<&B::Id> = m.picked.iter().map(|(_, w)| w).collect();
+        windows.dedup();
+        let several = windows.len() > 1;
+        let mut lines = Vec::new();
+        for ((id, w), c) in shown.iter().zip(&centers) {
+            let rid = self.add_ref(id, &cache[id], &app_key).await;
+            let mut line = render::describe(&cache[id], rid);
+            if let Ok((x, y)) = c {
+                line.push_str(&format!(" at {x},{y}"));
+            }
+            if several && let Some(info) = cache.get(w) {
+                line.push_str(&format!(" in {}", render::py_repr(&info.name)));
+                if render::is_dialog(info) {
+                    line.push_str(" (dialog)");
+                }
+            }
+            lines.push(line);
+        }
+        let n = m.picked.len();
+        if n > AMBIGUOUS_SHOWN {
+            lines.push(format!("… {} more", n - AMBIGUOUS_SHOWN));
+        }
+        let with_role = if role.is_empty() {
+            String::new()
+        } else {
+            format!(" with role '{role}'")
+        };
+        let first_role = &cache[&m.picked[0].0].role;
+        let roles_differ = m.picked.iter().any(|(id, _)| &cache[id].role != first_role);
+        let narrow = match (several, roles_differ) {
+            (true, _) => "pass one id, or window= its title",
+            (false, true) => "pass one id, or role",
+            (false, false) => "pass one id",
+        };
+        // A refusal: nothing was sent, and the candidates say what to pass
+        // (no on_fail, no "now:" line).
+        Err(refusal(format!(
+            "ambiguous: {n} elements in '{app}' match '{query}'{with_role}; nothing sent. \
+             {narrow}:\n{}",
+            lines.join("\n")
+        )))
     }
 
-    /// `target`, and with `center` the element's centre when it was cheap
-    /// to measure alongside the last lookups (found by query); None then
-    /// to measure it after.
+    /// The element an input tool names: `id`, or `app` + `query` (+
+    /// `role`). The tool's tier (and confirmation, `permit`) is checked
+    /// against the element's app before anything is looked up there. A
+    /// query that names several elements equally well, after the
+    /// tie-breaks (render::locate_all), is refused with the candidates.
+    async fn target(&self, a: &Json) -> R<Target<B::Id>> {
+        Ok(self.target_and_center(a, false, true).await?.0)
+    }
+
+    /// `target` for a read tool: of several elements a query names equally
+    /// well it takes the first, and says so.
+    async fn read_target(&self, a: &Json) -> R<Target<B::Id>> {
+        Ok(self.target_and_center(a, false, false).await?.0)
+    }
+
+    /// `target` (`input`) or `read_target`, and with `center` the element's
+    /// centre when it was cheap to measure alongside the last lookups
+    /// (found by query); None then to measure it after.
     async fn target_and_center(
         &self,
         a: &Json,
         center: bool,
+        input: bool,
     ) -> R<(Target<B::Id>, Option<R<(i32, i32)>>)> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
             let r = trace::time("resolve_ref", self.resolve_ref(rid)).await?;
@@ -2030,11 +2291,16 @@ impl<B: Backend> Server<B> {
             };
             return Ok((t, None));
         }
+        // `role` alone (no `query`) names the first element of that role,
+        // e.g. an editor's text: input tools still refuse a tie.
+        let has_role = !arg_s(a, "role", "").trim().is_empty();
         let (Some(app), Some(query)) = (
             a.get("app").and_then(Json::as_str),
-            a.get("query").and_then(Json::as_str),
+            a.get("query")
+                .and_then(Json::as_str)
+                .or(has_role.then_some("")),
         ) else {
-            return Err("pass `id` (from tree/find), or `app` and `query`".into());
+            return Err("pass `id` (from tree/find), or `app` and `query` (or `role`)".into());
         };
         if !self.is_allowed(app) {
             return Err(self.not_allowed(app));
@@ -2042,12 +2308,14 @@ impl<B: Backend> Server<B> {
         trace::time("permit", self.permit(app)).await?;
         trace::time("enable", self.b.enable()).await;
         let role = arg_s(a, "role", "");
+        let window = a.get("window").and_then(Json::as_str).unwrap_or("");
         let app_key = app.to_lowercase();
         let mut kept = true;
-        let (id, cache, at) = loop {
-            let located = trace::time("locate", self.locate(app, query, &role, true, kept)).await?;
-            let (id, mut cache, cached) = match located {
-                Located::Found(id, cache, cached) => (id, cache, cached),
+        let (id, cache, at, ties) = loop {
+            let located = self.locate(app, query, &role, true, kept, window);
+            let located = trace::time("locate", located).await?;
+            let (mut m, mut cache, cached) = match located {
+                Located::Found(m, cache, cached) => (m, cache, cached),
                 Located::Missed(windows, mut cache) => {
                     let with_role = if role.is_empty() {
                         String::new()
@@ -2062,6 +2330,17 @@ impl<B: Backend> Server<B> {
                     ));
                 }
             };
+            if input && m.picked.len() > 1 {
+                // Candidates come from one read: a kept one is read afresh.
+                if cached {
+                    self.forget_reads(&app_key);
+                    kept = false;
+                    continue;
+                }
+                self.untie(&mut m, &mut cache, app, query, &role).await?;
+            }
+            let ties = m.picked.len();
+            let id = m.first().clone();
             // The window it is in, from the nodes read: no walk up to it.
             let frame = if center { frame_in(&cache, &id) } else { None };
             // An element from a kept read is checked to be still there, in
@@ -2086,7 +2365,7 @@ impl<B: Backend> Server<B> {
                 }
             );
             if there {
-                break (id, cache, at);
+                break (id, cache, at, ties);
             }
             // Gone or hidden without an event: read afresh.
             self.forget_reads(&app_key);
@@ -2094,7 +2373,11 @@ impl<B: Backend> Server<B> {
         };
         let rid = trace::time("add_ref", self.add_ref(&id, &cache[&id], &app_key)).await;
         note_step_element(rid, true);
-        let found = Some(render::describe(&cache[&id], rid));
+        let mut found = render::describe(&cache[&id], rid);
+        if ties > 1 {
+            found.push_str(&format!(" (first of {ties} matches)"));
+        }
+        let found = Some(found);
         let role = cache[&id].role.clone();
         let t = Target {
             id,
@@ -2113,7 +2396,7 @@ impl<B: Backend> Server<B> {
         let (print, focus) = tokio::join!(self.fingerprint(), self.focus_note(false));
         let window = match print.window {
             Some((app, title)) if self.is_allowed(&app) => {
-                format!("active window {} [{app}]", render::py_repr(&title))
+                format!("active window {} [{app}]", render::short_title(&title))
             }
             Some((app, _)) => format!("active window of '{app}' (not allowed)"),
             None => "no active window".into(),
@@ -2138,7 +2421,290 @@ impl<B: Backend> Server<B> {
         if first {
             return String::new();
         }
-        format!("; active window now {}", render::py_repr(&now))
+        format!("; active window now {}", render::short_title(&now))
+    }
+
+    /// "\nopened: …" for what an input without `observe` opened: when it is
+    /// likely to open something (`opens_surface`, a click on an
+    /// OPENER_ROLES element) it first waits up to SETTLE_MS for a menu,
+    /// list or dialog to show; otherwise only what showed already counts.
+    async fn opened_note(&self, tool: &str, a: &Json, mark: u64) -> String {
+        if !self.b.names_surfaces() {
+            return String::new();
+        }
+        let opener =
+            opens_surface(tool, a) || GATE.try_with(|g| g.borrow().opener).unwrap_or(false);
+        if opener {
+            let wait = Duration::from_millis(SETTLE_MS as u64);
+            trace::time("wait_shown", self.b.wait_shown(&[], mark, wait)).await;
+        }
+        self.surfaces_note(mark, opener).await
+    }
+
+    /// "\nopened: …" lines for the menus, popups, combo box lists and
+    /// dialogs of allowed apps shown since `mark`, with their entries' ids
+    /// (`surfaces`), after this call's "before it, opened: …" lines
+    /// (`opened_before`). No round trip when nothing was shown. Without
+    /// such events (`shown_since` None), only with `scan`: the active app's
+    /// windows are looked at, and what the last scan listed is not again.
+    /// What shows after this is left to the next input's reply.
+    async fn surfaces_note(&self, mark: u64, scan: bool) -> String {
+        if !self.b.names_surfaces() {
+            return String::new();
+        }
+        let next = self.b.change_mark();
+        let quiet = GATE.try_with(|g| g.borrow().quiet).unwrap_or(false);
+        let lines = match quiet {
+            true => Vec::new(),
+            false => self.surfaces_since(mark, scan).await,
+        };
+        let (before, listed) = GATE
+            .try_with(|g| {
+                let mut g = g.borrow_mut();
+                (std::mem::take(&mut g.before), g.reported.clone())
+            })
+            .unwrap_or_default();
+        *self.shown_pending.lock().await = Some((next, listed));
+        let mut out = before;
+        for l in lines {
+            out.push_str(&format!("\nopened: {l}"));
+        }
+        out
+    }
+
+    /// The surface lines (`surfaces`) for what showed since `mark`, or
+    /// with `scan` and no such events, among the active app's windows.
+    async fn surfaces_since(&self, mark: u64, scan: bool) -> Vec<String> {
+        match self.b.shown_since(mark) {
+            Some(shown) if shown.is_empty() => Vec::new(),
+            Some(shown) => self.surfaces(cap_candidates(shown), false, None, &[]).await,
+            None if scan => {
+                let app = self.b.active_app().await;
+                if app.is_empty() || !self.is_allowed(&app) {
+                    return Vec::new();
+                }
+                let app = app.to_lowercase();
+                match self.b.app_windows(&app).await {
+                    Some(windows) => self.surfaces(windows, true, Some(&app), &[]).await,
+                    None => Vec::new(),
+                }
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// "\nbefore it, opened: …" lines for the surfaces that showed after
+    /// the last input's reply listed what it opened (a dialog a button
+    /// opened a few ms after its click), but for those it listed. Taken
+    /// before this call's input; said with its own "opened:" lines. No
+    /// round trip when nothing was shown.
+    async fn opened_before(&self) -> String {
+        if !self.b.names_surfaces() {
+            return String::new();
+        }
+        let Some((mark, listed)) = self.shown_pending.lock().await.clone() else {
+            return String::new();
+        };
+        match self.b.shown_since(mark) {
+            Some(shown) if !shown.is_empty() => self
+                .surfaces(cap_candidates(shown), false, None, &listed)
+                .await
+                .iter()
+                .map(|l| format!("\nbefore it, opened: {l}"))
+                .collect(),
+            _ => String::new(),
+        }
+    }
+
+    /// A line (`render::surface_line`) for each surface among `candidates`
+    /// (elements shown lately, or windows): a menu, a combo box's list or
+    /// a dialog of an allowed app, still showing, with entries (dialogs
+    /// may have none), and neither in `skip` nor listed by this call
+    /// already (`id_hash`es): those are not read. `scanned`: the
+    /// candidates are windows looked at without change events; one the
+    /// last scan listed is left out while it shows. `app`: the (allowed)
+    /// app all candidates belong to, when known.
+    async fn surfaces(
+        &self,
+        candidates: Vec<B::Id>,
+        scanned: bool,
+        app: Option<&str>,
+        skip: &[u64],
+    ) -> Vec<String> {
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let candidates: Vec<(B::Id, String)> = match app {
+            Some(app) => candidates.into_iter().map(|c| (c, app.into())).collect(),
+            None => self.candidate_apps(candidates).await,
+        };
+        let candidates: Vec<(B::Id, String)> = candidates
+            .into_iter()
+            .filter(|(_, app)| !app.is_empty() && self.is_allowed(app))
+            .collect();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let roles =
+            futures_util::future::join_all(candidates.iter().map(|(c, _)| self.b.identity(c)))
+                .await;
+        let mut picked: Vec<(B::Id, String, render::Surface)> = candidates
+            .into_iter()
+            .zip(roles)
+            .filter_map(|((c, app), (role, _))| Some((c, app, render::surface_kind(&role)?)))
+            .collect();
+        // A list counts only under a combo box.
+        let keep = futures_util::future::join_all(picked.iter().map(|(c, _, kind)| async move {
+            if *kind != render::Surface::List {
+                return true;
+            }
+            match self.b.parent(c).await {
+                Some(p) => self.b.identity(&p).await.0 == "combo box",
+                None => false,
+            }
+        }))
+        .await;
+        let mut keep = keep.into_iter();
+        picked.retain(|_| keep.next().unwrap_or(false));
+        // Dialogs first: what they hold is not listed again on its own.
+        picked.sort_by_key(|(_, _, kind)| match kind {
+            render::Surface::Dialog => 0,
+            render::Surface::Menu => 1,
+            render::Surface::List => 2,
+        });
+        let reported = GATE
+            .try_with(|g| g.borrow().reported.clone())
+            .unwrap_or_default();
+        let seen = match scanned {
+            true => self.seen_surfaces.lock().await.clone(),
+            false => Vec::new(),
+        };
+        let mut cache = Cache::new();
+        let mut found = Vec::new();
+        let mut lines = Vec::new();
+        for (id, app, kind) in picked {
+            if lines.len() >= SURFACE_MAX {
+                break;
+            }
+            // Inside a surface read already.
+            if cache.contains_key(&id) {
+                continue;
+            }
+            let hash = id_hash(&id);
+            // Listed already: not read again.
+            if reported.contains(&hash) || skip.contains(&hash) {
+                continue;
+            }
+            if seen.contains(&hash) {
+                // Listed by the last scan: still so while it shows (its
+                // own node is enough to tell).
+                let fetch = Fetch {
+                    limit: 1,
+                    ..surface_fetch(kind)
+                };
+                let mut one = Cache::new();
+                self.b
+                    .prefetch_with(&mut one, vec![id.clone()], &fetch)
+                    .await;
+                if one.get(&id).is_some_and(|i| i.showing) {
+                    found.push(hash);
+                }
+                continue;
+            }
+            let listed = self.surface_entries(&mut cache, &id, kind).await;
+            let Some(root) = cache.get(&id) else {
+                continue;
+            };
+            if !root.showing || (kind != render::Surface::Dialog && listed.entries.is_empty()) {
+                continue;
+            }
+            found.push(hash);
+            if kind == render::Surface::Dialog
+                && listed.maybe_file_dialog(root)
+                && self.b.fills_file_dialog(&id).await
+            {
+                lines.push(render::file_dialog_line(root));
+                continue;
+            }
+            let mut items = Vec::new();
+            for (i, e) in listed.entries.iter().enumerate() {
+                // Ids only for the entries the line can show.
+                let rid = match i < render::SURFACE_ENTRIES {
+                    true => self.add_ref(e, &cache[e], &app).await,
+                    false => 0,
+                };
+                items.push((rid, &cache[e]));
+            }
+            lines.push(render::surface_line(
+                root,
+                kind,
+                listed.message.as_deref(),
+                &items,
+            ));
+        }
+        if scanned {
+            *self.seen_surfaces.lock().await = found.clone();
+        }
+        let _ = GATE.try_with(|g| g.borrow_mut().reported.extend(found));
+        lines
+    }
+
+    /// Each candidate with the lower-case name of its app ("" when it
+    /// could not be read: not allowed), asked once per app. Only for a
+    /// backend that cannot tell an element's app (`app_key` None) is it
+    /// taken to be the active app's.
+    async fn candidate_apps(&self, candidates: Vec<B::Id>) -> Vec<(B::Id, String)> {
+        let mut firsts: Vec<(Option<String>, B::Id)> = Vec::new();
+        for c in &candidates {
+            let key = self.b.app_key(c);
+            if !firsts.iter().any(|(k, _)| *k == key) {
+                firsts.push((key, c.clone()));
+            }
+        }
+        let names = futures_util::future::join_all(firsts.iter().map(|(k, c)| async move {
+            match k {
+                Some(_) => self.b.app_name(c).await.unwrap_or_default(),
+                None => self.b.active_app().await,
+            }
+        }))
+        .await;
+        let apps: Vec<(Option<String>, String)> = firsts
+            .into_iter()
+            .zip(names)
+            .map(|((k, _), n)| (k, n.to_lowercase()))
+            .collect();
+        candidates
+            .into_iter()
+            .filter_map(|c| {
+                let key = self.b.app_key(&c);
+                let app = apps.iter().find(|(k, _)| *k == key)?.1.clone();
+                Some((c, app))
+            })
+            .collect()
+    }
+
+    /// The entries of the surface `root` (`render::surface_entries`),
+    /// reading the showing nodes below it into `cache`; after
+    /// SURFACE_ROUNDS reads, what was found.
+    async fn surface_entries(
+        &self,
+        cache: &mut Cache<B::Id>,
+        root: &B::Id,
+        kind: render::Surface,
+    ) -> render::SurfaceEntries<B::Id> {
+        let fetch = surface_fetch(kind);
+        self.b
+            .prefetch_with(cache, vec![root.clone()], &fetch)
+            .await;
+        let mut round = 1;
+        loop {
+            let (listed, missing) = render::surface_entries(cache, root, kind);
+            if missing.is_empty() || round >= SURFACE_ROUNDS {
+                return listed;
+            }
+            self.b.prefetch_with(cache, missing, &fetch).await;
+            round += 1;
+        }
     }
 
     /// Title of the active window, if any.
@@ -2196,6 +2762,7 @@ impl<B: Backend> Server<B> {
             "; effect: {}",
             effect_text(&before, &after, events, is_allowed)
         );
+        text.push_str(&trace::time("surfaces", self.surfaces_note(mark, true)).await);
         if before.window != after.window
             && let Some((app, title)) = &after.window
             && is_allowed(app)
@@ -2429,15 +2996,32 @@ impl<B: Backend> Server<B> {
             }
         };
         let what = format!("{} [{}]", render::py_repr(&closed.title), closed.app);
-        let reply = if gone {
-            format!("closed {what}")
-        } else {
+        if gone {
+            return Ok(format!("closed {what}"));
+        }
+        // The app's dialogs (a save prompt), with their buttons' ids.
+        let windows = match self.b.names_surfaces() {
+            true => self
+                .b
+                .app_windows(&app.to_lowercase())
+                .await
+                .unwrap_or_default(),
+            false => Vec::new(),
+        };
+        let shown = self
+            .surfaces(windows, false, Some(&app.to_lowercase()), &[])
+            .await;
+        Ok(if shown.is_empty() {
             format!(
                 "asked {what} to close; it is still open, probably asking whether to save \
                  changes (see apps, then find/act on its dialog)"
             )
-        };
-        Ok(reply)
+        } else {
+            format!(
+                "asked {what} to close; it is still open, showing {}",
+                shown.join("; ")
+            )
+        })
     }
 
     async fn launch(&self, a: &Json) -> R<String> {
@@ -2816,14 +3400,52 @@ impl<B: Backend> Server<B> {
     }
 
     async fn act(&self, a: &Json) -> R<String> {
+        let action = arg_s(a, "action", "");
+        // Clients that fill every optional field send "": no option.
+        let option = match a.get("option") {
+            None | Some(Json::Null) => None,
+            Some(Json::String(s)) if s.trim().is_empty() => None,
+            Some(Json::String(s)) => Some(s.trim().to_string()),
+            Some(_) => return Err("option must be the label of the entry to select".into()),
+        };
+        let verb = match (Verb::parse(&action), option.is_some()) {
+            (None, true) if action.is_empty() => Some(Verb::Select),
+            (Some(Verb::Select), has) => has.then_some(Verb::Select),
+            (v, false) => v,
+            (_, true) => {
+                return Err(format!(
+                    "option goes with action=select, not '{action}'; nothing sent"
+                ));
+            }
+        };
         let t = self.target(a).await?;
         let id = &t.id;
-        let action = arg_s(a, "action", "");
+        if let Some(verb) = verb {
+            let done = self.verified(&t, verb, &action, option.as_deref()).await;
+            // None: not of the kind, but it has an action of that name.
+            if let Some(reply) = done.map_err(|e| t.reply(&e))? {
+                return Ok(t.reply(&reply));
+            }
+        }
         let names = self.b.actions(id).await;
         if names.is_empty() {
             return Err("element has no actions; try click, or focus + key".into());
         }
-        let mut idx = 0;
+        // Chromium lists showContextMenu on every element: never the
+        // default. Tree and find do not show it, so an element with nothing
+        // else looks plain there; opening its context menu instead (a chat
+        // row's Archive / Delete) would surprise.
+        let mut idx = names
+            .iter()
+            .position(|n| !n.eq_ignore_ascii_case("showcontextmenu"))
+            .unwrap_or(usize::MAX);
+        if action.is_empty() && idx == usize::MAX {
+            return Err(
+                "element has no default action (only showContextMenu); use click, \
+                 or act with action=showContextMenu"
+                    .into(),
+            );
+        }
         if !action.is_empty() {
             let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
             idx = lowered
@@ -2841,6 +3463,726 @@ impl<B: Backend> Server<B> {
             names[idx],
             if ok { "ok" } else { "failed" }
         )))
+    }
+
+    // ------------------------------------------------- verified actions
+
+    /// `act`'s verified actions: the reply, or Ok(None) when the element is
+    /// not of the kind the verb needs (not checkable, not expandable) but
+    /// has an action named `action`, which then runs as a plain action.
+    /// Nothing is sent when the element already is as asked; a state read
+    /// back that contradicts the request is an error saying what was sent.
+    async fn verified(
+        &self,
+        t: &Target<B::Id>,
+        verb: Verb,
+        action: &str,
+        option: Option<&str>,
+    ) -> R<Option<String>> {
+        match verb {
+            Verb::Check | Verb::Uncheck | Verb::Toggle => self.set_checked(t, verb, action).await,
+            Verb::Expand => self.set_expanded(t, Some(true), action).await,
+            Verb::Collapse => self.set_expanded(t, Some(false), action).await,
+            Verb::Select => self
+                .select_option(t, option.unwrap_or_default())
+                .await
+                .map(Some),
+            Verb::ScrollTo => self.scroll_to(t).await.map(Some),
+        }
+    }
+
+    /// Read `id`'s states until `done` holds or `limit` passed; the last
+    /// read.
+    async fn await_state(
+        &self,
+        id: &B::Id,
+        limit: Duration,
+        done: impl Fn(&Toggles) -> bool,
+    ) -> Toggles {
+        let start = Instant::now();
+        let near = std::slice::from_ref(id);
+        loop {
+            let mark = self.b.change_mark();
+            let s = self.b.toggles(id).await;
+            let left = limit.saturating_sub(start.elapsed());
+            if done(&s) || left.is_zero() {
+                return s;
+            }
+            self.b.wait_change(near, mark, left.min(VERIFY_POLL)).await;
+        }
+    }
+
+    /// check, uncheck, toggle: idempotent, then verified.
+    async fn set_checked(&self, t: &Target<B::Id>, verb: Verb, action: &str) -> R<Option<String>> {
+        let id = &t.id;
+        let (info, now) = tokio::join!(self.b.info(id, 0), self.b.toggles(id));
+        let checkable = now.checkable || semantic::is_check_role(&info.role);
+        if !checkable {
+            // An action of that name runs as before (Qt's Toggle on an
+            // item-view row selects it); toggle flips the expansion only
+            // of an element without one.
+            let want = semantic::norm(action);
+            let named = info.actions.iter().any(|a| semantic::norm(a) == want);
+            let expandable =
+                now.expandable || now.expanded || semantic::has_expand_action(&info.actions);
+            if verb == Verb::Toggle && expandable && !named {
+                return self.set_expanded(t, None, action).await;
+            }
+            return not_of_kind(&info, action, "checkable");
+        }
+        let want = match verb {
+            Verb::Check => true,
+            Verb::Uncheck => false,
+            _ => !now.checked,
+        };
+        let word = |on: bool| if on { "checked" } else { "unchecked" };
+        if now.checked == want {
+            return Ok(Some(format!("already {}; nothing sent", word(want))));
+        }
+        if !want && semantic::is_radio(&info.role) {
+            return Err(
+                "a radio button is unchecked by checking another one of its group; nothing sent"
+                    .into(),
+            );
+        }
+        if now.disabled {
+            return Err("it is disabled; nothing sent".into());
+        }
+        // Qt's Toggle on a row selects it rather than check it.
+        let qt = semantic::is_item_role(&info.role) && self.b.toolkit_of(id).await == "qt";
+        let how = match semantic::check_action(&info.role, &info.actions, want, qt) {
+            Some(idx) => {
+                self.b.do_action(id, idx).await?;
+                info.actions[idx].clone()
+            }
+            // A checkable row or cell: its generic action would select or
+            // open it; space on it checks it.
+            None if semantic::is_item_role(&info.role) => {
+                let what = if want { "check it" } else { "uncheck it" };
+                self.key_on(t, "space", 1, what).await?
+            }
+            None => return Err(no_action(&info, if want { "check" } else { "uncheck" })),
+        };
+        let name = &how;
+        let after = self
+            .await_state(id, VERIFY_WAIT, |s| s.checked == want)
+            .await;
+        if after.checked == want {
+            Ok(Some(format!("{name} -> {} (verified)", word(want))))
+        } else {
+            Err(format!(
+                "sent {name}, but it reads {} afterwards",
+                word(after.checked)
+            ))
+        }
+    }
+
+    /// expand, collapse (`want`; None: the other way): idempotent, then
+    /// verified. An element with no action for it (Qt's tree items) is
+    /// focused and sent right or left, where the app's tier allows keys.
+    async fn set_expanded(
+        &self,
+        t: &Target<B::Id>,
+        want: Option<bool>,
+        action: &str,
+    ) -> R<Option<String>> {
+        let id = &t.id;
+        let (info, now) = tokio::join!(self.b.info(id, 0), self.b.toggles(id));
+        if !(now.expandable || now.expanded || semantic::has_expand_action(&info.actions)) {
+            return not_of_kind(&info, action, "expandable");
+        }
+        let want = want.unwrap_or(!now.expanded);
+        let word = |on: bool| if on { "expanded" } else { "collapsed" };
+        if now.expanded == want {
+            return Ok(Some(format!("already {}; nothing sent", word(want))));
+        }
+        if now.disabled {
+            return Err("it is disabled; nothing sent".into());
+        }
+        if semantic::opens_menu(&info.role) && !self.b.may_open_menu(id).await {
+            return Err(NO_MENU_OPEN.into());
+        }
+        let how = match semantic::expand_action(&info.role, &info.actions, want) {
+            Some(idx) => {
+                self.b.do_action(id, idx).await?;
+                info.actions[idx].clone()
+            }
+            None => {
+                let key = if want { "right" } else { "left" };
+                let what = if want { "expand it" } else { "collapse it" };
+                self.key_on(t, key, 1, what).await?
+            }
+        };
+        let after = self
+            .await_state(id, VERIFY_WAIT, |s| s.expanded == want)
+            .await;
+        if after.expanded == want {
+            Ok(Some(format!("{how} -> {} (verified)", word(want))))
+        } else {
+            Err(format!(
+                "sent {how}, but it reads {} afterwards",
+                word(after.expanded)
+            ))
+        }
+    }
+
+    /// The keyboard fallback for what an element has no action for: focus
+    /// `t` without the pointer, then press `combo` `times` times. Needs the
+    /// full tier (keys) in its app; refused, with nothing sent, when the
+    /// focus cannot be moved there or its window is not in front. The
+    /// reply says what was done.
+    async fn key_on(&self, t: &Target<B::Id>, combo: &str, times: usize, what: &str) -> R<String> {
+        self.keys_permitted(t, combo, what).await?;
+        let Some(method) = self.b.try_focus(&t.id).await? else {
+            return Err(format!(
+                "there is no action to {what}, and it cannot be focused without the \
+                 pointer; nothing sent: click it, then key {combo}"
+            ));
+        };
+        // Keys go to the focused element of the window in front.
+        match self.b.focused().await {
+            Some(f) if f.id == t.id => {}
+            _ => {
+                return Err(format!(
+                    "focused it ({method}) to {what}, but its window is not in front; no key \
+                     sent: pass window=…"
+                ));
+            }
+        }
+        for i in 0..times {
+            // The user may take over between presses.
+            if i > 0 {
+                self.gate(true).await?;
+            }
+            self.b.press_combo(combo).await?;
+        }
+        let times = if times > 1 {
+            format!(" x{times}")
+        } else {
+            String::new()
+        };
+        Ok(format!("focus ({method}) + key {combo}{times}"))
+    }
+
+    /// Whether the key fallback may press `combo` for `t`'s app: the full
+    /// tier, its confirmation, and the key not held already.
+    async fn keys_permitted(&self, t: &Target<B::Id>, combo: &str, what: &str) -> R<()> {
+        let policy = self.policy();
+        let tier = policy.tier(&t.app).unwrap_or(Tier::View);
+        if tier < Tier::Full {
+            return Err(refusal(format!(
+                "there is no action to {what}, and the fallback, key {combo}, needs the \
+                 full tier ('{}' has {tier}); nothing sent",
+                t.app
+            )));
+        }
+        // One confirmation covers the whole call: the act call's own
+        // (by elicitation, or its confirm: true) covers its keys too.
+        let (confirmed, confirm_arg) = GATE
+            .try_with(|g| {
+                let g = g.borrow();
+                (g.confirmed, g.args.get("confirm").cloned())
+            })
+            .unwrap_or((false, None));
+        if !confirmed && policy.needs_confirm("key", Some(&t.app)) {
+            let mut args = json!({"combo": combo});
+            if let Some(c) = confirm_arg {
+                args["confirm"] = c;
+            }
+            self.confirm("key", Some(&t.app), &args).await?;
+        }
+        // A held key stays down: pressing it again would release it.
+        if chord_keys(combo)
+            .iter()
+            .any(|k| self.is_held(&Held::Key(k.clone())))
+        {
+            return Err(format!(
+                "there is no action to {what}, and the fallback, key {combo}, is held already \
+                 (hold with down=false releases it); nothing sent"
+            ));
+        }
+        Ok(())
+    }
+
+    /// The fallback for a closed combo box that takes no focus without the
+    /// pointer (Qt's): open its list through its own action (a shown popup
+    /// takes the keyboard), press down or up from the entry it highlights
+    /// (selected or focused there, else the current value) to `want`, and
+    /// Enter. Needs the full tier, like `key_on`.
+    async fn select_in_popup(&self, t: &Target<B::Id>, want: &str) -> R<String> {
+        self.keys_permitted(t, "enter", "select it").await?;
+        let control = &t.id;
+        if !self.b.may_open_menu(control).await {
+            return Err(NO_MENU_OPEN.into());
+        }
+        let actions = self.b.actions(control).await;
+        let open = actions
+            .iter()
+            .position(|a| semantic::norm(a) == "showmenu")
+            .or_else(|| actions.iter().position(|a| semantic::norm(a) == "press"))
+            .ok_or("it has no action that opens its list")?;
+        self.b.do_action(control, open).await?;
+        // Keys go to the popup once its list shows (Qt reports no focus
+        // for it): wait for that.
+        let start = Instant::now();
+        let (cache, items) = loop {
+            let (cache, items) = self.read_options(control).await;
+            if items.iter().any(|id| cache[id].showing) {
+                break (cache, items);
+            }
+            if start.elapsed() >= VERIFY_WAIT {
+                return Err(format!(
+                    "opened its list ({}), but no list showed; no key sent (it may still be \
+                     open: key escape closes it)",
+                    actions[open]
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let enabled: Vec<&B::Id> = items
+            .iter()
+            .filter(|id| !cache[*id].states.contains(&"disabled"))
+            .collect();
+        let at = |id: &B::Id| enabled.iter().position(|e| *e == id);
+        let wanted = enabled
+            .iter()
+            .position(|id| render::menu_norm(&cache[*id].name) == render::menu_norm(want))
+            .ok_or("its list does not show that entry; no key sent (key escape closes it)")?;
+        let lit = |state: &str| {
+            enabled
+                .iter()
+                .position(|id| cache[*id].states.contains(&state))
+        };
+        let from = lit("focused")
+            .or_else(|| lit("selected"))
+            .or_else(|| semantic::current(&cache, control, &items).and_then(|c| at(&c)))
+            .ok_or(
+                "cannot tell which entry its list highlights; no key sent (key escape closes it)",
+            )?;
+        let steps = wanted as i64 - from as i64;
+        let key = if steps > 0 { "down" } else { "up" };
+        for i in 0..steps.unsigned_abs() {
+            if i > 0 {
+                self.gate(true).await?;
+            }
+            self.b.press_combo(key).await?;
+        }
+        self.gate(true).await?;
+        self.b.press_combo("enter").await?;
+        Ok(match steps {
+            0 => format!("{} + key enter", actions[open]),
+            n => format!(
+                "{} + key {key} x{} + enter",
+                actions[open],
+                n.unsigned_abs()
+            ),
+        })
+    }
+
+    /// The control's subtree, hidden parts included (a closed combo box's
+    /// list), and its entries.
+    async fn read_options(&self, control: &B::Id) -> (Cache<B::Id>, Vec<B::Id>) {
+        let mut cache = Cache::new();
+        let fetch = Fetch {
+            only_showing: false,
+            text_limit: render::FIND_TEXT_LIMIT,
+            limit: OPTIONS_FETCH,
+            actions: false,
+            stop_roles: &[],
+            offscreen: false,
+        };
+        let mut next = vec![control.clone()];
+        for _ in 0..MENU_FETCH_ROUNDS {
+            self.b.prefetch_with(&mut cache, next, &fetch).await;
+            let (items, missing) = semantic::walk_options(&cache, control);
+            // What the read skipped (past its limit, or a backend that
+            // reads one level a call), until enough was read.
+            if missing.is_empty() || cache.len() >= OPTIONS_FETCH {
+                return (cache, items);
+            }
+            next = missing;
+        }
+        let items = semantic::options(&cache, control);
+        (cache, items)
+    }
+
+    /// Whether `control` shows the entry `label` (of `labels`, all its
+    /// entries) as its value, or the entry `item` reads selected or
+    /// checked; waits up to VERIFY_WAIT for it. Also what it shows then.
+    async fn option_shown(
+        &self,
+        control: &B::Id,
+        item: &B::Id,
+        label: &str,
+        labels: &[String],
+    ) -> (bool, String) {
+        let start = Instant::now();
+        let near = std::slice::from_ref(control);
+        let want = render::menu_norm(label);
+        loop {
+            let mark = self.b.change_mark();
+            let (info, state) = tokio::join!(self.b.info(control, 0), self.b.toggles(item));
+            let named = semantic::named_option(&info.name, info.text.as_deref(), labels);
+            let ok = match named {
+                Some(i) => render::menu_norm(&labels[i]) == want,
+                None => state.selected || state.checked,
+            };
+            let left = VERIFY_WAIT.saturating_sub(start.elapsed());
+            if ok || left.is_zero() {
+                let shows = match named {
+                    Some(i) => format!("it shows {}", render::json_str(&labels[i])),
+                    None if ok => format!("{} reads selected", render::json_str(label)),
+                    None => format!("{} is not selected", render::json_str(label)),
+                };
+                return (ok, shows);
+            }
+            self.b.wait_change(near, mark, left.min(VERIFY_POLL)).await;
+        }
+    }
+
+    /// select with `option`: pick the entry of a combo box, list, tab list
+    /// or menu button named `want`, without the pointer: through the
+    /// list's Selection, else the entry's own action, else (a closed combo
+    /// box, full tier) focus and arrow keys; each tried only while the one
+    /// before is not verified.
+    async fn select_option(&self, t: &Target<B::Id>, want: &str) -> R<String> {
+        let control = &t.id;
+        let (mut cache, mut items) = self.read_options(control).await;
+        let opened = items.is_empty();
+        let mut open_note = String::new();
+        if opened {
+            let (how, found) = self.open_options(t, &mut cache).await?;
+            items = found;
+            open_note = format!("opened it ({how}); ");
+        }
+        let item = semantic::pick_option(&cache, &items, want).map_err(|e| {
+            let left = if opened {
+                " (it may still be open: key escape closes it)"
+            } else {
+                "; nothing sent"
+            };
+            format!("{open_note}{e}{left}")
+        })?;
+        let label = cache[&item].name.trim().to_string();
+        let quoted = render::json_str(&label);
+        let labels: Vec<String> = items.iter().map(|id| cache[id].name.clone()).collect();
+        let current = semantic::current(&cache, control, &items);
+        if !opened && current.as_ref() == Some(&item) {
+            return Ok(format!("already {quoted}; nothing sent"));
+        }
+        if cache[&item].states.contains(&"disabled") {
+            return Err(format!("{open_note}{quoted} is disabled; nothing sent"));
+        }
+        let mut tried: Vec<String> = Vec::new();
+        let mut shows = String::new();
+        // In a web page, Selection sets the entry's selected state without
+        // the events the page's script listens to: the entry's own action
+        // runs them.
+        let web = matches!(
+            self.b.toolkit_of(control).await.as_str(),
+            "gecko" | "chromium"
+        );
+        if !opened && !web && self.b.select_item(&item).await.is_ok() {
+            tried.push("Selection".into());
+            let (ok, s) = self.option_shown(control, &item, &label, &labels).await;
+            if ok {
+                let more = self.also_selected(control, &item).await;
+                return Ok(format!("{quoted} selected (Selection; verified){more}"));
+            }
+            shows = s;
+        }
+        let actions = self.b.actions(&item).await;
+        if let Some(idx) = semantic::item_action(&actions) {
+            self.b.do_action(&item, idx).await?;
+            tried.push(format!("the entry's {} action", actions[idx]));
+            let (ok, s) = self.option_shown(control, &item, &label, &labels).await;
+            if ok {
+                let more = match opened {
+                    true => String::new(),
+                    false => self.also_selected(control, &item).await,
+                };
+                return Ok(format!(
+                    "{open_note}{quoted} selected ({}; verified){more}",
+                    actions[idx]
+                ));
+            }
+            if opened && !self.b.toggles(&item).await.showing {
+                // A menu button that does not show its value: the entry ran
+                // and its menu closed.
+                return Ok(format!(
+                    "{open_note}{quoted}: {} -> ok (the menu closed; the control does not \
+                     show a value to verify)",
+                    actions[idx]
+                ));
+            }
+            shows = s;
+        }
+        // A closed combo box takes arrow keys: as many as entries between
+        // the one shown now (read afresh after the steps above) and the one
+        // wanted, by label; disabled ones are skipped.
+        let steps = if opened || self.b.toggles(control).await.expanded {
+            None
+        } else {
+            let (now, now_items) = if tried.is_empty() {
+                (cache.clone(), items.clone())
+            } else {
+                self.read_options(control).await
+            };
+            let enabled: Vec<String> = now_items
+                .iter()
+                .filter(|id| !now[*id].states.contains(&"disabled"))
+                .map(|id| render::menu_norm(&now[id].name))
+                .collect();
+            let at = |label: &str| enabled.iter().position(|l| *l == render::menu_norm(label));
+            semantic::current(&now, control, &now_items)
+                .and_then(|cur| at(&now[&cur].name))
+                .zip(at(&label))
+                .map(|(c, w)| w as i64 - c as i64)
+        };
+        let sent = |tried: &[String]| {
+            if tried.is_empty() {
+                "nothing sent".to_string()
+            } else {
+                format!("sent {}", tried.join(", then "))
+            }
+        };
+        if let Some(steps) = steps.filter(|s| *s != 0) {
+            let key = if steps > 0 { "down" } else { "up" };
+            match self
+                .key_on(t, key, steps.unsigned_abs() as usize, "select it")
+                .await
+            {
+                Ok(how) => {
+                    tried.push(how.clone());
+                    let (ok, s) = self.option_shown(control, &item, &label, &labels).await;
+                    if ok {
+                        return Ok(format!("{quoted} selected ({how}; verified)"));
+                    }
+                    shows = s;
+                }
+                // Qt's combo boxes take no focus without the pointer:
+                // open the list through its action and pick from there.
+                Err(e) if e.contains("cannot be focused without the pointer") => {
+                    match self.select_in_popup(t, &label).await {
+                        Ok(how) => {
+                            tried.push(how.clone());
+                            let (ok, s) = self.option_shown(control, &item, &label, &labels).await;
+                            if ok {
+                                return Ok(format!("{quoted} selected ({how}; verified)"));
+                            }
+                            return Err(format!(
+                                "{}, but {s} afterwards (check with get_text before retrying)",
+                                sent(&tried)
+                            ));
+                        }
+                        Err(e2) if tried.is_empty() => return Err(e2),
+                        Err(e2) => {
+                            return Err(format!(
+                                "{}, but {shows} afterwards; the key fallback: {e2}",
+                                sent(&tried)
+                            ));
+                        }
+                    }
+                }
+                Err(e) if tried.is_empty() => return Err(e),
+                Err(e) => {
+                    return Err(format!(
+                        "{}, but {shows} afterwards; the key fallback: {e}",
+                        sent(&tried)
+                    ));
+                }
+            }
+        }
+        let still_open = if opened {
+            " (it may still be open: key escape closes it)"
+        } else {
+            ""
+        };
+        if tried.is_empty() {
+            return Err(format!(
+                "{open_note}found {quoted}, but no way to select it without the pointer; \
+                 nothing sent: click the control, then click the entry{still_open}"
+            ));
+        }
+        Err(format!(
+            "{open_note}{}, but {shows} afterwards{still_open}",
+            sent(&tried)
+        ))
+    }
+
+    /// After `item` was selected in `control`: "; N other entries stay
+    /// selected too" when a multi-selection list kept others selected
+    /// (a following Delete or Enter would act on all of them), else "".
+    async fn also_selected(&self, control: &B::Id, item: &B::Id) -> String {
+        let (cache, items) = self.read_options(control).await;
+        let others = items
+            .iter()
+            .filter(|id| *id != item && cache[*id].states.contains(&"selected"))
+            .count();
+        match others {
+            0 => String::new(),
+            1 => "; 1 other entry stays selected too".into(),
+            n => format!("; {n} other entries stay selected too"),
+        }
+    }
+
+    /// For a control that lists no entries until opened (a menu button):
+    /// open it through its action and wait for a popup menu of its app
+    /// to show entries. The action that opened it, and the entries.
+    async fn open_options(
+        &self,
+        t: &Target<B::Id>,
+        cache: &mut Cache<B::Id>,
+    ) -> R<(String, Vec<B::Id>)> {
+        let id = &t.id;
+        // Only a control that opens a popup: pressing anything else (OK,
+        // Delete, a file's row) would do what it does.
+        let (info, now) = tokio::join!(self.b.info(id, 0), self.b.toggles(id));
+        if !semantic::may_open(&info.role, &info.actions, now.popup) {
+            return Err(format!(
+                "it lists no entries ({}): not a combo box, list or menu button; nothing sent",
+                info.role
+            ));
+        }
+        if !self.b.may_open_menu(id).await {
+            return Err(format!(
+                "it lists no entries until opened, and {NO_MENU_OPEN}"
+            ));
+        }
+        let actions = info.actions;
+        let idx = semantic::open_action(&actions)
+            .ok_or("it lists no entries and has no action to open; nothing sent")?;
+        let windows = self.app_windows(&t.app).await?;
+        let how = actions[idx].clone();
+        let mut mark = self.b.change_mark();
+        self.b.do_action(id, idx).await?;
+        let start = Instant::now();
+        loop {
+            let (fresh, items) = self.read_options(id).await;
+            let showing: Vec<B::Id> = items.into_iter().filter(|i| fresh[i].showing).collect();
+            cache.extend(fresh);
+            if !showing.is_empty() {
+                return Ok((how, showing));
+            }
+            let mut popups = Cache::new();
+            let mut next = windows.clone();
+            for _ in 0..MENU_FETCH_ROUNDS {
+                let fetch = search_fetch(0, render::FIND_MAX_SEEN);
+                self.b.prefetch_with(&mut popups, next, &fetch).await;
+                next = popups
+                    .values()
+                    .filter(|i| i.showing)
+                    .flat_map(|i| i.children.iter())
+                    .filter(|c| !popups.contains_key(*c))
+                    .cloned()
+                    .collect();
+                if next.is_empty() || popups.len() >= render::FIND_MAX_SEEN {
+                    break;
+                }
+            }
+            let menus: Vec<B::Id> = popups
+                .iter()
+                .filter(|(_, i)| i.showing && matches!(i.role.as_str(), "menu" | "popup menu"))
+                .map(|(id, _)| id.clone())
+                .collect();
+            let found: Vec<B::Id> = menus
+                .iter()
+                .flat_map(|m| semantic::options(&popups, m))
+                .filter(|i| popups[i].showing)
+                .collect();
+            cache.extend(popups);
+            if !found.is_empty() {
+                return Ok((how, found));
+            }
+            let left = MENU_OPEN_WAIT.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                return Err(format!(
+                    "opened it ({how}), but no entries showed within {} ms (it may still be \
+                     open: key escape closes it)",
+                    MENU_OPEN_WAIT.as_millis()
+                ));
+            }
+            self.b
+                .wait_change(&windows, mark, left.min(WAIT_FALLBACK))
+                .await;
+            mark = self.b.change_mark();
+        }
+    }
+
+    /// scroll_to: ask the app to scroll the element into view, else turn
+    /// the wheel over its scrollable container (the pointer moves; said
+    /// so) until it shows.
+    async fn scroll_to(&self, t: &Target<B::Id>) -> R<String> {
+        let id = &t.id;
+        let now = self.b.toggles(id).await;
+        if now.showing {
+            return Ok("already in view; nothing sent".into());
+        }
+        let why = match self.b.scroll_into_view(id).await {
+            Ok(true) => {
+                if self
+                    .await_state(id, VERIFY_WAIT, |s| s.showing)
+                    .await
+                    .showing
+                {
+                    return Ok("in view (ScrollTo; verified)".into());
+                }
+                "ScrollTo was accepted, but it did not show".to_string()
+            }
+            Ok(false) => "the app declined ScrollTo".to_string(),
+            Err(e) => e,
+        };
+        // A wheel cannot show what a closed popup or collapsed branch holds.
+        if !now.offscreen {
+            return Err(format!(
+                "{why}; it is hidden (in a closed popup or collapsed branch?), not scrolled \
+                 out of view; no wheel turned: open or expand what holds it"
+            ));
+        }
+        let Some(pane) = self.b.scroll_container(id).await else {
+            return Err(format!(
+                "{why}; no scrollable container found to turn the wheel over: scroll it with \
+                 scroll on the list or page"
+            ));
+        };
+        let (active, pane_at, at) = tokio::join!(
+            self.require_active_allowed(),
+            self.b.wheel_point(&pane),
+            self.b.element_center(id)
+        );
+        let (x, y) = active
+            .and(pane_at)
+            .map_err(|e| format!("{why}; the wheel fallback: {e}"))?;
+        // Off-screen elements still have a position: above or below.
+        let dir = match at {
+            Ok((_, ey)) if ey < y => -1,
+            _ => 1,
+        };
+        let way = if dir > 0 { "down" } else { "up" };
+        let mut total = 0;
+        for round in 0..WHEEL_ROUNDS {
+            // The user may take over between turns.
+            if round > 0 {
+                self.gate(true).await?;
+            }
+            self.b
+                .pointer(x as i64, y as i64, "left", 0, dir * WHEEL_STEP)
+                .await?;
+            total += WHEEL_STEP;
+            if self
+                .await_state(id, WHEEL_WAIT, |s| s.showing)
+                .await
+                .showing
+            {
+                return Ok(format!(
+                    "in view (wheel {total} {way} at {x},{y}, the pointer moved; verified)"
+                ));
+            }
+        }
+        Err(format!(
+            "{why}; turned the wheel {total} {way} at {x},{y} (the pointer moved), but it is \
+             still not in view"
+        ))
     }
 
     async fn menu(&self, a: &Json) -> R<String> {
@@ -2882,8 +4224,22 @@ impl<B: Backend> Server<B> {
                     .map_err(|e| format!("{}: {e}{}", where_(&trail), open_note(&opened)))?;
                 opened.push(render::json_str(trail.last().unwrap()));
             }
-            let item = render::pick_menu_item(&cache, &items, seg)
-                .map_err(|e| format!("in {}: {e}{}", where_(&trail), open_note(&opened)))?;
+            let item = match render::pick_menu_item(&cache, &items, seg) {
+                Ok(item) => item,
+                // A path in another language than the UI ("File > Save As"
+                // in a Turkish Kate): KDE's English object names.
+                Err(e) => {
+                    let ids = futures_util::future::join_all(
+                        items
+                            .iter()
+                            .map(|id| async { (id.clone(), self.b.object_id(id).await) }),
+                    )
+                    .await;
+                    render::pick_by_object_name(&ids, seg).ok_or_else(|| {
+                        format!("in {}: {e}{}", where_(&trail), open_note(&opened))
+                    })?
+                }
+            };
             trail.push(cache[&item].name.trim().to_string());
             node = item;
         }
@@ -2892,6 +4248,8 @@ impl<B: Backend> Server<B> {
             .await;
         let list = trail.is_empty() || render::is_submenu(&cache, &cache[&node]);
         if list {
+            // The listing is what opened.
+            let _ = GATE.try_with(|g| g.borrow_mut().quiet = true);
             let mut items = self.menu_entries(&mut cache, &node).await;
             if items.is_empty() && !trail.is_empty() {
                 items = self
@@ -3073,11 +4431,21 @@ impl<B: Backend> Server<B> {
         if t.protected() && !self.passwords_allowed(&t.app) {
             return Err(t.reply(&self.password_refusal("set_text", &t.app)));
         }
-        if !self.b.set_text(&t.id, &text).await? {
-            return Ok(t.reply("failed"));
-        }
+        let typed = match self.write_text(&t.id, &text).await? {
+            Written::Refused => return Ok(t.reply("failed")),
+            Written::Set => false,
+            Written::Typed => true,
+        };
         if t.protected() {
             return Ok(t.reply("ok (password field: contents cannot be read back)"));
+        }
+        if typed {
+            let how = "; typed: the element has no text interface";
+            return match self.read_back(&t.id, &text, SET_TEXT_VERIFY).await {
+                Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
+                Ok(Some(now)) => Err(t.reply(&written_mismatch(&now, &text, how))),
+                Err(e) => Ok(t.reply(&format!("ok (not verified: {e}{how})"))),
+            };
         }
         // Firefox reports success for accessibility writes and changes
         // nothing. Retype through the keyboard when the element takes focus;
@@ -3109,17 +4477,34 @@ impl<B: Backend> Server<B> {
         }
         match seen {
             Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
-            Ok(Some(now)) => {
-                let shown: String = now.chars().take(120).collect();
-                let more = if now.chars().count() > 120 { "…" } else { "" };
-                Err(t.reply(&format!(
-                    "written, but the field now holds {shown:?}{more} ({} chars, {} asked{how}); \
-                     it may limit or reformat input. Check with get_text before retrying.",
-                    now.chars().count(),
-                    text.chars().count()
-                )))
-            }
+            Ok(Some(now)) => Err(t.reply(&written_mismatch(&now, &text, how))),
             Err(e) => Ok(t.reply(&format!("ok (not verified: {e})"))),
+        }
+    }
+
+    /// Write `text` into an element: through its text interface, else, for an
+    /// editable element without one (Qt's editable combo boxes, e.g. a KDE
+    /// file dialog's name field), by focusing it, selecting all and typing.
+    /// Text with a newline is never typed: Enter would submit. Err when it
+    /// is neither, or typing could not start (nothing typed then).
+    async fn write_text(&self, id: &B::Id, text: &str) -> R<Written> {
+        match self.b.set_text(id, text).await {
+            Ok(true) => Ok(Written::Set),
+            Ok(false) => Ok(Written::Refused),
+            Err(e) => {
+                let editable = self.b.info(id, 0).await.states.contains(&"editable");
+                if text.contains('\n') || !editable {
+                    return Err(e);
+                }
+                if self.retype(id, text).await {
+                    Ok(Written::Typed)
+                } else {
+                    Err(format!(
+                        "{e}, and it would not take the focus to be typed into (not the \
+                         field itself? find it by role, e.g. role \"text\"); nothing typed"
+                    ))
+                }
+            }
         }
     }
 
@@ -3156,24 +4541,39 @@ impl<B: Backend> Server<B> {
 
     /// Why a password field is not filled in, and how the user can allow it.
     fn password_refusal(&self, tool: &str, app: &str) -> String {
-        format!(
+        refusal(format!(
             "{tool} refused: the target is a password field. Ask the user to type it \
              themselves; only they can allow agents to fill in passwords ('passwords: {app}' \
              in {}, or {}=1)",
             self.allow_file.display(),
             policy::PASSWORDS_ENV
-        )
+        ))
     }
 
     async fn get_text(&self, a: &Json) -> R<String> {
-        let t = self.target(a).await?;
+        let t = self.read_target(a).await?;
         if t.protected() {
             return Err(t.reply("a password field: its text is never read"));
         }
-        let limit = arg_i(a, "limit", 20000).max(0) as usize;
-        let mut text = trace::time("full_text", self.b.full_text(&t.id, limit)).await?;
+        let limit = arg_i(a, "limit", GET_TEXT_LIMIT).max(0) as usize;
+        let offset = arg_i(a, "offset", 0).max(0) as usize;
+        // One character more than asked for tells whether there is more.
+        let want = offset.saturating_add(limit).saturating_add(1);
+        let mut text = trace::time("full_text", self.b.full_text(&t.id, want)).await?;
         if render::has_embedded_objects(&text) {
-            text = self.container_text(&t.id, limit).await;
+            text = self.container_text(&t.id, want).await;
+        }
+        let more = text.chars().count() > offset + limit;
+        let mut text: String = text.chars().skip(offset).take(limit).collect();
+        if more {
+            let next = offset + limit;
+            text.push_str(&format!(
+                "\n… cut at character {next}; get_text with offset={next} reads on"
+            ));
+        }
+        // An empty reply reads as "no output" to a client: say it.
+        if text.is_empty() && offset == 0 {
+            text = "(empty: the element has no text)".into();
         }
         Ok(match t.found {
             Some(d) => format!("{d}:\n{text}"),
@@ -3471,6 +4871,9 @@ impl<B: Backend> Server<B> {
             self.check_button_free(&button)?;
         }
         let (t, (x, y)) = self.target_center(a).await?;
+        if clicks > 0 && OPENER_ROLES.contains(&t.role.as_str()) {
+            let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
+        }
         self.with_modifiers(
             &mods,
             self.b.pointer(x as i64, y as i64, &button, clicks, 0),
@@ -3499,7 +4902,8 @@ impl<B: Backend> Server<B> {
         let (active, found) = tokio::join!(
             trace::time("require_active_allowed", self.require_active_allowed()),
             async {
-                let (t, center) = trace::time("target", self.target_and_center(a, true)).await?;
+                let target = self.target_and_center(a, true, true);
+                let (t, center) = trace::time("target", target).await?;
                 let center = match center {
                     Some(c) => c,
                     None => trace::time("element_center", self.b.element_center(&t.id)).await,
@@ -3691,7 +5095,13 @@ impl<B: Backend> Server<B> {
     /// input was sent to, when the input moved focus); nothing is reported,
     /// and no id issued, unless that app is allowed.
     async fn focus_note(&self, typing: bool) -> String {
-        let Some(Focused { id, info, app }) = self.b.focused().await else {
+        let mut focused = self.b.focused().await;
+        // Focus events arrive after the input: read it once they did.
+        let near: Vec<B::Id> = focused.iter().map(|f| f.id.clone()).collect();
+        if self.settle(&near).await {
+            focused = self.b.focused().await;
+        }
+        let Some(Focused { id, info, app }) = focused else {
             return String::new();
         };
         if !self.is_allowed(&app) {
@@ -3699,7 +5109,16 @@ impl<B: Backend> Server<B> {
         }
         let rid = self.add_ref(&id, &info, &app.to_lowercase()).await;
         note_step_element(rid, false);
-        let mut note = format!("; focus: {}", render::describe(&info, rid));
+        let desc = render::describe_focused(&info, rid);
+        // In a batch, focus that stayed put is not described again.
+        let same = BATCH_FOCUS
+            .try_with(|last| last.replace(Some(desc.clone())).as_deref() == Some(desc.as_str()))
+            .unwrap_or(false);
+        let mut note = if same {
+            format!("; focus: [{rid}] (unchanged)")
+        } else {
+            format!("; focus: {desc}")
+        };
         if typing && !info.states.contains(&"editable") && !TEXT_SINKS.contains(&info.role.as_str())
         {
             note.push_str(" (not an editable field: check where the text went)");
@@ -3893,10 +5312,10 @@ impl<B: Backend> Server<B> {
         let d = self.b.active_file_dialog().await?;
         let allowed = self.allowed();
         let owner = file_dialog_owner(&d, &allowed)
-            .map_err(|e| format!("{e} (allowlist: {})", self.allow_file.display()))?;
+            .map_err(|e| refusal(format!("{e} (allowlist: {})", self.allow_file.display())))?;
         self.permit(&owner).await?;
         let text = path.display().to_string();
-        if !self.b.set_text(&d.field, &text).await? {
+        if matches!(self.write_text(&d.field, &text).await?, Written::Refused) {
             return Err("the file name field refused the path".into());
         }
         if let Some(now) = self.read_back(&d.field, &text, SET_TEXT_VERIFY).await? {
@@ -3997,7 +5416,7 @@ impl<B: Backend> Server<B> {
         let file = path.clone();
         let done = trace::time(
             "convert+encode",
-            tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac)),
+            tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac, inline)),
         )
         .await
         .map_err(|e| e.to_string())??;
@@ -4009,7 +5428,15 @@ impl<B: Backend> Server<B> {
         let map = area.and_then(|a| ShotMap::new(done.size, a));
         *self.last_shot.lock().await = map;
         let (iw, ih) = done.size;
-        let mut text = format!("{path}\n{iw}x{ih} px");
+        // The image inline is all the agent sees (it is told not to read
+        // the file): no path to read, no file left behind. Only
+        // inline=false keeps the file and names it.
+        let mut text = if inline {
+            let _ = std::fs::remove_file(&path);
+            format!("{iw}x{ih} px")
+        } else {
+            format!("{path}\n{iw}x{ih} px")
+        };
         if let (Some((x, y, w, h)), Some(_)) = (area, map) {
             // How to click a point in it is in the server instructions.
             let r = |v: f64| (v * 100.0).round() / 100.0;
@@ -4030,32 +5457,38 @@ impl<B: Backend> Server<B> {
         Ok(Out {
             text,
             images: if inline {
-                vec![shot::base64(&done.png)]
+                let (bytes, mime) = done.inline();
+                vec![(shot::base64(bytes), mime)]
             } else {
                 Vec::new()
             },
         })
     }
 
-    /// Run `steps` in order. A batch with any input step holds the input
-    /// lock for its whole run (its steps are called as already holding it),
-    /// so two batches' input never interleaves. A step's `id`/`*_id`
-    /// argument "$N" names the element step N produced (`STEP_ELEMENT`).
+    /// Run `steps` in order, with their control flow (`flow`: if, on_fail,
+    /// repeat, stop_if), all checked before anything runs. A batch with any
+    /// input step holds the input lock for its whole run (its steps are
+    /// called as already holding it), so two batches' input never
+    /// interleaves. A step's `id`/`*_id` argument "$N" names the element
+    /// step N produced (`STEP_ELEMENT`).
     async fn batch(&self, a: &Json) -> R<Out> {
-        let steps = a
+        // Steps share the focus they reported last (BATCH_FOCUS).
+        BATCH_FOCUS
+            .scope(std::cell::RefCell::new(None), self.batch_steps(a))
+            .await
+    }
+
+    async fn batch_steps(&self, a: &Json) -> R<Out> {
+        let raw = a
             .get("steps")
             .and_then(Json::as_array)
             .ok_or("missing array argument 'steps'")?;
-        fn tool_of(step: &Json) -> &str {
-            step.get("tool").and_then(Json::as_str).unwrap_or("")
-        }
-        if steps.iter().any(|s| tool_of(s) == "batch") {
-            return Err("batch cannot contain batch".into());
-        }
+        let steps =
+            flow::parse(raw, tools::is_tool).map_err(|e| format!("not run (nothing sent): {e}"))?;
         // A step with `window` activates a window: input too.
-        let input = steps.iter().any(|s| {
-            let args = s.get("args").unwrap_or(&Json::Null);
-            INPUT_TOOLS.contains(&tool_of(s)) || matches!(window_arg(tool_of(s), args), Ok(Some(_)))
+        let input = steps.iter().flat_map(flow::Step::calls).any(|c| {
+            INPUT_TOOLS.contains(&c.tool.as_str())
+                || matches!(window_arg(&c.tool, &c.args), Ok(Some(_)))
         });
         let _input = if input {
             let guard = self.input.lock().await;
@@ -4064,61 +5497,216 @@ impl<B: Backend> Server<B> {
         } else {
             None
         };
-        let mut out = Vec::new();
-        let mut images = Vec::new();
-        let mut done: Vec<(String, StepElement)> = Vec::new();
+        // Input steps a later condition tests settle before their reply.
+        let tested: Vec<usize> = steps
+            .iter()
+            .filter_map(|s| match (&s.cond, &s.body) {
+                (_, flow::Body::Stop(c)) | (Some(c), _) => Some(c.step),
+                _ => None,
+            })
+            .collect();
+        let mut run = BatchRun::default();
         for (i, step) in steps.iter().enumerate() {
-            let tool = tool_of(step);
-            let mut args = step.get("args").cloned().unwrap_or_else(|| json!({}));
-            // An optional step (typically a wait) may fail without costing
-            // the steps after it, e.g. the final observation.
-            let optional = step.get("optional").and_then(Json::as_bool) == Some(true);
-            let result = match resolve_step_refs(&mut args, i + 1, &done) {
-                Ok(()) => {
-                    STEP_ELEMENT
-                        .scope(std::cell::Cell::new(None), async {
-                            let r = self.call_inner(tool, &args, input).await;
-                            (r, STEP_ELEMENT.with(|e| e.get()))
-                        })
-                        .await
-                }
-                Err(e) => (Err(e), None),
-            };
-            let produced = match (&result.0, result.1) {
-                (Err(_), _) => StepElement::Failed,
-                (Ok(_), Some(rid)) => StepElement::Element(rid),
-                (Ok(_), None) => StepElement::NoElement,
-            };
-            done.push((tool.to_string(), produced));
-            match result.0 {
-                Ok(o) => {
-                    out.push(format!("[{}] {tool}: {}", i + 1, o.text));
-                    images.extend(o.images);
-                }
-                Err(e) if optional => {
-                    out.push(format!("[{}] {tool} failed (optional): {e}", i + 1));
-                }
-                Err(e) => {
-                    out.push(format!("[{}] {tool} failed: {e}", i + 1));
-                    if i + 1 < steps.len() {
-                        out.push(format!("stopped; {} step(s) not run", steps.len() - i - 1));
+            let n = i + 1;
+            let left = steps.len() - n;
+            if let Some(c) = &step.cond
+                && !c.holds(&run.done)
+            {
+                run.out.push(format!("[{n}] skipped (if {})", c.describe()));
+                run.skip(step.name());
+                continue;
+            }
+            let (ok, hard) = match &step.body {
+                flow::Body::Stop(c) => {
+                    let stop = c.holds(&run.done);
+                    run.skip("stop_if");
+                    if stop {
+                        let rest = match left {
+                            0 => String::new(),
+                            k => format!("; {k} step(s) not run"),
+                        };
+                        run.out.push(format!("[{n}] stop ({}){rest}", c.describe()));
+                        break;
                     }
-                    return Err(format!("{}{}", out.join("\n"), self.where_note().await));
+                    continue;
+                }
+                flow::Body::Tool(call) => {
+                    let settle = tested.contains(&n);
+                    let r = self.batch_call(call, n, &run.done, input, settle).await;
+                    let hard = r.refused;
+                    let ok = r.result.is_ok();
+                    run.print(&n.to_string(), call, &r, step.optional);
+                    run.record(call.tool.clone(), ok, r);
+                    (ok, hard)
+                }
+                flow::Body::Repeat { steps, until, max } => {
+                    let r = flow::Repeat {
+                        steps,
+                        until,
+                        max: *max,
+                    };
+                    self.repeat(&mut run, n, r, step.optional, input).await
+                }
+            };
+            if ok {
+                continue;
+            }
+            // Failed: its on_fail steps instead (never after a refusal or
+            // the user taking over), else the batch stops unless optional.
+            let mut handled = false;
+            if !step.on_fail.is_empty() && hard {
+                run.out.push(format!("[{n}.on_fail] not run (refused)"));
+            }
+            if !step.on_fail.is_empty() && !hard {
+                handled = true;
+                for (k, call) in step.on_fail.iter().enumerate() {
+                    let label = match step.on_fail.len() {
+                        1 => format!("{n}.on_fail"),
+                        _ => format!("{n}.on_fail.{}", k + 1),
+                    };
+                    let r = self.batch_call(call, n, &run.done, input, false).await;
+                    run.print(&label, call, &r, call.optional);
+                    if r.result.is_err() && !call.optional {
+                        handled = false;
+                        break;
+                    }
                 }
             }
+            if !handled && !step.optional {
+                if left > 0 {
+                    run.out.push(format!("stopped; {left} step(s) not run"));
+                }
+                return Err(format!("{}{}", run.out.join("\n"), self.where_note().await));
+            }
         }
-        let mut text = out.join("\n");
+        let mut text = run.out.join("\n");
         // A step failed or found nothing: say what is on screen once, unless
         // the batch ends with a look at it.
-        let failed = done.iter().any(|(_, e)| matches!(e, StepElement::Failed))
-            || out.iter().any(|l| l.ends_with(": no matches"));
-        let looked = steps
-            .last()
-            .is_some_and(|s| ["screenshot", "tree"].contains(&tool_of(s)));
+        let failed = run.failed || run.out.iter().any(|l| l.ends_with(": no matches"));
+        // (Run to the end, the last step not skipped.)
+        let looked = run.done.len() == steps.len()
+            && steps
+                .last()
+                .is_some_and(|s| ["screenshot", "tree"].contains(&s.name()))
+            && run
+                .done
+                .last()
+                .is_some_and(|r| !matches!(r.outcome, flow::Outcome::Skipped));
         if failed && !looked {
             text.push_str(&self.where_note().await);
         }
-        Ok(Out { text, images })
+        Ok(Out {
+            text,
+            images: run.images,
+        })
+    }
+
+    /// One tool call of batch step `n`: its `"$N"` resolved, then run as a
+    /// call of its own, noting the element it produced and whether it was
+    /// refused. `settle`: its reply is tested (`call_inner`).
+    async fn batch_call(
+        &self,
+        call: &flow::Call,
+        n: usize,
+        done: &[flow::Record],
+        held: bool,
+        settle: bool,
+    ) -> StepResult {
+        let mut args = call.args.clone();
+        if let Err(e) = flow::resolve_refs(&mut args, n, done) {
+            return StepResult {
+                result: Err(e),
+                element: None,
+                refused: false,
+            };
+        }
+        let ((result, refused), element) = STEP_ELEMENT
+            .scope(std::cell::Cell::new(None), async {
+                let r = with_refusals(self.call_inner(&call.tool, &args, held, settle)).await;
+                (r, STEP_ELEMENT.with(|e| e.get()))
+            })
+            .await;
+        StepResult {
+            result,
+            element,
+            refused,
+        }
+    }
+
+    /// Run a repeat (batch step `n`) until `until` holds on its last step,
+    /// at most `max` runs and REPEAT_TIME. Prints its header and its last
+    /// run's lines and records it. Returns (succeeded, failed by a refusal
+    /// or the user taking over).
+    async fn repeat(
+        &self,
+        run: &mut BatchRun,
+        n: usize,
+        flow::Repeat { steps, until, max }: flow::Repeat<'_>,
+        optional: bool,
+        held: bool,
+    ) -> (bool, bool) {
+        let start = Instant::now();
+        let mut runs = 0;
+        loop {
+            runs += 1;
+            let mut lines = BatchRun::default();
+            let mut last = None;
+            let mut broke = None;
+            for (k, call) in steps.iter().enumerate() {
+                // Its until (or a later step) tests what the input did.
+                let r = self.batch_call(call, n, &run.done, held, true).await;
+                let label = format!("{n}.{}", k + 1);
+                lines.print(&label, call, &r, call.optional);
+                let hard = r.refused;
+                if r.result.is_err() && (!call.optional || hard) {
+                    broke = Some((label, hard));
+                }
+                last = Some(r);
+                if broke.is_some() {
+                    break;
+                }
+            }
+            let last = last.expect("a repeat has steps");
+            let text = match &last.result {
+                Ok(o) => o.text.clone(),
+                Err(e) => e.clone(),
+            };
+            let in_runs = match runs {
+                1 => "1 run".to_string(),
+                k => format!("{k} runs"),
+            };
+            let (ok, head, hard) = match broke {
+                Some((label, hard)) => (false, format!("step {label} failed in run {runs}"), hard),
+                None if until.holds(last.result.is_ok(), last.element, &text) => {
+                    (true, format!("until met in run {runs}"), false)
+                }
+                None if runs >= max => (false, format!("until not met in {in_runs}"), false),
+                None if start.elapsed() >= REPEAT_TIME => (
+                    false,
+                    format!("until not met in {in_runs} (time limit)"),
+                    false,
+                ),
+                None => continue,
+            };
+            let head = match (ok, optional) {
+                (true, _) => format!("[{n}] repeat: {head}"),
+                (false, false) => format!("[{n}] repeat failed: {head}"),
+                (false, true) => format!("[{n}] repeat failed (optional): {head}"),
+            };
+            run.out.push(head);
+            run.out.append(&mut lines.out);
+            run.images.append(&mut lines.images);
+            run.failed |= lines.failed || !ok;
+            run.done.push(flow::Record {
+                tool: "repeat".into(),
+                outcome: flow::Outcome::Ran {
+                    ok,
+                    element: last.element,
+                    text,
+                },
+            });
+            return (ok, hard);
+        }
     }
 
     /// Run a tool. When it fails, everything held is released (keys and
@@ -4130,7 +5718,8 @@ impl<B: Backend> Server<B> {
         a: &'a Json,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         Box::pin(async move {
-            let result = trace::time(name, self.call_inner(name, a, false)).await;
+            let (result, refused) =
+                with_refusals(trace::time(name, self.call_inner(name, a, false, false))).await;
             let result = match result {
                 Err(e) if !self.held_names().is_empty() => {
                     let (names, released) = self.release_all().await;
@@ -4145,10 +5734,9 @@ impl<B: Backend> Server<B> {
             // What is on screen when it failed or found nothing, so the next
             // call needs no screenshot to see why.
             match result {
-                Err(e)
-                    if CONTEXT_TOOLS.contains(&name)
-                        && wants_context(&e, &self.allow_file.display().to_string()) =>
-                {
+                // Not after a refusal: that is about the allowlist, a
+                // confirmation or the user taking over, not the screen.
+                Err(e) if CONTEXT_TOOLS.contains(&name) && !refused => {
                     Err(format!("{e}{}", self.where_note().await))
                 }
                 Ok(mut o) if name == "find" && o.text.starts_with("no matches") => {
@@ -4161,17 +5749,26 @@ impl<B: Backend> Server<B> {
     }
 
     /// `call`, for a caller that may already hold the input lock (`held`: a
-    /// batch with input steps), which then is not taken again.
+    /// batch with input steps), which then is not taken again. `settle`: a
+    /// batch tests its reply (a repeat's until, a condition), so an input
+    /// tool without `observe` lets the app react first (`Server::settle`):
+    /// its focus note and the next step then see the input's effect.
     fn call_inner<'a>(
         &'a self,
         name: &'a str,
         a: &'a Json,
         held: bool,
+        settle: bool,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         let gate = Gate {
             tool: name.to_string(),
             args: a.clone(),
             confirmed: false,
+            settle: None,
+            opener: false,
+            quiet: false,
+            reported: Vec::new(),
+            before: String::new(),
         };
         Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
             let window = window_arg(name, a)?;
@@ -4225,6 +5822,18 @@ impl<B: Backend> Server<B> {
                 )),
                 None => None,
             };
+            // What the app the focus is in reports from now on ends the
+            // settle; `focus_note` waits for it, or else the end of the call.
+            let settle_near = match observe {
+                None if settle && WINDOW_NOTE_TOOLS.contains(&name) => {
+                    let mark = self.b.change_mark();
+                    let near: Vec<B::Id> =
+                        self.b.focused().await.map(|f| f.id).into_iter().collect();
+                    let _ = GATE.try_with(|g| g.borrow_mut().settle = Some(mark));
+                    Some(near)
+                }
+                _ => None,
+            };
             // A window that came to the front since the last input (a dialog
             // that opened after its reply): said before this input's result.
             let pre_note = match observe {
@@ -4233,6 +5842,15 @@ impl<B: Backend> Server<B> {
                 }
                 _ => String::new(),
             };
+            // Before the input: what shows after it was opened by it.
+            let shown_mark =
+                (observe.is_none() && SURFACE_TOOLS.contains(&name)).then(|| self.b.change_mark());
+            // What showed after the last input's reply, said with this
+            // one's "opened:" lines (`surfaces_note`).
+            if observe.is_some() || shown_mark.is_some() {
+                let before = trace::time("opened before", self.opened_before()).await;
+                let _ = GATE.try_with(|g| g.borrow_mut().before = before);
+            }
             let result = match name {
                 "apps" => self.apps().await.map(Out::from),
                 "tree" => self.tree(a).await,
@@ -4266,6 +5884,9 @@ impl<B: Backend> Server<B> {
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
             };
+            if let (Ok(_), Some(near)) = (&result, &settle_near) {
+                trace::time("settle", self.settle(near)).await;
+            }
             let result = match (result, observe, before) {
                 (Ok(mut o), Some(observe), Some((mark, before))) => {
                     let seen = trace::time(
@@ -4280,11 +5901,18 @@ impl<B: Backend> Server<B> {
                 // Without `observe`, still say when another window came to
                 // the front (a dialog, a new browser window).
                 (Ok(mut o), None, _) if WINDOW_NOTE_TOOLS.contains(&name) => {
+                    let opened = match shown_mark {
+                        Some(mark) => {
+                            trace::time("surfaces", self.opened_note(name, a, mark)).await
+                        }
+                        None => String::new(),
+                    };
                     if let Some(before) = pre_note.strip_prefix("; active window now ") {
                         o.text
                             .push_str(&format!("; before it, {before} had come to the front"));
                     }
                     o.text.push_str(&self.window_change_note().await);
+                    o.text.push_str(&opened);
                     Ok(o)
                 }
                 (result, _, _) => result,
@@ -4302,7 +5930,7 @@ impl<B: Backend> Server<B> {
             });
             let result = match activated {
                 Some(title) => {
-                    let done = format!("activated {}; ", render::py_repr(&title));
+                    let done = format!("activated {}; ", render::short_title(&title));
                     result
                         .map(|mut o| {
                             o.text.insert_str(0, &done);
@@ -4323,6 +5951,28 @@ impl<B: Backend> Server<B> {
     }
 }
 
+/// How `Server::write_text` got the text in.
+enum Written {
+    /// Through the text interface.
+    Set,
+    /// Typed: the element had no text interface.
+    Typed,
+    /// The text interface refused it.
+    Refused,
+}
+
+/// The reply when a written field holds something else than `text`.
+fn written_mismatch(now: &str, text: &str, how: &str) -> String {
+    let shown: String = now.chars().take(120).collect();
+    let more = if now.chars().count() > 120 { "…" } else { "" };
+    format!(
+        "written, but the field now holds {shown:?}{more} ({} chars, {} asked{how}); \
+         it may limit or reformat input. Check with get_text before retrying.",
+        now.chars().count(),
+        text.chars().count()
+    )
+}
+
 /// Tools whose failure reply ends with what is on screen (`where_note`).
 const CONTEXT_TOOLS: [&str; 14] = [
     "act",
@@ -4341,16 +5991,6 @@ const CONTEXT_TOOLS: [&str; 14] = [
     "find",
 ];
 
-/// Whether a failure is about the screen (worth `where_note`), not the
-/// setup, the allowlist (`allow_file` named) or the user taking over.
-fn wants_context(e: &str, allow_file: &str) -> bool {
-    !(e.starts_with("paused")
-        || e.starts_with("interrupted")
-        || e.contains("stopped by the user")
-        || e.contains(allow_file)
-        || e.contains("confirmation"))
-}
-
 /// Input tools that, without `observe`, note when another window came to
 /// the front. activate_window says so itself; act, menu and close_window
 /// report the effect line by default.
@@ -4365,6 +6005,80 @@ const WINDOW_NOTE_TOOLS: [&str; 9] = [
     "drag",
     "file_dialog",
 ];
+
+/// Input tools that, without `observe`, list the menus, popups and dialogs
+/// the input opened (`Server::opened_note`); act, menu and close_window do
+/// it with their effect line.
+const SURFACE_TOOLS: [&str; 4] = ["click", "mouse", "key", "type_text"];
+
+/// Roles of elements a click on likely opens a menu, list or dialog with.
+const OPENER_ROLES: [&str; 4] = ["combo box", "push button menu", "menu", "menu item"];
+
+/// Whether an input is likely to open a menu, list or dialog, so its reply
+/// waits (up to SETTLE_MS) for one to show: a right click, the menu key,
+/// F10 or alt + a letter (menus), alt+down (a combo box's list), and the
+/// shortcuts that open, save, print or close documents (dialogs).
+fn opens_surface(tool: &str, a: &Json) -> bool {
+    match tool {
+        "click" | "mouse" => {
+            arg_s(a, "button", "left").eq_ignore_ascii_case("right") && arg_i(a, "clicks", 1) > 0
+        }
+        "key" => {
+            let keys = chord_keys(&arg_s(a, "combo", ""));
+            let k: Vec<&str> = keys.iter().map(String::as_str).collect();
+            match k.as_slice() {
+                ["menu"] | ["f10"] | ["shift", "f10"] | ["alt", "down"] | ["alt", "f4"] => true,
+                ["alt", c] => c.chars().count() == 1 && c.chars().all(char::is_alphanumeric),
+                ["ctrl", c] => ["o", "s", "w", "q", "p"].contains(c),
+                ["ctrl", "shift", "s"] | ["shift", "ctrl", "s"] => true,
+                _ => false,
+            }
+        }
+        _ => false,
+    }
+}
+
+/// How a surface of `kind` is read: its showing nodes, a dialog's not
+/// below its views, documents and tool bars (`render::DIALOG_STOP`).
+fn surface_fetch(kind: render::Surface) -> Fetch {
+    Fetch {
+        only_showing: true,
+        text_limit: 0,
+        limit: SURFACE_NODES,
+        actions: false,
+        stop_roles: match kind {
+            render::Surface::Dialog => &render::DIALOG_STOP,
+            _ => &[],
+        },
+        offscreen: false,
+    }
+}
+
+/// At most SURFACE_CANDIDATES of the elements shown: the oldest and the
+/// newest half.
+fn cap_candidates<T>(mut shown: Vec<T>) -> Vec<T> {
+    if shown.len() > SURFACE_CANDIDATES {
+        let half = SURFACE_CANDIDATES / 2;
+        shown.drain(half..shown.len() - half);
+    }
+    shown
+}
+
+/// A backend id as a number, to remember which surfaces a reply listed
+/// (`Gate::reported`, `Server::seen_surfaces`) without reading them.
+fn id_hash<I: std::hash::Hash>(id: &I) -> u64 {
+    use std::hash::{BuildHasher, BuildHasherDefault, DefaultHasher};
+    BuildHasherDefault::<DefaultHasher>::default().hash_one(id)
+}
+
+/// Most surfaces one reply lists.
+const SURFACE_MAX: usize = 3;
+/// Shown elements whose role is looked at: the oldest and the newest half
+/// (Qt says a dialog's widgets show before the dialog itself).
+const SURFACE_CANDIDATES: usize = 48;
+/// Nodes read below a surface per round, and rounds.
+const SURFACE_NODES: usize = 300;
+const SURFACE_ROUNDS: usize = 3;
 
 /// Tools that never call `Server::permit` (they reach no app, or only read
 /// with a tier every allowed app has); `call_inner` handles their
@@ -4391,49 +6105,48 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
     let id = msg.get("id")?.clone();
     let method = msg.get("method").and_then(Json::as_str).unwrap_or("");
     let params = msg.get("params").cloned().unwrap_or(Json::Null);
-    let result = match method {
-        "initialize" => {
-            let asked = params["protocolVersion"].as_str().unwrap_or("");
-            server.link.borrow_mut().elicitation = params
-                .pointer("/capabilities/elicitation")
-                .is_some_and(Json::is_object);
-            let version = if PROTOCOL_VERSIONS.contains(&asked) {
-                asked
-            } else {
-                PROTOCOL_VERSIONS[0]
-            };
-            json!({
-                "protocolVersion": version,
-                "capabilities": { "tools": { "listChanged": false } },
-                "serverInfo": { "name": "desktop", "version": env!("CARGO_PKG_VERSION") },
-                "instructions": tools::INSTRUCTIONS,
-            })
-        }
-        "ping" => json!({}),
-        "tools/list" => json!({ "tools": tools::tools() }),
-        "tools/call" => {
-            let name = params["name"].as_str().unwrap_or("");
-            let args = params
-                .get("arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            let (out, is_error) = match server.call(name, &args).await {
-                Ok(o) => (o, false),
-                Err(e) => (Out::from(format!("Error executing tool {name}: {e}")), true),
-            };
-            let mut content = vec![json!({ "type": "text", "text": out.text })];
-            content.extend(
-                out.images
-                    .into_iter()
-                    .map(|data| json!({ "type": "image", "data": data, "mimeType": "image/png" })),
-            );
-            json!({ "content": content, "isError": is_error })
-        }
-        _ => {
-            return Some(json!({ "jsonrpc": "2.0", "id": id,
+    let result =
+        match method {
+            "initialize" => {
+                let asked = params["protocolVersion"].as_str().unwrap_or("");
+                server.link.borrow_mut().elicitation = params
+                    .pointer("/capabilities/elicitation")
+                    .is_some_and(Json::is_object);
+                let version = if PROTOCOL_VERSIONS.contains(&asked) {
+                    asked
+                } else {
+                    PROTOCOL_VERSIONS[0]
+                };
+                json!({
+                    "protocolVersion": version,
+                    "capabilities": { "tools": { "listChanged": false } },
+                    "serverInfo": { "name": "desktop", "version": env!("CARGO_PKG_VERSION") },
+                    "instructions": tools::INSTRUCTIONS,
+                })
+            }
+            "ping" => json!({}),
+            "tools/list" => json!({ "tools": tools::tools() }),
+            "tools/call" => {
+                let name = params["name"].as_str().unwrap_or("");
+                let args = params
+                    .get("arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                let (out, is_error) = match server.call(name, &args).await {
+                    Ok(o) => (o, false),
+                    Err(e) => (Out::from(format!("Error executing tool {name}: {e}")), true),
+                };
+                let mut content = vec![json!({ "type": "text", "text": out.text })];
+                content.extend(out.images.into_iter().map(
+                    |(data, mime)| json!({ "type": "image", "data": data, "mimeType": mime }),
+                ));
+                json!({ "content": content, "isError": is_error })
+            }
+            _ => {
+                return Some(json!({ "jsonrpc": "2.0", "id": id,
                 "error": { "code": -32601, "message": format!("Method not found: {method}") } }));
-        }
-    };
+            }
+        };
     Some(json!({ "jsonrpc": "2.0", "id": id, "result": result }))
 }
 
@@ -4721,6 +6434,159 @@ mod tests {
         nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
         /// What kept reads see: see `FakeReads`.
         reads: Rc<FakeReads>,
+        /// Scrolls left until "report.pdf" (REVEALED) shows under the
+        /// focus element, when Some.
+        reveal: Rc<std::cell::Cell<Option<u32>>>,
+        /// "down" moves the focus this many ms after the key is released
+        /// (as focus events arrive late), when not 0.
+        lag: Rc<std::cell::Cell<u64>>,
+        /// Windows of the app after `focus`, by id in `nodes`.
+        more_windows: Rc<RefCell<Vec<u32>>>,
+        /// Elements without an on-screen area.
+        no_area: Rc<RefCell<Vec<u32>>>,
+        /// Elements' windows are not in front: as on KDE and Hyprland,
+        /// `element_center` then fails for every element with an area.
+        background: Rc<std::cell::Cell<bool>>,
+        /// What inputs show: see `FakeShown`.
+        shown: Rc<FakeShown>,
+        /// What `act`'s verified actions meet: see `FakeSemantic`.
+        sem: Rc<FakeSemantic>,
+    }
+
+    /// How the fake answers `act`'s verified actions. Actions flip a check
+    /// box's `checked` and an expandable (operable) element's `expanded`,
+    /// unless its name has "stuck"; an entry's select or click action picks
+    /// it (and its combo box shows it).
+    #[derive(Default)]
+    struct FakeSemantic {
+        /// `select_item`: None: no Selection interface; Some(true): picks
+        /// the entry; Some(false): only marks it selected, as Qt's hidden
+        /// combo box list does.
+        selection: std::cell::Cell<Option<bool>>,
+        /// `scroll_into_view`: None: no ScrollTo; Some(true) shows the
+        /// element; Some(false): declined.
+        scroll_to: std::cell::Cell<Option<bool>>,
+        /// The wheel shows element `.0` after `.1` turns.
+        wheel: std::cell::Cell<Option<(u32, u32)>>,
+        /// `try_focus` works.
+        focusable: std::cell::Cell<bool>,
+        /// `may_open_menu` says no (Firefox).
+        no_menu_open: std::cell::Cell<bool>,
+        /// `toolkit_of` for every element ("" by default).
+        toolkit: RefCell<String>,
+        /// `select_item` adds to the selection, as AT-SPI's SelectChild
+        /// does in a multi-selection list that is not cleared first.
+        adds: std::cell::Cell<bool>,
+    }
+
+    /// The fake's node `id` (the focus element too), changed by `f`.
+    fn fake_edit(
+        focus: &RefCell<Info<u32>>,
+        nodes: &RefCell<HashMap<u32, Info<u32>>>,
+        id: u32,
+        f: impl FnOnce(&mut Info<u32>),
+    ) {
+        if id == FAKE_FOCUS {
+            f(&mut focus.borrow_mut());
+        } else if let Some(n) = nodes.borrow_mut().get_mut(&id) {
+            f(n);
+        }
+    }
+
+    /// Toggle `state` in `states`.
+    fn flip(states: &mut Vec<&'static str>, state: &'static str) {
+        match states.iter().position(|s| *s == state) {
+            Some(i) => {
+                states.remove(i);
+            }
+            None => states.push(state),
+        }
+    }
+
+    /// Pick entry `item` of a fake list: it alone is selected, and with
+    /// `commit` the combo box holding the list is named after it.
+    fn fake_pick(
+        focus: &RefCell<Info<u32>>,
+        nodes: &RefCell<HashMap<u32, Info<u32>>>,
+        item: u32,
+        commit: bool,
+    ) {
+        let (list, label) = {
+            let n = nodes.borrow();
+            let Some(list) = n
+                .iter()
+                .find(|(_, i)| i.children.contains(&item))
+                .map(|(k, _)| *k)
+            else {
+                return;
+            };
+            (list, n[&item].name.clone())
+        };
+        let siblings = nodes.borrow()[&list].children.clone();
+        for sib in siblings {
+            fake_edit(focus, nodes, sib, |i| {
+                i.states.retain(|s| *s != "selected");
+                if sib == item {
+                    i.states.push("selected");
+                }
+            });
+        }
+        if commit {
+            let combo = if focus.borrow().children.contains(&list) {
+                Some(FAKE_FOCUS)
+            } else {
+                nodes
+                    .borrow()
+                    .iter()
+                    .find(|(_, i)| i.children.contains(&list))
+                    .map(|(k, _)| *k)
+            };
+            if let Some(c) = combo {
+                fake_edit(focus, nodes, c, |i| {
+                    if i.role == "combo box" && i.name != "Encoding" {
+                        i.name = label.clone();
+                    }
+                });
+            }
+        }
+    }
+
+    /// Elements the fake app shows (a menu or dialog opening) and the
+    /// events it sends for them.
+    #[derive(Default)]
+    struct FakeShown {
+        /// `shown_since` hears of them (else None: callers scan).
+        live: std::cell::Cell<bool>,
+        /// The change sequence: `change_mark`.
+        seq: std::cell::Cell<u64>,
+        /// (sequence number, element) per shown event.
+        events: RefCell<Vec<(u64, u32)>>,
+        /// Elements the next input (click, key, action) shows.
+        next: RefCell<Vec<u32>>,
+        /// Parent of an element, by id.
+        parents: RefCell<HashMap<u32, u32>>,
+        /// `close_window` leaves the window open and opens this dialog
+        /// window; without it, the fake has no window control.
+        close_opens: std::cell::Cell<Option<u32>>,
+        /// `identity` calls so far.
+        identities: std::cell::Cell<u32>,
+        /// Elements of another app (another `app_key`) whose name cannot
+        /// be read (`app_name` None).
+        nameless: RefCell<Vec<u32>>,
+        /// Roles do not name surfaces (as UIA's): `names_surfaces` false.
+        uia_roles: std::cell::Cell<bool>,
+        /// Dialogs `fills_file_dialog` takes for file dialogs.
+        file_dialogs: RefCell<Vec<u32>>,
+    }
+
+    impl FakeShown {
+        /// The elements an input shows appear, with an event each.
+        fn input(&self) {
+            for id in self.next.take() {
+                self.seq.set(self.seq.get() + 1);
+                self.events.borrow_mut().push((self.seq.get(), id));
+            }
+        }
     }
 
     /// The fake's change events, for kept reads: off unless a test turns
@@ -4790,7 +6656,11 @@ mod tests {
             }]
         }
         async fn app_windows(&self, app: &str) -> Option<Vec<u32>> {
-            (app == "fake").then(|| vec![FAKE_FOCUS])
+            (app == "fake").then(|| {
+                let mut windows = vec![FAKE_FOCUS];
+                windows.extend(self.more_windows.borrow().iter());
+                windows
+            })
         }
         async fn active_app(&self) -> String {
             self.active.borrow().0.clone()
@@ -4800,6 +6670,54 @@ mod tests {
                 FAKE_FOCUS => self.focus.borrow().clone(),
                 _ => self.nodes.borrow().get(id).cloned().unwrap_or_default(),
             }
+        }
+        async fn identity(&self, id: &u32) -> (String, String) {
+            let s = &self.shown;
+            s.identities.set(s.identities.get() + 1);
+            let info = self.info(id, 0).await;
+            (info.role, info.name)
+        }
+        fn change_mark(&self) -> u64 {
+            self.shown.seq.get()
+        }
+        fn shown_since(&self, mark: u64) -> Option<Vec<u32>> {
+            let s = &self.shown;
+            s.live.get().then(|| {
+                let mut out: Vec<u32> = Vec::new();
+                for (n, id) in s.events.borrow().iter() {
+                    if *n > mark && !out.contains(id) {
+                        out.push(*id);
+                    }
+                }
+                out
+            })
+        }
+        async fn parent(&self, id: &u32) -> Option<u32> {
+            self.shown.parents.borrow().get(id).copied()
+        }
+        fn names_surfaces(&self) -> bool {
+            !self.shown.uia_roles.get()
+        }
+        async fn fills_file_dialog(&self, window: &u32) -> bool {
+            self.shown.file_dialogs.borrow().contains(window)
+        }
+        async fn app_name(&self, id: &u32) -> Option<String> {
+            (!self.shown.nameless.borrow().contains(id)).then(|| "fake".into())
+        }
+        async fn close_window(&self, query: &str, allowed: &[String]) -> R<WindowGeo> {
+            let dialog = self
+                .shown
+                .close_opens
+                .get()
+                .ok_or(backend::NO_WINDOW_CONTROL)?;
+            let list = self.windows(query, allowed).await?;
+            let [w] = list.as_slice() else {
+                return Err(backend::not_one_window(query, &list));
+            };
+            self.more_windows.borrow_mut().push(dialog);
+            self.shown.next.borrow_mut().push(dialog);
+            self.shown.input();
+            Ok(w.clone())
         }
         fn read_mark(&self) -> Option<u64> {
             self.reads.live.get().then(|| self.reads.changes.get())
@@ -4835,13 +6753,103 @@ mod tests {
                 cache.insert(id, info);
             }
         }
+        /// As on Linux, a read without `actions` leaves them out:
+        /// `fill_actions` reads them.
+        async fn prefetch_with(&self, cache: &mut Cache<u32>, roots: Vec<u32>, f: &Fetch) {
+            let read = roots.clone();
+            self.prefetch(cache, roots, f.only_showing, f.text_limit, f.limit)
+                .await;
+            if !f.actions {
+                for id in &read {
+                    if let Some(info) = cache.get_mut(id) {
+                        info.actions.clear();
+                    }
+                }
+            }
+        }
+        async fn fill_actions(&self, cache: &mut Cache<u32>, ids: &[u32]) {
+            for id in ids {
+                let actions = self.actions(id).await;
+                if let Some(info) = cache.get_mut(id) {
+                    info.actions = actions;
+                }
+            }
+        }
         async fn actions(&self, id: &u32) -> Vec<String> {
             self.info(id, 0).await.actions
+        }
+        async fn toggles(&self, id: &u32) -> backend::Toggles {
+            let info = self.info(id, 0).await;
+            backend::Toggles {
+                checkable: info.states.contains(&"checkable"),
+                expandable: info.operable,
+                // Hidden rather than scrolled away: named so.
+                offscreen: !info.showing && !info.name.contains("(hidden)"),
+                ..backend::Toggles::from_info(&info)
+            }
+        }
+        async fn select_item(&self, item: &u32) -> R<bool> {
+            let commit = self
+                .sem
+                .selection
+                .get()
+                .ok_or("its list offers no accessibility selection")?;
+            self.keys.borrow_mut().push(format!("select {item}"));
+            if self.sem.adds.get() {
+                fake_edit(&self.focus, &self.nodes, *item, |i| {
+                    i.states.push("selected")
+                });
+            } else {
+                fake_pick(&self.focus, &self.nodes, *item, commit);
+            }
+            Ok(true)
+        }
+        async fn toolkit_of(&self, _: &u32) -> String {
+            self.sem.toolkit.borrow().clone()
+        }
+        async fn scroll_into_view(&self, id: &u32) -> R<bool> {
+            let works = self.sem.scroll_to.get().ok_or(backend::NO_SCROLL_TO)?;
+            self.keys.borrow_mut().push(format!("scroll_to {id}"));
+            if works {
+                fake_edit(&self.focus, &self.nodes, *id, |i| i.showing = true);
+            }
+            Ok(works)
+        }
+        async fn scroll_container(&self, id: &u32) -> Option<u32> {
+            if self.focus.borrow().children.contains(id) {
+                return Some(FAKE_FOCUS);
+            }
+            self.nodes
+                .borrow()
+                .iter()
+                .find(|(_, i)| i.children.contains(id))
+                .map(|(k, _)| *k)
+        }
+        async fn may_open_menu(&self, _: &u32) -> bool {
+            !self.sem.no_menu_open.get()
         }
         async fn do_action(&self, id: &u32, index: usize) -> R<bool> {
             self.keys
                 .borrow_mut()
                 .push(format!("action {index} on {id}"));
+            self.shown.input();
+            let info = self.info(id, 0).await;
+            let action = info.actions.get(index).map(|a| semantic::norm(a));
+            if !info.name.to_lowercase().contains("stuck") {
+                if semantic::is_check_role(&info.role) || info.states.contains(&"checkable") {
+                    fake_edit(&self.focus, &self.nodes, *id, |i| {
+                        flip(&mut i.states, "checked")
+                    });
+                } else if info.operable {
+                    fake_edit(&self.focus, &self.nodes, *id, |i| {
+                        flip(&mut i.states, "expanded")
+                    });
+                } else if info.role == "list item"
+                    && matches!(action.as_deref(), Some("select" | "click"))
+                {
+                    fake_pick(&self.focus, &self.nodes, *id, true);
+                }
+            }
             let mut nodes = self.nodes.borrow_mut();
             if let Some(n) = nodes.get_mut(id)
                 && n.role == "menu"
@@ -4862,25 +6870,87 @@ mod tests {
         async fn set_text(&self, _: &u32, _: &str) -> R<bool> {
             Ok(true)
         }
-        fn app_key(&self, _: &u32) -> Option<String> {
-            Some("fake".into())
+        fn app_key(&self, id: &u32) -> Option<String> {
+            match self.shown.nameless.borrow().contains(id) {
+                true => Some(":1.99".into()),
+                false => Some("fake".into()),
+            }
         }
         async fn is_focused(&self, _: &u32) -> bool {
             self.field.borrow().is_some()
         }
         async fn try_focus(&self, _: &u32) -> R<Option<String>> {
-            Ok(None)
+            Ok(self.sem.focusable.get().then(|| "grab_focus".into()))
         }
-        async fn element_center(&self, _: &u32) -> R<(i32, i32)> {
+        async fn element_center(&self, id: &u32) -> R<(i32, i32)> {
+            if self.no_area.borrow().contains(id) {
+                return Err(backend::NO_AREA.into());
+            }
+            if self.background.get() {
+                return Err("element's window is not active; call activate_window first".into());
+            }
             Ok((0, 0))
+        }
+        async fn has_area(&self, ids: &[u32]) -> Vec<Option<bool>> {
+            let no_area = self.no_area.borrow();
+            ids.iter().map(|id| Some(!no_area.contains(id))).collect()
         }
         fn check_combo(&self, _: &str) -> R<()> {
             Ok(())
         }
         async fn press_combo(&self, combo: &str) -> R<()> {
             self.keys.borrow_mut().push(format!("down {combo}"));
+            self.shown.input();
+            // A list whose focused "Item N" moves down.
+            let down = |focus: &RefCell<Info<u32>>| {
+                let mut focus = focus.borrow_mut();
+                if let Some(k) = focus
+                    .name
+                    .strip_prefix("Item ")
+                    .and_then(|k| k.parse::<u32>().ok())
+                {
+                    focus.name = format!("Item {}", k + 1);
+                }
+            };
+            let lag = self.lag.get();
+            if combo == "down" && lag == 0 {
+                down(&self.focus);
+            }
+            // A focused tree item expands and collapses; a focused combo
+            // box moves to the next or previous entry of its list.
+            let role = self.focus.borrow().role.clone();
+            match (role.as_str(), combo) {
+                ("tree item", "right") => self.focus.borrow_mut().states.push("expanded"),
+                ("tree item", "space") => flip(&mut self.focus.borrow_mut().states, "checked"),
+                ("tree item", "left") => {
+                    self.focus.borrow_mut().states.retain(|s| *s != "expanded")
+                }
+                ("combo box", "down" | "up") => {
+                    let list = self.focus.borrow().children[0];
+                    let items = self.nodes.borrow()[&list].children.clone();
+                    let name = self.focus.borrow().name.clone();
+                    let at = items
+                        .iter()
+                        .position(|i| self.nodes.borrow()[i].name == name)
+                        .unwrap_or(0);
+                    let to = if combo == "down" {
+                        (at + 1).min(items.len() - 1)
+                    } else {
+                        at.saturating_sub(1)
+                    };
+                    fake_pick(&self.focus, &self.nodes, items[to], true);
+                }
+                _ => {}
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
             self.keys.borrow_mut().push(format!("up {combo}"));
+            if combo == "down" && lag > 0 {
+                let focus = self.focus.clone();
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(lag)).await;
+                    down(&focus);
+                });
+            }
             Ok(())
         }
         async fn type_text(&self, text: &str) -> R<String> {
@@ -4917,9 +6987,29 @@ mod tests {
                 self.keys
                     .borrow_mut()
                     .push(format!("click {button} x{clicks}"));
+                self.shown.input();
             }
             if scroll != 0 {
                 self.keys.borrow_mut().push(format!("scroll {scroll}"));
+                if let Some((id, n)) = self.sem.wheel.get() {
+                    if n > 1 {
+                        self.sem.wheel.set(Some((id, n - 1)));
+                    } else {
+                        self.sem.wheel.set(None);
+                        fake_edit(&self.focus, &self.nodes, id, |i| i.showing = true);
+                    }
+                }
+                match self.reveal.get() {
+                    Some(n) if n > 1 => self.reveal.set(Some(n - 1)),
+                    Some(_) => {
+                        self.reveal.set(None);
+                        self.focus.borrow_mut().children.push(REVEALED);
+                        self.nodes
+                            .borrow_mut()
+                            .insert(REVEALED, fake_node("list item", "report.pdf", &[]));
+                    }
+                    None => {}
+                }
             }
             Ok(())
         }
@@ -4997,6 +7087,8 @@ mod tests {
     }
 
     const FAKE_FOCUS: u32 = 7;
+    /// The element `FakeBackend::reveal` shows.
+    const REVEALED: u32 = 60;
     /// `pointer` at this x fails.
     const FAIL_X: i64 = 666;
     /// `pointer` at this x takes 5 s.
@@ -5024,6 +7116,13 @@ mod tests {
         takeover: std::sync::Arc<takeover::Takeover>,
         nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
         reads: Rc<FakeReads>,
+        reveal: Rc<std::cell::Cell<Option<u32>>>,
+        lag: Rc<std::cell::Cell<u64>>,
+        more_windows: Rc<RefCell<Vec<u32>>>,
+        no_area: Rc<RefCell<Vec<u32>>>,
+        background: Rc<std::cell::Cell<bool>>,
+        shown: Rc<FakeShown>,
+        sem: Rc<FakeSemantic>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -5053,7 +7152,21 @@ mod tests {
         ));
         let nodes = Rc::new(RefCell::new(HashMap::new()));
         let reads = Rc::new(FakeReads::default());
+        let reveal = Rc::new(std::cell::Cell::new(None));
+        let lag = Rc::new(std::cell::Cell::new(0));
+        let more_windows = Rc::new(RefCell::new(Vec::new()));
+        let no_area = Rc::new(RefCell::new(Vec::new()));
+        let background = Rc::new(std::cell::Cell::new(false));
+        let shown = Rc::new(FakeShown::default());
+        let sem = Rc::new(FakeSemantic::default());
         let server = Rc::new(Server::new(FakeBackend {
+            shown: shown.clone(),
+            sem: sem.clone(),
+            lag: lag.clone(),
+            reveal: reveal.clone(),
+            more_windows: more_windows.clone(),
+            no_area: no_area.clone(),
+            background: background.clone(),
             reads: reads.clone(),
             takeover: takeover.clone(),
             allow_file,
@@ -5079,6 +7192,13 @@ mod tests {
             takeover,
             nodes,
             reads,
+            reveal,
+            lag,
+            more_windows,
+            no_area,
+            background,
+            shown,
+            sem,
         }
     }
 
@@ -5899,23 +8019,25 @@ mod tests {
                     .unwrap()
                     .starts_with("iVBORw0KGgo")
             );
-            // The file on disk is the shrunk image the coordinates refer to.
-            let path = text.lines().next().unwrap();
-            let img = shot::read_png(path).unwrap();
-            assert_eq!((img.width, img.height), (100, 50));
-            std::fs::remove_file(path).unwrap();
+            // Inline, the reply names no file and leaves none behind.
+            assert!(text.starts_with("100x50 px"), "{text}");
             // Pixel (50, 25) of a 4x-scaled image of an area at (10, 20).
             let r = call_tool(&mut s, 3, "mouse", json!({"image_x": 50, "image_y": 25})).await;
             let text = r["result"]["content"][0]["text"].as_str().unwrap();
             assert_eq!(text, "pointer at (212,122) in fake");
             let r = call_tool(&mut s, 4, "screenshot", json!({"inline": false})).await;
             assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1, "{r}");
+            // Not inline: the file on disk is the shrunk image the
+            // coordinates refer to.
             let path = r["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
                 .lines()
                 .next()
                 .unwrap();
+            let img = shot::read_png(path).unwrap();
+            let size = format!("\n{}x{} px", img.width, img.height);
+            assert!(reply_text(&r).contains(&size), "{r}");
             std::fs::remove_file(path).unwrap();
         });
     }
@@ -5933,14 +8055,19 @@ mod tests {
             call_tool(&mut s, 3, "screenshot", json!({"max_size": 100})).await;
             // Pixels (25, 10)-(35, 15) are screen (110, 60), 40x20: the
             // 2x capture's pixels (50, 20)-(70, 30), sent as they are.
-            let r = call_tool(&mut s, 4, "screenshot", json!({"region": [25, 10, 10, 5]})).await;
+            let r = call_tool(
+                &mut s,
+                4,
+                "screenshot",
+                json!({"region": [25, 10, 10, 5], "inline": false}),
+            )
+            .await;
             let content = &r["result"]["content"];
             let text = content[0]["text"].as_str().unwrap();
             assert!(
                 text.contains("20x10 px of screen area at (110,60), 40x20 (zoom of region"),
                 "{text}"
             );
-            assert_eq!(content[1]["type"], "image", "{r}");
             let path = text.lines().next().unwrap();
             let img = shot::read_png(path).unwrap();
             assert_eq!((img.width, img.height), (20, 10));
@@ -6132,6 +8259,98 @@ mod tests {
             // The same element again: the same id.
             assert!(text.contains("; focus: [1] push button \"OK\""), "{text}");
             assert!(!text.contains("not an editable"), "{text}");
+        });
+    }
+
+    #[test]
+    fn batch_steps_do_not_repeat_an_unchanged_focus() {
+        local(async {
+            let mut s = session("batch-focus");
+            s.focus.borrow_mut().states = vec!["focused", "editable"];
+            let r = call_tool(
+                &mut s,
+                2,
+                "batch",
+                json!({"steps": [
+                    {"tool": "key", "args": {"combo": "a"}},
+                    {"tool": "pause", "args": {"ms": 0}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                    {"tool": "type_text", "args": {"text": "x"}},
+                ]}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            let lines: Vec<&str> = reply_text(&r).lines().collect();
+            // Described once, without the state every focus has.
+            assert_eq!(
+                lines[0], "[1] key: sent a x1 to fake; focus: [1] push button \"OK\" {editable}",
+                "{r}"
+            );
+            assert_eq!(
+                lines[2],
+                "[3] key: sent b x1 to fake; focus: [1] (unchanged)"
+            );
+            assert!(lines[3].contains("; focus: [1] (unchanged)"), "{r}");
+            // Once focus moves, it is described again.
+            s.focus.borrow_mut().name = "Cancel".into();
+            let r = call_tool(
+                &mut s,
+                3,
+                "batch",
+                json!({"steps": [
+                    {"tool": "key", "args": {"combo": "a"}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                ]}),
+            )
+            .await;
+            let lines: Vec<&str> = reply_text(&r).lines().collect();
+            assert!(
+                lines[0].ends_with("push button \"Cancel\" {editable}"),
+                "{r}"
+            );
+            assert!(lines[1].ends_with("(unchanged)"), "{r}");
+            // A call of its own always describes it.
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "a"})).await;
+            assert!(reply_text(&r).ends_with("\"Cancel\" {editable}"), "{r}");
+        });
+    }
+
+    #[test]
+    fn get_text_says_where_a_cut_reply_goes_on() {
+        local(async {
+            let mut s = session("get-text-cut");
+            *s.field.borrow_mut() = Some("çağ 0123456789".into());
+            let args = |extra: Json| {
+                let mut a = json!({"app": "fake", "query": "OK"});
+                a.as_object_mut()
+                    .unwrap()
+                    .extend(extra.as_object().unwrap().clone());
+                a
+            };
+            let r = call_tool(&mut s, 2, "get_text", args(json!({"limit": 6}))).await;
+            let text = reply_text(&r);
+            assert!(
+                text.ends_with(":\nçağ 01\n… cut at character 6; get_text with offset=6 reads on"),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                3,
+                "get_text",
+                args(json!({"limit": 6, "offset": 6})),
+            )
+            .await;
+            assert!(
+                reply_text(&r).ends_with(
+                    ":\n234567\n… cut at character 12; get_text with offset=12 reads on"
+                ),
+                "{r}"
+            );
+            // The rest fits: no note.
+            let r = call_tool(&mut s, 4, "get_text", args(json!({"offset": 12}))).await;
+            assert!(reply_text(&r).ends_with(":\n89"), "{r}");
+            let r = call_tool(&mut s, 5, "get_text", args(json!({"limit": 14}))).await;
+            assert!(reply_text(&r).ends_with(":\nçağ 0123456789"), "{r}");
         });
     }
 
@@ -6631,6 +8850,891 @@ mod tests {
         });
     }
 
+    /// The fake window holding `kids` (nodes the test adds).
+    fn fake_window(s: &Session, kids: &[u32]) {
+        *s.focus.borrow_mut() = Info {
+            role: "frame".into(),
+            name: "notes.txt — Fake".into(),
+            showing: true,
+            states: vec!["active"],
+            children: kids.to_vec(),
+            ..Info::default()
+        };
+    }
+
+    fn with_states(mut info: Info<u32>, states: &[&'static str]) -> Info<u32> {
+        info.states = states.to_vec();
+        info
+    }
+
+    fn with_actions(mut info: Info<u32>, actions: &[&str]) -> Info<u32> {
+        info.actions = actions.iter().map(|a| a.to_string()).collect();
+        info
+    }
+
+    fn is_error(r: &Json) -> bool {
+        r["result"]["isError"] == json!(true)
+    }
+
+    /// The id `tree(include_hidden)` gives the element named `name`.
+    async fn hidden_id(s: &mut Session, call: u64, name: &str) -> i64 {
+        let r = call_tool(
+            s,
+            call,
+            "tree",
+            json!({"app": "fake", "include_hidden": true}),
+        )
+        .await;
+        let text = reply_text(&r).to_string();
+        let line = text
+            .lines()
+            .find(|l| l.contains(&format!("\"{name}\"")))
+            .unwrap_or_else(|| panic!("{name} not in {text}"));
+        // Siblings may share the line: the id just before the name.
+        let name_at = line.find(&format!("\"{name}\"")).unwrap();
+        let at = line[..name_at].rfind('[').unwrap() + 1;
+        line[at..].split(']').next().unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn check_and_uncheck_are_idempotent_and_verified() {
+        local(async {
+            let mut s = session("check");
+            fake_window(&s, &[10, 11, 12, 13]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                let qt =
+                    |name| with_actions(fake_node("check box", name, &[]), &["Toggle", "Press"]);
+                n.insert(10, with_states(qt("Wrap lines"), &["checked"]));
+                n.insert(11, qt("Stuck option"));
+                n.insert(12, fake_node("push button", "Apply", &[]));
+                n.insert(
+                    13,
+                    with_actions(fake_node("section", "Agree", &[]), &["check"]),
+                );
+            }
+            let call = |a: Json| {
+                let mut args = json!({"app": "fake"});
+                args.as_object_mut()
+                    .unwrap()
+                    .extend(a.as_object().unwrap().clone());
+                args
+            };
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                call(json!({"query": "Wrap lines", "action": "check"})),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "[1] check box \"Wrap lines\" {checked} actions=Toggle,Press: already checked; \
+                 nothing sent; effect: no visible change",
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0);
+            let r = call_tool(
+                &mut s,
+                3,
+                "act",
+                call(json!({"query": "Wrap lines", "action": "uncheck"})),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(
+                    "\"Wrap lines\" {checked} actions=Toggle,Press: Toggle -> unchecked (verified)"
+                ),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 1);
+            assert!(!s.nodes.borrow()[&10].states.contains(&"checked"));
+            // toggle flips it back, verified.
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                call(json!({"query": "Wrap lines", "action": "Toggle"})),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("Toggle -> checked (verified)"),
+                "{r}"
+            );
+            // The state read back contradicts: an error saying what was sent.
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                call(json!({"query": "Stuck option", "action": "check"})),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains("[2] check box \"Stuck option\" actions=Toggle,Press: sent Toggle, but it reads unchecked afterwards"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 3);
+            // Not checkable: nothing sent, its actions named.
+            let r = call_tool(
+                &mut s,
+                6,
+                "act",
+                call(json!({"query": "Apply", "action": "check"})),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "it is not checkable (push button); nothing sent: its actions are ['Press']"
+                ),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 3);
+            // Not checkable, but an action of that name: run as before.
+            let r = call_tool(
+                &mut s,
+                7,
+                "act",
+                call(json!({"query": "Agree", "action": "check"})),
+            )
+            .await;
+            assert!(reply_text(&r).contains("check -> ok"), "{r}");
+            assert_eq!(actions_run(&s), 4);
+            // `option` belongs to select only.
+            let r = call_tool(
+                &mut s,
+                8,
+                "act",
+                call(json!({"query": "Apply", "action": "check", "option": "x"})),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("option goes with action=select"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 4);
+        });
+    }
+
+    #[test]
+    fn a_radio_button_is_not_unchecked() {
+        local(async {
+            let mut s = session("radio");
+            fake_window(&s, &[10]);
+            s.nodes.borrow_mut().insert(
+                10,
+                with_states(fake_node("radio button", "Tabs", &[]), &["checked"]),
+            );
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "Tabs", "action": "uncheck"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains("checking another one of its group; nothing sent"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0);
+        });
+    }
+
+    #[test]
+    fn expand_and_collapse_are_verified_with_a_key_fallback() {
+        local(async {
+            let mut s = session("expand");
+            fake_window(&s, &[10, 11]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                let mut gtk = with_actions(
+                    fake_node("tree item", "src", &[]),
+                    &["activate", "expand or contract"],
+                );
+                gtk.operable = true;
+                n.insert(10, gtk);
+                let mut combo = fake_node("combo box", "Mode", &[]);
+                combo.operable = true;
+                n.insert(11, combo);
+            }
+            let q = |query: &str, action: &str| json!({"app": "fake", "query": query, "action": action});
+            let r = call_tool(&mut s, 2, "act", q("src", "expand")).await;
+            assert!(
+                reply_text(&r).contains(": expand or contract -> expanded (verified)"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 1 on 10");
+            let r = call_tool(&mut s, 3, "act", q("src", "expand")).await;
+            assert!(
+                reply_text(&r).contains("already expanded; nothing sent"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 4, "act", q("src", "collapse")).await;
+            assert!(reply_text(&r).contains("collapsed (verified)"), "{r}");
+            // toggle on an expandable element without a Toggle flips it.
+            let r = call_tool(&mut s, 12, "act", q("src", "toggle")).await;
+            assert!(
+                reply_text(&r).contains(": expand or contract -> expanded (verified)"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 13, "act", q("src", "collapse")).await;
+            assert!(reply_text(&r).contains("collapsed (verified)"), "{r}");
+            assert_eq!(actions_run(&s), 4);
+            // Firefox: no menu is opened through accessibility.
+            s.sem.no_menu_open.set(true);
+            let r = call_tool(&mut s, 5, "act", q("Mode", "expand")).await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains("can hang or crash this app (Firefox); nothing sent"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 4);
+            // A Qt tree item: only Toggle (which selects), so focus + key.
+            let mut qt = with_actions(fake_node("tree item", "docs", &[]), &["Toggle"]);
+            qt.operable = true;
+            *s.focus.borrow_mut() = qt;
+            let id = focus_id(&mut s, 6).await;
+            let r = call_tool(&mut s, 7, "act", json!({"id": id, "action": "expand"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "cannot be focused without the pointer; nothing sent: click it, then key right"
+                ),
+                "{r}"
+            );
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("right")));
+            s.sem.focusable.set(true);
+            let r = call_tool(&mut s, 8, "act", json!({"id": id, "action": "expand"})).await;
+            assert!(
+                reply_text(&r).starts_with("focus (grab_focus) + key right -> expanded (verified)"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 9, "act", json!({"id": id, "action": "collapse"})).await;
+            assert!(
+                reply_text(&r).starts_with("focus (grab_focus) + key left -> collapsed (verified)"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 4, "Toggle never ran");
+            // Its own Toggle (which selects the row) still runs as asked.
+            let keys = s.keys.borrow().len();
+            let r = call_tool(&mut s, 11, "act", json!({"id": id, "action": "Toggle"})).await;
+            assert!(reply_text(&r).starts_with("Toggle -> ok"), "{r}");
+            assert_eq!(actions_run(&s), 5);
+            assert!(
+                !s.keys.borrow()[keys..]
+                    .iter()
+                    .any(|k| k.starts_with("down")),
+                "no key sent: {:?}",
+                &s.keys.borrow()[keys..]
+            );
+            // Keys need the full tier.
+            let allow = std::env::temp_dir().join(format!(
+                "desktop-mcp-test-{}-expand.txt",
+                std::process::id()
+            ));
+            std::fs::write(&allow, "fake:click\n").unwrap();
+            // (The fake's Toggle expanded it.)
+            let r = call_tool(&mut s, 10, "act", json!({"id": id, "action": "collapse"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains("needs the full tier ('fake' has click); nothing sent"),
+                "{r}"
+            );
+        });
+    }
+
+    /// A combo box (10, or the focus element) named after its value, with
+    /// a hidden list (11) of three entries (12-14) whose action is Qt's
+    /// Toggle.
+    fn fake_combo(s: &Session, focused: bool, name: &str, actions: &[&str]) {
+        let mut combo = fake_node("combo box", name, &[11]);
+        combo.actions = vec!["Show Menu".into()];
+        if focused {
+            *s.focus.borrow_mut() = combo;
+        } else {
+            fake_window(s, &[10]);
+            s.nodes.borrow_mut().insert(10, combo);
+        }
+        let mut n = s.nodes.borrow_mut();
+        let mut list = fake_node("list", "", &[12, 13, 14]);
+        list.showing = false;
+        n.insert(11, list);
+        for (id, label) in [(12, "UTF-8"), (13, "UTF-16"), (14, "ISO-8859-1")] {
+            let mut item = with_actions(fake_node("list item", label, &[]), actions);
+            item.showing = false;
+            n.insert(id, item);
+        }
+    }
+
+    #[test]
+    fn select_picks_an_entry_without_the_pointer_and_verifies() {
+        local(async {
+            let mut s = session("select");
+            fake_combo(&s, false, "UTF-8", &["Toggle"]);
+            let q = |option: &str| json!({"app": "fake", "query": "UTF-8", "role": "combo box", "option": option});
+            let r = call_tool(&mut s, 2, "act", q("utf-8")).await;
+            assert!(
+                reply_text(&r).starts_with(
+                    "[1] combo box \"UTF-8\" actions=Show Menu: already \"UTF-8\"; nothing sent"
+                ),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 3, "act", q("Latin")).await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains("no entry \"Latin\" here; there are: \"UTF-8\", \"UTF-16\", \"ISO-8859-1\"; nothing sent"),
+                "{r}"
+            );
+            // Selection that picks it.
+            s.sem.selection.set(Some(true));
+            let r = call_tool(&mut s, 4, "act", q("utf-16")).await;
+            assert!(
+                reply_text(&r).contains(": \"UTF-16\" selected (Selection; verified)"),
+                "{r}"
+            );
+            assert_eq!(s.nodes.borrow()[&10].name, "UTF-16");
+            assert_eq!(actions_run(&s), 0);
+        });
+    }
+
+    #[test]
+    fn select_falls_back_to_the_entry_action_and_reports_a_contradiction() {
+        local(async {
+            let mut s = session("select-fallback");
+            // Firefox: the control is named after its label; the entry's
+            // select action picks it.
+            fake_combo(&s, false, "Encoding", &["select"]);
+            let q = |option: &str| json!({"app": "fake", "query": "Encoding", "option": option});
+            let r = call_tool(&mut s, 2, "act", q("ISO")).await;
+            assert!(
+                reply_text(&r).contains(": \"ISO-8859-1\" selected (select; verified)"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 14");
+            let r = call_tool(&mut s, 3, "act", q("ISO")).await;
+            assert!(
+                reply_text(&r).contains("already \"ISO-8859-1\"; nothing sent"),
+                "{r}"
+            );
+            // Qt: Selection marks the hidden list's entry but the combo box
+            // still shows the old value; Toggle is never run, and keys
+            // need focus.
+            fake_combo(&s, false, "UTF-8", &["Toggle"]);
+            s.sem.selection.set(Some(false));
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"app": "fake", "query": "UTF-8", "role": "combo box", "option": "UTF-16"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "sent Selection, but it shows \"UTF-8\" afterwards; the key fallback: opened its list (Show Menu), but no list showed"
+                ),
+                "{r}"
+            );
+            // The Firefox step's action, and Show Menu opening the list.
+            assert_eq!(actions_run(&s), 2);
+        });
+    }
+
+    #[test]
+    fn select_moves_a_closed_combo_box_with_arrow_keys() {
+        local(async {
+            let mut s = session("select-keys");
+            fake_combo(&s, true, "UTF-8", &["Toggle"]);
+            s.sem.focusable.set(true);
+            let id = focus_id(&mut s, 2).await;
+            let r = call_tool(&mut s, 3, "act", json!({"id": id, "option": "ISO-8859-1"})).await;
+            assert_eq!(
+                reply_text(&r),
+                "\"ISO-8859-1\" selected (focus (grab_focus) + key down x2; verified); effect: changed",
+                "{r}"
+            );
+            let downs = s.keys.borrow().iter().filter(|k| *k == "down down").count();
+            assert_eq!(downs, 2);
+            let r = call_tool(&mut s, 4, "act", json!({"id": id, "option": "UTF-8"})).await;
+            assert!(
+                reply_text(&r)
+                    .starts_with("\"UTF-8\" selected (focus (grab_focus) + key up x2; verified)"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn select_opens_a_menu_button_that_lists_no_entries() {
+        local(async {
+            let mut s = session("select-menu");
+            fake_window(&s, &[10, 20]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(
+                    10,
+                    with_actions(
+                        fake_node("push button", "Sort", &[]),
+                        &["Press", "Show Menu"],
+                    ),
+                );
+                let mut popup = fake_node("popup menu", "", &[21, 22]);
+                popup.showing = false;
+                n.insert(20, popup);
+                n.insert(
+                    21,
+                    with_actions(fake_node("radio menu item", "By name", &[]), &["click"]),
+                );
+                n.insert(
+                    22,
+                    with_actions(fake_node("radio menu item", "By date", &[]), &["click"]),
+                );
+            }
+            // Firefox: its menus are not opened through accessibility.
+            s.sem.no_menu_open.set(true);
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "Sort", "option": "date"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains("lists no entries until opened, and opening its menu"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0);
+            s.sem.no_menu_open.set(false);
+            // The popup shows once opened (here: right away).
+            s.nodes.borrow_mut().get_mut(&20).unwrap().showing = true;
+            let r = call_tool(
+                &mut s,
+                3,
+                "act",
+                json!({"app": "fake", "query": "Sort", "option": "date"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(text.contains("opened it (Show Menu); "), "{r}");
+            assert_eq!(
+                s.keys
+                    .borrow()
+                    .iter()
+                    .filter(|k| k.starts_with("action"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec!["action 1 on 10", "action 0 on 22"]
+            );
+        });
+    }
+
+    #[test]
+    fn scroll_to_uses_scroll_to_then_the_wheel() {
+        local(async {
+            let mut s = session("scroll-to");
+            fake_window(&s, &[40]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("list", "Files", &[41, 42, 43]));
+                n.insert(41, fake_node("list item", "near.txt", &[]));
+                let mut far = fake_node("list item", "far.txt", &[]);
+                far.showing = false;
+                n.insert(42, far);
+                let mut hidden = fake_node("list item", "inner.txt (hidden)", &[]);
+                hidden.showing = false;
+                n.insert(43, hidden);
+            }
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "near.txt", "action": "scroll_to"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(": already in view; nothing sent"),
+                "{r}"
+            );
+            let id = hidden_id(&mut s, 3, "far.txt").await;
+            // Neither ScrollTo nor a wheel that reaches it.
+            let r = call_tool(&mut s, 4, "act", json!({"id": id, "action": "scroll_to"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains(&format!(
+                    "{}; turned the wheel 50 down at 0,0 (the pointer moved), but it is still not in view",
+                    backend::NO_SCROLL_TO
+                )),
+                "{r}"
+            );
+            // A hidden element gets no wheel.
+            let inner = hidden_id(&mut s, 7, "inner.txt (hidden)").await;
+            let before = s.keys.borrow().len();
+            let r = call_tool(
+                &mut s,
+                8,
+                "act",
+                json!({"id": inner, "action": "scroll_to"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains("not scrolled out of view; no wheel turned"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().len(), before);
+            // The wheel shows it on its second turn.
+            s.sem.wheel.set(Some((42, 2)));
+            let r = call_tool(&mut s, 5, "act", json!({"id": id, "action": "scroll to"})).await;
+            assert!(
+                reply_text(&r)
+                    .starts_with("in view (wheel 10 down at 0,0, the pointer moved; verified)"),
+                "{r}"
+            );
+            // ScrollTo, no pointer.
+            s.nodes.borrow_mut().get_mut(&42).unwrap().showing = false;
+            s.sem.scroll_to.set(Some(true));
+            let before = s.keys.borrow().len();
+            let r = call_tool(&mut s, 6, "act", json!({"id": id, "action": "scroll_to"})).await;
+            assert!(
+                reply_text(&r).starts_with("in view (ScrollTo; verified)"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow()[before..], ["scroll_to 42".to_string()]);
+        });
+    }
+
+    #[test]
+    fn select_never_presses_a_control_that_lists_no_entries() {
+        local(async {
+            let mut s = session("select-plain");
+            fake_window(&s, &[10, 11]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(
+                    10,
+                    with_actions(fake_node("push button", "Apply", &[]), &["Press"]),
+                );
+                n.insert(
+                    11,
+                    with_actions(fake_node("list item", "report.pdf", &[]), &["activate"]),
+                );
+            }
+            for (i, (query, role)) in [("Apply", "push button"), ("report.pdf", "list item")]
+                .into_iter()
+                .enumerate()
+            {
+                let r = call_tool(
+                    &mut s,
+                    2 + i as u64,
+                    "act",
+                    json!({"app": "fake", "query": query, "option": "x"}),
+                )
+                .await;
+                assert!(is_error(&r), "{r}");
+                assert!(
+                    reply_text(&r).contains(&format!(
+                        "it lists no entries ({role}): not a combo box, list or menu button; \
+                         nothing sent"
+                    )),
+                    "{r}"
+                );
+            }
+            assert_eq!(actions_run(&s), 0);
+            // A button that says it has a popup is opened.
+            s.nodes
+                .borrow_mut()
+                .get_mut(&10)
+                .unwrap()
+                .states
+                .push("has popup");
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"app": "fake", "query": "Apply", "option": "x"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("opened it (Press)"), "{r}");
+            // An empty option is no option: a plain act.
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                json!({"app": "fake", "query": "report.pdf", "option": "", "action": ""}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("activate -> ok"), "{r}");
+        });
+    }
+
+    #[test]
+    fn select_in_a_multi_selection_list_says_what_else_stays_selected() {
+        local(async {
+            let mut s = session("select-multi");
+            fake_window(&s, &[40]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("list", "Files", &[41, 42, 43]));
+                n.insert(
+                    41,
+                    with_states(fake_node("list item", "a.txt", &[]), &["selected"]),
+                );
+                n.insert(
+                    42,
+                    with_states(fake_node("list item", "b.txt", &[]), &["selected"]),
+                );
+                n.insert(43, fake_node("list item", "c.txt", &[]));
+            }
+            s.sem.selection.set(Some(true));
+            s.sem.adds.set(true);
+            let q = |option: &str| json!({"app": "fake", "query": "Files", "role": "list", "option": option});
+            // b.txt is selected, but along with a.txt: not "already".
+            let r = call_tool(&mut s, 2, "act", q("b.txt")).await;
+            assert!(
+                reply_text(&r).contains(
+                    "\"b.txt\" selected (Selection; verified); 1 other entry stays selected too"
+                ),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 3, "act", q("c.txt")).await;
+            assert!(
+                reply_text(&r).contains("; 2 other entries stay selected too"),
+                "{r}"
+            );
+            // A list that keeps one selected says nothing more.
+            s.sem.adds.set(false);
+            let r = call_tool(&mut s, 4, "act", q("a.txt")).await;
+            assert!(
+                reply_text(&r).contains("\"a.txt\" selected (Selection; verified); effect"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn select_in_a_web_page_runs_the_entry_action_not_selection() {
+        local(async {
+            let mut s = session("select-web");
+            fake_combo(&s, false, "Encoding", &["select"]);
+            s.sem.selection.set(Some(true));
+            *s.sem.toolkit.borrow_mut() = "gecko".into();
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "Encoding", "option": "UTF-16"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(": \"UTF-16\" selected (select; verified)"),
+                "{r}"
+            );
+            assert!(!s.keys.borrow().iter().any(|k| k.starts_with("select ")));
+        });
+    }
+
+    #[test]
+    fn a_checkable_row_is_checked_by_space_not_its_toggle() {
+        local(async {
+            let mut s = session("check-row");
+            let mut qt = with_actions(fake_node("tree item", "Plugin", &[]), &["Toggle"]);
+            qt.states = vec!["checkable"];
+            *s.focus.borrow_mut() = qt;
+            *s.sem.toolkit.borrow_mut() = "qt".into();
+            let id = focus_id(&mut s, 2).await;
+            let r = call_tool(&mut s, 3, "act", json!({"id": id, "action": "check"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "there is no action to check it, and it cannot be focused without the \
+                     pointer; nothing sent: click it, then key space"
+                ),
+                "{r}"
+            );
+            s.sem.focusable.set(true);
+            let r = call_tool(&mut s, 4, "act", json!({"id": id, "action": "check"})).await;
+            assert!(
+                reply_text(&r).starts_with("focus (grab_focus) + key space -> checked (verified)"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0, "Toggle (select the row) never ran");
+            // GTK's toggle cell checks with its toggle; Windows spells the
+            // check box role without a space.
+            fake_window(&s, &[10, 11]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                let mut cell = with_actions(
+                    fake_node("table cell", "Enabled", &[]),
+                    &["activate", "toggle"],
+                );
+                cell.states = vec!["checkable"];
+                n.insert(10, cell);
+                n.insert(
+                    11,
+                    with_actions(fake_node("checkbox", "Wrap", &[]), &["toggle"]),
+                );
+            }
+            *s.sem.toolkit.borrow_mut() = "gtk".into();
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                json!({"app": "fake", "query": "Enabled", "action": "check"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(": toggle -> checked (verified)"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 1 on 10");
+            let r = call_tool(
+                &mut s,
+                6,
+                "act",
+                json!({"app": "fake", "query": "Wrap", "action": "check"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(": toggle -> checked (verified)"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_key_fallback_is_covered_by_the_act_calls_confirmation() {
+        local(async {
+            let mut s = session("confirm-key-on");
+            let mut qt = with_actions(fake_node("tree item", "docs", &[]), &["Toggle"]);
+            qt.operable = true;
+            *s.focus.borrow_mut() = qt;
+            s.sem.focusable.set(true);
+            let id = focus_id(&mut s, 2).await;
+            set_allow("confirm-key-on", "fake\nconfirm: key:fake\n");
+            let r = call_tool(&mut s, 3, "act", json!({"id": id, "action": "expand"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(reply_text(&r).contains("confirm: true"), "{r}");
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("right")));
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"id": id, "action": "expand", "confirm": true}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with("focus (grab_focus) + key right -> expanded (verified)"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn user_input_stops_the_key_and_wheel_fallbacks() {
+        local(async {
+            let mut s = session("takeover-semantic");
+            fake_combo(&s, true, "UTF-8", &["Toggle"]);
+            s.sem.focusable.set(true);
+            let id = focus_id(&mut s, 2).await;
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                t.user_input(Instant::now(), takeover::Device::Keyboard);
+            });
+            let r = call_tool(&mut s, 3, "act", json!({"id": id, "option": "ISO-8859-1"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(reply_text(&r).contains("interrupted"), "{r}");
+            let downs = s.keys.borrow().iter().filter(|k| *k == "down down").count();
+            assert_eq!(downs, 1);
+        });
+        local(async {
+            let mut s = session("takeover-wheel");
+            fake_window(&s, &[40]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("list", "Files", &[42]));
+                let mut far = fake_node("list item", "far.txt", &[]);
+                far.showing = false;
+                n.insert(42, far);
+            }
+            let id = hidden_id(&mut s, 2, "far.txt").await;
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                t.user_input(Instant::now(), takeover::Device::Pointer);
+            });
+            let r = call_tool(&mut s, 3, "act", json!({"id": id, "action": "scroll_to"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(reply_text(&r).contains("interrupted"), "{r}");
+            let turns = s
+                .keys
+                .borrow()
+                .iter()
+                .filter(|k| k.starts_with("scroll "))
+                .count();
+            assert_eq!(turns, 1);
+        });
+    }
+
+    #[test]
+    fn verified_actions_run_in_a_batch() {
+        local(async {
+            let mut s = session("verified-batch");
+            fake_window(&s, &[10]);
+            s.nodes.borrow_mut().insert(
+                10,
+                with_actions(fake_node("check box", "Wrap", &[]), &["Toggle"]),
+            );
+            let r = call_tool(
+                &mut s,
+                2,
+                "batch",
+                json!({"steps": [
+                    {"tool": "act", "args": {"app": "fake", "query": "Wrap", "action": "check"}},
+                    {"tool": "act", "args": {"id": "$1", "action": "check"}},
+                ]}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(text.contains("Toggle -> checked (verified)"), "{text}");
+            assert!(text.contains("already checked; nothing sent"), "{text}");
+            assert_eq!(actions_run(&s), 1);
+        });
+    }
+
+    #[test]
+    fn act_never_opens_a_context_menu_by_default() {
+        local(async {
+            let mut s = session("ctx-menu");
+            let id = focus_id(&mut s, 2).await;
+            s.focus.borrow_mut().actions = vec!["showContextMenu".into()];
+            let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains("no default action (only showContextMenu)"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0);
+            // Asked for by name, it runs.
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"id": id, "action": "showContextMenu"}),
+            )
+            .await;
+            assert!(reply_text(&r).starts_with("showContextMenu -> ok"), "{r}");
+            // Another action is the default, wherever it is listed.
+            s.focus.borrow_mut().actions = vec!["showContextMenu".into(), "doDefault".into()];
+            let r = call_tool(&mut s, 5, "act", json!({"id": id})).await;
+            assert!(reply_text(&r).starts_with("doDefault -> ok"), "{r}");
+            assert!(s.keys.borrow().last().unwrap().starts_with("action 1 on "));
+        });
+    }
+
     #[test]
     fn no_matches_and_failures_say_what_is_on_screen() {
         local(async {
@@ -6663,6 +9767,399 @@ mod tests {
             assert!(reply_text(&r).ends_with(&want), "{r}");
             let r = call_tool(&mut s, 4, "key", json!({"combo": "c"})).await;
             assert!(!reply_text(&r).contains("active window now"), "{r}");
+        });
+    }
+
+    /// A context menu (40) with Copy, Paste, a checked Wrap entry and a
+    /// separator; a save dialog (60) asking with Save, Discard and Cancel;
+    /// a combo box (69) whose list (70) holds two entries.
+    fn fake_surfaces(s: &Session) {
+        let mut nodes = s.nodes.borrow_mut();
+        nodes.insert(40, fake_node("popup menu", "", &[41, 42, 43, 44]));
+        nodes.insert(41, fake_node("menu item", "Copy", &[]));
+        nodes.insert(42, fake_node("menu item", "Paste", &[]));
+        let mut wrap = fake_node("check menu item", "Wrap", &[]);
+        wrap.states = vec!["checked"];
+        nodes.insert(43, wrap);
+        nodes.insert(44, fake_node("separator", "", &[]));
+        nodes.insert(60, fake_node("dialog", "Save?", &[61, 62, 63, 64]));
+        nodes.insert(61, fake_node("label", "Save changes to notes.txt?", &[]));
+        nodes.insert(62, fake_node("push button", "Save", &[]));
+        nodes.insert(63, fake_node("push button", "Discard", &[]));
+        nodes.insert(64, fake_node("push button", "Cancel", &[]));
+        nodes.insert(69, fake_node("combo box", "Encoding", &[70]));
+        nodes.insert(70, fake_node("list", "", &[71, 72]));
+        nodes.insert(71, fake_node("list item", "UTF-8", &[]));
+        nodes.insert(72, fake_node("list item", "Latin-1", &[]));
+        nodes.insert(80, fake_node("label", "Saved", &[]));
+        s.shown.parents.borrow_mut().insert(70, 69);
+        s.shown.live.set(true);
+    }
+
+    /// The id printed just before `"label"` in `text`.
+    fn id_before(text: &str, label: &str) -> i64 {
+        let at = text.find(&format!("\"{label}\"")).expect(text);
+        let open = text[..at].rfind('[').expect(text);
+        text[open + 1..].split(']').next().unwrap().parse().unwrap()
+    }
+
+    #[test]
+    fn a_right_click_lists_the_context_menu_it_opened() {
+        local(async {
+            let mut s = session("surface-menu");
+            fake_surfaces(&s);
+            let id = focus_id(&mut s, 2).await;
+            // The menu and its entries each say they show.
+            s.shown.next.borrow_mut().extend([40, 41, 42, 43]);
+            let r = call_tool(&mut s, 3, "click", json!({"id": id, "button": "right"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nopened: popup menu (3 entries): ["),
+                "{text}"
+            );
+            assert!(
+                text.contains("\"Paste\" [")
+                    && text.contains("] check menu item \"Wrap\" {checked}"),
+                "{text}"
+            );
+            assert_eq!(text.matches("opened:").count(), 1, "{text}");
+            // Its ids work as they are.
+            let copy = id_before(text, "Copy");
+            let r = call_tool(&mut s, 4, "act", json!({"id": copy})).await;
+            assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
+            assert!(s.keys.borrow().iter().any(|k| k == "action 0 on 41"));
+            // Nothing opened by the action: nothing listed.
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn act_key_and_a_combo_click_list_what_they_opened() {
+        local(async {
+            let mut s = session("surface-kinds");
+            fake_surfaces(&s);
+            let id = focus_id(&mut s, 2).await;
+            // An action that opens a menu: listed after the effect line.
+            s.shown.next.borrow_mut().push(40);
+            let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
+            let text = reply_text(&r);
+            assert!(text.contains("; effect: "), "{text}");
+            assert!(
+                text.contains("\nopened: popup menu (3 entries): "),
+                "{text}"
+            );
+            // A shortcut that opens a dialog: its question and buttons,
+            // buttons named once by role.
+            s.shown.next.borrow_mut().extend([62, 63, 64, 60]);
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "ctrl+s"})).await;
+            let text = reply_text(&r);
+            let at = text.find("\nopened: dialog 'Save?': ").expect(text);
+            let line = &text[at..];
+            assert!(
+                line.contains("\"Save changes to notes.txt?\" [")
+                    && line.contains("] push button \"Save\" [")
+                    && line.contains("] \"Discard\" [")
+                    && line.contains("] \"Cancel\""),
+                "{line}"
+            );
+            // Its buttons were not listed again on their own.
+            assert_eq!(text.matches("opened:").count(), 1, "{text}");
+            // A combo box's list, shown by a plain click on the combo box.
+            let r = call_tool(&mut s, 5, "find", json!({"app": "fake", "query": "OK"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            s.focus.borrow_mut().role = "combo box".into();
+            s.shown.next.borrow_mut().push(70);
+            let r = call_tool(&mut s, 6, "click", json!({"app": "fake", "query": "OK"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nopened: list (2 entries): [") && text.contains("\"Latin-1\""),
+                "{text}"
+            );
+            // A list outside a combo box is no surface.
+            s.shown.parents.borrow_mut().clear();
+            s.shown.next.borrow_mut().push(70);
+            let r = call_tool(&mut s, 7, "click", json!({"app": "fake", "query": "OK"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn nothing_opened_costs_no_reads_and_adds_nothing() {
+        local(async {
+            let mut s = session("surface-none");
+            fake_surfaces(&s);
+            let id = focus_id(&mut s, 2).await;
+            let (ids, reads) = (s.shown.identities.get(), s.reads.prefetches.get());
+            // No event: no read beyond the id's own check.
+            let r = call_tool(&mut s, 3, "click", json!({"id": id})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "ctrl+s"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            let r = call_tool(&mut s, 5, "type_text", json!({"text": "x"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            assert_eq!(s.shown.identities.get(), ids + 1);
+            assert_eq!(s.reads.prefetches.get(), reads);
+            // Something shown that is no menu or dialog: its role is read,
+            // nothing more.
+            s.shown.next.borrow_mut().push(80);
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "a"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            assert_eq!(s.shown.identities.get(), ids + 2);
+            assert_eq!(s.reads.prefetches.get(), reads);
+            // A menu that closed again before the reply is not listed.
+            s.nodes.borrow_mut().get_mut(&40).unwrap().showing = false;
+            s.shown.next.borrow_mut().push(40);
+            let r = call_tool(
+                &mut s,
+                7,
+                "mouse",
+                json!({"x": 5, "y": 5, "button": "right"}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn without_events_likely_openers_scan_the_app_windows_once() {
+        local(async {
+            let mut s = session("surface-scan");
+            fake_surfaces(&s);
+            s.shown.live.set(false);
+            s.more_windows.borrow_mut().push(60);
+            // A plain key looks at nothing.
+            let ids = s.shown.identities.get();
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            assert_eq!(s.shown.identities.get(), ids);
+            // One that may open a dialog looks at the app's windows.
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "ctrl+s"})).await;
+            assert!(reply_text(&r).contains("\nopened: dialog 'Save?': "), "{r}");
+            // Still open: not listed again.
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "ctrl+o"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn close_window_lists_the_save_prompt_it_left_open() {
+        local(async {
+            let mut s = session("surface-close");
+            fake_surfaces(&s);
+            s.shown.close_opens.set(Some(60));
+            let r = call_tool(
+                &mut s,
+                2,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("still open, showing dialog 'Save?': \"Save changes to notes.txt?\"")
+                    && text.contains("] push button \"Save\" ["),
+                "{text}"
+            );
+            // Listed once, not again after the effect line.
+            assert!(!text.contains("opened:"), "{text}");
+            let save = id_before(text, "Save");
+            let r = call_tool(&mut s, 3, "act", json!({"id": save})).await;
+            assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_surface_whose_app_name_cannot_be_read_is_not_listed() {
+        local(async {
+            let mut s = session("surface-nameless");
+            fake_surfaces(&s);
+            // Another app's menu (another bus) whose name reads empty: not
+            // taken for the active app's, so neither listed nor given ids.
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.insert(90, fake_node("popup menu", "", &[91]));
+                nodes.insert(91, fake_node("menu item", "Delete all", &[]));
+            }
+            s.shown.nameless.borrow_mut().extend([90, 91]);
+            s.shown.next.borrow_mut().extend([90, 40]);
+            let r = call_tool(
+                &mut s,
+                2,
+                "mouse",
+                json!({"x": 5, "y": 5, "button": "right"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(text.contains("\nopened: popup menu (3 entries)"), "{text}");
+            assert!(!text.contains("Delete all"), "{text}");
+            assert_eq!(text.matches("opened:").count(), 1, "{text}");
+        });
+    }
+
+    #[test]
+    fn without_surface_roles_nothing_waits_or_scans() {
+        local(async {
+            let mut s = session("surface-uia");
+            fake_surfaces(&s);
+            s.shown.live.set(false);
+            s.shown.uia_roles.set(true);
+            s.more_windows.borrow_mut().push(60);
+            let ids = s.shown.identities.get();
+            for (n, combo) in [(2, "ctrl+s"), (3, "menu")] {
+                let r = call_tool(&mut s, n, "key", json!({"combo": combo})).await;
+                assert!(!reply_text(&r).contains("opened:"), "{r}");
+            }
+            let id = focus_id(&mut s, 4).await;
+            let r = call_tool(&mut s, 5, "act", json!({"id": id})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            // No window's role read (but the act's own target check).
+            assert_eq!(s.shown.identities.get(), ids + 1);
+            // close_window gives the plain hint.
+            s.shown.close_opens.set(Some(60));
+            let r = call_tool(
+                &mut s,
+                6,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("probably asking whether to save"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_dialog_that_opened_after_a_reply_is_listed_by_the_next() {
+        local(async {
+            let mut s = session("surface-late");
+            fake_surfaces(&s);
+            let id = focus_id(&mut s, 2).await;
+            // A plain click: nothing showed before its reply.
+            let r = call_tool(&mut s, 3, "click", json!({"id": id})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            // The dialog it opened shows a few ms later.
+            s.shown.next.borrow_mut().extend([62, 63, 64, 60]);
+            s.shown.input();
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "a"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nbefore it, opened: dialog 'Save?': \"Save changes"),
+                "{text}"
+            );
+            assert_eq!(text.matches("opened:").count(), 1, "{text}");
+            // Its ids work.
+            let save = id_before(text, "Save");
+            let r = call_tool(&mut s, 5, "act", json!({"id": save})).await;
+            assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            // Listed once: an act's reply after more shows, but not again.
+            s.shown.next.borrow_mut().extend([60, 40]);
+            s.shown.input();
+            let r = call_tool(&mut s, 6, "act", json!({"id": id})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nbefore it, opened: dialog 'Save?'"),
+                "{text}"
+            );
+            assert!(text.contains("before it, opened: popup menu"), "{text}");
+            // Something shown again after the reply of a call that listed
+            // it is not listed again.
+            s.shown.next.borrow_mut().push(40);
+            s.shown.input();
+            let r = call_tool(&mut s, 7, "key", json!({"combo": "b"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_surface_listed_once_is_not_read_again() {
+        local(async {
+            let mut s = session("surface-reads");
+            fake_surfaces(&s);
+            s.shown.close_opens.set(Some(60));
+            let reads = s.reads.prefetches.get();
+            let r = call_tool(
+                &mut s,
+                2,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("showing dialog 'Save?'"), "{r}");
+            // The dialog and its children: two reads, none in the effect line.
+            assert_eq!(s.reads.prefetches.get(), reads + 2);
+            // Scanning without events: a dialog still open is checked by
+            // its own node only.
+            s.shown.live.set(false);
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "ctrl+s"})).await;
+            assert!(reply_text(&r).contains("opened: dialog 'Save?'"), "{r}");
+            let reads = s.reads.prefetches.get();
+            let r = call_tool(&mut s, 4, "key", json!({"combo": "ctrl+o"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            assert_eq!(s.reads.prefetches.get(), reads + 1);
+            // Once hidden, it is listed again when it shows.
+            s.nodes.borrow_mut().get_mut(&60).unwrap().showing = false;
+            let r = call_tool(&mut s, 5, "key", json!({"combo": "ctrl+o"})).await;
+            assert!(!reply_text(&r).contains("opened:"), "{r}");
+            s.nodes.borrow_mut().get_mut(&60).unwrap().showing = true;
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "ctrl+o"})).await;
+            assert!(reply_text(&r).contains("opened: dialog 'Save?'"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_file_dialog_is_named_for_file_dialog_and_others_skip_their_views() {
+        local(async {
+            let mut s = session("surface-file");
+            fake_surfaces(&s);
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.insert(
+                    100,
+                    fake_node("dialog", "Open File", &[101, 108, 103, 104, 105]),
+                );
+                nodes.insert(101, fake_node("tool bar", "", &[102]));
+                nodes.insert(102, fake_node("push button", "Back", &[]));
+                nodes.insert(108, fake_node("panel", "", &[109, 110]));
+                nodes.insert(109, fake_node("push button", "home", &[]));
+                nodes.insert(110, fake_node("push button", "docs", &[]));
+                nodes.insert(103, fake_node("list", "", &[111]));
+                nodes.insert(111, fake_node("list item", "notes.txt", &[]));
+                let mut name = fake_node("text", "", &[]);
+                name.states = vec!["editable"];
+                nodes.insert(104, name);
+                nodes.insert(105, fake_node("panel", "", &[106, 107]));
+                nodes.insert(106, fake_node("push button", "Open", &[]));
+                nodes.insert(107, fake_node("push button", "Cancel", &[]));
+            }
+            // Not one file_dialog fills: its buttons, OK and Cancel first,
+            // without the tool bar's or the file list's.
+            s.shown.next.borrow_mut().push(100);
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "ctrl+o"})).await;
+            let text = reply_text(&r);
+            let at = text.find("\nopened: dialog 'Open File': [").expect(text);
+            let line = &text[at..];
+            assert!(
+                line.find("\"Open\"") < line.find("\"home\"")
+                    && line.find("\"Cancel\"") < line.find("\"home\""),
+                "{line}"
+            );
+            assert!(
+                !line.contains("Back") && !line.contains("notes.txt"),
+                "{line}"
+            );
+            // One it fills: named, nothing read for entries.
+            s.shown.file_dialogs.borrow_mut().push(100);
+            s.shown.next.borrow_mut().push(100);
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "ctrl+o"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("\nopened: file dialog 'Open File' (use file_dialog)"),
+                "{text}"
+            );
+            assert!(!text.contains("\"Open\""), "{text}");
         });
     }
 
@@ -6889,11 +10386,9 @@ mod tests {
                      "args": {"app": "fake", "query": "never there", "timeout_ms": 0}},
                     {"tool": "act", "args": {"id": "$1"}, "optional": true},
                     {"tool": "act", "args": {"id": "$2"}, "optional": true},
-                    {"tool": "act", "args": {"id": "$5"}, "optional": true},
-                    {"tool": "act", "args": {"id": "$x"}, "optional": true},
                     // Text arguments are never references.
                     {"tool": "clipboard_set", "args": {"text": "$1"}},
-                    {"tool": "act", "args": {"id": "$0"}},
+                    {"tool": "act", "args": {"id": "$2"}},
                     {"tool": "key", "args": {"combo": "a"}},
                 ]}),
             )
@@ -6909,21 +10404,609 @@ mod tests {
                 lines[3],
                 "[4] act failed (optional): `id` \"$2\": step 2 (wait_for) failed"
             );
-            assert_eq!(
-                lines[4],
-                "[5] act failed (optional): `id` \"$5\": refer to an earlier step (1 to 4)"
-            );
+            assert!(lines[4].starts_with("[5] clipboard_set: "), "{r}");
             assert_eq!(
                 lines[5],
-                "[6] act failed (optional): `id` \"$x\": use \"$N\" for the element step N produced"
+                "[6] act failed: `id` \"$2\": step 2 (wait_for) failed"
             );
-            assert!(lines[6].starts_with("[7] clipboard_set: "), "{r}");
-            assert_eq!(
-                lines[7],
-                "[8] act failed: `id` \"$0\": refer to an earlier step (1 to 7)"
-            );
-            assert_eq!(lines[8], "stopped; 1 step(s) not run");
+            assert_eq!(lines[6], "stopped; 1 step(s) not run");
             assert_eq!(actions_run(&s), 0);
+            assert!(s.keys.borrow().is_empty());
+            // A reference that can never work fails the whole batch before
+            // anything runs.
+            for (bad, why) in [
+                ("$3", "refer to an earlier step (1 to 1)"),
+                ("$0", "refer to an earlier step (1 to 1)"),
+                ("$x", "use \"$N\" for the element step N produced"),
+            ] {
+                let r = call_tool(
+                    &mut s,
+                    3,
+                    "batch",
+                    json!({"steps": [
+                        {"tool": "key", "args": {"combo": "a"}},
+                        {"tool": "act", "args": {"id": bad}},
+                    ]}),
+                )
+                .await;
+                assert_eq!(r["result"]["isError"], true, "{r}");
+                assert_eq!(
+                    reply_text(&r),
+                    format!(
+                        "Error executing tool batch: not run (nothing sent): [2] act: `id` \"{bad}\": {why}"
+                    ),
+                );
+            }
+            assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    /// Run a batch and return (is error, its lines).
+    async fn run_batch(s: &mut Session, id: u64, steps: Json) -> (bool, Vec<String>) {
+        let r = call_tool(s, id, "batch", json!({ "steps": steps })).await;
+        let lines = reply_text(&r).lines().map(String::from).collect();
+        (r["result"]["isError"] == true, lines)
+    }
+
+    #[test]
+    fn a_batch_step_with_if_runs_only_when_its_condition_holds() {
+        local(async {
+            let mut s = session("batch-if");
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                    {"tool": "act", "args": {"id": "$1"}, "if": {"step": 1, "found": true}},
+                    {"tool": "find", "args": {"app": "fake", "query": "zzz"}},
+                    {"tool": "key", "args": {"combo": "a"}, "if": {"step": 3, "found": true}},
+                    {"tool": "key", "args": {"combo": "b"}, "if": {"step": 3, "contains": "NO MATCHES"}},
+                    {"tool": "wait_for", "optional": true,
+                     "args": {"app": "fake", "query": "Overwrite?", "timeout_ms": 0}},
+                    {"tool": "key", "args": {"combo": "c"}, "if": {"step": 6, "ok": true}},
+                    {"tool": "key", "args": {"combo": "d"}, "if": {"step": 6, "ok": false}},
+                    // A skipped step meets no condition, and "$N" to it fails.
+                    {"tool": "key", "args": {"combo": "e"}, "if": {"step": 7, "found": false}},
+                    {"tool": "act", "args": {"id": "$4"}, "optional": true},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(lines[1].starts_with("[2] act: Press -> ok"), "{lines:?}");
+            assert_eq!(lines[3], "[4] skipped (if step 3 found)");
+            assert!(lines[4].starts_with("[5] key: sent b"), "{lines:?}");
+            assert!(
+                lines[5].starts_with("[6] wait_for failed (optional): "),
+                "{lines:?}"
+            );
+            assert_eq!(lines[6], "[7] skipped (if step 6 ok)");
+            assert!(lines[7].starts_with("[8] key: sent d"), "{lines:?}");
+            assert_eq!(lines[8], "[9] skipped (if step 7 not found)");
+            assert_eq!(
+                lines[9],
+                "[10] act failed (optional): `id` \"$4\": step 4 (key) was skipped"
+            );
+            assert!(lines[10].starts_with("now: "), "{lines:?}");
+            assert_eq!(lines.len(), 11, "{lines:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                ["action 0 on 7", "down b", "up b", "down d", "up d"]
+            );
+        });
+    }
+
+    #[test]
+    fn on_fail_steps_run_only_when_their_step_failed() {
+        local(async {
+            let mut s = session("batch-on-fail");
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "act", "args": {"app": "fake", "query": "Save"},
+                     "on_fail": [{"tool": "key", "args": {"combo": "ctrl+s"}}]},
+                    {"tool": "key", "args": {"combo": "a"},
+                     "on_fail": [{"tool": "key", "args": {"combo": "x"}}]},
+                    {"tool": "key", "args": {"combo": "b"}, "if": {"step": 1, "ok": false}},
+                    {"tool": "mouse", "args": {"x": FAIL_X, "y": 0},
+                     "on_fail": [
+                        {"tool": "act", "args": {"app": "fake", "query": "zzz"}, "optional": true},
+                        {"tool": "key", "args": {"combo": "c"}},
+                     ]},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(lines[0].starts_with("[1] act failed: "), "{lines:?}");
+            assert!(
+                lines[1].starts_with("[1.on_fail] key: sent ctrl+s"),
+                "{lines:?}"
+            );
+            assert!(lines[2].starts_with("[2] key: sent a"), "{lines:?}");
+            assert!(lines[3].starts_with("[3] key: sent b"), "{lines:?}");
+            assert_eq!(lines[4], "[4] mouse failed: pointer failed");
+            assert!(
+                lines[5].starts_with("[4.on_fail.1] act failed (optional): "),
+                "{lines:?}"
+            );
+            assert!(
+                lines[6].starts_with("[4.on_fail.2] key: sent c"),
+                "{lines:?}"
+            );
+            assert!(lines[7].starts_with("now: "), "{lines:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                [
+                    "down ctrl+s",
+                    "up ctrl+s",
+                    "down a",
+                    "up a",
+                    "down b",
+                    "up b",
+                    "down c",
+                    "up c"
+                ]
+            );
+            // An on_fail step failing stops the batch, and what is held is
+            // released.
+            s.keys.borrow_mut().clear();
+            call_tool(&mut s, 3, "hold", json!({"key": "shift"})).await;
+            let (err, lines) = run_batch(
+                &mut s,
+                4,
+                json!([
+                    {"tool": "act", "args": {"app": "fake", "query": "Save"},
+                     "on_fail": [{"tool": "act", "args": {"app": "fake", "query": "Save as"}}]},
+                    {"tool": "key", "args": {"combo": "a"}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(
+                lines[1].starts_with("[1.on_fail] act failed: "),
+                "{lines:?}"
+            );
+            assert_eq!(lines[2], "stopped; 1 step(s) not run");
+            assert!(lines[3].starts_with("now: "), "{lines:?}");
+            assert!(lines[3].ends_with("; released shift"), "{lines:?}");
+            assert_eq!(*s.keys.borrow(), ["keydown shift", "keyup shift"]);
+            // Never after the user stopped input: the failure stands.
+            s.keys.borrow_mut().clear();
+            s.takeover.stop();
+            let (err, lines) = run_batch(
+                &mut s,
+                5,
+                json!([
+                    {"tool": "key", "args": {"combo": "a"}, "optional": true,
+                     "on_fail": [{"tool": "find", "args": {"app": "fake", "query": "OK"}}]},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(
+                lines[0].starts_with("[1] key failed (optional): stopped by the user"),
+                "{lines:?}"
+            );
+            assert_eq!(lines[1], "[1.on_fail] not run (refused)");
+            assert!(lines[2].starts_with("now: "), "{lines:?}");
+        });
+    }
+
+    #[test]
+    fn a_repeat_scrolls_until_an_element_shows_and_a_later_step_uses_it() {
+        local(async {
+            let mut s = session("batch-repeat-scroll");
+            s.reveal.set(Some(3));
+            let scroll_find = json!({"steps": [
+                {"tool": "scroll", "args": {"app": "fake", "query": "OK", "observe": "effect"}},
+                {"tool": "find", "args": {"app": "fake", "query": "report.pdf"}},
+            ], "until": {"found": true}, "max": 5});
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": scroll_find},
+                    {"tool": "act", "args": {"id": "$1"}},
+                    {"tool": "key", "args": {"combo": "a"}, "if": {"step": 1, "contains": "report"}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] repeat: until met in run 3");
+            assert!(
+                lines[1].starts_with("[1.1] scroll: ") && lines[1].contains("effect: "),
+                "{lines:?}"
+            );
+            let found = printed_ids(lines[2].strip_prefix("[1.2] find: ").unwrap())[0];
+            assert_eq!(
+                lines[2],
+                format!("[1.2] find: [{found}] list item \"report.pdf\" actions=Press")
+            );
+            assert!(lines[3].starts_with("[2] act: Press -> ok"), "{lines:?}");
+            assert!(lines[4].starts_with("[3] key: sent a"), "{lines:?}");
+            assert_eq!(lines.len(), 5, "{lines:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                [
+                    "scroll 3",
+                    "scroll 3",
+                    "scroll 3",
+                    "action 0 on 60",
+                    "down a",
+                    "up a"
+                ]
+            );
+            // Never there within `max` runs: the repeat fails.
+            let mut s = session("batch-repeat-max");
+            s.reveal.set(Some(10));
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "scroll", "args": {"app": "fake", "query": "OK"}},
+                        {"tool": "find", "args": {"app": "fake", "query": "report.pdf"}},
+                    ], "until": {"found": true}, "max": 2}},
+                    {"tool": "act", "args": {"id": "$1"}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert_eq!(
+                lines[0],
+                "Error executing tool batch: [1] repeat failed: until not met in 2 runs"
+            );
+            assert!(lines[1].starts_with("[1.1] scroll: "), "{lines:?}");
+            assert_eq!(lines[2], "[1.2] find: no matches");
+            assert_eq!(lines[3], "stopped; 1 step(s) not run");
+            assert!(lines[4].starts_with("now: "), "{lines:?}");
+            assert_eq!(*s.keys.borrow(), ["scroll 3", "scroll 3"]);
+            // Optional: the batch goes on, but "$1" names a failed step.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "find", "args": {"app": "fake", "query": "report.pdf"}},
+                    ], "until": {"found": true}, "max": 1}, "optional": true},
+                    {"tool": "act", "args": {"id": "$1"}, "optional": true},
+                    {"tool": "key", "args": {"combo": "a"}, "if": {"step": 1, "ok": false}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(
+                lines[0],
+                "[1] repeat failed (optional): until not met in 1 run"
+            );
+            assert_eq!(
+                lines[2],
+                "[2] act failed (optional): `id` \"$1\": step 1 (repeat) failed"
+            );
+            assert!(lines[3].starts_with("[3] key: sent a"), "{lines:?}");
+        });
+    }
+
+    #[test]
+    fn a_repeat_presses_down_until_the_focus_is_right() {
+        local(async {
+            let mut s = session("batch-repeat-key");
+            s.focus.borrow_mut().role = "list item".into();
+            s.focus.borrow_mut().name = "Item 1".into();
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": {"steps": [{"tool": "key", "args": {"combo": "down"}}],
+                                "until": {"contains": "item 4\""}}},
+                    {"tool": "key", "args": {"combo": "Return"}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] repeat: until met in run 3");
+            assert!(
+                lines[1].starts_with("[1.1] key: sent down") && lines[1].contains("\"Item 4\""),
+                "{lines:?}"
+            );
+            assert!(lines[2].starts_with("[2] key: sent Return"), "{lines:?}");
+            assert_eq!(s.keys.borrow().len(), 8);
+            // A failing inner step ends the repeat at once.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "key", "args": {"combo": "down"}},
+                        {"tool": "mouse", "args": {"x": FAIL_X, "y": 0}},
+                    ], "until": {"ok": true}}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert_eq!(
+                lines[0],
+                "Error executing tool batch: [1] repeat failed: step 1.2 failed in run 1"
+            );
+            assert_eq!(lines[2], "[1.2] mouse failed: pointer failed");
+            // An optional one does not.
+            let (err, lines) = run_batch(
+                &mut s,
+                4,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "mouse", "args": {"x": FAIL_X, "y": 0}, "optional": true},
+                        {"tool": "key", "args": {"combo": "down"}},
+                    ], "until": {"contains": "item 7"}}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] repeat: until met in run 2");
+            assert_eq!(lines[1], "[1.1] mouse failed (optional): pointer failed");
+        });
+    }
+
+    #[test]
+    fn a_repeat_reads_the_focus_once_the_input_took_effect() {
+        local(async {
+            let mut s = session("batch-repeat-lag");
+            s.focus.borrow_mut().role = "list item".into();
+            s.focus.borrow_mut().name = "Item 1".into();
+            // The focus moves 30 ms after each key: read at once, the
+            // reply would name the item before it, and until would hold
+            // one press late, on Item 5.
+            s.lag.set(30);
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": {"steps": [{"tool": "key", "args": {"combo": "down"}}],
+                                "until": {"contains": "item 4\""}}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] repeat: until met in run 3");
+            assert!(lines[1].contains("\"Item 4\""), "{lines:?}");
+            assert_eq!(s.focus.borrow().name, "Item 4");
+            // A step a condition tests settles too; others do not wait.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"tool": "key", "args": {"combo": "down"}},
+                    {"tool": "key", "args": {"combo": "down"}},
+                    {"tool": "key", "args": {"combo": "x"}, "if": {"step": 2, "contains": "item 6\""}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(lines[2].starts_with("[3] key: sent x"), "{lines:?}");
+        });
+    }
+
+    #[test]
+    fn a_refused_step_runs_no_on_fail_and_ends_a_repeat() {
+        local(async {
+            let mut s = session("batch-refused");
+            // The allowlist refuses: on_fail does not run, and says so.
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "find", "args": {"app": "secret", "query": "Save"},
+                     "on_fail": [{"tool": "key", "args": {"combo": "ctrl+s"}}]},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(
+                lines[0].contains("[1] find failed: app 'secret' is not in"),
+                "{lines:?}"
+            );
+            assert_eq!(lines[1], "[1.on_fail] not run (refused)");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // A miss whose message echoes "confirmation" is no refusal:
+            // on_fail runs, and an optional one does not end a repeat.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"tool": "wait_for", "args": {"app": "fake", "query": "delete confirmation",
+                                                  "timeout_ms": 0},
+                     "on_fail": [{"tool": "key", "args": {"combo": "a"}}]},
+                    {"repeat": {"steps": [
+                        {"tool": "wait_for", "args": {"app": "fake", "query": "confirmation",
+                                                      "timeout_ms": 0}, "optional": true},
+                        {"tool": "key", "args": {"combo": "b"}},
+                    ], "until": {"contains": "never"}, "max": 2}, "optional": true},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(lines[1].starts_with("[1.on_fail] key: sent a"), "{lines:?}");
+            assert_eq!(
+                lines[2],
+                "[2] repeat failed (optional): until not met in 2 runs"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                ["down a", "up a", "down b", "up b", "down b", "up b"]
+            );
+            // Nor does it lose the screen context of a plain call.
+            let r = call_tool(
+                &mut s,
+                4,
+                "wait_for",
+                json!({"app": "fake", "query": "delete confirmation", "timeout_ms": 0}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("\nnow: "), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_declined_confirmation_runs_no_on_fail_and_ends_a_repeat() {
+        local(async {
+            let mut s = session("batch-declined");
+            set_allow("batch-declined", "fake\nconfirm: key:fake\n");
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"elicitation": {}},
+                    "clientInfo": {"name": "test", "version": "0"}}}),
+            )
+            .await;
+            replies_within(&mut s, Duration::from_millis(200)).await;
+            let batches = [
+                // A fallback must not do what the user just declined.
+                json!([{"tool": "key", "args": {"combo": "ctrl+s"},
+                        "on_fail": [{"tool": "mouse", "args": {"x": 5, "y": 5}}]}]),
+                // Asked once, not on every run.
+                json!([{"repeat": {"steps": [
+                    {"tool": "key", "args": {"combo": "down"}, "optional": true},
+                ], "until": {"contains": "never"}, "max": 20}}]),
+            ];
+            for (call, steps) in (2..).zip(batches) {
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": call, "method": "tools/call",
+                    "params": {"name": "batch", "arguments": {"steps": steps}}}),
+                )
+                .await;
+                let ask = next(&mut s).await;
+                assert_eq!(ask["method"], "elicitation/create", "{ask}");
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": ask["id"], "result": {"action": "decline"}}),
+                )
+                .await;
+                let r = next(&mut s).await;
+                assert_eq!(r["id"], call, "asked again: {r}");
+                assert_eq!(r["result"]["isError"], true, "{r}");
+                let text = reply_text(&r);
+                assert!(text.contains("the user declined key"), "{text}");
+                match call {
+                    2 => assert!(text.contains("[1.on_fail] not run (refused)"), "{text}"),
+                    _ => assert!(text.contains("step 1.1 failed in run 1"), "{text}"),
+                }
+                assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            }
+        });
+    }
+
+    #[test]
+    fn user_input_during_a_repeat_ends_it_without_on_fail() {
+        local(async {
+            let mut s = session("batch-repeat-takeover");
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                t.user_input(Instant::now(), takeover::Device::Pointer);
+            });
+            // Only nested steps send input: the batch still holds the input
+            // lock and counts as one run.
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "key", "args": {"combo": "a"}, "optional": true},
+                        {"tool": "pause", "args": {"ms": 60}},
+                    ], "until": {"contains": "never"}, "max": 20},
+                     "on_fail": [{"tool": "key", "args": {"combo": "z"}}]},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(
+                lines[0].starts_with(
+                    "Error executing tool batch: [1] repeat failed: step 1.1 failed in run "
+                ),
+                "{lines:?}"
+            );
+            assert!(
+                lines[1].starts_with("[1.1] key failed (optional): interrupted: "),
+                "{lines:?}"
+            );
+            assert!(
+                !s.keys.borrow().iter().any(|k| k.contains('z')),
+                "{:?}",
+                s.keys.borrow()
+            );
+        });
+    }
+
+    #[test]
+    fn stop_if_ends_the_batch_early_and_successfully() {
+        local(async {
+            let mut s = session("batch-stop");
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "find", "args": {"app": "fake", "query": "zzz"}},
+                    {"stop_if": {"step": 1, "found": true}},
+                    {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                    {"stop_if": {"step": 3, "found": true}},
+                    {"tool": "key", "args": {"combo": "a"}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] find: no matches");
+            // A stop_if that does not hold says nothing.
+            assert!(lines[1].starts_with("[3] find: ["), "{lines:?}");
+            assert_eq!(lines[2], "[4] stop (step 3 found); 2 step(s) not run");
+            assert!(lines[3].starts_with("now: "), "{lines:?}");
+            assert_eq!(lines.len(), 4, "{lines:?}");
+            assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_bad_batch_is_refused_before_anything_runs() {
+        local(async {
+            let mut s = session("batch-invalid");
+            for (steps, why) in [
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}},
+                           {"tool": "key", "args": {"combo": "b"}, "if": {"step": 3, "ok": true}}]),
+                    "[2] if: `step` 3 is not an earlier step (1 to 1)",
+                ),
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}}, {"tool": "kye"}]),
+                    "[2] unknown tool 'kye'",
+                ),
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}},
+                           {"repeat": {"steps": [{"repeat": {}}], "until": {"ok": true}}}]),
+                    "[2] repeat step 1: repeat cannot be nested; put it at the top level",
+                ),
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}},
+                           {"tool": "key", "args": {"combo": "b"}, "if": {"step": 1, "ok": false}}]),
+                    "[2] if: {\"ok\": false} on step 1 never holds: the batch stops when it \
+                     fails; mark it \"optional\": true or give it on_fail",
+                ),
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}},
+                           {"repeat": {"steps": [{"tool": "key"}], "until": {"ok": true}, "max": 50}}]),
+                    "[2] repeat: `max` must be 1 to 20, not 50",
+                ),
+            ] {
+                let (err, lines) = run_batch(&mut s, 2, steps).await;
+                assert!(err);
+                assert_eq!(
+                    lines,
+                    [format!(
+                        "Error executing tool batch: not run (nothing sent): {why}"
+                    )]
+                );
+            }
             assert!(s.keys.borrow().is_empty());
         });
     }
@@ -7631,6 +11714,214 @@ mod tests {
                 reply_text(&r).starts_with("[1] push button \"Open\""),
                 "{r}"
             );
+        });
+    }
+
+    /// The fake app's first window: a frame "notes.txt — Fake" (active
+    /// with `active`) holding `kids`.
+    fn fake_frame(s: &Session, active: bool, kids: &[u32]) {
+        *s.focus.borrow_mut() = Info {
+            states: if active { vec!["active"] } else { vec![] },
+            ..fake_node("frame", "notes.txt — Fake", kids)
+        };
+    }
+
+    /// The message of an error reply, without the "Error executing tool"
+    /// prefix.
+    fn error_text(r: &Json) -> &str {
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        let text = reply_text(r);
+        text.split_once(": ").map_or(text, |(_, m)| m)
+    }
+
+    #[test]
+    fn an_ambiguous_query_is_refused_by_input_tools_with_the_candidates() {
+        local(async {
+            let mut s = session("ambiguous");
+            fake_frame(&s, true, &[40, 41, 42]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("push button", "Delete", &[]));
+                n.insert(41, fake_node("push button", "Delete", &[]));
+                // Only shows the name: a button of the name beats it.
+                let mut label = fake_node("label", "Delete", &[]);
+                label.actions.clear();
+                n.insert(42, label);
+            }
+            let q = json!({"app": "fake", "query": "Delete"});
+            let r = call_tool(&mut s, 2, "act", q.clone()).await;
+            // The read has no action names (as on Linux): the lines have
+            // them read, so a button does not say `actions=none`.
+            assert_eq!(
+                error_text(&r),
+                "ambiguous: 2 elements in 'fake' match 'Delete'; nothing sent. pass one id:\n\
+                 [1] push button \"Delete\" at 0,0\n\
+                 [2] push button \"Delete\" at 0,0"
+            );
+            let mut call = 3;
+            for tool in ["click", "focus", "scroll"] {
+                let r = call_tool(&mut s, call, tool, q.clone()).await;
+                assert!(error_text(&r).starts_with("ambiguous: 2 elements"), "{r}");
+                call += 1;
+            }
+            let r = call_tool(
+                &mut s,
+                call,
+                "set_text",
+                json!({"app": "fake", "query": "Delete", "text": "x"}),
+            )
+            .await;
+            assert!(error_text(&r).starts_with("ambiguous: 2 elements"), "{r}");
+            // Nothing was sent.
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // A read takes the first and says so.
+            let r = call_tool(&mut s, 10, "get_text", q.clone()).await;
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Delete\" (first of 2 matches):"),
+                "{r}"
+            );
+            // The id from the list acts.
+            let r = call_tool(&mut s, 11, "act", json!({"id": 2})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 41");
+            // One of them has no on-screen area: the other is the target.
+            s.no_area.borrow_mut().push(41);
+            let r = call_tool(&mut s, 12, "act", q.clone()).await;
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Delete\""),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 40");
+            // The same with the app's window behind the terminal, where a
+            // centre is not measured (KDE, Hyprland): the size still counts.
+            s.background.set(true);
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 13, "act", q.clone()).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 40");
+            // Both with an area there: refused, without positions.
+            s.no_area.borrow_mut().clear();
+            let r = call_tool(&mut s, 14, "act", q.clone()).await;
+            assert_eq!(
+                error_text(&r),
+                "ambiguous: 2 elements in 'fake' match 'Delete'; nothing sent. pass one id:\n\
+                 [1] push button \"Delete\"\n\
+                 [2] push button \"Delete\""
+            );
+            s.background.set(false);
+            // With `role` and more candidates than are listed.
+            let kids: Vec<u32> = (100..110).collect();
+            fake_frame(&s, true, &kids);
+            for k in &kids {
+                s.nodes
+                    .borrow_mut()
+                    .insert(*k, fake_node("push button", "Delete", &[]));
+            }
+            let r = call_tool(
+                &mut s,
+                15,
+                "act",
+                json!({"app": "fake", "query": "Delete", "role": "push button"}),
+            )
+            .await;
+            let text = error_text(&r);
+            assert!(
+                text.starts_with("ambiguous: 10 elements in 'fake' match 'Delete' with role 'push button'; nothing sent. pass one id:\n"),
+                "{text}"
+            );
+            assert_eq!(text.lines().count(), 1 + AMBIGUOUS_SHOWN + 1, "{text}");
+            assert!(text.ends_with("\n… 4 more"), "{text}");
+            // No "now:" context line: the candidates say where they are.
+            assert!(!text.contains("\nnow: "), "{text}");
+        });
+    }
+
+    #[test]
+    fn the_window_argument_and_the_active_window_break_a_tie_between_windows() {
+        local(async {
+            let mut s = session("ambiguous-windows");
+            fake_frame(&s, false, &[40]);
+            s.more_windows.borrow_mut().push(50);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("push button", "Save", &[]));
+                let mut todo = fake_node("frame", "todo.txt — Fake", &[51]);
+                todo.states = vec!["active"];
+                n.insert(50, todo);
+                n.insert(51, fake_node("push button", "Save", &[]));
+            }
+            let q = json!({"app": "fake", "query": "Save"});
+            let r = call_tool(&mut s, 2, "act", q.clone()).await;
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Save\""),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 51");
+            // Neither window active (a terminal in front): refused, with the
+            // windows.
+            s.nodes.borrow_mut().get_mut(&50).unwrap().states.clear();
+            let r = call_tool(&mut s, 3, "act", q.clone()).await;
+            let text = error_text(&r);
+            assert!(
+                text.contains("pass one id, or window= its title:"),
+                "{text}"
+            );
+            assert!(
+                text.contains("\"Save\" at 0,0 in 'notes.txt — Fake'\n"),
+                "{text}"
+            );
+            assert!(text.ends_with("in 'todo.txt — Fake'"), "{text}");
+            // The window argument names it.
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"app": "fake", "query": "Save", "window": "todo"}),
+            )
+            .await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 51");
+            // The named window beats one still marked ACTIVE (the toolkit
+            // not yet caught up with `window` bringing todo to the front).
+            fake_frame(&s, true, &[40]);
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                json!({"app": "fake", "query": "Save", "window": "todo"}),
+            )
+            .await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 51");
+        });
+    }
+
+    #[test]
+    fn a_dialog_breaks_a_tie_with_its_parent_window() {
+        local(async {
+            let mut s = session("ambiguous-dialog");
+            fake_frame(&s, false, &[40]);
+            s.more_windows.borrow_mut().push(60);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("push button", "OK", &[]));
+                n.insert(60, fake_node("dialog", "Save — Fake", &[61]));
+                n.insert(61, fake_node("push button", "OK", &[]));
+                n.insert(70, fake_node("dialog", "Overwrite? — Fake", &[71]));
+                n.insert(71, fake_node("push button", "OK", &[]));
+            }
+            let q = json!({"app": "fake", "query": "OK"});
+            let r = call_tool(&mut s, 2, "click", q.clone()).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            let r = call_tool(&mut s, 3, "act", q.clone()).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 61");
+            // Stacked dialogs: the one opened last.
+            s.more_windows.borrow_mut().push(70);
+            let r = call_tool(&mut s, 4, "act", q.clone()).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 71");
         });
     }
 

@@ -21,8 +21,8 @@ pub struct Info<Id> {
     pub states: Vec<&'static str>,
     pub showing: bool,
     pub actions: Vec<String>,
-    /// Single-line text preview (newlines already turned into spaces), up to
-    /// the limit asked for; None when the element has no text.
+    /// The element's text, up to the limit asked for, with its line breaks
+    /// ("\n"); None when the element has no text.
     pub text: Option<String>,
     pub children: Vec<Id>,
     /// The platform marks it selectable, checkable or expandable (a list
@@ -65,6 +65,11 @@ pub struct Fetch {
     /// out of the cache. Backends that cannot tell them apart ignore it.
     pub offscreen: bool,
 }
+
+/// The error `element_center` gives for an element without an on-screen
+/// area (zero width or height): an input tool's query that names several
+/// elements leaves such ones out.
+pub const NO_AREA: &str = "element has no on-screen area";
 
 /// Window management the desktop does not offer (KDE and Hyprland do).
 pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma and Hyprland";
@@ -222,6 +227,56 @@ pub struct FileDialog<Id> {
     pub accept: Option<Id>,
 }
 
+/// The states `act`'s verified actions (check, expand, select, scroll_to)
+/// read before and after acting, fresh, in one call where the platform
+/// allows. `checkable`/`expandable` are false when the platform does not
+/// say; the caller then goes by role and actions.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Toggles {
+    pub checkable: bool,
+    /// Checked, or pressed (a toggle button).
+    pub checked: bool,
+    pub expandable: bool,
+    pub expanded: bool,
+    pub selected: bool,
+    /// Says it opens a popup (AT-SPI HAS_POPUP: a menu button).
+    pub popup: bool,
+    pub showing: bool,
+    /// Not showing because it is scrolled out of view (visible), rather
+    /// than hidden (a closed popup, a collapsed branch).
+    pub offscreen: bool,
+    pub disabled: bool,
+}
+
+impl Toggles {
+    /// What `info` says (no checkable or expandable).
+    pub fn from_info<Id>(info: &Info<Id>) -> Self {
+        let has = |s: &str| info.states.contains(&s);
+        Toggles {
+            checkable: false,
+            checked: has("checked"),
+            expandable: false,
+            expanded: has("expanded"),
+            selected: has("selected"),
+            popup: has("has popup"),
+            showing: info.showing,
+            // The platform does not say: assume scrolled out of view.
+            offscreen: !info.showing,
+            disabled: has("disabled"),
+        }
+    }
+}
+
+/// Picking a list entry through the platform's selection interface, which
+/// the desktop does not offer.
+pub const NO_SELECTION: &str = "selecting through the accessibility selection interface is not \
+     supported on this platform";
+
+/// Scrolling an element into view through accessibility, which the desktop
+/// does not offer.
+pub const NO_SCROLL_TO: &str = "scrolling an element into view through accessibility is not \
+     supported on this platform";
+
 pub struct WindowEntry {
     pub kind: String,
     pub title: String,
@@ -278,6 +333,46 @@ pub trait Backend {
     /// change after `mark`, or windows or apps came or went; None when the
     /// backend gets no change events. Cheap: no round trip.
     fn changed_since(&self, _near: &[Self::Id], _mark: u64) -> Option<bool> {
+        None
+    }
+    /// Elements that were shown or created after `mark` (`change_mark`),
+    /// oldest first, without repeats: a menu, popup, dialog or window that
+    /// opened, and often what it holds. Cheap: no round trip. None when
+    /// the backend hears of no such events (callers look at the active
+    /// app's windows instead).
+    fn shown_since(&self, _mark: u64) -> Option<Vec<Self::Id>> {
+        None
+    }
+    /// Wait until `shown_since(mark)` names something of the app whose
+    /// elements are `near` (none: of any app) and the burst of events
+    /// settled, or `timeout` passed; false when nothing was shown. The
+    /// default (no such events, nothing listed) returns false at once.
+    async fn wait_shown(
+        &self,
+        _near: &[Self::Id],
+        _mark: u64,
+        _timeout: std::time::Duration,
+    ) -> bool {
+        false
+    }
+    /// Whether roles name menus, popups and dialogs the way
+    /// `render::surface_kind` knows them (AT-SPI's), so what an input
+    /// opened can be listed. UIA's do not (a dialog is a "window").
+    fn names_surfaces(&self) -> bool {
+        false
+    }
+    /// Whether `window`, a dialog, is a file dialog `file_dialog` fills.
+    async fn fills_file_dialog(&self, _window: &Self::Id) -> bool {
+        false
+    }
+    /// Name of the app `id` belongs to, as `list_apps` names it; None when
+    /// it could not be read (empty, or the call failed). Callers take the
+    /// active app only when `app_key` is None as well.
+    async fn app_name(&self, _id: &Self::Id) -> Option<String> {
+        None
+    }
+    /// The element holding `id`; None at the top or when unknown.
+    async fn parent(&self, _id: &Self::Id) -> Option<Self::Id> {
         None
     }
     /// A mark for `unchanged_since`, taken before a read that may be kept
@@ -358,7 +453,44 @@ pub trait Backend {
     }
 
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
+    /// The toolkit's id of an element (Qt: object names joined by dots,
+    /// e.g. `…QMenuBar.file.file.file_save_as`); empty when it has none.
+    async fn object_id(&self, _id: &Self::Id) -> String {
+        String::new()
+    }
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
+    /// The element's states as `act`'s verified actions read them, fresh.
+    async fn toggles(&self, id: &Self::Id) -> Toggles {
+        Toggles::from_info(&self.info(id, 0).await)
+    }
+    /// Select the list entry `item` through its container's selection
+    /// interface (AT-SPI Selection.SelectChild): no pointer, no focus.
+    /// Err when the platform or the container offers none.
+    async fn select_item(&self, _item: &Self::Id) -> R<bool> {
+        Err(NO_SELECTION.into())
+    }
+    /// Ask the app to scroll the element into view (AT-SPI
+    /// Component.ScrollTo, else on its parent): no pointer. Ok(false) when
+    /// the app declined.
+    async fn scroll_into_view(&self, _id: &Self::Id) -> R<bool> {
+        Err(NO_SCROLL_TO.into())
+    }
+    /// The nearest scrollable ancestor that is on screen (a scroll pane, a
+    /// list, a web page), for a wheel over it; None when unknown.
+    async fn scroll_container(&self, _id: &Self::Id) -> Option<Self::Id> {
+        None
+    }
+    /// Where to turn the wheel over the container `pane`: the centre of
+    /// the part of it inside its window (a long list or web page reaches
+    /// past it). Err as `element_center`, or when none of it is inside.
+    async fn wheel_point(&self, pane: &Self::Id) -> R<(i32, i32)> {
+        self.element_center(pane).await
+    }
+    /// The toolkit of the element's app, lower case ("qt", "gtk", "gecko",
+    /// "chromium"); empty when unknown.
+    async fn toolkit_of(&self, _id: &Self::Id) -> String {
+        String::new()
+    }
     /// Complete text content (falls back to the name).
     async fn full_text(&self, id: &Self::Id, limit: usize) -> R<String>;
     /// Replace the contents; Err when the element is not editable.
@@ -390,6 +522,27 @@ pub trait Backend {
     /// what they share (the active window's origin) is looked up once.
     async fn element_centers(&self, ids: &[Self::Id]) -> Vec<R<(i32, i32)>> {
         futures_util::future::join_all(ids.iter().map(|id| self.element_center(id))).await
+    }
+    /// `element_center_in` of several (element, frame) pairs at once.
+    async fn element_centers_in(&self, items: &[(Self::Id, Self::Id)]) -> Vec<R<(i32, i32)>> {
+        futures_util::future::join_all(items.iter().map(|(id, f)| self.element_center_in(id, f)))
+            .await
+    }
+    /// Whether each element has an on-screen area (width and height above
+    /// zero), in front or not: Some(false) for none, None when unknown.
+    /// The default asks `element_center`, which suits a backend whose
+    /// centre does not depend on the active window; one that checks it
+    /// first reads the size alone.
+    async fn has_area(&self, ids: &[Self::Id]) -> Vec<Option<bool>> {
+        self.element_centers(ids)
+            .await
+            .into_iter()
+            .map(|c| match c {
+                Ok(_) => Some(true),
+                Err(e) if e == NO_AREA => Some(false),
+                Err(_) => None,
+            })
+            .collect()
     }
 
     /// Check a chord such as "ctrl+s" without pressing it.

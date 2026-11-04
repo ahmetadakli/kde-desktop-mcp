@@ -1,6 +1,6 @@
 [package]
 name = "desktop-mcp"
-version = "0.13.0"
+version = "0.14.0"
 edition = "2024"
 description = "Screenshot-free desktop control MCP server for KDE Plasma (Wayland), Hyprland and Windows"
 license = "MIT"
@@ -13,12 +13,14 @@ tokio = { version = "1", features = ["rt", "macros", "time", "process", "io-std"
 [target.'cfg(target_os = "linux")'.dependencies]
 evdev = "0.13"
 fontdue = "=0.9.5"
+jpeg-encoder = "=0.7.1"
 png = "=0.18.0"
 serde = "1"
 smithay-client-toolkit = { version = "=0.21.1", default-features = false }
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 
 [target.'cfg(windows)'.dependencies]
+jpeg-encoder = "=0.7.1"
 png = "=0.18.0"
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",

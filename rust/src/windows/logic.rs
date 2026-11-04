@@ -242,12 +242,18 @@ pub fn exe_stem(path: &str) -> String {
     stem.to_lowercase()
 }
 
-/// Single-line preview: first `limit` characters, CR and LF as spaces.
-pub fn one_line(text: &str, limit: usize) -> String {
-    text.chars()
-        .take(limit)
-        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
-        .collect()
+/// Text preview: the first `limit` characters, Windows line ends as "\n"
+/// (tree/find print it JSON-escaped, so the lines stay visible).
+pub fn preview(text: &str, limit: usize) -> String {
+    unix_newlines(
+        &text
+            .chars()
+            .take(limit.saturating_add(1))
+            .collect::<String>(),
+    )
+    .chars()
+    .take(limit)
+    .collect()
 }
 
 /// TextPattern text with Windows line ends turned into "\n".
@@ -339,7 +345,7 @@ impl Props {
 
     /// Preview from the cached ValuePattern value; None when there is none.
     pub fn value_preview(&self, limit: usize) -> Option<String> {
-        self.value.then(|| one_line(&self.value_text, limit))
+        self.value.then(|| preview(&self.value_text, limit))
     }
 
     fn editable(&self) -> bool {
@@ -549,8 +555,9 @@ mod tests {
 
     #[test]
     fn previews_are_single_line() {
-        assert_eq!(one_line("a\r\nb\nc", 80), "a  b c");
-        assert_eq!(one_line("çğüşöı", 3), "çğü");
+        assert_eq!(preview("a\r\nb\nc\rd", 80), "a\nb\nc\nd");
+        assert_eq!(preview("a\r\nb", 2), "a\n");
+        assert_eq!(preview("çğüşöı", 3), "çğü");
         assert_eq!(unix_newlines("a\r\nb\rc\n"), "a\nb\nc\n");
     }
 
@@ -625,7 +632,7 @@ mod tests {
         p.value = true;
         p.value_text = "x\ny".into();
         assert!(!p.wants_document_text());
-        assert_eq!(p.value_preview(80).as_deref(), Some("x y"));
+        assert_eq!(p.value_preview(80).as_deref(), Some("x\ny"));
         let label = Props {
             control_type: 50020,
             text: true,

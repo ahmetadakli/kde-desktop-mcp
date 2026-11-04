@@ -90,22 +90,23 @@ Controls GUI apps on the user's desktop (KDE Plasma, Hyprland, Windows) through 
 accessibility tree, with real keyboard and mouse input.
 
 Workflow:
-- apps lists running apps, marking the allowed ones. find (app + query) locates elements; \
-act, click, focus, get_text, set_text and scroll take the target themselves, so find-and-act \
-is one call. tree shows structure; find is cheaper.
-- Target: `id` from tree/find, or `app` + `query` (+ `role`): the first visible element named \
-`query` (case-insensitive) wins, else the first whose name or text contains it. \
-Titles (window, tab, page) count only when nothing else does or `role` names them. The \
-reply starts with the element picked. A miss lists near or off-screen matches with ids.
-- batch runs steps in one round trip when later steps don't need a result. \
-Mark waits \"optional\": true and end with an observation step, or give the last input \
-`observe`. A later step's `id` (or root_id/from_id/to_id) may be \"$N\": the element step N found or acted on \
-(find: its first hit).
+- apps lists running apps. find (app + query) locates elements; act, click, focus, \
+get_text, set_text and scroll take the target themselves. tree shows structure; find is \
+cheaper. act also does check, uncheck, expand, collapse, select (+ `option`) and scroll_to, \
+verified; already so: nothing sent.
+- Target: `id` from tree/find, or `app` + `query` (+ `role`): a visible element named \
+`query` (case-insensitive), else one whose name or text has it; titles (window, tab, page) \
+only if nothing else does or `role` names them. Ties favor the active window, a dialog, an \
+operable element; input tools refuse other ties, listing ids. The reply starts with \
+the element picked; a miss lists near or off-screen matches.
+- batch runs steps in one call; with if, on_fail, repeat and stop_if (see batch) a small \
+procedure fits in one. Mark waits \"optional\": true and end with an observation step, or \
+give the last input `observe`. A later step's `id`/`*_id` may be \"$N\": the element step \
+N found or acted on.
 - Input tools (key, type_text, click, mouse, scroll, focus, drag, set_text, act, screenshot) \
-take `window` (title or app substring) instead of a separate activate_window step; it \
-activates that window only when it isn't in front. Without it, input fails while \
-the user's terminal is in front.
-- click, mouse and scroll take `modifiers` (e.g. [\"ctrl\"]); hold keeps keys down.
+take `window` (title or app substring) to activate that window first unless it is in \
+front. Without it, input fails while the user's terminal is in front.
+- click, mouse and scroll take `modifiers`; hold keeps keys down.
 - If the user takes over keyboard and mouse, input fails with \"paused\" (or \
 \"interrupted\" mid-batch) without acting: pause ~2 s and retry. \"stopped by the user\": \
 stop and ask them; once they agree, a standalone activate_window call resumes input.
@@ -113,21 +114,38 @@ stop and ask them; once they agree, a standalone activate_window call resumes in
 that appears or goes away (gone=true), a state or a window; never as a sleep. \
 tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
-view after the input settled, instead of a separate look. Failures end with the active \
-window and focus.
+view. On Linux, menus, lists and dialogs an input opened come with ids (`opened:`). Failures \
+end with the active window and focus.
 - menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
-- screenshot is a last resort (inline image: don't Read the file). To click something seen \
+- screenshot is a last resort. To click something seen \
 only in it, pass its pixels to mouse as image_x/image_y; `region`=[x, y, w, h] zooms in.
 
 Allowlist: only apps in the user's allowlist file can be read, activated or sent input, and \
 input only goes to an allowed active window. An app may be limited to a tier: view \
 (read only) or click (no typing or keys). When a refusal says to, ask the user and retry with \
 confirm: true only if they agree. Password fields are never read, and filled in only if the \
-user allowed it. Errors name the file; changing it is the user's decision. When tools fail \
-as if the setup were broken (AT-SPI, virtual input, KWin, screenshots), run doctor.
+user allowed it. Changing the file is the user's decision. When tools fail \
+as if the setup were broken (AT-SPI, input, KWin), run doctor.
 
-Clients loading schemas on demand: load the common ones in one search: batch, find, \
+Clients loading schemas on demand: load in one search: batch, find, \
 act, activate_window, key, type_text, wait_for, wait_idle, screenshot, apps.";
+
+/// Tools Claude Code loads with the session instead of deferring them
+/// behind a tool search (`_meta` "anthropic/alwaysLoad"): the ones nearly
+/// every desktop task starts with, so the first call needs no search turn.
+/// The rest stay deferred, keeping the per-turn context small.
+pub const ALWAYS_LOAD: [&str; 10] = [
+    "batch",
+    "find",
+    "act",
+    "activate_window",
+    "key",
+    "type_text",
+    "wait_for",
+    "wait_idle",
+    "screenshot",
+    "apps",
+];
 
 /// The `confirm` argument of tools that change something.
 const CONFIRM: &str =
@@ -135,7 +153,51 @@ const CONFIRM: &str =
 
 /// Shared by the tools that take a target; the matching rules are in
 /// INSTRUCTIONS.
-const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`); rules in the server instructions.";
+const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`); rules in the server instructions. \
+A tie left after them: input tools list the candidates' ids and send nothing; get_text reads the first.";
+
+/// The `batch` description, before its examples (BATCH_EXAMPLES).
+const BATCH_DESCRIPTION: &str = "Run tool calls in order in one round trip; prefer it whenever later steps
+don't depend on reading a result, or only on a condition below. `steps` is a
+list of {\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.
+[{\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+o\", \"window\": \"Kate\"}},
+ {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},
+ {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].
+Stops at the first failing step unless it is `optional`: then it is reported
+as failed (optional) and the rest still runs. Mark waits optional and end
+with an observation step (find, get_text, screenshot). Give the first
+input step `window` when input goes to an app. Ids from earlier tree/find work.
+An `id`/`*_id` arg of \"$N\" is the element step N produced: find's first
+hit, wait_for's match, the target of act/click/focus/get_text/set_text/
+scroll, else the focus key/type_text report; e.g. {\"tool\": \"act\",
+\"args\": {\"id\": \"$3\"}}. Input steps of one batch never interleave with
+another call's.
+Control flow (the whole batch is checked first; a mistake runs nothing):
+- \"if\": COND on a step runs it only when COND holds, else `[N] skipped (if …)`.
+- \"on_fail\": [steps] on a step run only if it failed; then the batch goes on.
+  Not after a refusal (allowlist, declined confirmation, the user taking over):
+  `[N.on_fail] not run (refused)`.
+- {\"repeat\": {\"steps\": [...], \"until\": TEST, \"max\": 10}} runs its steps until
+  TEST holds on the last of them, checked after each run; fails after `max` runs (1-20).
+  Its input steps, and those a COND tests, let the app react (<=150 ms) before replying.
+- {\"stop_if\": COND} ends the batch there, successfully, if COND holds.
+COND is {\"step\": N, TEST} on an earlier step. TEST is \"ok\": bool (succeeded),
+\"found\": bool (succeeded with an element; find: had a match) or
+\"contains\": \"text\" (its reply, any case). A skipped step meets no COND.
+N and \"$N\" count top-level steps only; for a repeat, they mean its last step
+in the latest run.
+Steps in repeat and on_fail take only tool, args, optional.";
+
+/// The examples of the `batch` description (checked by a test).
+pub const BATCH_EXAMPLES: [&str; 2] = [
+    r#"[{"repeat": {"steps": [{"tool": "scroll", "args": {"app": "dolphin", "query": "Reports", "role": "list"}},
+   {"tool": "wait_idle", "args": {"app": "dolphin", "quiet_ms": 150}},
+   {"tool": "find", "args": {"app": "dolphin", "query": "report.pdf"}}], "until": {"found": true}}},
+ {"tool": "click", "args": {"id": "$1"}}]"#,
+    r#"[{"tool": "act", "args": {"app": "kate", "query": "Save", "window": "Kate"}},
+ {"tool": "wait_for", "args": {"app": "kate", "query": "Overwrite", "timeout_ms": 1500}, "optional": true},
+ {"tool": "act", "args": {"app": "kate", "query": "Overwrite"}, "if": {"step": 2, "found": true}}]"#,
+];
 
 pub fn tools() -> Json {
     let target = |extra: &[(&'static str, &'static str, Option<Json>)]| {
@@ -154,14 +216,28 @@ pub fn tools() -> Json {
         "name": name, "description": desc, "inputSchema": input })
     };
     let mut batch_schema = schema(&[("steps", "array", None)]);
+    let cond = "{\"step\": N, \"ok\"|\"found\": bool or \"contains\": \"text\"} on an earlier step";
     batch_schema["properties"]["steps"]["items"] = json!({
         "type": "object",
         "properties": {
             "tool": { "type": "string" },
             "args": { "type": "object" },
             "optional": { "type": "boolean", "default": false },
+            "if": { "type": "object", "description": format!("Run only if {cond} holds.") },
+            "on_fail": {
+                "type": "array",
+                "items": { "type": "object" },
+                "description": "Steps run only if this one failed; then the batch goes on.",
+            },
+            "repeat": {
+                "type": "object",
+                "description": "Instead of tool: {\"steps\": [...], \"until\": {\"found\": true}, \"max\": 10}.",
+            },
+            "stop_if": {
+                "type": "object",
+                "description": format!("Alone, instead of tool: end the batch successfully if {cond} holds."),
+            },
         },
-        "required": ["tool"],
     });
     let mut list = json!([
         t(
@@ -171,7 +247,7 @@ pub fn tools() -> Json {
         ),
         t(
             "tree",
-            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. Actions the role implies (a link's jump, a\nbutton's press, a tab's switch, a section's click) are omitted;\n`actions=none` marks a button or link without any. Nameless wrappers are left\nout (their children lifted). Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nWith `document`=true only the page of `app`'s active window is listed: in a\nbrowser, the current tab's web page without the tabs and toolbars.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.\n`interactive`=true lists only what can be operated (actions, editable,\nselectable, checkable, expandable), each under its nearest named ancestor.\nA reply over `max_chars` (0 = no cap) or `max_nodes` ends with\n`… N more nodes; continue with tree(…, after=ID)`: repeat that call for the\nnext part. `screenshot`=true also returns the image of the app's window\nwhen it is the active one.",
+            "Return the accessibility tree as `[id] role \"name\" text=… {states} actions=…`,\none space of indent per level. `text=` shows up to 80 characters, line breaks\nas \\n; `…` after its closing quote means it goes on (get_text reads all).\nActions the role implies (a link's jump, a\nbutton's press, a tab's switch, a section's click) are omitted;\n`actions=none` marks a button or link without any. Nameless wrappers are left\nout (their children lifted), as are text nodes repeating their parent's line. Runs of sibling leaves with the same role and\nactions share a line: `list item ×3: [8] \"a\" [9] \"b\" [10] \"c\"`.\nPass `app` (name from `apps`) for its windows, or `root_id` to expand a subtree.\nWith `document`=true only the page of `app`'s active window is listed: in a\nbrowser, the current tab's web page without the tabs and toolbars.\nTo locate something, `find` is cheaper; to act on a named element, pass\n`app` + `query` to act/click/focus directly.\n`interactive`=true lists only what can be operated (actions, editable,\nselectable, checkable, expandable, focusable named rows and cells), each\nunder its nearest named ancestor.\nA reply over `max_chars` (0 = no cap) or `max_nodes` ends with\n`… N more nodes; continue with tree(…, after=ID)`: repeat that call for the\nnext part. `screenshot`=true also returns the image of the app's window\nwhen it is the active one.",
             schema(&[
                 ("app", "string", Some(json!(""))),
                 ("root_id", "integer", Some(json!(0))),
@@ -198,9 +274,12 @@ pub fn tools() -> Json {
         t(
             "act",
             &d(
-                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nThe effect line says when the active window changed (e.g. a dialog opened)."
+                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nVerified actions, preferred over toggling or clicking: `action` check, uncheck,\nexpand, collapse (already so: \"nothing sent\"), toggle; `option` (with action\nselect, or alone) picks the entry with that label in a combo box, list, tab list\nor menu button, without opening it where it can; scroll_to brings an element\nscrolled out of view (an id from a miss list) into view, else turns the wheel\nover its list (the pointer moves). Each reads the state back: the reply gives\nit, or fails saying what was sent and what it reads instead.\nThe effect line says when the active window changed; a menu, combo box\nlist or dialog the action opened follows with its entries' ids (opened: …;\nLinux)."
             ),
-            target(&[("action", "string", Some(json!("")))])
+            target(&[
+                ("action", "string", Some(json!(""))),
+                ("option", "string", Some(Json::Null)),
+            ])
         ),
         t(
             "set_text",
@@ -212,9 +291,12 @@ pub fn tools() -> Json {
         t(
             "get_text",
             &d(
-                "Read the full text of an element (documents, fields, labels). A web page or\nother container gives the text of everything in it, in reading order.\nPassword fields are never read (tree and find show no text for them either)."
+                "Read the text of an element (documents, fields, labels). A web page or\nother container gives the text of everything in it, in reading order.\nAt most `limit` characters from `offset`; a cut reply ends saying which\noffset reads on. To locate one thing on a long page, find is cheaper.\nPassword fields are never read (tree and find show no text for them either)."
             ),
-            target(&[("limit", "integer", Some(json!(20000)))])
+            target(&[
+                ("limit", "integer", Some(json!(10000))),
+                ("offset", "integer", Some(json!(0))),
+            ])
         ),
         t(
             "focus",
@@ -226,7 +308,7 @@ pub fn tools() -> Json {
         t(
             "click",
             &d(
-                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. `button`: left, right or middle;\n`clicks`: 2 = double, 3 = triple (select a line). `modifiers` are held\nduring the click, e.g. [\"ctrl\"] to add to a selection, [\"shift\"] for a\nrange. To see what the click opened, use wait_for."
+                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. `button`: left, right or middle;\n`clicks`: 2 = double, 3 = triple (select a line). `modifiers` are held\nduring the click, e.g. [\"ctrl\"] to add to a selection, [\"shift\"] for a\nrange. A menu, combo box list or dialog the click opened is listed with its\nentries' ids (opened: …; Linux); a right click, or one on a combo box or menu\nentry, waits up to 150 ms for one to show."
             ),
             target(&[
                 ("button", "string", Some(json!("left"))),
@@ -287,7 +369,7 @@ pub fn tools() -> Json {
         ),
         t(
             "key",
-            "Press a key or chord in the active window, e.g. \"ctrl+s\", \"alt+tab\", \"enter\",\n\"f5\", \"left\". Only sent when the active window belongs to an allowed app.\nThe reply names the element that has focus afterwards. To wait for what a\nkey opens or closes (a dialog), use wait_for.",
+            "Press a key or chord in the active window, e.g. \"ctrl+s\", \"alt+tab\", \"enter\",\n\"f5\", \"left\". Only sent when the active window belongs to an allowed app.\nThe reply names the element that has focus afterwards, and a menu or dialog\nit opened with its entries' ids (opened: …; Linux); keys that usually open one\n(menu, shift+f10, f10, alt+letter, alt+down, ctrl+o/s/p/w/q) wait up to\n150 ms for it. For a slower dialog use wait_for.",
             schema(&[
                 ("combo", "string", None),
                 ("repeat", "integer", Some(json!(1)))
@@ -310,7 +392,7 @@ pub fn tools() -> Json {
         ),
         t(
             "mouse",
-            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple; `button` left, right or middle) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags.",
+            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple; `button` left, right or middle) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. A right click lists the menu it opened with ids (opened: …; Linux).",
             schema(&[
                 ("x", "integer", Some(Json::Null)),
                 ("y", "integer", Some(Json::Null)),
@@ -364,7 +446,7 @@ pub fn tools() -> Json {
         ),
         t(
             "close_window",
-            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes, which the reply then says. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma and\nHyprland.",
+            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes: the reply then lists that dialog\nwith its buttons' ids. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma and\nHyprland.",
             schema(&[
                 ("query", "string", None),
                 ("confirm", "boolean", Some(json!(false))),
@@ -372,7 +454,7 @@ pub fn tools() -> Json {
         ),
         t(
             "menu",
-            "Use an app's menu bar by labels, in one call: `path` is a list\n([\"File\", \"Save As…\"]) or one string (\"File > Save As\"), in the app's\nlanguage. Labels match case-insensitively, without & or _ markers or a\ntrailing ellipsis; a unique part is enough. The last entry's action runs\n(the reply notes a dialog it opened). Without `path`, lists the top\nlevel; a path ending at a submenu lists its entries with ids instead.\nWorks on the active window's menu bar even when hidden behind a\nhamburger button (KDE apps). Firefox lists a menu's entries only while\nit is open: open it with key (e.g. alt+f) first.",
+            "Use an app's menu bar by labels, in one call: `path` is a list\n([\"File\", \"Save As…\"]) or one string (\"File > Save As\"), in the app's\nlanguage. Labels match case-insensitively, without & or _ markers or a\ntrailing ellipsis; a unique part is enough. The last entry's action runs\n(the reply lists a dialog it opened, with ids). Without `path`, lists the top\nlevel; a path ending at a submenu lists its entries with ids instead.\nWorks on the active window's menu bar even when hidden behind a\nhamburger button (KDE apps). Firefox lists a menu's entries only while\nit is open: open it with key (e.g. alt+f) first.",
             schema(&[("app", "string", None), ("path", "array", Some(Json::Null)),])
         ),
         t(
@@ -400,7 +482,7 @@ pub fn tools() -> Json {
         ),
         t(
             "screenshot",
-            "Last resort only: capture the active window. The image comes back in the\nreply (no need to Read the file), shrunk so its longer side is at most\n`max_size` px; `inline`=false returns only the file path. Also says which\nscreen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution; image_x/image_y then refer to the zoomed image.",
+            "Last resort only: capture the active window. The image comes back in the\nreply (JPEG when much smaller than PNG), shrunk so its longer side is at\nmost `max_size` px; `inline`=false instead saves a PNG and returns only\nits path. Also says which screen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution; image_x/image_y then refer to the zoomed image.",
             schema(&[
                 ("max_size", "integer", Some(json!(1024))),
                 ("inline", "boolean", Some(json!(true))),
@@ -409,7 +491,11 @@ pub fn tools() -> Json {
         ),
         t(
             "batch",
-            "Run tool calls in order in one round trip; prefer it whenever later steps\ndon't depend on reading a result. `steps` is a list of\n{\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.\n[{\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+o\", \"window\": \"Kate\"}},\n {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},\n {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].\nStops at the first failing step unless it is `optional`: then it is reported\nas failed (optional) and the rest still runs. Mark waits optional and end\nwith an observation step (find, get_text, screenshot). Give the first\ninput step `window` when input goes to an app. Ids from earlier tree/find work.\nAn `id`/`*_id` arg of \"$N\" is the element step N produced: find's first\nhit, wait_for's match, the target of act/click/focus/get_text/set_text/\nscroll, else the focus key/type_text report; e.g. {\"tool\": \"act\",\n\"args\": {\"id\": \"$3\"}}. Input steps of one batch never interleave with\nanother call's.",
+            &format!(
+                "{BATCH_DESCRIPTION}\nScroll until a file shows, then click it:\n{}\n\
+                 Click Save; if asked to overwrite, confirm:\n{}",
+                BATCH_EXAMPLES[0], BATCH_EXAMPLES[1]
+            ),
             batch_schema
         ),
     ]);
@@ -447,7 +533,7 @@ pub fn tools() -> Json {
                 "type": "string",
                 "enum": OBSERVE_KINDS,
                 "default": "none",
-                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds nothing and costs nothing; act, menu and close_window report the effect line by default."
+                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds no effect line or view (on Linux, click, key, mouse and type_text still list a menu or dialog they opened, at no cost when none did); act, menu and close_window report the effect line, and what opened, by default."
             });
             props["settle_ms"] = json!({
                 "type": "integer",
@@ -473,13 +559,51 @@ pub fn tools() -> Json {
                 "description": CONFIRM
             });
         }
+        if ALWAYS_LOAD.contains(&name) {
+            tool["_meta"] = json!({ "anthropic/alwaysLoad": true });
+        }
     }
     list
+}
+
+/// Whether `name` is one of the tools.
+pub fn is_tool(name: &str) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            tools()
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["name"].as_str().map(String::from))
+                .collect()
+        })
+        .iter()
+        .any(|n| n == name)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_common_tools_load_up_front() {
+        let list = tools();
+        let names: Vec<&str> = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        for name in ALWAYS_LOAD {
+            assert!(names.contains(&name), "{name} is no tool");
+        }
+        for tool in list.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            let up = tool["_meta"]["anthropic/alwaysLoad"] == json!(true);
+            assert_eq!(up, ALWAYS_LOAD.contains(&name), "{name}");
+        }
+    }
 
     #[test]
     fn only_reading_tools_are_marked_read_only() {

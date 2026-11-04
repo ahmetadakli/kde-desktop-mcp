@@ -68,12 +68,31 @@ Why it is fast:
   `tree(document=true)` shows only the active tab's page (found in one call
   through the window's EMBEDS relation). The same Firefox page went from 5,943
   to 1,421 characters.
+- In Chromium and Electron apps, the `showContextMenu` action every element
+  carries is not listed either, and the generic `doDefault` of their frame,
+  panels and pages counts as implied: it no longer keeps nameless panels as
+  lines. A Ferdium (WhatsApp) tree went from 19,906 characters, cut at 300
+  nodes behind six nested panels, to 7,759 for the whole window; with
+  `interactive: true` from 19,924 to 2,586, the chat list's rows included
+  (see below). `act` without `action` never picks `showContextMenu`: an
+  element with no other action is an error that says to use `click`, or
+  `action: "showContextMenu"` when the menu is what is wanted.
 - Actions a role implies are left out (a link's jump, a button's press, a
   tab's switch, a web section's click); a button or link without any says
   `actions=none`. Nameless, text-free wrappers (landmarks, forms, scroll panes)
   are left out with their children lifted, as are empty nameless leaves
   (separators, images inside buttons) and labels around a same-named button.
   A Google results page in Firefox went from 6,976 to 5,702 characters.
+  A static text or label leaf that only repeats what its parent's line
+  shows (a heading's or link's own text node, a status bar's count) is left
+  out of `tree`, and of `find` when the parent is listed as high; asked for
+  with `role`, it is listed. A YouTube page's `tree(document=true)` went
+  from 3,792 to 3,327 characters. `get_text` in Chromium no longer reads
+  such leaves a second time after the text of the element that holds them
+  (a WhatsApp page: 3,035 instead of 5,010 characters, the same text), and
+  the U+FFFC in a container's text goes to the child object it stands for
+  (an avatar, an emoji image) rather than to a text leaf whose words the
+  text already holds.
 - On Linux, a `find`, `tree` of an app, or element picked by `app` + `query`
   reuses the app's tree read by an earlier call while the app provably did not
   change: it sent no AT-SPI change event since (children, name, text, any
@@ -109,7 +128,8 @@ Why it is fast:
   yontemleri" for "Çözüm Yöntemleri"). When still nothing visible matches,
   `find` (and the error of a tool given `query`) lists up to five matches
   scrolled out of view in the web page, with ids (`act` and `get_text` work
-  on them as they are), else up to five visible elements with the closest
+  on them as they are; `act` with `action: "scroll_to"` brings one into view
+  for `click`), else up to five visible elements with the closest
   names (`no matches; closest: …`), so the next call can use an id instead of
   a screenshot.
 - Read tools (`apps`, `tree`, `find`, `get_text`, `wait_for`, `wait_idle`,
@@ -175,9 +195,19 @@ tool; `off` turns it off). Not available on Windows yet.
   `document: true`, `tree` lists only the document of the active window (in a
   browser, that tab's page without tabs and toolbars). `get_text` on a web page
   or another container returns the text of everything in it in reading order
-  (web containers' own text is only a placeholder per child element).
+  (web containers' own text is only a placeholder per child element). It
+  returns at most `limit` characters (default 10,000, about 2,500 tokens)
+  from `offset` (default 0); a cut reply ends with `… cut at character N;
+  get_text with offset=N reads on`. Whole web pages used to come back as
+  20,000 characters while the part wanted was near the top.
+  A `tree`/`find` line shows up to 80 characters of an element's text with its
+  line breaks (`text="Shopping list\nmilk\nbread\n"`), so a short document's
+  lines and final newline are visible without `get_text`; `…` after the
+  closing quote marks a text that goes on.
 - Large trees: `tree(interactive: true)` lists only elements one can operate
-  (actions, editable/checkable/selectable/expandable) under their nearest
+  (actions, editable/checkable/selectable/expandable, and on Linux focusable
+  named table rows, cells, list and tree items: a web app's chat list whose
+  rows say only `clickAncestor`/`showContextMenu`) under their nearest
   named ancestor; on a GitHub issues page in Firefox it was 15,339 instead of
   24,687 characters and still listed all 259 links, buttons and fields. A
   reply is capped at `max_chars` (default 20,000) and `max_nodes`; a cut one
@@ -188,8 +218,75 @@ tool; `off` turns it off). Not available on Windows yet.
   saying what the field holds (a length limit, reformatting). Firefox's input
   fields report accessibility writes as successful and do nothing, so when
   single-line text does not take, it focuses the element, selects all with
-  Ctrl+A and types it. Password fields cannot be read back.
+  Ctrl+A and types it. An editable element without a text interface (Qt 6's
+  editable combo boxes, such as a KDE file dialog's name field) is typed into
+  the same way and read back from its name. Password fields cannot be read
+  back.
 - `scroll`: turns the wheel over an element (a list, a page, a panel).
+- Verified actions of `act` (one tool rather than new ones: `act` is loaded
+  up front, so they cost no tool-search turn, and the schema grew by about
+  570 characters instead of three new tools of 1,700 each). Each reads the
+  state back and replies with it (`Toggle -> checked (verified)`), or fails
+  saying what it sent and what it reads instead (`sent Toggle, but it reads
+  unchecked afterwards`); one already in the asked state sends nothing and
+  says so (`already checked; nothing sent`), so it is safe to repeat:
+  - `action: "check"` / `"uncheck"`: a check box, check menu item, radio
+    button (only checked: another one of its group unchecks it), toggle button
+    or switch, or anything the platform marks checkable. Runs its check,
+    uncheck, toggle, press or click action. A checkable list or tree row
+    (Qt's item views, GTK's toggle cells) only through an action named
+    check/uncheck, or toggle outside Qt (Qt's Toggle selects the row);
+    otherwise focus through accessibility and Space (`full` tier).
+    `"toggle"` flips it, or the expansion of an element that is expandable,
+    not checkable, and has no action named Toggle (one that has it, a Qt
+    row, runs that action as before).
+  - `action: "expand"` / `"collapse"`: a tree item, disclosure button,
+    accordion or combo box through an action named for it (`expand`,
+    `collapse`, GTK's `expand or contract`); buttons and combo boxes may use
+    their press. A list or tree row is never pressed for it (that opens a
+    file in Dolphin): an element with no such action (Qt's tree items) gets
+    focused through accessibility and sent Right or Left, which needs the
+    `full` tier; when it cannot be focused that way the reply says to click
+    it and press the key.
+  - `option: "UTF-8"` (with `action: "select"`, or alone): picks the entry
+    with that label (matched like `menu` labels: case, `&` markers, ellipses
+    aside; a unique part is enough) in a combo box, list, tab list or menu
+    button, from its entries in the tree even while it is closed. In order,
+    each only while the one before is not verified: the list's AT-SPI
+    Selection (`SelectChild`, after `ClearSelection` in a multi-selection
+    list; skipped in Firefox and Chromium pages, whose scripts would not see
+    it), the entry's own select/click/press action (not
+    Qt's Toggle, which only marks a row), then for a closed combo box (with the
+    `full` tier) focus through accessibility and as many Down/Up presses as
+    entries lie between the shown one and the wanted one. Verified by the
+    value a combo box is named after (Qt, GTK), else the entry's `selected`
+    state (Firefox); a list where other entries stay selected too says how
+    many. A control that lists no entries is opened through its action only
+    when it opens a popup (a combo box, a menu, a button marked as having a
+    popup or with a Show Menu/open/expand action) and the entry is taken from
+    the popup menu; anything else (a plain button, a row) fails with nothing
+    sent.
+  - `action: "scroll_to"`: brings an element scrolled out of view (an id from
+    the off-screen list of a miss) into view through AT-SPI
+    `Component.ScrollTo` (on the element, else its nearest ancestors); when
+    that is missing or does not show it, turns the wheel over its scrollable
+    container (5 notches a turn, at most 10, toward the element) until it is
+    showing, and says that the pointer moved. The wheel turns over the part of
+    the container inside its window (in a web page over the page, not a
+    `<ul>` or `<table>` in it), and stops when the user takes over. An element
+    that is hidden (not visible: in a closed popup or a collapsed branch; a Qt
+    row scrolled out of a showing list counts as scrolled away) gets no wheel.
+
+  None of them opens a Firefox menu or `<select>` popup through accessibility
+  (see `menu`): such a call fails with nothing sent and says to click the
+  control. Their key fallbacks stop when the user takes over, and the act
+  call's confirmation covers them. On Windows (roles compared without
+  spaces: `checkbox`, `listitem`), check/uncheck/expand/collapse use the UI
+  Automation Toggle and ExpandCollapse actions and `select` the entry's
+  SelectionItem;
+  Selection and ScrollTo are not supported there (untested on Windows).
+  Verified so far with unit tests only; not yet tried against Kate, Dolphin
+  or Firefox.
 - Modifier clicks: `click`, `mouse` and `scroll` take `modifiers` (`ctrl`,
   `shift`, `alt`, `meta`), pressed before the pointer action and released in
   reverse order afterwards, also when it fails (ctrl+click adds to a
@@ -212,11 +309,36 @@ tool; `off` turns it off). Not available on Windows yet.
   coordinate, or with `image: true` a pixel of the last screenshot.
 - `act`, `set_text`, `focus`, `click`: act on an element. The element is picked
   by its `tree`/`find` number (`id`) or in one call by `app` + `query`
-  (+ `role`): the first visible element whose name equals `query`, else the
-  first whose name or text contains it. Window, tab and page titles (frame,
-  window, page tab, and a web page's document) count only when nothing else
-  matches or `role` names that role; `wait_for` skips them unless `role` names
-  them. Last come elements holding every word of the query, accents aside.
+  (+ `role`): a visible element whose name equals `query`, else one whose
+  name or text contains it. Window, tab and page titles (frame, window, page
+  tab, and a web page's document) count only when nothing else matches or
+  `role` names that role; `wait_for` skips them unless `role` names them.
+  Last come elements holding every word of the query, accents aside.
+- Ties: when several elements match equally well (the best of those tiers),
+  these tie-breaks apply in turn, while the matches are in several windows of
+  the app: (1) a window whose title contains the call's `window` argument
+  beats the others (before the active window, whose ACTIVE state can lag
+  just after `window` raised another); (2) the app's active window beats its
+  background windows; (3) a dialog (dialog, alert, file chooser) beats the app's other windows,
+  and of stacked dialogs the one opened last (listed last) wins. Then,
+  wherever they are: (4) an element one operates (a button, entry, list
+  item: an interactive role or state) beats one that only shows the name (a
+  label, a heading, a list named the same); (5) for input tools, an element
+  with an on-screen area beats one without (zero size), whether its window
+  is in front or not (checked for up to 12 candidates). A tie left after
+  that is refused by the input tools (`act`, `click`, `focus`, `set_text`,
+  `scroll`), which send nothing and list at most 6 candidates with ids, so the
+  next call passes one `id` (or `role`, or `window`):
+  ```
+  ambiguous: 2 elements in 'firefox' match 'Kapat'; nothing sent. pass one id:
+  [3] push button "Kapat" at 3440,0
+  [4] push button "Kapat" at 3440,22
+  ```
+  The position is shown when the window is in front; the window title is
+  added when the candidates are in several windows.
+  Read tools take the first: `get_text` notes it (`[5] … (first of 2
+  matches):`), `wait_for` matches on it, `find` lists them all. Matches are
+  counted over one read of the app, made afresh for a refusal.
 - Effect and `observe` on input tools (`act`, `menu`, `close_window`, `click`,
   `key`, `type_text`, `mouse`, `drag`, `scroll`, `set_text`): with
   `observe` (and by default for `act`, `menu` and `close_window`) the reply
@@ -234,13 +356,55 @@ tool; `off` turns it off). Not available on Windows yet.
   window now '<title>'`) or came to the front since the previous input (`;
   before it, '<title>' had come to the front`: a dialog that opened after
   that reply); about 3 ms per input.
+- What an input opened (Linux): after `act`, `menu`, `close_window` and the
+  input tools given `observe`, and after `click`, `key`, `mouse` and
+  `type_text` without it, the reply lists the menus, popup menus, combo box
+  lists, dialogs and alerts of allowed apps that opened, one line each, with
+  their entries' ids, so the next call acts on them directly:
+  ```
+  opened: popup menu (8 entries): [51] "Kopyala" [52] "Yapıştır" [53] check menu item "Satır Sarma" {checked} …
+  opened: dialog 'Değişiklikleri kaydet?': "Belge değiştirildi." [60] push button "Kaydet" [61] "Kaydetme" [62] "İptal"
+  ```
+  A role is named where it changes (a menu's `menu item`s and a list's `list
+  item`s go without); a dialog's buttons come first, after its first label
+  (the question it asks), those of its last button group (OK, Save, Cancel)
+  before the others, then its other controls; its lists, tables, trees,
+  documents and tool bars are not read. A KDE file dialog that `file_dialog`
+  fills is named as `opened: file dialog 'Open File' (use file_dialog)`,
+  without entries. At most 12 entries and about 600 characters a line (the
+  rest is counted: `… +5 more`), 3 surfaces a reply; a surface listed once
+  in a call (by `close_window`) is not read or listed again in its effect
+  line. What showed after a reply (a dialog a button opened a few ms after
+  the click) is listed by the next input's reply as `before it, opened: …`;
+  what one reply listed is not again. A surface is listed only when its
+  app's name reads as an allowed app's. The AT-SPI events
+  `object:state-changed:showing` and `window:create` say what showed since
+  the input: when none came, this costs nothing (no round trip); otherwise
+  the role of each shown element is read (one round trip for all of them),
+  and only menus, dialogs and lists under a combo box are read further. A
+  right click (`click`, `mouse`), a click on a combo box or menu entry, and
+  keys that usually open a menu or dialog (`menu`, `shift+f10`, `f10`,
+  `alt`+a letter, `alt+down`, `alt+f4`, `ctrl+o/s/p/w/q`, `ctrl+shift+s`)
+  wait up to 150 ms for something to show, ending as soon as it did; other
+  inputs only list what showed already. When registering those events
+  failed, those likely openers and `act`, `menu` and `close_window` look at
+  the active app's top-level windows instead, and a surface one such look
+  listed is not read or listed again while it stays open. Not on Windows:
+  UI Automation's roles do not name menus and dialogs this way (a dialog is
+  a `window`), so nothing is looked at or waited for there.
+  Only menus already open are read: nothing here opens a menu through
+  accessibility (Firefox can crash when one does).
 - Failures say what is on screen: when `find` finds nothing, or `act`,
   `click`, `focus`, `get_text`, `set_text`, `scroll`, `drag`, `wait_for`,
   `wait_idle`, `menu`, `key`, `type_text` or `mouse` fails (or a `batch` step
   fails and the batch does not end with `screenshot` or `tree`), the reply
   ends with `now: active window '<title>' [app]; focus: <element>`, so the
-  next call needs no screenshot to see why. Not for refusals by the
-  allowlist, confirmations or the user taking over. A miss by `query` also
+  next call needs no screenshot to see why. Titles in such notes
+  (`now:`, `activated '…'`, `active window now '…'`) are cut at 80
+  characters like element names, with the `…` after the closing quote so the
+  quoted part still works as `window`, and a focus line leaves out the
+  `focused` state. Not for refusals by the
+  allowlist, confirmations, an ambiguous target or the user taking over. A miss by `query` also
   lists off-screen matches or the closest names with ids (see `find`).
 - Stale ids: every use of an `id` reads the element's role and name again (one
   round trip). If the element is gone, or its role or name changed (the page
@@ -278,14 +442,19 @@ tool; `off` turns it off). Not available on Windows yet.
 - `close_window`: closes the one window whose title or app name contains
   `query` (several matches: an error listing them) as its close button does
   (KWin `closeWindow()`, Hyprland `closewindow`), so an app with unsaved
-  changes still asks; the reply then says the window is still open. Always
+  changes still asks; the reply then says the window is still open and
+  lists the app's dialog (the save prompt) with its buttons' ids
+  (`showing dialog '…': [60] push button "Save" [61] "Discard" …`). Always
   needs the user's consent, as tools on the `confirm:` list do (see
   [Tiers, confirmation and password fields](#tiers-confirmation-and-password-fields)).
 - `menu`: runs a menu bar entry by its labels in one call: `path` is a list
   (`["Dosya", "Farklı Kaydet…"]`) or one string (`"Dosya > Farklı Kaydet"`).
   Labels are matched case-insensitively (Turkish dotted and dotless i
   alike), without `&`/`_` accelerator markers, a shortcut after a tab or a
-  trailing ellipsis; an exact label wins, else a unique part of one. Without
+  trailing ellipsis; an exact label wins, else a unique part of one. A label
+  that is not there is also tried against KDE's English action names
+  (`file`, `file_save_as`, `edit_copy`), so `"File > Save As"` works in a
+  Turkish Kate (it saved two turns per task in the e2e benchmark). Without
   `path` it lists the top level, and a path ending at a submenu lists that
   submenu's entries with ids (read-only where the app keeps closed submenus
   in the tree). Qt and GTK apps keep closed submenus' entries in the tree, so
@@ -308,7 +477,8 @@ tool; `off` turns it off). Not available on Windows yet.
   it shows. The terminal must be in the allowlist (e.g. `konsole`).
 - `file_dialog`: fills in the file Open/Save dialog in front: `path` (absolute
   or `~/…`) is written into its file name field, the default button (Open,
-  Save) is pressed and the dialog's closing is awaited. Works on an allowed
+  Save) is pressed and the dialog's closing is awaited (Qt 5's name field and
+  Qt 6's editable combo box alike). Works on an allowed
   app's own KDE dialog and on the portal dialog (`xdg-desktop-portal-kde`) a
   browser opens for uploads and downloads; a portal dialog is filled only when
   the parent window KWin reports for it belongs to an allowed app, and a
@@ -320,6 +490,9 @@ tool; `off` turns it off). Not available on Windows yet.
   scripting, screens and the screenshot path.
 - `key`, `type_text`: keyboard. The reply names the element that has focus
   afterwards; `type_text` warns when focus is not on an editable field (KDE).
+  In a `batch`, a step whose focus is the one the previous report described
+  says `focus: [id] (unchanged)` instead of describing it again. A menu or
+  dialog the key opened is listed with ids (see "What an input opened").
 - `activate_window`: brings a window to the front; fails when no window of an
   allowed app matches.
 - `window` on input tools (`key`, `type_text`, `click`, `mouse`, `scroll`,
@@ -337,9 +510,16 @@ tool; `off` turns it off). Not available on Windows yet.
   rather than text, it only names the types, and it does not read content a
   password manager marked as a password (`x-kde-passwordManagerHint`).
 - `mouse`, `screenshot`: fallback only. `screenshot` returns the image inside
-  the reply (no need to read the file separately), shrinks it so its longer
-  side is 1024 px by default (`max_size`; `inline: false` returns only the file
-  path) and reports which screen area it shows; given `image_x`/`image_y`,
+  the reply, shrinks it so its longer side is 1024 px by default (`max_size`)
+  and reports which screen area it shows. The inline image is a JPEG
+  (quality 80, full colour resolution, so small text stays sharp) when that
+  takes at most three quarters of the PNG's bytes, else a PNG: a 1024x576
+  YouTube window took 132 KB instead of 670 KB, a Confluence page 94 KB
+  instead of 246 KB; flat windows stay PNG. Image tokens depend on the size
+  only (about width x height / 750: 786 at 1024x576), so the default size
+  stays: at 896 px a 1080p window's 13 px text shrinks to 6 px. An inline
+  screenshot leaves no file behind and names none; `inline: false` saves a
+  PNG and returns only its path; given `image_x`/`image_y`,
   `mouse` converts a pixel of the image to a screen coordinate (window position
   and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
   in pixels of the last screenshot captures again and returns only that part,
@@ -349,9 +529,48 @@ tool; `off` turns it off). Not available on Windows yet.
   error; reduces Claude's number of turns. A step with `"optional": true`
   (typically a `wait_for`) may fail without stopping the batch: it is reported
   as `[n] tool failed (optional): …` and the remaining steps still run, so a
-  final observation step (`find`, `screenshot`) is not lost.
+  final observation step (`find`, `screenshot`) is not lost. A step's
+  `id`/`*_id` argument `"$N"` is the element step N produced (find's first
+  hit, wait_for's match, the target of a tool given one).
+  A small procedure fits in one batch, with plain JSON control flow:
+  - `"if": {"step": N, TEST}` on a step runs it only when the test holds on
+    earlier step N; otherwise it is reported as `[n] skipped (if step N …)`.
+    TEST is one of `"ok": bool` (the step succeeded), `"found": bool` (it
+    succeeded and produced an element; `find` had a match) or
+    `"contains": "text"` (its reply or error, case-insensitive). A skipped
+    step meets no condition.
+  - `"on_fail": [steps]` on a step runs those steps (reported as
+    `[n.on_fail] …`) only when the step failed; the batch then goes on. Not
+    after a refusal by the allowlist (or a tier, or a password field), a
+    confirmation the user declined or was not asked for, or the user taking
+    over: then `[n.on_fail] not run (refused)`. Such a refusal also ends a
+    repeat, even in an optional step.
+  - `{"repeat": {"steps": [...], "until": TEST, "max": 10}}` runs its steps
+    (reported as `[n.k] …`, last run only) until TEST holds on the last of
+    them, checked after each run; it fails after `max` runs (1 to 20, default
+    10) or once it ran 10 minutes, and when a step in it fails that is not
+    optional. `"$N"` and conditions on a repeat mean its last step's result in
+    the latest run. Its input steps without `observe` (and any such step a
+    condition tests) wait for the app to react, up to 150 ms (ending at its
+    first change events), before their reply is read: the focus a `key`
+    reports is the one it moved to.
+  - `{"stop_if": {"step": N, TEST}}` ends the batch there, successfully.
+  Steps are numbered at the top level only; steps inside `repeat` and
+  `on_fail` take only `tool`, `args` and `optional` (no nesting). The whole
+  batch is checked before anything runs (unknown tools or keys, conditions
+  and `"$N"` that do not name an earlier step or can never hold, `max` out of
+  range): a mistake fails it with `not run (nothing sent): [n] …`. Its input
+  lock, the takeover check, the allowlist and `observe` work per step as in a
+  plain batch. Example, scroll Dolphin's view of a folder "Reports" (the view
+  is named after the folder) until a file shows, then click it, once the
+  view stopped moving:
+  `[{"repeat": {"steps": [{"tool": "scroll", "args": {"app": "dolphin",
+  "query": "Reports", "role": "list"}}, {"tool": "wait_idle", "args": {"app":
+  "dolphin", "quiet_ms": 150}}, {"tool": "find", "args": {"app": "dolphin",
+  "query": "report.pdf"}}], "until": {"found": true}}}, {"tool": "click",
+  "args": {"id": "$1"}}]`.
 
-The `initialize` reply carries `instructions` (about 2.6 KB): the workflow,
+The `initialize` reply carries `instructions` (about 3 KB): the workflow,
 the targeting rules shared by the tools above, the allowlist and which tools
 to load together. Clients that load tool schemas on demand, such as Claude
 Code, show it at session start before any schema is loaded; the per-tool
@@ -396,7 +615,7 @@ passwords: keepassxc
 | tier | allows |
 | --- | --- |
 | `view` | `tree`, `find`, `get_text`, `wait_for`, `wait_idle`, `screenshot`, `clipboard_get`, `cursor_position` (and `activate_window`) |
-| `click` | plus `act`, `menu`, `click`, `focus`, `scroll`, `drag`, `mouse`, `move_window`, `close_window`, `launch` without `args` |
+| `click` | plus `act` (its key fallbacks need `full`), `menu`, `click`, `focus`, `scroll`, `drag`, `mouse`, `move_window`, `close_window`, `launch` without `args` |
 | `full` | plus `key`, `hold`, `type_text`, `set_text`, `clipboard_set`, `file_dialog`, `launch` with `args` |
 
 The tier is checked against the app a call reaches: the target element's app
@@ -470,6 +689,17 @@ Building for Windows on Linux also works (`mingw-w64-gcc` and
 `rustup target add x86_64-pc-windows-gnu`, then
 `cargo build --release --target x86_64-pc-windows-gnu`).
 
+### Speed: tools loaded up front
+
+Claude Code defers MCP tools behind a tool search, which costs a model turn at
+the start of every desktop task. The server marks the ten tools nearly every
+task starts with (`batch`, `find`, `act`, `activate_window`, `key`,
+`type_text`, `wait_for`, `wait_idle`, `screenshot`, `apps`) with
+`_meta: {"anthropic/alwaysLoad": true}`, so Claude Code loads them with the
+session (about 11.5k characters of schema); the others stay deferred. To load
+every tool up front instead, add `"alwaysLoad": true` to the server's entry in
+the MCP config.
+
 ### Speed: skipping the permission prompt
 
 Claude Code sends every MCP call that is not in its allow list to a prompt or,
@@ -510,6 +740,44 @@ prints a table of median ms (the window must be open):
 python3 tools/mcp_bench.py --app kate --window notes.txt \
     --server "Rust=rust/target/release/desktop-mcp"
 ```
+
+### End-to-end task benchmark
+
+Tool calls take milliseconds; what makes a desktop task slow is the number of
+model turns and the size of what the model reads. `tools/e2e_bench.py` measures
+that on real tasks: it runs Claude Code headless (`claude -p`, only this
+server's tools; built-in tools, the user's settings, plugins, hooks and skills
+left out) once per task × model × server binary and records model turns,
+desktop tool calls, wall time up to the final result split into startup,
+model and tool time (calls of one turn that run at once count once), the
+exit after the result on its own, reply characters and images, tokens, the
+model actually used, and whether the task got done. `default` in `--models`
+means Claude Code's own default model, not the one in your settings. The tasks
+in `tools/e2e_tasks.json` each open their own window on a fresh temp file
+(Kate: append a line and save, Save As to a new path, search and replace, read
+a value; Firefox: fill and submit a local form in a new window; Dolphin:
+create a folder), state the goal as a user would, check the
+outcome on disk, in the final answer or with a read-only query, and close only
+what they opened (the PID their setup recorded, or the one window carrying the
+run's unique tag).
+
+```bash
+python3 tools/e2e_bench.py --list
+python3 tools/e2e_bench.py --tasks kate_append,kate_replace --models default,claude-haiku-5-5 \
+    --server "old=/path/to/old/desktop-mcp" \
+    --server "new=rust/target/release/desktop-mcp" --repeat 3 --results /tmp/e2e
+```
+
+It prints a Markdown table of medians and writes `results.json` (with every
+tool call, its time and reply size), `table.md` and each run's raw stream to
+`--results` (default: a new temp dir; never inside the repository). The agent
+types into the windows the tasks open (each run makes its window the active
+one first): do not use the keyboard or mouse while it runs. Firefox and
+Dolphin open the task's window in their running instance; close your own
+windows of them first, or pass `--exclusive` to skip those runs (each run
+notes other open windows of its app). Ctrl+C stops the agent with its whole
+process group before cleanup. `python3 -m unittest tools/test_e2e_bench.py`
+tests the measuring and the process handling without a desktop.
 
 ## Measurements: KDE speed-up
 
@@ -671,3 +939,6 @@ file manager or system settings to the list.
 ## License
 
 MIT
+
+Inline screenshots are encoded with the `jpeg-encoder` crate; this software
+is based in part on the work of the Independent JPEG Group.

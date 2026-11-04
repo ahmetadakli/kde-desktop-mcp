@@ -86,9 +86,11 @@ pub fn text_preview<Id>(info: &Info<Id>, limit: usize) -> String {
 /// Actions that say nothing about the element itself, so listing them only
 /// costs tokens (and would keep unnamed containers from being lifted). Qt
 /// gives nearly every widget "Set Focus", which the `focus` tool uses on its
-/// own; Firefox gives every element inside a clickable one "clickAncestor".
-/// `act` still runs them by name.
-const UNLISTED_ACTIONS: [&str; 2] = ["set focus", "clickancestor"];
+/// own; Firefox gives every element inside a clickable one "clickAncestor";
+/// Chromium and Electron give every element "showContextMenu" (it made
+/// nameless panels nest six deep in a Ferdium tree). `act` still runs them
+/// by name.
+pub const UNLISTED_ACTIONS: [&str; 3] = ["set focus", "clickancestor", "showcontextmenu"];
 
 /// Actions worth listing.
 pub fn shown_actions<Id>(info: &Info<Id>) -> Vec<&str> {
@@ -158,7 +160,8 @@ const IMPLIED_ACTIONS: [Implied; 8] = [
             "page tab list",
             "menu",
         ],
-        actions: &["click"],
+        // Chromium's containers (its frame, panels, pages) say doDefault.
+        actions: &["click", "dodefault"],
         expected: false,
     },
 ];
@@ -194,6 +197,18 @@ fn short_name<Id>(info: &Info<Id>) -> String {
     first_chars(&info.name.replace('\n', " "), 80)
 }
 
+/// A window title in a status note ("now: active window '…'", "activated
+/// '…'"): quoted as `py_repr` does, cut at 80 characters like element
+/// names (a cut one ends `'…`); the window's app is named beside it where
+/// it matters.
+pub fn short_title(title: &str) -> String {
+    let t = first_chars(title, 80);
+    // The mark goes outside the quotes, so the quoted part can be passed
+    // back as `window`, which matches a substring of the title.
+    let cut = if t.len() < title.len() { "…" } else { "" };
+    format!("{}{cut}", py_repr(&t))
+}
+
 /// `role "name"` as `describe` shows it, for messages about an element.
 pub fn role_and_name(role: &str, name: &str) -> String {
     let role = if role.is_empty() { "?" } else { role };
@@ -205,7 +220,31 @@ pub fn role_and_name(role: &str, name: &str) -> String {
     }
 }
 
+/// Characters of an element's text a tree/find line shows. Fetches for
+/// lines read one more, so a cut shows (`text="…"…`).
+pub const PREVIEW_CHARS: usize = 80;
+
+/// The text a line shows, and whether it was cut.
+fn line_text<Id>(info: &Info<Id>) -> (String, bool) {
+    let txt = text_preview(info, PREVIEW_CHARS + 1);
+    if txt.chars().count() > PREVIEW_CHARS {
+        (first_chars(&txt, PREVIEW_CHARS), true)
+    } else {
+        (txt, false)
+    }
+}
+
 pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
+    describe_but(info, id, None)
+}
+
+/// `describe` for the element holding focus: its `focused` state goes
+/// without saying ("focus: [3] entry \"To\" {editable}").
+pub fn describe_focused<Id>(info: &Info<Id>, id: u64) -> String {
+    describe_but(info, id, Some("focused"))
+}
+
+fn describe_but<Id>(info: &Info<Id>, id: u64, implied_state: Option<&str>) -> String {
     let name = short_name(info);
     let role = if info.role.is_empty() {
         "?"
@@ -217,13 +256,22 @@ pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
         out.push(' ');
         out.push_str(&json_str(&name));
     }
-    let txt = text_preview(info, 80);
+    let (txt, cut) = line_text(info);
     if !txt.is_empty() && txt != name {
         out.push_str(" text=");
         out.push_str(&json_str(&txt));
+        if cut {
+            out.push('…');
+        }
     }
-    if !info.states.is_empty() {
-        out.push_str(&format!(" {{{}}}", info.states.join(",")));
+    let states: Vec<&str> = info
+        .states
+        .iter()
+        .copied()
+        .filter(|s| Some(*s) != implied_state)
+        .collect();
+    if !states.is_empty() {
+        out.push_str(&format!(" {{{}}}", states.join(",")));
     }
     let actions = listed_actions(info);
     if !actions.is_empty() {
@@ -232,10 +280,46 @@ pub fn describe<Id>(info: &Info<Id>, id: u64) -> String {
     out
 }
 
+/// Whether `info` is a static text or label leaf that only repeats what
+/// the line of `parent` (the element printed above it) already shows: a
+/// heading's or link's own text node, a status bar's "3". Such lines cost
+/// a twentieth of a web page's tree and add nothing one could act on.
+/// Matching is `fold`ed; only the parts the parent's line shows count.
+pub fn echoes_parent<Id>(info: &Info<Id>, parent: &Info<Id>) -> bool {
+    if !LABEL_ROLES.contains(&info.role.as_str())
+        || !info.states.is_empty()
+        || !shown_actions(info).is_empty()
+    {
+        return false;
+    }
+    let own = [fold(&short_name(info)), fold(&text_preview(info, 80))];
+    if own.iter().all(String::is_empty) {
+        return false;
+    }
+    let shown = format!(
+        "{} {}",
+        fold(&short_name(parent)),
+        fold(&text_preview(parent, 80))
+    );
+    own.iter().all(|o| contains_whole(&shown, o))
+}
+
+/// Whether `hay` holds `needle` with no letter or digit right before or
+/// after it: "3" is in "sohbetler 3" but not in "13 mesaj".
+fn contains_whole(hay: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    let word = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    hay.match_indices(needle).any(|(at, _)| {
+        !word(hay[..at].chars().next_back()) && !word(hay[at + needle.len()..].chars().next())
+    })
+}
+
 /// An element described by its role, name and actions alone: no text or
 /// states. Such siblings with the same role and actions share one line.
 fn plain<Id>(info: &Info<Id>) -> bool {
-    let txt = text_preview(info, 80);
+    let (txt, _) = line_text(info);
     info.states.is_empty() && (txt.is_empty() || txt == short_name(info))
 }
 
@@ -420,7 +504,7 @@ pub fn walk<Id: Clone + Eq + Hash>(
         start: None,
         truncated: false,
     };
-    walk_into(&mut st, children, depth);
+    walk_into(&mut st, children, depth, None);
     let after_found = after.is_none() || st.start.is_some();
     match st.start {
         Some(start) => drop(st.lines.drain(base..start)),
@@ -591,9 +675,18 @@ fn bare<Id>(info: &Info<Id>) -> bool {
     info.name.trim().is_empty() && info.states.is_empty() && text_preview(info, 80).is_empty()
 }
 
+/// Whether the element has an action of its own: one worth listing other
+/// than Chromium's generic doDefault, which its frame and every nameless
+/// panel of its window carry (six nested panels in an Electron app).
+fn acts_on_its_own<Id>(info: &Info<Id>) -> bool {
+    shown_actions(info)
+        .iter()
+        .any(|a| !a.eq_ignore_ascii_case("dodefault"))
+}
+
 fn shape<Id: Clone + Eq + Hash>(cache: &Cache<Id>, info: &Info<Id>, opts: &WalkOpts) -> Shape {
     let role = info.role.as_str();
-    let acts = !shown_actions(info).is_empty();
+    let acts = acts_on_its_own(info);
     if acts {
         return Shape::Line;
     }
@@ -623,7 +716,13 @@ fn shape<Id: Clone + Eq + Hash>(cache: &Cache<Id>, info: &Info<Id>, opts: &WalkO
 /// `walk`, going on past missing nodes (the lines are then incomplete and
 /// get thrown away) to collect all of them. In an interactive walk, true
 /// when a line it kept still wants its nearest named ancestor printed.
-fn walk_into<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, children: &[Id], depth: usize) -> bool {
+/// `parent`: the element printed above `children` (lifted ones skipped).
+fn walk_into<'c, Id: Clone + Eq + Hash>(
+    st: &mut Walk<'c, Id>,
+    children: &'c [Id],
+    depth: usize,
+    parent: Option<&'c Info<Id>>,
+) -> bool {
     let (cache, opts) = (st.cache, st.opts);
     let mut wants_context = false;
     if st.truncated || depth > opts.max_depth {
@@ -641,7 +740,7 @@ fn walk_into<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, children: &[Id], dept
             continue;
         }
         if shape(cache, info, opts) == Shape::Lift {
-            wants_context |= walk_into(st, &info.children, depth);
+            wants_context |= walk_into(st, &info.children, depth, parent);
             continue;
         }
         let at = st.lines.len();
@@ -654,7 +753,7 @@ fn walk_into<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, children: &[Id], dept
         }
         // Whether the children were looked at, not cut by budget or depth.
         let walked = st.counted() < opts.budget && depth < opts.max_depth;
-        let kids_want = walk_into(st, &info.children, depth + 1);
+        let kids_want = walk_into(st, &info.children, depth + 1, Some(info));
         if opts.interactive {
             if interactive(info) {
                 wants_context = true;
@@ -665,9 +764,10 @@ fn walk_into<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, children: &[Id], dept
             }
         } else if st.lines.len() == at + 1
             && (info.children.is_empty() || walked)
-            && EMPTY_LEAF_ROLES.contains(&info.role.as_str())
-            && bare(info)
-            && shown_actions(info).is_empty()
+            && ((EMPTY_LEAF_ROLES.contains(&info.role.as_str())
+                && bare(info)
+                && !acts_on_its_own(info))
+                || parent.is_some_and(|p| echoes_parent(info, p)))
         {
             st.remove(at, false);
         }
@@ -884,22 +984,31 @@ pub fn find<Id: Clone + Eq + Hash>(
             break;
         }
         seen += 1;
-        let kids: &[Id] = match node {
-            None => roots,
-            Some(o) => &cache[o].children,
+        let tier_of = |info: &Info<Id>| {
+            matches(info, &q, role).map(|hit| match rank(hit, is_title(info, role)) {
+                0 | 1 => 0,
+                2 | 3 => 1,
+                r => r as usize - 2,
+            })
+        };
+        let (kids, parent_tier): (&[Id], _) = match node {
+            None => (roots, None),
+            Some(o) => (&cache[o].children, tier_of(&cache[o])),
         };
         for (c, info) in get(cache, kids, &mut missing).into_iter().rev() {
             if !info.showing {
                 continue;
             }
             stack.push(Some(c));
-            if let Some(hit) = matches(info, &q, role) {
-                let tier = match rank(hit, is_title(info, role)) {
-                    0 | 1 => 0,
-                    2 | 3 => 1,
-                    r => r as usize - 2,
-                };
-                tiers[tier].push(c.clone());
+            if let Some(tier) = tier_of(info) {
+                // A text leaf repeating its parent, which is listed as
+                // high: the parent's line says it all.
+                let echo = parent_tier.is_some_and(|t| t <= tier)
+                    && info.children.is_empty()
+                    && node.is_some_and(|o| echoes_parent(info, &cache[o]));
+                if !echo {
+                    tiers[tier].push(c.clone());
+                }
             }
         }
     }
@@ -929,13 +1038,48 @@ fn push_showing<'a, Id: Clone + Eq + Hash>(
     );
 }
 
-/// The element a query names: depth-first in document order over visible
-/// elements, the first whose name equals `query` (`fold`ed: case, Turkish
-/// i, whitespace) wins, else the first whose name or text contains it (or
-/// role, when `role` is given). Window, tab and page titles (TITLE_ROLES)
-/// count only when nothing else matches, and with `titles` false not at
-/// all. Last, the first whose name or text has every word of the query,
-/// accents aside. Ok(None) when nothing matches.
+/// Roles of a window that is a dialog: its elements beat those of the
+/// app's other windows (see `locate_all`).
+const DIALOG_ROLES: [&str; 4] = ["dialog", "alert", "file chooser", "color chooser"];
+
+/// Whether `info` is a dialog window (DIALOG_ROLES).
+pub fn is_dialog<Id>(info: &Info<Id>) -> bool {
+    DIALOG_ROLES.contains(&info.role.as_str())
+}
+
+/// What `locate_all` found.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Matches<Id> {
+    /// The best matches the tie-breaks left, in document order, each with
+    /// the window (one of the roots) it is in; never empty. More than one:
+    /// the query is ambiguous.
+    pub picked: Vec<(Id, Id)>,
+}
+
+impl<Id> Matches<Id> {
+    /// The element a read takes: the first one picked.
+    pub fn first(&self) -> &Id {
+        &self.picked[0].0
+    }
+}
+
+/// Keep the items `keep` holds for, when it holds for any (else all).
+fn narrow<T>(items: &mut Vec<T>, keep: impl Fn(&T) -> bool) {
+    if items.iter().any(&keep) {
+        items.retain(keep);
+    }
+}
+
+/// Number of different windows among `hits` (element, root index).
+fn window_count<Id>(hits: &[(&Id, usize)]) -> usize {
+    let mut w: Vec<usize> = hits.iter().map(|h| h.1).collect();
+    w.sort_unstable();
+    w.dedup();
+    w.len()
+}
+
+/// The first element `locate_all` picks, without a window hint.
+#[cfg(test)]
 pub fn locate<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     roots: &[Id],
@@ -943,14 +1087,60 @@ pub fn locate<Id: Clone + Eq + Hash>(
     role: &str,
     titles: bool,
 ) -> Result<Option<Id>, Vec<Id>> {
+    locate_all(cache, roots, query, role, titles, "").map(|m| m.map(|m| m.first().clone()))
+}
+
+/// The elements `query` names best, depth-first in document order over
+/// visible elements: those whose name equals `query` (`fold`ed: case,
+/// Turkish i, whitespace), else those whose name or text contains it (or
+/// role, when `role` is given). Window, tab and page titles (TITLE_ROLES)
+/// count only when nothing else matches, and with `titles` false not at
+/// all. Last, those whose name or text has every word of the query, accents
+/// aside. Of these, the ones left after the tie-breaks, which apply in turn
+/// while the matches are in several windows of the app (`roots`):
+/// 1. those in a window whose title contains `window` (the tool's
+///    `window` argument; "" for none) beat the others: the caller named
+///    it, and the ACTIVE state can still be the previous window's just
+///    after `window` brought this one to the front;
+/// 2. the active window's elements beat those of its other windows;
+/// 3. those in a dialog (DIALOG_ROLES) beat those in other windows, and of
+///    several dialogs the one listed last (opened last) wins;
+///
+/// and then, wherever they are:
+/// 4. an element one operates (`interactive`: a button, an entry, a list
+///    item) beats one that only shows the name (a label, a list or
+///    heading named the same).
+///
+/// Ok(None) when nothing matches.
+pub fn locate_all<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+    query: &str,
+    role: &str,
+    titles: bool,
+    window: &str,
+) -> Result<Option<Matches<Id>>, Vec<Id>> {
     let q = Query::new(query);
-    // The first element of each rank.
-    let mut best: [Option<&Id>; 6] = Default::default();
+    // Matches per rank, with the index of their root.
+    let mut best: [Vec<(&Id, usize)>; 6] = Default::default();
     let mut missing = Vec::new();
-    let mut stack: Vec<&Id> = Vec::new();
-    push_showing(cache, roots, &mut stack, &mut missing);
+    let mut stack: Vec<(&Id, usize)> = Vec::new();
+    let showing = |ids: &'_ [Id], missing: &mut Vec<Id>| -> Vec<usize> {
+        let mut out = Vec::new();
+        for (i, o) in ids.iter().enumerate() {
+            match cache.get(o) {
+                Some(info) if info.showing => out.push(i),
+                Some(_) => {}
+                None => missing.push(o.clone()),
+            }
+        }
+        out
+    };
+    for i in showing(roots, &mut missing).into_iter().rev() {
+        stack.push((&roots[i], i));
+    }
     let mut seen = 0;
-    while let Some(id) = stack.pop() {
+    while let Some((id, w)) = stack.pop() {
         seen += 1;
         if seen > FIND_MAX_SEEN {
             break;
@@ -960,16 +1150,42 @@ pub fn locate<Id: Clone + Eq + Hash>(
         if let Some(hit) = matches(info, &q, role)
             && (titles || !title)
         {
-            let r = rank(hit, title);
-            if r == 0 {
-                return done(Some(id.clone()), missing);
-            }
-            best[r as usize].get_or_insert(id);
+            best[rank(hit, title) as usize].push((id, w));
         }
-        push_showing(cache, &info.children, &mut stack, &mut missing);
+        for i in showing(&info.children, &mut missing).into_iter().rev() {
+            stack.push((&info.children[i], w));
+        }
     }
-    let found = best.into_iter().flatten().next();
-    done(found.cloned(), missing)
+    let Some(mut hits) = best.into_iter().find(|b| !b.is_empty()) else {
+        return done(None, missing);
+    };
+    // Rules on the windows (by index in `roots`), in turn.
+    let fw = fold(window);
+    let windows: Vec<Option<&Info<Id>>> = roots.iter().map(|r| cache.get(r)).collect();
+    let rule = |f: &dyn Fn(&Info<Id>) -> bool| -> Vec<bool> {
+        windows.iter().map(|w| w.is_some_and(f)).collect()
+    };
+    let window_rules = [
+        rule(&|w| !fw.is_empty() && fold(&w.name).contains(&fw)),
+        rule(&|w| w.states.contains(&"active")),
+        rule(&|w| is_dialog(w)),
+    ];
+    for holds in &window_rules {
+        if window_count(&hits) > 1 {
+            narrow(&mut hits, |h| holds[h.1]);
+        }
+    }
+    let root = |w: usize| &cache[&roots[w]];
+    if window_count(&hits) > 1 && is_dialog(root(hits[0].1)) {
+        let last = hits.iter().map(|h| h.1).max().unwrap_or(0);
+        hits.retain(|h| h.1 == last);
+    }
+    narrow(&mut hits, |h| interactive(&cache[h.0]));
+    let picked = hits
+        .into_iter()
+        .map(|(id, w)| (id.clone(), roots[w].clone()))
+        .collect();
+    done(Some(Matches { picked }), missing)
 }
 
 /// Elements of `roots` that match `query` (and `role`) but are not
@@ -1234,8 +1450,11 @@ pub fn container_text<Id: Clone + Eq + Hash>(
     let mut out = String::new();
     let mut missing = Vec::new();
     let mut seen = 0;
+    // Reading stops past twice the limit: tidying below drops blank runs,
+    // and a text cut at the limit must still be seen to go on.
+    let stop = limit.saturating_mul(2);
     match cache.get(root) {
-        Some(info) => read_into(cache, info, limit, &mut out, &mut missing, &mut seen),
+        Some(info) => read_into(cache, info, stop, &mut out, &mut missing, &mut seen),
         None => missing.push(root.clone()),
     }
     // Tidy: no blank runs, no spaces at line ends, no empty lines.
@@ -1290,21 +1509,56 @@ fn read_into<Id: Clone + Eq + Hash>(
     };
     match info.text.as_deref() {
         Some(text) if !text.is_empty() => {
-            let mut after_child = false;
+            // Chromium writes its text leaves' words into the parent's text
+            // and gives only the other children a U+FFFC; Firefox gives
+            // every child one. A text leaf whose words the text already
+            // holds is not read again, and takes no U+FFFC while there are
+            // fewer of them than children (a row's name, avatar and time
+            // read "Arda ￼03:05": the U+FFFC is the avatar's).
+            let folded = fold(text);
+            let given = |id: &Id| {
+                cache.get(id).is_some_and(|k| {
+                    k.children.is_empty() && LABEL_ROLES.contains(&k.role.as_str()) && {
+                        let own = fold(k.text.as_deref().unwrap_or(&k.name));
+                        !own.is_empty() && folded.contains(&own)
+                    }
+                })
+            };
+            let inline =
+                text.chars().filter(|&c| c == EMBEDDED_OBJECT).count() < info.children.len();
+            // An object read as its name (an image's alt text) is a word of
+            // its own, even where the text has no space around it.
+            let name_only = |id: &Id| {
+                cache.get(id).is_some_and(|k| {
+                    k.children.is_empty() && k.text.as_deref().is_none_or(str::is_empty)
+                })
+            };
+            let word_end = |out: &String| out.ends_with(char::is_alphanumeric);
+            let (mut after_child, mut pad) = (false, false);
             for ch in text.chars() {
                 if ch == EMBEDDED_OBJECT {
-                    if let Some(id) = kids.next() {
+                    if let Some(id) = kids.by_ref().find(|id| !(inline && given(id))) {
+                        pad = name_only(id);
+                        if pad && word_end(out) {
+                            out.push(' ');
+                        }
                         child(out, id, after_child);
                     }
                     after_child = true;
                 } else {
+                    if pad && ch.is_alphanumeric() && word_end(out) {
+                        out.push(' ');
+                    }
                     out.push(ch);
-                    after_child = false;
+                    (after_child, pad) = (false, false);
                 }
             }
-            // Children the text did not place (it was cut at the limit).
+            // Children the text did not place: it was cut at the limit, or
+            // (Chromium) it holds their words itself.
             for id in kids {
-                child(out, id, true);
+                if !given(id) {
+                    child(out, id, true);
+                }
             }
         }
         _ if info.children.is_empty() => out.push_str(info.name.trim()),
@@ -1541,6 +1795,38 @@ pub fn pick_menu_item<Id: Clone + Eq + Hash>(
     }
 }
 
+/// The entry whose toolkit object name `want` names, for a path written in
+/// another language than the UI: KDE names its standard actions in English
+/// (`file`, `file_save_as`, `edit_copy`, `options_configure`). `ids` pairs
+/// each entry with its object id (dot-separated); `want` as a slug
+/// ("Save As…" → `save_as`) must equal the id's last part or end it after
+/// an underscore. None unless exactly one entry fits.
+pub fn pick_by_object_name<Id: Clone>(ids: &[(Id, String)], want: &str) -> Option<Id> {
+    let slug: String = menu_norm(want)
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if slug.is_empty() || !slug.is_ascii() {
+        return None;
+    }
+    let fits: Vec<&Id> = ids
+        .iter()
+        .filter(|(_, oid)| {
+            let last = oid.rsplit('.').next().unwrap_or("").to_lowercase();
+            last == slug || last.ends_with(&format!("_{slug}"))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    match fits.as_slice() {
+        [one] => Some((*one).clone()),
+        _ => None,
+    }
+}
+
 /// A menu `path`: a list of labels, or one string split at `>`; empty for
 /// none.
 pub fn menu_path(path: Option<&Json>) -> Result<Vec<String>, String> {
@@ -1566,6 +1852,276 @@ pub fn menu_path(path: Option<&Json>) -> Result<Vec<String>, String> {
             .collect(),
         Some(_) => Err(bad()),
     }
+}
+
+// ---------------------------------------------------------------- surfaces
+
+/// What an input opened that the reply lists with its entries: a menu or
+/// popup menu, a combo box's list, or a dialog or alert.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Surface {
+    Menu,
+    List,
+    Dialog,
+}
+
+/// Roles of a list that is a surface only when a combo box holds it.
+pub const SURFACE_LIST_ROLES: [&str; 2] = ["list", "list box"];
+
+/// The kind of surface an element of `role` is, if any. A list only
+/// counts under a combo box: the caller checks its parent.
+pub fn surface_kind(role: &str) -> Option<Surface> {
+    match role {
+        "menu" | "popup menu" => Some(Surface::Menu),
+        r if SURFACE_LIST_ROLES.contains(&r) => Some(Surface::List),
+        r if DIALOG_ROLES.contains(&r) => Some(Surface::Dialog),
+        _ => None,
+    }
+}
+
+/// Roles of a list's entries.
+const LIST_ENTRY_ROLES: [&str; 6] = [
+    "list item",
+    "menu item",
+    "check menu item",
+    "radio menu item",
+    "tree item",
+    "table cell",
+];
+
+/// Roles of a dialog's buttons, listed before its other controls.
+/// AT-SPI 2.5x names a push button's role "button" (Qt 6 dialogs).
+const DIALOG_BUTTON_ROLES: [&str; 3] = ["push button", "button", "toggle button"];
+
+/// Roles of a dialog's other controls listed after its buttons.
+const DIALOG_CONTROL_ROLES: [&str; 10] = [
+    "check box",
+    "radio button",
+    "combo box",
+    "text",
+    "entry",
+    "password text",
+    "spin button",
+    "link",
+    "page tab",
+    "slider",
+];
+
+/// Roles below which a dialog's read and its entries stop: views (a file
+/// dialog's file list, a settings page's list), documents and tool bars
+/// (a file dialog's Back/Up/Reload). Their contents are no entries, and
+/// reading them would take most of a read's nodes.
+pub const DIALOG_STOP: [&str; 9] = [
+    "list",
+    "list box",
+    "table",
+    "tree",
+    "tree table",
+    "tool bar",
+    "document web",
+    "document frame",
+    "document",
+];
+
+/// The views among DIALOG_STOP: a dialog holding one may be a file dialog.
+const DIALOG_VIEW_ROLES: [&str; 5] = ["list", "list box", "table", "tree", "tree table"];
+
+/// What a surface lists: its entries (a dialog's buttons first), and for
+/// a dialog the first label that is not its title (the question it asks).
+pub struct SurfaceEntries<Id> {
+    pub entries: Vec<Id>,
+    pub message: Option<String>,
+    /// A dialog holds a showing list, table or tree view (DIALOG_VIEW_ROLES).
+    pub views: bool,
+}
+
+impl<Id> SurfaceEntries<Id> {
+    /// Whether the dialog `root` may be a file dialog (a file chooser, or
+    /// one with a view): the backend has the last word
+    /// (`Backend::fills_file_dialog`).
+    pub fn maybe_file_dialog(&self, root: &Info<Id>) -> bool {
+        self.views || root.role == "file chooser"
+    }
+}
+
+/// The entries of the surface `root` of `kind`, in document order, from
+/// the showing nodes below it, and the nodes still to fetch for the rest.
+/// A dialog's buttons come first, those of its last button group (the
+/// one holding the last button: OK, Save, Cancel) before the others; its
+/// DIALOG_STOP nodes are not looked into. An entry's own children are not
+/// looked into (a submenu's entries), nor are hidden nodes'.
+pub fn surface_entries<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    root: &Id,
+    kind: Surface,
+) -> (SurfaceEntries<Id>, Vec<Id>) {
+    let mut missing = Vec::new();
+    let Some(info) = cache.get(root) else {
+        let none = SurfaceEntries {
+            entries: Vec::new(),
+            message: None,
+            views: false,
+        };
+        return (none, vec![root.clone()]);
+    };
+    let title = fold(&info.name);
+    // Each button with the node holding it.
+    let mut buttons: Vec<(Id, &Id)> = Vec::new();
+    let mut others = Vec::new();
+    let mut message = None;
+    let mut views = false;
+    let mut stack: Vec<(&Id, &Id)> = get(cache, &info.children, &mut missing)
+        .into_iter()
+        .map(|(c, _)| (c, root))
+        .rev()
+        .collect();
+    let mut seen = 0;
+    while let Some((id, parent)) = stack.pop() {
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        let info = &cache[id];
+        if !info.showing {
+            continue;
+        }
+        let role = info.role.as_str();
+        let named = !info.name.trim().is_empty();
+        let entry = match kind {
+            Surface::Menu => MENU_ITEM_ROLES.contains(&role) && named,
+            Surface::List => LIST_ENTRY_ROLES.contains(&role) && named,
+            Surface::Dialog => {
+                if DIALOG_BUTTON_ROLES.contains(&role) && named {
+                    buttons.push((id.clone(), parent));
+                    continue;
+                }
+                if DIALOG_STOP.contains(&role) {
+                    views |= DIALOG_VIEW_ROLES.contains(&role);
+                    continue;
+                }
+                if message.is_none()
+                    && LABEL_ROLES.contains(&role)
+                    && named
+                    && fold(&info.name) != title
+                {
+                    message = Some(info.name.trim().to_string());
+                }
+                DIALOG_CONTROL_ROLES.contains(&role) && (named || info.states.contains(&"editable"))
+            }
+        };
+        if entry {
+            others.push(id.clone());
+            continue;
+        }
+        stack.extend(
+            get(cache, &info.children, &mut missing)
+                .into_iter()
+                .map(|(c, _)| (c, id))
+                .rev(),
+        );
+    }
+    // The last button group first (stable: document order within each).
+    let last = buttons.last().map(|(_, p)| (*p).clone());
+    buttons.sort_by_key(|(_, p)| Some(*p) != last.as_ref());
+    let mut entries: Vec<Id> = buttons.into_iter().map(|(b, _)| b).collect();
+    entries.extend(others);
+    let listed = SurfaceEntries {
+        entries,
+        message,
+        views,
+    };
+    (listed, missing)
+}
+
+/// The line for a file dialog, which `file_dialog` fills in one call: its
+/// entries are not listed.
+pub fn file_dialog_line<Id>(root: &Info<Id>) -> String {
+    let name = first_chars(&root.name.replace('\n', " "), 80);
+    match name.trim() {
+        "" => "file dialog (use file_dialog)".into(),
+        t => format!("file dialog {} (use file_dialog)", py_repr(t)),
+    }
+}
+
+/// Most entries a surface line lists, and characters it takes.
+pub const SURFACE_ENTRIES: usize = 12;
+pub const SURFACE_CHARS: usize = 600;
+
+/// The role an entry of `kind` has unless its line says otherwise.
+fn default_entry_role(kind: Surface) -> &'static str {
+    match kind {
+        Surface::Menu => "menu item",
+        Surface::List => "list item",
+        Surface::Dialog => "",
+    }
+}
+
+/// One line for a surface, after "opened: ": its role and title, the
+/// number of entries (menus, lists), a dialog's message, and the entries
+/// with their ids, `[51] "Copy" [52] check menu item "Wrap" {checked}`:
+/// a role is named where it differs from the entry before (from the
+/// usual one, for the first). At most SURFACE_ENTRIES entries and about
+/// SURFACE_CHARS characters; the rest is counted.
+pub fn surface_line<Id>(
+    root: &Info<Id>,
+    kind: Surface,
+    message: Option<&str>,
+    entries: &[(u64, &Info<Id>)],
+) -> String {
+    let mut out = root.role.clone();
+    let name = first_chars(&root.name.replace('\n', " "), 80);
+    if !name.trim().is_empty() {
+        out.push(' ');
+        out.push_str(&py_repr(name.trim()));
+    }
+    if kind != Surface::Dialog {
+        let n = entries.len();
+        out.push_str(&format!(
+            " ({n} {})",
+            if n == 1 { "entry" } else { "entries" }
+        ));
+    }
+    out.push(':');
+    if let Some(m) = message {
+        let m = m.replace('\n', " ");
+        let short = first_chars(&m, 120);
+        let cut = if short.len() < m.len() { "…" } else { "" };
+        out.push_str(&format!(" {}{cut}", json_str(&short)));
+    }
+    if entries.is_empty() {
+        out.push_str(" (no entries listed)");
+        return out;
+    }
+    let mut role = default_entry_role(kind);
+    for (i, (rid, info)) in entries.iter().enumerate() {
+        let mut item = format!(" [{rid}]");
+        if info.role != role {
+            role = info.role.as_str();
+            item.push(' ');
+            item.push_str(role);
+        }
+        let name = first_chars(&info.name.trim().replace('\n', " "), 60);
+        if !name.is_empty() {
+            item.push(' ');
+            item.push_str(&json_str(&name));
+        }
+        let states: Vec<&str> = info
+            .states
+            .iter()
+            .copied()
+            .filter(|s| ["checked", "selected", "disabled"].contains(s))
+            .collect();
+        if !states.is_empty() {
+            item.push_str(&format!(" {{{}}}", states.join(",")));
+        }
+        let left = entries.len() - i;
+        if i >= SURFACE_ENTRIES || out.chars().count() + item.chars().count() > SURFACE_CHARS {
+            out.push_str(&format!(" … +{left} more"));
+            break;
+        }
+        out.push_str(&item);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1712,6 +2268,28 @@ mod tests {
     }
 
     #[test]
+    fn english_paths_find_kde_entries_by_object_name() {
+        let bar = "QApplication.MainWindow#1.QMenuBar";
+        let top = vec![(1, format!("{bar}.file")), (2, format!("{bar}.edit"))];
+        assert_eq!(pick_by_object_name(&top, "File"), Some(1));
+        assert_eq!(pick_by_object_name(&top, "Edit"), Some(2));
+        assert_eq!(pick_by_object_name(&top, "View"), None);
+        let file = vec![
+            (3, format!("{bar}.file.file.file_save")),
+            (4, format!("{bar}.file.file.file_save_as")),
+            (5, format!("{bar}.file.file.file_save_as_with_encoding")),
+            (6, format!("{bar}.file.file.file_close")),
+            (7, format!("{bar}.file.file.file_close_other")),
+        ];
+        assert_eq!(pick_by_object_name(&file, "Save As..."), Some(4));
+        assert_eq!(pick_by_object_name(&file, "Save As…"), Some(4));
+        assert_eq!(pick_by_object_name(&file, "save"), Some(3));
+        assert_eq!(pick_by_object_name(&file, "Close"), Some(6));
+        // Not ASCII: a translated label, never matched against object names.
+        assert_eq!(pick_by_object_name(&file, "Kaydet"), None);
+    }
+
+    #[test]
     fn menu_paths_are_lists_or_split_at_arrows() {
         let p = |v: Json| menu_path(Some(&v));
         assert_eq!(
@@ -1798,6 +2376,31 @@ mod tests {
                 after_found: true
             }
         );
+    }
+
+    #[test]
+    fn text_keeps_lines_and_marks_a_cut() {
+        // Kate's document: the lines and the final newline stay visible.
+        let mut doc = node("text", "notes.txt", true, &["editable"], &[]);
+        doc.text = Some("Shopping list\nmilk\nbread\n".into());
+        assert_eq!(
+            describe(&doc, 3),
+            "[3] text \"notes.txt\" text=\"Shopping list\\nmilk\\nbread\\n\" {editable}"
+        );
+        // Searches still see the lines as words.
+        let mut c = Cache::new();
+        c.insert("/d", doc.clone());
+        assert_eq!(find(&c, &["/d"], "milk bread", "", 5).unwrap(), vec!["/d"]);
+        // Exactly PREVIEW_CHARS characters: complete, no mark.
+        doc.text = Some("x".repeat(PREVIEW_CHARS));
+        assert!(describe(&doc, 3).ends_with(&format!("text=\"{}\" {{editable}}", "x".repeat(80))));
+        // One more (as a tree fetch reads at most): cut, marked after the quote.
+        doc.text = Some(format!("{}yz", "x".repeat(PREVIEW_CHARS)));
+        assert!(describe(&doc, 3).ends_with(&format!("text=\"{}\"… {{editable}}", "x".repeat(80))));
+        // A text that only repeats the (cut) name adds nothing: still plain.
+        doc.states.clear();
+        doc.name = "x".repeat(PREVIEW_CHARS);
+        assert!(plain(&doc));
     }
 
     #[test]
@@ -1958,6 +2561,110 @@ mod tests {
             locate(&cache, &["/w"], "x", "", true).unwrap_err(),
             vec!["/b2"]
         );
+    }
+
+    /// Ids of what `locate_all` picked, with their windows.
+    fn picked(
+        cache: &Cache<&'static str>,
+        roots: &[&'static str],
+        query: &str,
+        role: &str,
+        window: &str,
+    ) -> Vec<(&'static str, &'static str)> {
+        let m = locate_all(cache, roots, query, role, true, window)
+            .unwrap()
+            .unwrap();
+        m.picked
+    }
+
+    #[test]
+    fn locate_all_returns_every_tie_of_the_best_rank() {
+        let mut cache = sample();
+        cache.insert("/b3", node("push button", "Kaydet", true, &[], &[]));
+        cache.insert("/b4", node("push button", "Farklı Kaydet", true, &[], &[]));
+        cache.get_mut("/p").unwrap().children = vec!["/b4", "/b1", "/h", "/b3"];
+        // Exact names tie; the partial match and the hidden one do not count.
+        assert_eq!(
+            picked(&cache, &["/w"], "kaydet", "", ""),
+            vec![("/b1", "/w"), ("/b3", "/w")]
+        );
+        assert_eq!(
+            picked(&cache, &["/w"], "farklı", "", ""),
+            vec![("/b4", "/w")]
+        );
+        // Partial matches tie when nothing matches exactly.
+        assert_eq!(picked(&cache, &["/w"], "kayde", "", "").len(), 3);
+    }
+
+    /// Two windows of an app, each with a push button "OK": "/w1" (`r1`)
+    /// and "/w2" (`r2`, with `states`).
+    fn two_windows(r1: &str, r2: &str, states: &[&'static str]) -> Cache<&'static str> {
+        let mut c = Cache::new();
+        c.insert("/w1", node(r1, "notes.txt — Kate", true, &[], &["/a"]));
+        c.insert("/a", node("push button", "OK", true, &[], &[]));
+        c.insert("/w2", node(r2, "todo.txt — Kate", true, states, &["/b"]));
+        c.insert("/b", node("push button", "OK", true, &[], &[]));
+        c
+    }
+
+    #[test]
+    fn the_window_hint_then_the_active_window_break_ties_between_windows() {
+        let roots = ["/w1", "/w2"];
+        let cache = two_windows("frame", "frame", &["active"]);
+        assert_eq!(picked(&cache, &roots, "ok", "", ""), vec![("/b", "/w2")]);
+        // Neither active: a tie, unless the window argument names one.
+        let cache = two_windows("frame", "frame", &[]);
+        assert_eq!(picked(&cache, &roots, "ok", "", "").len(), 2);
+        assert_eq!(
+            picked(&cache, &roots, "ok", "", "NOTES"),
+            vec![("/a", "/w1")]
+        );
+        // A hint every window matches decides nothing.
+        assert_eq!(picked(&cache, &roots, "ok", "", "kate").len(), 2);
+        // The hint beats the active window (whose ACTIVE state may be left
+        // over from before `window` raised the other one), and that a
+        // dialog.
+        let mut cache = two_windows("frame", "dialog", &[]);
+        cache.get_mut("/w1").unwrap().states = vec!["active"];
+        assert_eq!(
+            picked(&cache, &roots, "ok", "", "todo"),
+            vec![("/b", "/w2")]
+        );
+        // Without a hint, or one every window matches, the active window
+        // beats the dialog.
+        for hint in ["", "kate"] {
+            assert_eq!(
+                picked(&cache, &roots, "ok", "", hint),
+                vec![("/a", "/w1")],
+                "{hint}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dialog_and_then_the_last_dialog_break_ties_between_windows() {
+        let roots = ["/w1", "/w2"];
+        let cache = two_windows("frame", "dialog", &[]);
+        assert_eq!(picked(&cache, &roots, "ok", "", ""), vec![("/b", "/w2")]);
+        let cache = two_windows("dialog", "frame", &[]);
+        assert_eq!(picked(&cache, &roots, "ok", "", ""), vec![("/a", "/w1")]);
+        // Stacked dialogs: the one listed (opened) last.
+        let cache = two_windows("dialog", "dialog", &[]);
+        assert_eq!(picked(&cache, &roots, "ok", "", ""), vec![("/b", "/w2")]);
+    }
+
+    #[test]
+    fn an_element_one_operates_beats_one_that_only_shows_the_name() {
+        let mut c = Cache::new();
+        c.insert("/w", node("frame", "Win", true, &[], &["/l", "/e", "/s"]));
+        c.insert("/l", node("label", "Ad", true, &[], &[]));
+        c.insert("/e", node("entry", "Ad", true, &["editable"], &[]));
+        c.insert("/s", node("section", "Ad", true, &[], &[]));
+        assert_eq!(picked(&c, &["/w"], "ad", "", ""), vec![("/e", "/w")]);
+        // Without one, they all stay.
+        c.remove("/e");
+        c.get_mut("/w").unwrap().children = vec!["/l", "/s"];
+        assert_eq!(picked(&c, &["/w"], "ad", "", "").len(), 2);
     }
 
     #[test]
@@ -2290,6 +2997,155 @@ mod tests {
         assert_eq!(describe(&named, 10), "[10] section \"Player\"");
     }
 
+    #[test]
+    fn text_leaves_repeating_their_parent_are_left_out() {
+        let mut c = Cache::new();
+        c.insert(
+            "/d",
+            node(
+                "document web",
+                "Page",
+                true,
+                &[],
+                &["/h", "/l", "/bar", "/n", "/s"],
+            ),
+        );
+        c.insert("/h", node("heading", "Ölüm Gemisi", true, &[], &["/hs"]));
+        let mut hs = node("static", "", true, &[], &[]);
+        hs.text = Some("ölüm  gemisi".into());
+        c.insert("/hs", hs);
+        // A link named after its title and duration: the title node goes.
+        c.insert(
+            "/l",
+            node("link", "MIXXY 1 saat 5 dakika", true, &[], &["/ls"]),
+        );
+        c.insert("/ls", node("static", "MIXXY", true, &[], &[]));
+        // A status bar's count, through a nameless panel the walk lifts.
+        let mut bar = node("status bar", "", true, &[], &["/p"]);
+        bar.text = Some("3".into());
+        c.insert("/bar", bar);
+        c.insert("/p", node("panel", "", true, &[], &["/3"]));
+        c.insert("/3", node("static", "3", true, &[], &[]));
+        // A number inside a longer one is not a repeat; nor is a label
+        // with states or actions.
+        c.insert("/n", node("button", "13 mesaj", true, &[], &["/1", "/st"]));
+        c.insert("/1", node("static", "3", true, &[], &[]));
+        c.insert("/st", node("label", "mesaj", true, &["selected"], &[]));
+        c.insert("/s", node("section", "Kanal", true, &[], &["/k"]));
+        c.insert(
+            "/k",
+            with_actions(node("static", "Kanal", true, &[], &[]), &["jump"]),
+        );
+        let got: Vec<&str> = walked(&c, &["/d"], &opts(300))
+            .iter()
+            .map(|l| l.1)
+            .collect();
+        assert_eq!(
+            got,
+            vec!["/d", "/h", "/l", "/bar", "/n", "/1", "/st", "/s", "/k"]
+        );
+        // find lists the parent alone when both match.
+        assert_eq!(find(&c, &["/d"], "ölüm", "", 10).unwrap(), vec!["/h"]);
+        assert_eq!(find(&c, &["/d"], "mixxy", "", 10).unwrap(), vec!["/l"]);
+        // Asked for by role, the text node is what was asked for.
+        assert_eq!(
+            find(&c, &["/d"], "mixxy", "static", 10).unwrap(),
+            vec!["/ls"]
+        );
+        // A title parent ranks below other hits: its text node stays.
+        let mut c = Cache::new();
+        c.insert("/t", node("page tab", "Tümü", true, &[], &["/ts"]));
+        c.insert("/ts", node("static", "Tümü", true, &[], &[]));
+        assert_eq!(
+            find(&c, &["/t"], "tümü", "", 10).unwrap(),
+            vec!["/ts", "/t"]
+        );
+    }
+
+    #[test]
+    fn chromium_context_menus_and_do_default_do_not_bloat_the_tree() {
+        let mut c = Cache::new();
+        let chrome = |n: Info<&'static str>, a: &[&str]| {
+            let mut a = a.to_vec();
+            a.push("showContextMenu");
+            with_actions(n, &a)
+        };
+        c.insert(
+            "/f",
+            chrome(node("frame", "App", true, &[], &["/p1"]), &["doDefault"]),
+        );
+        c.insert(
+            "/p1",
+            chrome(node("panel", "", true, &[], &["/p2"]), &["doDefault"]),
+        );
+        c.insert(
+            "/p2",
+            chrome(node("panel", "", true, &[], &["/d"]), &["doDefault"]),
+        );
+        c.insert(
+            "/d",
+            chrome(
+                node("document web", "Chat", true, &[], &["/s", "/b"]),
+                &["doDefault"],
+            ),
+        );
+        c.insert("/s", chrome(node("section", "", true, &[], &["/t"]), &[]));
+        c.insert(
+            "/t",
+            chrome(
+                node("toggle button", "Kanallar", true, &[], &[]),
+                &["check"],
+            ),
+        );
+        c.insert(
+            "/b",
+            chrome(node("button", "Menü", true, &[], &[]), &["press"]),
+        );
+        // Nameless sections are boring on Linux too.
+        let o = WalkOpts {
+            boring_roles: &["filler", "panel", "section"],
+            ..opts(300)
+        };
+        assert_eq!(
+            walked(&c, &["/f"], &o),
+            vec![(1, "/f"), (2, "/d"), (3, "/t"), (3, "/b")]
+        );
+        assert_eq!(describe(&c["/f"], 1), "[1] frame \"App\"");
+        assert_eq!(describe(&c["/d"], 2), "[2] document web \"Chat\"");
+        assert_eq!(
+            describe(&c["/t"], 3),
+            "[3] toggle button \"Kanallar\" actions=check"
+        );
+        assert_eq!(describe(&c["/b"], 4), "[4] button \"Menü\"");
+    }
+
+    #[test]
+    fn focus_lines_leave_out_the_focused_state() {
+        let n = node("entry", "To", true, &["focused", "editable"], &[]);
+        assert_eq!(describe_focused(&n, 3), "[3] entry \"To\" {editable}");
+        assert_eq!(describe(&n, 3), "[3] entry \"To\" {focused,editable}");
+        let only = node("document web", "Page", true, &["focused"], &[]);
+        assert_eq!(describe_focused(&only, 4), "[4] document web \"Page\"");
+    }
+
+    #[test]
+    fn long_titles_are_cut_in_notes() {
+        assert_eq!(short_title("Kate"), "'Kate'");
+        let long = "x".repeat(100);
+        assert_eq!(short_title(&long), format!("'{}'…", "x".repeat(80)));
+        // The quoted part of a cut title is a substring of it, so it can
+        // be passed back as `window`.
+        let title = format!("{} — Mozilla Firefox", "Jahrein ChatGPT ".repeat(6));
+        let note = short_title(&title);
+        let quoted = note.strip_suffix('…').unwrap();
+        let quoted = &quoted[1..quoted.len() - 1];
+        assert!(title.to_lowercase().contains(&quoted.to_lowercase()));
+        assert_eq!(
+            short_title(&"ı".repeat(80)),
+            format!("'{}'", "ı".repeat(80))
+        );
+    }
+
     /// (depth, id) of the walk's node lines.
     fn walked(
         cache: &Cache<&'static str>,
@@ -2539,6 +3395,70 @@ mod tests {
     }
 
     #[test]
+    fn chromium_text_leaves_its_text_already_holds_are_read_once() {
+        let mut c = Cache::new();
+        let mut row = node("section", "", true, &[], &["/name", "/time"]);
+        // Chromium puts its text leaves' words in the parent's text.
+        row.text = Some("Arda Atlı 03:05".into());
+        c.insert("/row", row);
+        let mut name = node("static", "", true, &[], &[]);
+        name.text = Some("Arda Atlı".into());
+        c.insert("/name", name);
+        c.insert("/time", node("static", "03:05", true, &[], &[]));
+        assert_eq!(
+            container_text(&c, &"/row", 1000).unwrap(),
+            "Arda Atlı 03:05"
+        );
+        // A leaf the text does not hold is still read.
+        c.get_mut("/time").unwrap().name = "04:10".into();
+        assert_eq!(
+            container_text(&c, &"/row", 1000).unwrap(),
+            "Arda Atlı 03:05 04:10"
+        );
+    }
+
+    #[test]
+    fn chromium_objects_take_the_embedded_characters_text_leaves_do_not() {
+        // Chromium: the leaves' words are in the row's text, the avatar is
+        // the one U+FFFC.
+        let mut c = Cache::new();
+        c.insert(
+            "/row",
+            texted(
+                "section",
+                "",
+                Some("Arda Atl\u{FFFC}03:05"),
+                &["/name", "/img", "/time"],
+            ),
+        );
+        c.insert("/name", texted("static", "", Some("Arda Atl"), &[]));
+        c.insert("/img", node("image", "avatar", true, &[], &[]));
+        c.insert("/time", texted("static", "", Some("03:05"), &[]));
+        assert_eq!(
+            container_text(&c, &"/row", 1000).unwrap(),
+            "Arda Atl avatar 03:05"
+        );
+        // Firefox: one U+FFFC per child, a label among them; its words
+        // appearing in the text elsewhere do not move the others.
+        let mut c = Cache::new();
+        c.insert(
+            "/p",
+            texted(
+                "paragraph",
+                "",
+                Some("Pass \u{FFFC} \u{FFFC}"),
+                &["/l", "/e"],
+            ),
+        );
+        c.insert("/l", texted("label", "", Some("Pass"), &[]));
+        c.insert("/e", texted("entry", "", Some("secret-ish"), &[]));
+        assert_eq!(
+            container_text(&c, &"/p", 1000).unwrap(),
+            "Pass Pass secret-ish"
+        );
+    }
+
+    #[test]
     fn container_text_reports_missing_nodes() {
         let mut cache = page_text();
         cache.remove("/a");
@@ -2705,5 +3625,135 @@ mod tests {
         let mut hidden = sample();
         hidden.get_mut("/h").unwrap().name = "other".into();
         assert_eq!(fp, fingerprint(&hidden, &["/w"]));
+    }
+
+    #[test]
+    fn dialog_buttons_named_button_are_listed() {
+        // Kate's save prompt (Qt 6): "button" roles in a panel, a hidden tree.
+        let mut c = Cache::new();
+        c.insert(
+            "/d",
+            node("dialog", "Close — Kate", true, &[], &["/l", "/t", "/p"]),
+        );
+        c.insert("/l", node("label", "Save changes?", true, &[], &[]));
+        c.insert("/t", node("tree", "", false, &[], &[]));
+        c.insert("/p", node("panel", "", true, &[], &["/s", "/x", "/c"]));
+        c.insert("/s", node("button", "Save", true, &[], &[]));
+        c.insert("/x", node("button", "Discard", true, &[], &[]));
+        c.insert("/c", node("button", "Cancel", true, &[], &[]));
+        let (l, _) = surface_entries(&c, &"/d", Surface::Dialog);
+        assert_eq!(l.entries, vec!["/s", "/x", "/c"]);
+        assert_eq!(l.message.as_deref(), Some("Save changes?"));
+    }
+
+    #[test]
+    fn surface_entries_skip_hidden_and_submenus_and_put_buttons_first() {
+        let mut c = Cache::new();
+        c.insert(
+            "/m",
+            node("popup menu", "", true, &[], &["/a", "/sep", "/sub", "/h"]),
+        );
+        c.insert("/a", node("menu item", "&Copy", true, &[], &[]));
+        c.insert("/sep", node("separator", "", true, &[], &[]));
+        c.insert("/sub", node("menu", "More", true, &[], &["/inner"]));
+        c.insert("/h", node("menu item", "Hidden", false, &[], &[]));
+        let (l, missing) = surface_entries(&c, &"/m", Surface::Menu);
+        assert_eq!(l.entries, vec!["/a", "/sub"]);
+        assert!(missing.is_empty());
+        c.insert(
+            "/d",
+            node("dialog", "Quit?", true, &[], &["/q", "/f", "/box"]),
+        );
+        c.insert("/q", node("label", "Really quit?", true, &[], &[]));
+        c.insert("/f", node("check box", "Don't ask again", true, &[], &[]));
+        c.insert("/box", node("panel", "", true, &[], &["/ok", "/no"]));
+        c.insert("/ok", node("push button", "Quit", true, &[], &[]));
+        let (l, missing) = surface_entries(&c, &"/d", Surface::Dialog);
+        assert_eq!(l.entries, vec!["/ok", "/f"]);
+        assert_eq!(l.message.as_deref(), Some("Really quit?"));
+        assert_eq!(missing, vec!["/no"]);
+    }
+
+    #[test]
+    fn a_dialogs_last_button_group_comes_first_and_views_are_not_looked_into() {
+        let mut c = Cache::new();
+        c.insert(
+            "/d",
+            node(
+                "dialog",
+                "Open File",
+                true,
+                &[],
+                &["/tb", "/crumbs", "/files", "/name", "/box"],
+            ),
+        );
+        c.insert("/tb", node("tool bar", "", true, &[], &["/back"]));
+        c.insert("/crumbs", node("panel", "", true, &[], &["/home", "/docs"]));
+        c.insert("/home", node("push button", "home", true, &[], &[]));
+        c.insert("/docs", node("push button", "docs", true, &[], &[]));
+        c.insert("/files", node("list", "", true, &[], &["/f1", "/f2"]));
+        c.insert("/name", node("text", "", true, &["editable"], &[]));
+        c.insert("/box", node("panel", "", true, &[], &["/open", "/cancel"]));
+        c.insert("/open", node("push button", "Open", true, &[], &[]));
+        c.insert("/cancel", node("push button", "Cancel", true, &[], &[]));
+        let (l, missing) = surface_entries(&c, &"/d", Surface::Dialog);
+        // The tool bar's and the list's children are neither entries nor
+        // missing: not read.
+        assert!(missing.is_empty(), "{missing:?}");
+        assert_eq!(
+            l.entries,
+            vec!["/open", "/cancel", "/home", "/docs", "/name"]
+        );
+        assert!(l.views && l.maybe_file_dialog(&c[&"/d"]));
+        // Without a view, no file dialog; one button group keeps its order.
+        c.get_mut("/d").unwrap().children = vec!["/box"];
+        let (l, _) = surface_entries(&c, &"/d", Surface::Dialog);
+        assert_eq!(l.entries, vec!["/open", "/cancel"]);
+        assert!(!l.maybe_file_dialog(&c[&"/d"]));
+        let chooser = node("file chooser", "Open", true, &[], &[]);
+        assert!(l.maybe_file_dialog(&chooser));
+        assert_eq!(
+            file_dialog_line(&c[&"/d"]),
+            "file dialog 'Open File' (use file_dialog)"
+        );
+    }
+
+    #[test]
+    fn a_surface_line_names_roles_once_and_is_capped() {
+        let root = node("popup menu", "", true, &[], &[]);
+        let items: Vec<Info<&str>> = (0..20)
+            .map(|i| node("menu item", &format!("Entry {i}"), true, &[], &[]))
+            .collect();
+        let entries: Vec<(u64, &Info<&str>)> = items
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (i as u64 + 1, n))
+            .collect();
+        let line = surface_line(&root, Surface::Menu, None, &entries);
+        assert!(
+            line.starts_with("popup menu (20 entries): [1] \"Entry 0\" [2] \"Entry 1\""),
+            "{line}"
+        );
+        assert!(line.ends_with("[12] \"Entry 11\" … +8 more"), "{line}");
+        let long: Vec<Info<&str>> = (0..10)
+            .map(|i| {
+                node(
+                    "push button",
+                    &format!("{i}{}", "x".repeat(200)),
+                    true,
+                    &[],
+                    &[],
+                )
+            })
+            .collect();
+        let entries: Vec<(u64, &Info<&str>)> = long.iter().map(|n| (1, n)).collect();
+        let dialog = node("alert", "Error", true, &[], &[]);
+        let line = surface_line(&dialog, Surface::Dialog, Some("Disk full"), &entries);
+        assert!(
+            line.starts_with("alert 'Error': \"Disk full\" [1] push button \"0x"),
+            "{line}"
+        );
+        assert!(line.chars().count() < SURFACE_CHARS + 40, "{line}");
+        assert!(line.ends_with("more"), "{line}");
     }
 }
