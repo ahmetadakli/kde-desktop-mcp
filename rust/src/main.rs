@@ -2833,11 +2833,20 @@ impl<B: Backend> Server<B> {
             return Err("element has no actions; try click, or focus + key".into());
         }
         // Chromium lists showContextMenu on every element: never the
-        // default while there is another action.
+        // default. Tree and find do not show it, so an element with nothing
+        // else looks plain there; opening its context menu instead (a chat
+        // row's Archive / Delete) would surprise.
         let mut idx = names
             .iter()
             .position(|n| !n.eq_ignore_ascii_case("showcontextmenu"))
-            .unwrap_or(0);
+            .unwrap_or(usize::MAX);
+        if action.is_empty() && idx == usize::MAX {
+            return Err(
+                "element has no default action (only showContextMenu); use click, \
+                 or act with action=showContextMenu"
+                    .into(),
+            );
+        }
         if !action.is_empty() {
             let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
             idx = lowered
@@ -6778,6 +6787,36 @@ mod tests {
                 "{r}"
             );
             assert_eq!(actions_run(&s), 1);
+        });
+    }
+
+    #[test]
+    fn act_never_opens_a_context_menu_by_default() {
+        local(async {
+            let mut s = session("ctx-menu");
+            let id = focus_id(&mut s, 2).await;
+            s.focus.borrow_mut().actions = vec!["showContextMenu".into()];
+            let r = call_tool(&mut s, 3, "act", json!({"id": id})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains("no default action (only showContextMenu)"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0);
+            // Asked for by name, it runs.
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"id": id, "action": "showContextMenu"}),
+            )
+            .await;
+            assert!(reply_text(&r).starts_with("showContextMenu -> ok"), "{r}");
+            // Another action is the default, wherever it is listed.
+            s.focus.borrow_mut().actions = vec!["showContextMenu".into(), "doDefault".into()];
+            let r = call_tool(&mut s, 5, "act", json!({"id": id})).await;
+            assert!(reply_text(&r).starts_with("doDefault -> ok"), "{r}");
+            assert!(s.keys.borrow().last().unwrap().starts_with("action 1 on "));
         });
     }
 

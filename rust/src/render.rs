@@ -199,13 +199,14 @@ fn short_name<Id>(info: &Info<Id>) -> String {
 
 /// A window title in a status note ("now: active window '…'", "activated
 /// '…'"): quoted as `py_repr` does, cut at 80 characters like element
-/// names; the window's app is named beside it where it matters.
+/// names (a cut one ends `'…`); the window's app is named beside it where
+/// it matters.
 pub fn short_title(title: &str) -> String {
-    let mut t = first_chars(title, 80);
-    if t.len() < title.len() {
-        t.push('…');
-    }
-    py_repr(&t)
+    let t = first_chars(title, 80);
+    // The mark goes outside the quotes, so the quoted part can be passed
+    // back as `window`, which matches a substring of the title.
+    let cut = if t.len() < title.len() { "…" } else { "" };
+    format!("{}{cut}", py_repr(&t))
 }
 
 /// `role "name"` as `describe` shows it, for messages about an element.
@@ -1384,30 +1385,54 @@ fn read_into<Id: Clone + Eq + Hash>(
     };
     match info.text.as_deref() {
         Some(text) if !text.is_empty() => {
-            let mut after_child = false;
-            for ch in text.chars() {
-                if ch == EMBEDDED_OBJECT {
-                    if let Some(id) = kids.next() {
-                        child(out, id, after_child);
-                    }
-                    after_child = true;
-                } else {
-                    out.push(ch);
-                    after_child = false;
-                }
-            }
-            // Children the text did not place: it was cut at the limit, or
-            // (Chromium) it holds their words itself. A text leaf whose
-            // words the text already gave is not read twice.
+            // Chromium writes its text leaves' words into the parent's text
+            // and gives only the other children a U+FFFC; Firefox gives
+            // every child one. A text leaf whose words the text already
+            // holds is not read again, and takes no U+FFFC while there are
+            // fewer of them than children (a row's name, avatar and time
+            // read "Arda ￼03:05": the U+FFFC is the avatar's).
             let folded = fold(text);
-            for id in kids {
-                let given = cache.get(id).is_some_and(|k| {
+            let given = |id: &Id| {
+                cache.get(id).is_some_and(|k| {
                     k.children.is_empty() && LABEL_ROLES.contains(&k.role.as_str()) && {
                         let own = fold(k.text.as_deref().unwrap_or(&k.name));
                         !own.is_empty() && folded.contains(&own)
                     }
-                });
-                if !given {
+                })
+            };
+            let inline =
+                text.chars().filter(|&c| c == EMBEDDED_OBJECT).count() < info.children.len();
+            // An object read as its name (an image's alt text) is a word of
+            // its own, even where the text has no space around it.
+            let name_only = |id: &Id| {
+                cache.get(id).is_some_and(|k| {
+                    k.children.is_empty() && k.text.as_deref().is_none_or(str::is_empty)
+                })
+            };
+            let word_end = |out: &String| out.ends_with(char::is_alphanumeric);
+            let (mut after_child, mut pad) = (false, false);
+            for ch in text.chars() {
+                if ch == EMBEDDED_OBJECT {
+                    if let Some(id) = kids.by_ref().find(|id| !(inline && given(id))) {
+                        pad = name_only(id);
+                        if pad && word_end(out) {
+                            out.push(' ');
+                        }
+                        child(out, id, after_child);
+                    }
+                    after_child = true;
+                } else {
+                    if pad && ch.is_alphanumeric() && word_end(out) {
+                        out.push(' ');
+                    }
+                    out.push(ch);
+                    (after_child, pad) = (false, false);
+                }
+            }
+            // Children the text did not place: it was cut at the limit, or
+            // (Chromium) it holds their words itself.
+            for id in kids {
+                if !given(id) {
                     child(out, id, true);
                 }
             }
@@ -2530,7 +2555,14 @@ mod tests {
     fn long_titles_are_cut_in_notes() {
         assert_eq!(short_title("Kate"), "'Kate'");
         let long = "x".repeat(100);
-        assert_eq!(short_title(&long), format!("'{}…'", "x".repeat(80)));
+        assert_eq!(short_title(&long), format!("'{}'…", "x".repeat(80)));
+        // The quoted part of a cut title is a substring of it, so it can
+        // be passed back as `window`.
+        let title = format!("{} — Mozilla Firefox", "Jahrein ChatGPT ".repeat(6));
+        let note = short_title(&title);
+        let quoted = note.strip_suffix('…').unwrap();
+        let quoted = &quoted[1..quoted.len() - 1];
+        assert!(title.to_lowercase().contains(&quoted.to_lowercase()));
         assert_eq!(
             short_title(&"ı".repeat(80)),
             format!("'{}'", "ı".repeat(80))
@@ -2805,6 +2837,47 @@ mod tests {
         assert_eq!(
             container_text(&c, &"/row", 1000).unwrap(),
             "Arda Atlı 03:05 04:10"
+        );
+    }
+
+    #[test]
+    fn chromium_objects_take_the_embedded_characters_text_leaves_do_not() {
+        // Chromium: the leaves' words are in the row's text, the avatar is
+        // the one U+FFFC.
+        let mut c = Cache::new();
+        c.insert(
+            "/row",
+            texted(
+                "section",
+                "",
+                Some("Arda Atl\u{FFFC}03:05"),
+                &["/name", "/img", "/time"],
+            ),
+        );
+        c.insert("/name", texted("static", "", Some("Arda Atl"), &[]));
+        c.insert("/img", node("image", "avatar", true, &[], &[]));
+        c.insert("/time", texted("static", "", Some("03:05"), &[]));
+        assert_eq!(
+            container_text(&c, &"/row", 1000).unwrap(),
+            "Arda Atl avatar 03:05"
+        );
+        // Firefox: one U+FFFC per child, a label among them; its words
+        // appearing in the text elsewhere do not move the others.
+        let mut c = Cache::new();
+        c.insert(
+            "/p",
+            texted(
+                "paragraph",
+                "",
+                Some("Pass \u{FFFC} \u{FFFC}"),
+                &["/l", "/e"],
+            ),
+        );
+        c.insert("/l", texted("label", "", Some("Pass"), &[]));
+        c.insert("/e", texted("entry", "", Some("secret-ish"), &[]));
+        assert_eq!(
+            container_text(&c, &"/p", 1000).unwrap(),
+            "Pass Pass secret-ish"
         );
     }
 

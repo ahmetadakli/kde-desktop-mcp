@@ -73,8 +73,10 @@ Why it is fast:
   panels and pages counts as implied: it no longer keeps nameless panels as
   lines. A Ferdium (WhatsApp) tree went from 19,906 characters, cut at 300
   nodes behind six nested panels, to 7,759 for the whole window; with
-  `interactive: true` from 19,924 to 2,059. `act` without `action` never
-  picks `showContextMenu` while the element has another action.
+  `interactive: true` from 19,924 to 2,586, the chat list's rows included
+  (see below). `act` without `action` never picks `showContextMenu`: an
+  element with no other action is an error that says to use `click`, or
+  `action: "showContextMenu"` when the menu is what is wanted.
 - Actions a role implies are left out (a link's jump, a button's press, a
   tab's switch, a web section's click); a button or link without any says
   `actions=none`. Nameless, text-free wrappers (landmarks, forms, scroll panes)
@@ -87,7 +89,10 @@ Why it is fast:
   with `role`, it is listed. A YouTube page's `tree(document=true)` went
   from 3,792 to 3,327 characters. `get_text` in Chromium no longer reads
   such leaves a second time after the text of the element that holds them
-  (a WhatsApp page: 3,035 instead of 5,010 characters, the same text).
+  (a WhatsApp page: 3,035 instead of 5,010 characters, the same text), and
+  the U+FFFC in a container's text goes to the child object it stands for
+  (an avatar, an emoji image) rather than to a text leaf whose words the
+  text already holds.
 - On Linux, a `find`, `tree` of an app, or element picked by `app` + `query`
   reuses the app's tree read by an earlier call while the app provably did not
   change: it sent no AT-SPI change event since (children, name, text, any
@@ -195,7 +200,9 @@ tool; `off` turns it off). Not available on Windows yet.
   get_text with offset=N reads on`. Whole web pages used to come back as
   20,000 characters while the part wanted was near the top.
 - Large trees: `tree(interactive: true)` lists only elements one can operate
-  (actions, editable/checkable/selectable/expandable) under their nearest
+  (actions, editable/checkable/selectable/expandable, and on Linux focusable
+  named table rows, cells, list and tree items: a web app's chat list whose
+  rows say only `clickAncestor`/`showContextMenu`) under their nearest
   named ancestor; on a GitHub issues page in Firefox it was 15,339 instead of
   24,687 characters and still listed all 259 links, buttons and fields. A
   reply is capped at `max_chars` (default 20,000) and `max_nodes`; a cut one
@@ -259,8 +266,9 @@ tool; `off` turns it off). Not available on Windows yet.
   ends with `now: active window '<title>' [app]; focus: <element>`, so the
   next call needs no screenshot to see why. Titles in such notes
   (`now:`, `activated '…'`, `active window now '…'`) are cut at 80
-  characters like element names, and a focus line leaves out the `focused`
-  state. Not for refusals by the
+  characters like element names, with the `…` after the closing quote so the
+  quoted part still works as `window`, and a focus line leaves out the
+  `focused` state. Not for refusals by the
   allowlist, confirmations or the user taking over. A miss by `query` also
   lists off-screen matches or the closest names with ids (see `find`).
 - Stale ids: every use of an `id` reads the element's role and name again (one
