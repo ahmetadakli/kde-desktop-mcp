@@ -90,13 +90,14 @@ Controls GUI apps on the user's desktop (KDE Plasma, Hyprland, Windows) through 
 accessibility tree, with real keyboard and mouse input.
 
 Workflow:
-- apps lists running apps, marking the allowed ones. find (app + query) locates elements; \
-act, click, focus, get_text, set_text and scroll take the target themselves, so find-and-act \
-is one call. tree shows structure; find is cheaper.
-- Target: `id` from tree/find, or `app` + `query` (+ `role`): the first visible element named \
-`query` (case-insensitive) wins, else the first whose name or text contains it. \
-Titles (window, tab, page) count only when nothing else does or `role` names them. The \
-reply starts with the element picked. A miss lists near or off-screen matches with ids.
+- apps lists running apps (allowed ones marked). find (app + query) locates elements; \
+act, click, focus, get_text, set_text and scroll take the target themselves. tree shows \
+structure; find is cheaper.
+- Target: `id` from tree/find, or `app` + `query` (+ `role`): a visible element named \
+`query` (case-insensitive), else one whose name or text has it; titles (window, tab, page) \
+only if nothing else does or `role` names them. Ties favor the active window, a dialog, an \
+operable element; input tools refuse other ties, listing ids. The reply starts with \
+the element picked; a miss lists near or off-screen matches.
 - batch runs steps in one call; with if, on_fail, repeat and stop_if (see batch) a small \
 procedure fits in one. Mark waits \"optional\": true and end with an observation step, or \
 give the last input `observe`. A later step's `id`/`*_id` may be \"$N\": the element step \
@@ -113,7 +114,7 @@ stop and ask them; once they agree, a standalone activate_window call resumes in
 that appears or goes away (gone=true), a state or a window; never as a sleep. \
 tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
-view after the input settled, instead of a separate look. Failures end with the active \
+view, instead of a separate look. Failures end with the active \
 window and focus.
 - menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
 - screenshot is a last resort (the image comes inline). To click something seen \
@@ -126,7 +127,7 @@ confirm: true only if they agree. Password fields are never read, and filled in 
 user allowed it. Errors name the file; changing it is the user's decision. When tools fail \
 as if the setup were broken (AT-SPI, virtual input, KWin, screenshots), run doctor.
 
-Clients loading schemas on demand: load the common ones in one search: batch, find, \
+Clients loading schemas on demand: load these in one search: batch, find, \
 act, activate_window, key, type_text, wait_for, wait_idle, screenshot, apps.";
 
 /// Tools Claude Code loads with the session instead of deferring them
@@ -152,7 +153,8 @@ const CONFIRM: &str =
 
 /// Shared by the tools that take a target; the matching rules are in
 /// INSTRUCTIONS.
-const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`); rules in the server instructions.";
+const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`); rules in the server instructions. \
+A tie left after them: input tools list the candidates' ids and send nothing; get_text reads the first.";
 
 /// The `batch` description, before its examples (BATCH_EXAMPLES).
 const BATCH_DESCRIPTION: &str = "Run tool calls in order in one round trip; prefer it whenever later steps

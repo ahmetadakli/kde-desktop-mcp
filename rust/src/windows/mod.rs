@@ -19,7 +19,7 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, SetProcessDpiAwarenessContext,
 };
 
-use crate::backend::{Activated, AppEntry, Backend, Cache, Info, R, Shot, WindowEntry};
+use crate::backend::{Activated, AppEntry, Backend, Cache, Info, NO_AREA, R, Shot, WindowEntry};
 use logic::Props;
 use uia::{Elem, Uia};
 
@@ -310,7 +310,7 @@ impl Backend for WindowsBackend {
         self.uia
             .bounds(&id.el)
             .and_then(|(l, t, r, b)| logic::center(l, t, r, b))
-            .ok_or_else(|| "element has no on-screen area".into())
+            .ok_or_else(|| NO_AREA.into())
     }
 
     fn check_combo(&self, combo: &str) -> R<()> {

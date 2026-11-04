@@ -48,17 +48,23 @@ const TREE_MAX_CHARS: i64 = 20_000;
 const CONTINUATION_CHARS: usize = 150;
 /// Nodes fetched ahead when rendering reaches an unfetched part of the tree.
 const PREFETCH_MORE: usize = 500;
+/// Candidates an ambiguous target lists (`Server::untie`).
+const AMBIGUOUS_SHOWN: usize = 6;
+/// Candidates of an ambiguous target measured for an on-screen area at
+/// most (`Server::untie`): more are refused as they are, as dropping the
+/// ones without would rarely leave one.
+const AREA_CHECK_MAX: usize = 2 * AMBIGUOUS_SHOWN;
 /// Off-screen matches or close names a missed search offers.
 const MISS_SUGGESTIONS: usize = 5;
 /// Nodes of a web page fetched when looking for matches scrolled out of
 /// view (see `Server::miss_report`).
 const OFFSCREEN_FETCH: usize = 3000;
 
-/// What `Server::locate` found: the element, or the windows searched; with
+/// What `Server::locate` found: the matches, or the windows searched; with
 /// the nodes fetched.
 enum Located<Id> {
-    /// The element, the nodes read, and whether they came from a kept read.
-    Found(Id, Cache<Id>, bool),
+    /// The matches, the nodes read, and whether they came from a kept read.
+    Found(render::Matches<Id>, Cache<Id>, bool),
     /// The windows searched and the nodes read there.
     Missed(Vec<Id>, Cache<Id>),
 }
@@ -1983,7 +1989,8 @@ impl<B: Backend> Server<B> {
         (out, cache, cached)
     }
 
-    /// Fetch the visible part of `app` and pick the element `query` names;
+    /// Fetch the visible part of `app` and find the elements `query` names
+    /// (render::locate_all; `window` the tool's window argument or "");
     /// window and tab titles only with `titles` (see render::TITLE_ROLES).
     /// `kept`: a kept read of `app` may serve. The cache holds no action
     /// names: `fill_actions` before describing.
@@ -1994,6 +2001,7 @@ impl<B: Backend> Server<B> {
         role: &str,
         titles: bool,
         kept: bool,
+        window: &str,
     ) -> R<Located<B::Id>> {
         let windows = trace::time("app_windows", self.app_windows(app)).await?;
         let app = app.to_lowercase();
@@ -2004,16 +2012,17 @@ impl<B: Backend> Server<B> {
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::locate(c, &windows, query, role, titles),
+                |c| render::locate_all(c, &windows, query, role, titles, window),
             )
             .await;
         Ok(match found {
-            Some(id) => Located::Found(id, cache, cached),
+            Some(m) => Located::Found(m, cache, cached),
             None => Located::Missed(windows, cache),
         })
     }
 
-    /// `locate` in the app windows `windows`, read afresh.
+    /// `locate` in the app windows `windows`, read afresh: the first
+    /// element picked (a read takes the first of a tie).
     async fn locate_in(
         &self,
         windows: Vec<B::Id>,
@@ -2028,10 +2037,10 @@ impl<B: Backend> Server<B> {
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::locate(c, &windows, query, role, titles),
+                |c| render::locate_all(c, &windows, query, role, titles, ""),
             )
             .await;
-        found.map(|id| (id, cache))
+        found.map(|m| (m.first().clone(), cache))
     }
 
     /// What to offer when nothing visible in `windows` matches `query`:
@@ -2082,20 +2091,108 @@ impl<B: Backend> Server<B> {
         format!("; closest:\n{text}")
     }
 
-    /// The element a tool call names: `id`, or `app` + `query` (+ `role`).
-    /// The tool's tier (and confirmation, `permit`) is checked against the
-    /// element's app before anything is looked up there.
-    async fn target(&self, a: &Json) -> R<Target<B::Id>> {
-        Ok(self.target_and_center(a, false).await?.0)
+    /// For an input tool's query that names several elements (`m`, from
+    /// one fresh read in `cache`): when some have an on-screen area and
+    /// others none (a collapsed menu's entries), the ones without are left
+    /// out (up to AREA_CHECK_MAX candidates, in front or not), and one left
+    /// is the target. Else the refusal, listing the candidates with ids,
+    /// actions and (when their window is in front) where they are: nothing
+    /// is sent.
+    async fn untie(
+        &self,
+        m: &mut render::Matches<B::Id>,
+        cache: &mut Cache<B::Id>,
+        app: &str,
+        query: &str,
+        role: &str,
+    ) -> R<()> {
+        if m.picked.len() <= AREA_CHECK_MAX {
+            let ids: Vec<B::Id> = m.picked.iter().map(|(id, _)| id.clone()).collect();
+            let area = trace::time("has_area", self.b.has_area(&ids)).await;
+            let no_area = |a: &Option<bool>| *a == Some(false);
+            if area.iter().any(|a| !no_area(a)) {
+                let mut keep = area.iter().map(|a| !no_area(a));
+                m.picked.retain(|_| keep.next().unwrap_or(true));
+            }
+        }
+        if m.picked.len() == 1 {
+            return Ok(());
+        }
+        // Only the lines shown: their actions (the read has none) and
+        // positions, together.
+        let shown: Vec<(B::Id, B::Id)> = m.picked.iter().take(AMBIGUOUS_SHOWN).cloned().collect();
+        let shown_ids: Vec<B::Id> = shown.iter().map(|(id, _)| id.clone()).collect();
+        let ((), centers) = tokio::join!(
+            trace::time("fill_actions", self.b.fill_actions(cache, &shown_ids)),
+            trace::time("element_centers", self.b.element_centers_in(&shown))
+        );
+        let app_key = app.to_lowercase();
+        let mut windows: Vec<&B::Id> = m.picked.iter().map(|(_, w)| w).collect();
+        windows.dedup();
+        let several = windows.len() > 1;
+        let mut lines = Vec::new();
+        for ((id, w), c) in shown.iter().zip(&centers) {
+            let rid = self.add_ref(id, &cache[id], &app_key).await;
+            let mut line = render::describe(&cache[id], rid);
+            if let Ok((x, y)) = c {
+                line.push_str(&format!(" at {x},{y}"));
+            }
+            if several && let Some(info) = cache.get(w) {
+                line.push_str(&format!(" in {}", render::py_repr(&info.name)));
+                if render::is_dialog(info) {
+                    line.push_str(" (dialog)");
+                }
+            }
+            lines.push(line);
+        }
+        let n = m.picked.len();
+        if n > AMBIGUOUS_SHOWN {
+            lines.push(format!("… {} more", n - AMBIGUOUS_SHOWN));
+        }
+        let with_role = if role.is_empty() {
+            String::new()
+        } else {
+            format!(" with role '{role}'")
+        };
+        let first_role = &cache[&m.picked[0].0].role;
+        let roles_differ = m.picked.iter().any(|(id, _)| &cache[id].role != first_role);
+        let narrow = match (several, roles_differ) {
+            (true, _) => "pass one id, or window= its title",
+            (false, true) => "pass one id, or role",
+            (false, false) => "pass one id",
+        };
+        // A refusal: nothing was sent, and the candidates say what to pass
+        // (no on_fail, no "now:" line).
+        Err(refusal(format!(
+            "ambiguous: {n} elements in '{app}' match '{query}'{with_role}; nothing sent. \
+             {narrow}:\n{}",
+            lines.join("\n")
+        )))
     }
 
-    /// `target`, and with `center` the element's centre when it was cheap
-    /// to measure alongside the last lookups (found by query); None then
-    /// to measure it after.
+    /// The element an input tool names: `id`, or `app` + `query` (+
+    /// `role`). The tool's tier (and confirmation, `permit`) is checked
+    /// against the element's app before anything is looked up there. A
+    /// query that names several elements equally well, after the
+    /// tie-breaks (render::locate_all), is refused with the candidates.
+    async fn target(&self, a: &Json) -> R<Target<B::Id>> {
+        Ok(self.target_and_center(a, false, true).await?.0)
+    }
+
+    /// `target` for a read tool: of several elements a query names equally
+    /// well it takes the first, and says so.
+    async fn read_target(&self, a: &Json) -> R<Target<B::Id>> {
+        Ok(self.target_and_center(a, false, false).await?.0)
+    }
+
+    /// `target` (`input`) or `read_target`, and with `center` the element's
+    /// centre when it was cheap to measure alongside the last lookups
+    /// (found by query); None then to measure it after.
     async fn target_and_center(
         &self,
         a: &Json,
         center: bool,
+        input: bool,
     ) -> R<(Target<B::Id>, Option<R<(i32, i32)>>)> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
             let r = trace::time("resolve_ref", self.resolve_ref(rid)).await?;
@@ -2121,12 +2218,14 @@ impl<B: Backend> Server<B> {
         trace::time("permit", self.permit(app)).await?;
         trace::time("enable", self.b.enable()).await;
         let role = arg_s(a, "role", "");
+        let window = a.get("window").and_then(Json::as_str).unwrap_or("");
         let app_key = app.to_lowercase();
         let mut kept = true;
-        let (id, cache, at) = loop {
-            let located = trace::time("locate", self.locate(app, query, &role, true, kept)).await?;
-            let (id, mut cache, cached) = match located {
-                Located::Found(id, cache, cached) => (id, cache, cached),
+        let (id, cache, at, ties) = loop {
+            let located = self.locate(app, query, &role, true, kept, window);
+            let located = trace::time("locate", located).await?;
+            let (mut m, mut cache, cached) = match located {
+                Located::Found(m, cache, cached) => (m, cache, cached),
                 Located::Missed(windows, mut cache) => {
                     let with_role = if role.is_empty() {
                         String::new()
@@ -2141,6 +2240,17 @@ impl<B: Backend> Server<B> {
                     ));
                 }
             };
+            if input && m.picked.len() > 1 {
+                // Candidates come from one read: a kept one is read afresh.
+                if cached {
+                    self.forget_reads(&app_key);
+                    kept = false;
+                    continue;
+                }
+                self.untie(&mut m, &mut cache, app, query, &role).await?;
+            }
+            let ties = m.picked.len();
+            let id = m.first().clone();
             // The window it is in, from the nodes read: no walk up to it.
             let frame = if center { frame_in(&cache, &id) } else { None };
             // An element from a kept read is checked to be still there, in
@@ -2165,7 +2275,7 @@ impl<B: Backend> Server<B> {
                 }
             );
             if there {
-                break (id, cache, at);
+                break (id, cache, at, ties);
             }
             // Gone or hidden without an event: read afresh.
             self.forget_reads(&app_key);
@@ -2173,7 +2283,11 @@ impl<B: Backend> Server<B> {
         };
         let rid = trace::time("add_ref", self.add_ref(&id, &cache[&id], &app_key)).await;
         note_step_element(rid, true);
-        let found = Some(render::describe(&cache[&id], rid));
+        let mut found = render::describe(&cache[&id], rid);
+        if ties > 1 {
+            found.push_str(&format!(" (first of {ties} matches)"));
+        }
+        let found = Some(found);
         let role = cache[&id].role.clone();
         let t = Target {
             id,
@@ -3259,7 +3373,7 @@ impl<B: Backend> Server<B> {
     }
 
     async fn get_text(&self, a: &Json) -> R<String> {
-        let t = self.target(a).await?;
+        let t = self.read_target(a).await?;
         if t.protected() {
             return Err(t.reply("a password field: its text is never read"));
         }
@@ -3603,7 +3717,8 @@ impl<B: Backend> Server<B> {
         let (active, found) = tokio::join!(
             trace::time("require_active_allowed", self.require_active_allowed()),
             async {
-                let (t, center) = trace::time("target", self.target_and_center(a, true)).await?;
+                let target = self.target_and_center(a, true, true);
+                let (t, center) = trace::time("target", target).await?;
                 let center = match center {
                     Some(c) => c,
                     None => trace::time("element_center", self.b.element_center(&t.id)).await,
@@ -5024,6 +5139,13 @@ mod tests {
         /// "down" moves the focus this many ms after the key is released
         /// (as focus events arrive late), when not 0.
         lag: Rc<std::cell::Cell<u64>>,
+        /// Windows of the app after `focus`, by id in `nodes`.
+        more_windows: Rc<RefCell<Vec<u32>>>,
+        /// Elements without an on-screen area.
+        no_area: Rc<RefCell<Vec<u32>>>,
+        /// Elements' windows are not in front: as on KDE and Hyprland,
+        /// `element_center` then fails for every element with an area.
+        background: Rc<std::cell::Cell<bool>>,
     }
 
     /// The fake's change events, for kept reads: off unless a test turns
@@ -5093,7 +5215,11 @@ mod tests {
             }]
         }
         async fn app_windows(&self, app: &str) -> Option<Vec<u32>> {
-            (app == "fake").then(|| vec![FAKE_FOCUS])
+            (app == "fake").then(|| {
+                let mut windows = vec![FAKE_FOCUS];
+                windows.extend(self.more_windows.borrow().iter());
+                windows
+            })
         }
         async fn active_app(&self) -> String {
             self.active.borrow().0.clone()
@@ -5138,6 +5264,28 @@ mod tests {
                 cache.insert(id, info);
             }
         }
+        /// As on Linux, a read without `actions` leaves them out:
+        /// `fill_actions` reads them.
+        async fn prefetch_with(&self, cache: &mut Cache<u32>, roots: Vec<u32>, f: &Fetch) {
+            let read = roots.clone();
+            self.prefetch(cache, roots, f.only_showing, f.text_limit, f.limit)
+                .await;
+            if !f.actions {
+                for id in &read {
+                    if let Some(info) = cache.get_mut(id) {
+                        info.actions.clear();
+                    }
+                }
+            }
+        }
+        async fn fill_actions(&self, cache: &mut Cache<u32>, ids: &[u32]) {
+            for id in ids {
+                let actions = self.actions(id).await;
+                if let Some(info) = cache.get_mut(id) {
+                    info.actions = actions;
+                }
+            }
+        }
         async fn actions(&self, id: &u32) -> Vec<String> {
             self.info(id, 0).await.actions
         }
@@ -5174,8 +5322,18 @@ mod tests {
         async fn try_focus(&self, _: &u32) -> R<Option<String>> {
             Ok(None)
         }
-        async fn element_center(&self, _: &u32) -> R<(i32, i32)> {
+        async fn element_center(&self, id: &u32) -> R<(i32, i32)> {
+            if self.no_area.borrow().contains(id) {
+                return Err(backend::NO_AREA.into());
+            }
+            if self.background.get() {
+                return Err("element's window is not active; call activate_window first".into());
+            }
             Ok((0, 0))
+        }
+        async fn has_area(&self, ids: &[u32]) -> Vec<Option<bool>> {
+            let no_area = self.no_area.borrow();
+            ids.iter().map(|id| Some(!no_area.contains(id))).collect()
         }
         fn check_combo(&self, _: &str) -> R<()> {
             Ok(())
@@ -5364,6 +5522,9 @@ mod tests {
         reads: Rc<FakeReads>,
         reveal: Rc<std::cell::Cell<Option<u32>>>,
         lag: Rc<std::cell::Cell<u64>>,
+        more_windows: Rc<RefCell<Vec<u32>>>,
+        no_area: Rc<RefCell<Vec<u32>>>,
+        background: Rc<std::cell::Cell<bool>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -5395,9 +5556,15 @@ mod tests {
         let reads = Rc::new(FakeReads::default());
         let reveal = Rc::new(std::cell::Cell::new(None));
         let lag = Rc::new(std::cell::Cell::new(0));
+        let more_windows = Rc::new(RefCell::new(Vec::new()));
+        let no_area = Rc::new(RefCell::new(Vec::new()));
+        let background = Rc::new(std::cell::Cell::new(false));
         let server = Rc::new(Server::new(FakeBackend {
             lag: lag.clone(),
             reveal: reveal.clone(),
+            more_windows: more_windows.clone(),
+            no_area: no_area.clone(),
+            background: background.clone(),
             reads: reads.clone(),
             takeover: takeover.clone(),
             allow_file,
@@ -5425,6 +5592,9 @@ mod tests {
             reads,
             reveal,
             lag,
+            more_windows,
+            no_area,
+            background,
         }
     }
 
@@ -8692,6 +8862,214 @@ mod tests {
                 reply_text(&r).starts_with("[1] push button \"Open\""),
                 "{r}"
             );
+        });
+    }
+
+    /// The fake app's first window: a frame "notes.txt — Fake" (active
+    /// with `active`) holding `kids`.
+    fn fake_frame(s: &Session, active: bool, kids: &[u32]) {
+        *s.focus.borrow_mut() = Info {
+            states: if active { vec!["active"] } else { vec![] },
+            ..fake_node("frame", "notes.txt — Fake", kids)
+        };
+    }
+
+    /// The message of an error reply, without the "Error executing tool"
+    /// prefix.
+    fn error_text(r: &Json) -> &str {
+        assert_eq!(r["result"]["isError"], true, "{r}");
+        let text = reply_text(r);
+        text.split_once(": ").map_or(text, |(_, m)| m)
+    }
+
+    #[test]
+    fn an_ambiguous_query_is_refused_by_input_tools_with_the_candidates() {
+        local(async {
+            let mut s = session("ambiguous");
+            fake_frame(&s, true, &[40, 41, 42]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("push button", "Delete", &[]));
+                n.insert(41, fake_node("push button", "Delete", &[]));
+                // Only shows the name: a button of the name beats it.
+                let mut label = fake_node("label", "Delete", &[]);
+                label.actions.clear();
+                n.insert(42, label);
+            }
+            let q = json!({"app": "fake", "query": "Delete"});
+            let r = call_tool(&mut s, 2, "act", q.clone()).await;
+            // The read has no action names (as on Linux): the lines have
+            // them read, so a button does not say `actions=none`.
+            assert_eq!(
+                error_text(&r),
+                "ambiguous: 2 elements in 'fake' match 'Delete'; nothing sent. pass one id:\n\
+                 [1] push button \"Delete\" at 0,0\n\
+                 [2] push button \"Delete\" at 0,0"
+            );
+            let mut call = 3;
+            for tool in ["click", "focus", "scroll"] {
+                let r = call_tool(&mut s, call, tool, q.clone()).await;
+                assert!(error_text(&r).starts_with("ambiguous: 2 elements"), "{r}");
+                call += 1;
+            }
+            let r = call_tool(
+                &mut s,
+                call,
+                "set_text",
+                json!({"app": "fake", "query": "Delete", "text": "x"}),
+            )
+            .await;
+            assert!(error_text(&r).starts_with("ambiguous: 2 elements"), "{r}");
+            // Nothing was sent.
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // A read takes the first and says so.
+            let r = call_tool(&mut s, 10, "get_text", q.clone()).await;
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Delete\" (first of 2 matches):"),
+                "{r}"
+            );
+            // The id from the list acts.
+            let r = call_tool(&mut s, 11, "act", json!({"id": 2})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 41");
+            // One of them has no on-screen area: the other is the target.
+            s.no_area.borrow_mut().push(41);
+            let r = call_tool(&mut s, 12, "act", q.clone()).await;
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Delete\""),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 40");
+            // The same with the app's window behind the terminal, where a
+            // centre is not measured (KDE, Hyprland): the size still counts.
+            s.background.set(true);
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 13, "act", q.clone()).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 40");
+            // Both with an area there: refused, without positions.
+            s.no_area.borrow_mut().clear();
+            let r = call_tool(&mut s, 14, "act", q.clone()).await;
+            assert_eq!(
+                error_text(&r),
+                "ambiguous: 2 elements in 'fake' match 'Delete'; nothing sent. pass one id:\n\
+                 [1] push button \"Delete\"\n\
+                 [2] push button \"Delete\""
+            );
+            s.background.set(false);
+            // With `role` and more candidates than are listed.
+            let kids: Vec<u32> = (100..110).collect();
+            fake_frame(&s, true, &kids);
+            for k in &kids {
+                s.nodes
+                    .borrow_mut()
+                    .insert(*k, fake_node("push button", "Delete", &[]));
+            }
+            let r = call_tool(
+                &mut s,
+                15,
+                "act",
+                json!({"app": "fake", "query": "Delete", "role": "push button"}),
+            )
+            .await;
+            let text = error_text(&r);
+            assert!(
+                text.starts_with("ambiguous: 10 elements in 'fake' match 'Delete' with role 'push button'; nothing sent. pass one id:\n"),
+                "{text}"
+            );
+            assert_eq!(text.lines().count(), 1 + AMBIGUOUS_SHOWN + 1, "{text}");
+            assert!(text.ends_with("\n… 4 more"), "{text}");
+            // No "now:" context line: the candidates say where they are.
+            assert!(!text.contains("\nnow: "), "{text}");
+        });
+    }
+
+    #[test]
+    fn the_window_argument_and_the_active_window_break_a_tie_between_windows() {
+        local(async {
+            let mut s = session("ambiguous-windows");
+            fake_frame(&s, false, &[40]);
+            s.more_windows.borrow_mut().push(50);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("push button", "Save", &[]));
+                let mut todo = fake_node("frame", "todo.txt — Fake", &[51]);
+                todo.states = vec!["active"];
+                n.insert(50, todo);
+                n.insert(51, fake_node("push button", "Save", &[]));
+            }
+            let q = json!({"app": "fake", "query": "Save"});
+            let r = call_tool(&mut s, 2, "act", q.clone()).await;
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Save\""),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 51");
+            // Neither window active (a terminal in front): refused, with the
+            // windows.
+            s.nodes.borrow_mut().get_mut(&50).unwrap().states.clear();
+            let r = call_tool(&mut s, 3, "act", q.clone()).await;
+            let text = error_text(&r);
+            assert!(
+                text.contains("pass one id, or window= its title:"),
+                "{text}"
+            );
+            assert!(
+                text.contains("\"Save\" at 0,0 in 'notes.txt — Fake'\n"),
+                "{text}"
+            );
+            assert!(text.ends_with("in 'todo.txt — Fake'"), "{text}");
+            // The window argument names it.
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"app": "fake", "query": "Save", "window": "todo"}),
+            )
+            .await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 51");
+            // The named window beats one still marked ACTIVE (the toolkit
+            // not yet caught up with `window` bringing todo to the front).
+            fake_frame(&s, true, &[40]);
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                json!({"app": "fake", "query": "Save", "window": "todo"}),
+            )
+            .await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 51");
+        });
+    }
+
+    #[test]
+    fn a_dialog_breaks_a_tie_with_its_parent_window() {
+        local(async {
+            let mut s = session("ambiguous-dialog");
+            fake_frame(&s, false, &[40]);
+            s.more_windows.borrow_mut().push(60);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("push button", "OK", &[]));
+                n.insert(60, fake_node("dialog", "Save — Fake", &[61]));
+                n.insert(61, fake_node("push button", "OK", &[]));
+                n.insert(70, fake_node("dialog", "Overwrite? — Fake", &[71]));
+                n.insert(71, fake_node("push button", "OK", &[]));
+            }
+            let q = json!({"app": "fake", "query": "OK"});
+            let r = call_tool(&mut s, 2, "click", q.clone()).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            let r = call_tool(&mut s, 3, "act", q.clone()).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 61");
+            // Stacked dialogs: the one opened last.
+            s.more_windows.borrow_mut().push(70);
+            let r = call_tool(&mut s, 4, "act", q.clone()).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 71");
         });
     }
 
