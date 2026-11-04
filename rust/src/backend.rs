@@ -396,6 +396,27 @@ pub trait Backend {
     async fn element_centers(&self, ids: &[Self::Id]) -> Vec<R<(i32, i32)>> {
         futures_util::future::join_all(ids.iter().map(|id| self.element_center(id))).await
     }
+    /// `element_center_in` of several (element, frame) pairs at once.
+    async fn element_centers_in(&self, items: &[(Self::Id, Self::Id)]) -> Vec<R<(i32, i32)>> {
+        futures_util::future::join_all(items.iter().map(|(id, f)| self.element_center_in(id, f)))
+            .await
+    }
+    /// Whether each element has an on-screen area (width and height above
+    /// zero), in front or not: Some(false) for none, None when unknown.
+    /// The default asks `element_center`, which suits a backend whose
+    /// centre does not depend on the active window; one that checks it
+    /// first reads the size alone.
+    async fn has_area(&self, ids: &[Self::Id]) -> Vec<Option<bool>> {
+        self.element_centers(ids)
+            .await
+            .into_iter()
+            .map(|c| match c {
+                Ok(_) => Some(true),
+                Err(e) if e == NO_AREA => Some(false),
+                Err(_) => None,
+            })
+            .collect()
+    }
 
     /// Check a chord such as "ctrl+s" without pressing it.
     fn check_combo(&self, combo: &str) -> R<()>;

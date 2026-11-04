@@ -49,6 +49,10 @@ const CONTINUATION_CHARS: usize = 150;
 const PREFETCH_MORE: usize = 500;
 /// Candidates an ambiguous target lists (`Server::untie`).
 const AMBIGUOUS_SHOWN: usize = 6;
+/// Candidates of an ambiguous target measured for an on-screen area at
+/// most (`Server::untie`): more are refused as they are, as dropping the
+/// ones without would rarely leave one.
+const AREA_CHECK_MAX: usize = 2 * AMBIGUOUS_SHOWN;
 /// Off-screen matches or close names a missed search offers.
 const MISS_SUGGESTIONS: usize = 5;
 /// Nodes of a web page fetched when looking for matches scrolled out of
@@ -2011,38 +2015,44 @@ impl<B: Backend> Server<B> {
     /// For an input tool's query that names several elements (`m`, from
     /// one fresh read in `cache`): when some have an on-screen area and
     /// others none (a collapsed menu's entries), the ones without are left
-    /// out, and one left is the target. Else the refusal, listing the
-    /// candidates with ids (and where they are, when known): nothing is
-    /// sent.
+    /// out (up to AREA_CHECK_MAX candidates, in front or not), and one left
+    /// is the target. Else the refusal, listing the candidates with ids,
+    /// actions and (when their window is in front) where they are: nothing
+    /// is sent.
     async fn untie(
         &self,
         m: &mut render::Matches<B::Id>,
-        cache: &Cache<B::Id>,
+        cache: &mut Cache<B::Id>,
         app: &str,
         query: &str,
         role: &str,
     ) -> R<()> {
-        let ids: Vec<B::Id> = m.picked.iter().map(|(id, _)| id.clone()).collect();
-        let mut centers = trace::time("element_centers", self.b.element_centers(&ids)).await;
-        let no_area = |c: &R<(i32, i32)>| matches!(c, Err(e) if e == backend::NO_AREA);
-        if centers.iter().any(|c| !no_area(c)) {
-            let mut has_area = centers
-                .iter()
-                .map(|c| !no_area(c))
-                .collect::<Vec<_>>()
-                .into_iter();
-            m.picked.retain(|_| has_area.next().unwrap_or(true));
-            centers.retain(|c| !no_area(c));
+        if m.picked.len() <= AREA_CHECK_MAX {
+            let ids: Vec<B::Id> = m.picked.iter().map(|(id, _)| id.clone()).collect();
+            let area = trace::time("has_area", self.b.has_area(&ids)).await;
+            let no_area = |a: &Option<bool>| *a == Some(false);
+            if area.iter().any(|a| !no_area(a)) {
+                let mut keep = area.iter().map(|a| !no_area(a));
+                m.picked.retain(|_| keep.next().unwrap_or(true));
+            }
         }
         if m.picked.len() == 1 {
             return Ok(());
         }
+        // Only the lines shown: their actions (the read has none) and
+        // positions, together.
+        let shown: Vec<(B::Id, B::Id)> = m.picked.iter().take(AMBIGUOUS_SHOWN).cloned().collect();
+        let shown_ids: Vec<B::Id> = shown.iter().map(|(id, _)| id.clone()).collect();
+        let ((), centers) = tokio::join!(
+            trace::time("fill_actions", self.b.fill_actions(cache, &shown_ids)),
+            trace::time("element_centers", self.b.element_centers_in(&shown))
+        );
         let app_key = app.to_lowercase();
         let mut windows: Vec<&B::Id> = m.picked.iter().map(|(_, w)| w).collect();
         windows.dedup();
         let several = windows.len() > 1;
         let mut lines = Vec::new();
-        for ((id, w), c) in m.picked.iter().zip(&centers).take(AMBIGUOUS_SHOWN) {
+        for ((id, w), c) in shown.iter().zip(&centers) {
             let rid = self.add_ref(id, &cache[id], &app_key).await;
             let mut line = render::describe(&cache[id], rid);
             if let Ok((x, y)) = c {
@@ -2156,7 +2166,7 @@ impl<B: Backend> Server<B> {
                     kept = false;
                     continue;
                 }
-                self.untie(&mut m, &cache, app, query, &role).await?;
+                self.untie(&mut m, &mut cache, app, query, &role).await?;
             }
             let ties = m.picked.len();
             let id = m.first().clone();
@@ -4829,6 +4839,9 @@ mod tests {
         more_windows: Rc<RefCell<Vec<u32>>>,
         /// Elements without an on-screen area.
         no_area: Rc<RefCell<Vec<u32>>>,
+        /// Elements' windows are not in front: as on KDE and Hyprland,
+        /// `element_center` then fails for every element with an area.
+        background: Rc<std::cell::Cell<bool>>,
     }
 
     /// The fake's change events, for kept reads: off unless a test turns
@@ -4947,6 +4960,28 @@ mod tests {
                 cache.insert(id, info);
             }
         }
+        /// As on Linux, a read without `actions` leaves them out:
+        /// `fill_actions` reads them.
+        async fn prefetch_with(&self, cache: &mut Cache<u32>, roots: Vec<u32>, f: &Fetch) {
+            let read = roots.clone();
+            self.prefetch(cache, roots, f.only_showing, f.text_limit, f.limit)
+                .await;
+            if !f.actions {
+                for id in &read {
+                    if let Some(info) = cache.get_mut(id) {
+                        info.actions.clear();
+                    }
+                }
+            }
+        }
+        async fn fill_actions(&self, cache: &mut Cache<u32>, ids: &[u32]) {
+            for id in ids {
+                let actions = self.actions(id).await;
+                if let Some(info) = cache.get_mut(id) {
+                    info.actions = actions;
+                }
+            }
+        }
         async fn actions(&self, id: &u32) -> Vec<String> {
             self.info(id, 0).await.actions
         }
@@ -4987,7 +5022,14 @@ mod tests {
             if self.no_area.borrow().contains(id) {
                 return Err(backend::NO_AREA.into());
             }
+            if self.background.get() {
+                return Err("element's window is not active; call activate_window first".into());
+            }
             Ok((0, 0))
+        }
+        async fn has_area(&self, ids: &[u32]) -> Vec<Option<bool>> {
+            let no_area = self.no_area.borrow();
+            ids.iter().map(|id| Some(!no_area.contains(id))).collect()
         }
         fn check_combo(&self, _: &str) -> R<()> {
             Ok(())
@@ -5141,6 +5183,7 @@ mod tests {
         reads: Rc<FakeReads>,
         more_windows: Rc<RefCell<Vec<u32>>>,
         no_area: Rc<RefCell<Vec<u32>>>,
+        background: Rc<std::cell::Cell<bool>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -5172,9 +5215,11 @@ mod tests {
         let reads = Rc::new(FakeReads::default());
         let more_windows = Rc::new(RefCell::new(Vec::new()));
         let no_area = Rc::new(RefCell::new(Vec::new()));
+        let background = Rc::new(std::cell::Cell::new(false));
         let server = Rc::new(Server::new(FakeBackend {
             more_windows: more_windows.clone(),
             no_area: no_area.clone(),
+            background: background.clone(),
             reads: reads.clone(),
             takeover: takeover.clone(),
             allow_file,
@@ -5202,6 +5247,7 @@ mod tests {
             reads,
             more_windows,
             no_area,
+            background,
         }
     }
 
@@ -7790,6 +7836,8 @@ mod tests {
             }
             let q = json!({"app": "fake", "query": "Delete"});
             let r = call_tool(&mut s, 2, "act", q.clone()).await;
+            // The read has no action names (as on Linux): the lines have
+            // them read, so a button does not say `actions=none`.
             assert_eq!(
                 error_text(&r),
                 "ambiguous: 2 elements in 'fake' match 'Delete'; nothing sent. pass one id:\n\
@@ -7830,8 +7878,24 @@ mod tests {
                 "{r}"
             );
             assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 40");
-            // With `role` and more candidates than are listed.
+            // The same with the app's window behind the terminal, where a
+            // centre is not measured (KDE, Hyprland): the size still counts.
+            s.background.set(true);
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 13, "act", q.clone()).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 40");
+            // Both with an area there: refused, without positions.
             s.no_area.borrow_mut().clear();
+            let r = call_tool(&mut s, 14, "act", q.clone()).await;
+            assert_eq!(
+                error_text(&r),
+                "ambiguous: 2 elements in 'fake' match 'Delete'; nothing sent. pass one id:\n\
+                 [1] push button \"Delete\"\n\
+                 [2] push button \"Delete\""
+            );
+            s.background.set(false);
+            // With `role` and more candidates than are listed.
             let kids: Vec<u32> = (100..110).collect();
             fake_frame(&s, true, &kids);
             for k in &kids {
@@ -7841,7 +7905,7 @@ mod tests {
             }
             let r = call_tool(
                 &mut s,
-                13,
+                15,
                 "act",
                 json!({"app": "fake", "query": "Delete", "role": "push button"}),
             )
@@ -7859,7 +7923,7 @@ mod tests {
     }
 
     #[test]
-    fn the_active_window_breaks_a_tie_between_windows_of_the_app() {
+    fn the_window_argument_and_the_active_window_break_a_tie_between_windows() {
         local(async {
             let mut s = session("ambiguous-windows");
             fake_frame(&s, false, &[40]);
@@ -7897,6 +7961,19 @@ mod tests {
             let r = call_tool(
                 &mut s,
                 4,
+                "act",
+                json!({"app": "fake", "query": "Save", "window": "todo"}),
+            )
+            .await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 51");
+            // The named window beats one still marked ACTIVE (the toolkit
+            // not yet caught up with `window` bringing todo to the front).
+            fake_frame(&s, true, &[40]);
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                5,
                 "act",
                 json!({"app": "fake", "query": "Save", "window": "todo"}),
             )

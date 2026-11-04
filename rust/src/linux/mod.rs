@@ -66,20 +66,27 @@ const EVENT_TOOLKITS: [&str; 3] = ["qt", "gecko", "chromium"];
 
 const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
 
+/// Whether extents (x, y, w, h) have no on-screen area: zero width or
+/// height.
+fn zero_size(ext: &R<(i32, i32, i32, i32)>) -> bool {
+    matches!(ext, Ok((_, _, w, h)) if *w <= 0 || *h <= 0)
+}
+
 /// Screen centre of an element from its extents in window coordinates
 /// and the active window's origin, once its window is known to be active.
+/// An element without an area says so whether its window is active or not.
 fn screen_center(
     frame_active: bool,
     ext: R<(i32, i32, i32, i32)>,
     origin: &R<(f64, f64)>,
 ) -> R<(i32, i32)> {
+    if zero_size(&ext) {
+        return Err(NO_AREA.into());
+    }
     if !frame_active {
         return Err(NOT_ACTIVE.into());
     }
     let (x, y, w, h) = ext?;
-    if w <= 0 || h <= 0 {
-        return Err(NO_AREA.into());
-    }
     let (gx, gy) = origin.clone()?;
     Ok((
         (gx + x as f64 + w as f64 / 2.0) as i32,
@@ -623,29 +630,31 @@ impl LinuxBackend {
     /// window, which Hyprland places at `at`: the client area, without
     /// borders. Toolkits that draw their own shadow and count it in the
     /// window extents (GTK3) come out off by the shadow's width.
+    /// An element without an area says so whether its window is active
+    /// or not.
     async fn hypr_center(&self, active: Option<&Json>, id: &Obj) -> R<(i32, i32)> {
         let a11y = &self.a11y;
-        let no_area = || NO_AREA.to_string();
-        let Some(aw) = active else {
-            return Err(NOT_ACTIVE.into());
-        };
-        let Some(frame) = a11y.frame_of(id).await else {
-            return Err(NOT_ACTIVE.into());
-        };
-        if !self.same_window(&frame, aw).await {
-            return Err(NOT_ACTIVE.into());
-        }
-        let xwayland = aw["xwayland"].as_bool().unwrap_or(false);
+        let xwayland = active.is_some_and(|aw| aw["xwayland"].as_bool().unwrap_or(false));
         // X11 clients report real screen coordinates.
         let coords = if xwayland {
             atspi::COORD_SCREEN
         } else {
             atspi::COORD_WINDOW
         };
-        let (x, y, w, h) = a11y.extents(id, coords).await?;
-        if w <= 0 || h <= 0 {
-            return Err(no_area());
+        let (frame, ext) = tokio::join!(a11y.frame_of(id), a11y.extents(id, coords));
+        if zero_size(&ext) {
+            return Err(NO_AREA.into());
         }
+        let Some(aw) = active else {
+            return Err(NOT_ACTIVE.into());
+        };
+        let Some(frame) = frame else {
+            return Err(NOT_ACTIVE.into());
+        };
+        if !self.same_window(&frame, aw).await {
+            return Err(NOT_ACTIVE.into());
+        }
+        let (x, y, w, h) = ext?;
         let (ox, oy) = if xwayland {
             (0.0, 0.0)
         } else {
@@ -1320,16 +1329,43 @@ impl Backend for LinuxBackend {
     }
 
     async fn element_center_in(&self, id: &Obj, frame: &Obj) -> R<(i32, i32)> {
+        self.element_centers_in(&[(id.clone(), frame.clone())])
+            .await
+            .pop()
+            .unwrap_or_else(|| Err(NO_AREA.into()))
+    }
+
+    async fn element_centers_in(&self, items: &[(Obj, Obj)]) -> Vec<R<(i32, i32)>> {
         let Compositor::Kde(kwin) = &self.comp else {
-            return self.element_center(id).await;
+            let ids: Vec<Obj> = items.iter().map(|(id, _)| id.clone()).collect();
+            return self.element_centers(&ids).await;
         };
-        // As `element_centers`, with the frame known: no walk up to it.
-        let (origin, frame_active, ext) = tokio::join!(
+        // As `element_centers`, with the frames known: no walk up to them.
+        let a11y = &self.a11y;
+        let (origin, parts) = tokio::join!(
             kwin.active_window_origin(),
-            self.a11y.has_state(frame, atspi::ACTIVE),
-            self.a11y.extents(id, atspi::COORD_WINDOW)
+            futures_util::future::join_all(items.iter().map(|(id, frame)| async move {
+                tokio::join!(
+                    a11y.has_state(frame, atspi::ACTIVE),
+                    a11y.extents(id, atspi::COORD_WINDOW)
+                )
+            }))
         );
-        screen_center(frame_active, ext, &origin)
+        parts
+            .into_iter()
+            .map(|(frame_active, ext)| screen_center(frame_active, ext, &origin))
+            .collect()
+    }
+
+    async fn has_area(&self, ids: &[Obj]) -> Vec<Option<bool>> {
+        // The size alone: one read each, no walk up to the window and no
+        // look at which one is active. Window coordinates suit X11
+        // clients too, as only the size counts.
+        futures_util::future::join_all(ids.iter().map(|id| async move {
+            let ext = self.a11y.extents(id, atspi::COORD_WINDOW).await;
+            ext.is_ok().then(|| !zero_size(&ext))
+        }))
+        .await
     }
 
     async fn element_centers(&self, ids: &[Obj]) -> Vec<R<(i32, i32)>> {
@@ -2017,6 +2053,27 @@ impl Backend for LinuxBackend {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn an_element_without_an_area_says_so_in_a_background_window() {
+        let origin = Ok((100.0, 50.0));
+        let zero = Ok((10, 10, 0, 20));
+        let sized = Ok((10, 10, 20, 20));
+        assert_eq!(
+            screen_center(false, zero.clone(), &origin),
+            Err(NO_AREA.into())
+        );
+        assert_eq!(screen_center(true, zero, &origin), Err(NO_AREA.into()));
+        assert_eq!(
+            screen_center(false, sized.clone(), &origin),
+            Err(NOT_ACTIVE.into())
+        );
+        assert_eq!(screen_center(true, sized, &origin), Ok((120, 70)));
+        assert_eq!(
+            screen_center(false, Err("gone".into()), &origin),
+            Err(NOT_ACTIVE.into())
+        );
+    }
 
     #[test]
     fn one_unfocusable_element_does_not_turn_focus_off_for_the_app() {

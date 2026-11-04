@@ -219,23 +219,26 @@ tool; `off` turns it off). Not available on Windows yet.
   Last come elements holding every word of the query, accents aside.
 - Ties: when several elements match equally well (the best of those tiers),
   these tie-breaks apply in turn, while the matches are in several windows of
-  the app: (1) the app's active window beats its background windows; (2) a
-  window whose title contains the call's `window` argument beats the others;
-  (3) a dialog (dialog, alert, file chooser) beats the app's other windows,
+  the app: (1) a window whose title contains the call's `window` argument
+  beats the others (before the active window, whose ACTIVE state can lag
+  just after `window` raised another); (2) the app's active window beats its
+  background windows; (3) a dialog (dialog, alert, file chooser) beats the app's other windows,
   and of stacked dialogs the one opened last (listed last) wins. Then,
   wherever they are: (4) an element one operates (a button, entry, list
   item: an interactive role or state) beats one that only shows the name (a
   label, a heading, a list named the same); (5) for input tools, an element
-  with an on-screen area beats one without (zero size). A tie left after
+  with an on-screen area beats one without (zero size), whether its window
+  is in front or not (checked for up to 12 candidates). A tie left after
   that is refused by the input tools (`act`, `click`, `focus`, `set_text`,
   `scroll`), which send nothing and list at most 6 candidates with ids, so the
   next call passes one `id` (or `role`, or `window`):
   ```
   ambiguous: 2 elements in 'firefox' match 'Kapat'; nothing sent. pass one id:
-  [3] button "Kapat" at 3440,0
-  [4] button "Kapat" at 3440,22
+  [3] push button "Kapat" at 3440,0
+  [4] push button "Kapat" at 3440,22
   ```
-  The window title is added when the candidates are in several windows.
+  The position is shown when the window is in front; the window title is
+  added when the candidates are in several windows.
   Read tools take the first: `get_text` notes it (`[5] … (first of 2
   matches):`), `wait_for` matches on it, `find` lists them all. Matches are
   counted over one read of the app, made afresh for a refusal.

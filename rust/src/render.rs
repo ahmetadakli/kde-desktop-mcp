@@ -989,9 +989,11 @@ pub fn locate<Id: Clone + Eq + Hash>(
 /// all. Last, those whose name or text has every word of the query, accents
 /// aside. Of these, the ones left after the tie-breaks, which apply in turn
 /// while the matches are in several windows of the app (`roots`):
-/// 1. the active window's elements beat those of its other windows;
-/// 2. those in a window whose title contains `window` (the tool's
-///    `window` argument; "" for none) beat the others;
+/// 1. those in a window whose title contains `window` (the tool's
+///    `window` argument; "" for none) beat the others: the caller named
+///    it, and the ACTIVE state can still be the previous window's just
+///    after `window` brought this one to the front;
+/// 2. the active window's elements beat those of its other windows;
 /// 3. those in a dialog (DIALOG_ROLES) beat those in other windows, and of
 ///    several dialogs the one listed last (opened last) wins;
 ///
@@ -1055,8 +1057,8 @@ pub fn locate_all<Id: Clone + Eq + Hash>(
         windows.iter().map(|w| w.is_some_and(f)).collect()
     };
     let window_rules = [
-        rule(&|w| w.states.contains(&"active")),
         rule(&|w| !fw.is_empty() && fold(&w.name).contains(&fw)),
+        rule(&|w| w.states.contains(&"active")),
         rule(&|w| is_dialog(w)),
     ];
     for holds in &window_rules {
@@ -2110,7 +2112,7 @@ mod tests {
     }
 
     #[test]
-    fn the_active_window_then_the_window_hint_break_ties_between_windows() {
+    fn the_window_hint_then_the_active_window_break_ties_between_windows() {
         let roots = ["/w1", "/w2"];
         let cache = two_windows("frame", "frame", &["active"]);
         assert_eq!(picked(&cache, &roots, "ok", "", ""), vec![("/b", "/w2")]);
@@ -2123,13 +2125,24 @@ mod tests {
         );
         // A hint every window matches decides nothing.
         assert_eq!(picked(&cache, &roots, "ok", "", "kate").len(), 2);
-        // The active window beats the hint and a dialog.
+        // The hint beats the active window (whose ACTIVE state may be left
+        // over from before `window` raised the other one), and that a
+        // dialog.
         let mut cache = two_windows("frame", "dialog", &[]);
         cache.get_mut("/w1").unwrap().states = vec!["active"];
         assert_eq!(
             picked(&cache, &roots, "ok", "", "todo"),
-            vec![("/a", "/w1")]
+            vec![("/b", "/w2")]
         );
+        // Without a hint, or one every window matches, the active window
+        // beats the dialog.
+        for hint in ["", "kate"] {
+            assert_eq!(
+                picked(&cache, &roots, "ok", "", hint),
+                vec![("/a", "/w1")],
+                "{hint}"
+            );
+        }
     }
 
     #[test]
