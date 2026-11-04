@@ -97,10 +97,10 @@ is one call. tree shows structure; find is cheaper.
 `query` (case-insensitive) wins, else the first whose name or text contains it. \
 Titles (window, tab, page) count only when nothing else does or `role` names them. The \
 reply starts with the element picked. A miss lists near or off-screen matches with ids.
-- batch runs steps in one round trip when later steps don't need a result. \
-Mark waits \"optional\": true and end with an observation step, or give the last input \
-`observe`. A later step's `id` (or root_id/from_id/to_id) may be \"$N\": the element step N found or acted on \
-(find: its first hit).
+- batch runs steps in one call; with if, on_fail, repeat and stop_if (see batch) a small \
+procedure fits in one. Mark waits \"optional\": true and end with an observation step, or \
+give the last input `observe`. A later step's `id`/`*_id` may be \"$N\": the element step \
+N found or acted on.
 - Input tools (key, type_text, click, mouse, scroll, focus, drag, set_text, act, screenshot) \
 take `window` (title or app substring) instead of a separate activate_window step; it \
 activates that window only when it isn't in front. Without it, input fails while \
@@ -154,6 +154,49 @@ const CONFIRM: &str =
 /// INSTRUCTIONS.
 const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`); rules in the server instructions.";
 
+/// The `batch` description, before its examples (BATCH_EXAMPLES).
+const BATCH_DESCRIPTION: &str = "Run tool calls in order in one round trip; prefer it whenever later steps
+don't depend on reading a result, or only on a condition below. `steps` is a
+list of {\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.
+[{\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+o\", \"window\": \"Kate\"}},
+ {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},
+ {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].
+Stops at the first failing step unless it is `optional`: then it is reported
+as failed (optional) and the rest still runs. Mark waits optional and end
+with an observation step (find, get_text, screenshot). Give the first
+input step `window` when input goes to an app. Ids from earlier tree/find work.
+An `id`/`*_id` arg of \"$N\" is the element step N produced: find's first
+hit, wait_for's match, the target of act/click/focus/get_text/set_text/
+scroll, else the focus key/type_text report; e.g. {\"tool\": \"act\",
+\"args\": {\"id\": \"$3\"}}. Input steps of one batch never interleave with
+another call's.
+Control flow (the whole batch is checked first; a mistake runs nothing):
+- \"if\": COND on a step runs it only when COND holds, else `[N] skipped (if …)`.
+- \"on_fail\": [steps] on a step run only if it failed; then the batch goes on.
+  Not after a refusal (allowlist, declined confirmation, the user taking over):
+  `[N.on_fail] not run (refused)`.
+- {\"repeat\": {\"steps\": [...], \"until\": TEST, \"max\": 10}} runs its steps until
+  TEST holds on the last of them, checked after each run; fails after `max` runs (1-20).
+  Its input steps, and those a COND tests, let the app react (<=150 ms) before replying.
+- {\"stop_if\": COND} ends the batch there, successfully, if COND holds.
+COND is {\"step\": N, TEST} on an earlier step. TEST is \"ok\": bool (succeeded),
+\"found\": bool (succeeded with an element; find: had a match) or
+\"contains\": \"text\" (its reply, any case). A skipped step meets no COND.
+N and \"$N\" count top-level steps only; for a repeat, they mean its last step
+in the latest run.
+Steps in repeat and on_fail take only tool, args, optional.";
+
+/// The examples of the `batch` description (checked by a test).
+pub const BATCH_EXAMPLES: [&str; 2] = [
+    r#"[{"repeat": {"steps": [{"tool": "scroll", "args": {"app": "dolphin", "query": "Reports", "role": "list"}},
+   {"tool": "wait_idle", "args": {"app": "dolphin", "quiet_ms": 150}},
+   {"tool": "find", "args": {"app": "dolphin", "query": "report.pdf"}}], "until": {"found": true}}},
+ {"tool": "click", "args": {"id": "$1"}}]"#,
+    r#"[{"tool": "act", "args": {"app": "kate", "query": "Save", "window": "Kate"}},
+ {"tool": "wait_for", "args": {"app": "kate", "query": "Overwrite", "timeout_ms": 1500}, "optional": true},
+ {"tool": "act", "args": {"app": "kate", "query": "Overwrite"}, "if": {"step": 2, "found": true}}]"#,
+];
+
 pub fn tools() -> Json {
     let target = |extra: &[(&'static str, &'static str, Option<Json>)]| {
         let mut p: Vec<(&str, &str, Option<Json>)> = vec![
@@ -171,14 +214,28 @@ pub fn tools() -> Json {
         "name": name, "description": desc, "inputSchema": input })
     };
     let mut batch_schema = schema(&[("steps", "array", None)]);
+    let cond = "{\"step\": N, \"ok\"|\"found\": bool or \"contains\": \"text\"} on an earlier step";
     batch_schema["properties"]["steps"]["items"] = json!({
         "type": "object",
         "properties": {
             "tool": { "type": "string" },
             "args": { "type": "object" },
             "optional": { "type": "boolean", "default": false },
+            "if": { "type": "object", "description": format!("Run only if {cond} holds.") },
+            "on_fail": {
+                "type": "array",
+                "items": { "type": "object" },
+                "description": "Steps run only if this one failed; then the batch goes on.",
+            },
+            "repeat": {
+                "type": "object",
+                "description": "Instead of tool: {\"steps\": [...], \"until\": {\"found\": true}, \"max\": 10}.",
+            },
+            "stop_if": {
+                "type": "object",
+                "description": format!("Alone, instead of tool: end the batch successfully if {cond} holds."),
+            },
         },
-        "required": ["tool"],
     });
     let mut list = json!([
         t(
@@ -426,7 +483,11 @@ pub fn tools() -> Json {
         ),
         t(
             "batch",
-            "Run tool calls in order in one round trip; prefer it whenever later steps\ndon't depend on reading a result. `steps` is a list of\n{\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.\n[{\"tool\": \"key\", \"args\": {\"combo\": \"ctrl+o\", \"window\": \"Kate\"}},\n {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},\n {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].\nStops at the first failing step unless it is `optional`: then it is reported\nas failed (optional) and the rest still runs. Mark waits optional and end\nwith an observation step (find, get_text, screenshot). Give the first\ninput step `window` when input goes to an app. Ids from earlier tree/find work.\nAn `id`/`*_id` arg of \"$N\" is the element step N produced: find's first\nhit, wait_for's match, the target of act/click/focus/get_text/set_text/\nscroll, else the focus key/type_text report; e.g. {\"tool\": \"act\",\n\"args\": {\"id\": \"$3\"}}. Input steps of one batch never interleave with\nanother call's.",
+            &format!(
+                "{BATCH_DESCRIPTION}\nScroll until a file shows, then click it:\n{}\n\
+                 Click Save; if asked to overwrite, confirm:\n{}",
+                BATCH_EXAMPLES[0], BATCH_EXAMPLES[1]
+            ),
             batch_schema
         ),
     ]);
@@ -495,6 +556,22 @@ pub fn tools() -> Json {
         }
     }
     list
+}
+
+/// Whether `name` is one of the tools.
+pub fn is_tool(name: &str) -> bool {
+    static NAMES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    NAMES
+        .get_or_init(|| {
+            tools()
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|t| t["name"].as_str().map(String::from))
+                .collect()
+        })
+        .iter()
+        .any(|n| n == name)
 }
 
 #[cfg(test)]
