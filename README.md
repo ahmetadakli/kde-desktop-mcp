@@ -361,14 +361,19 @@ tool; `off` turns it off). Not available on Windows yet.
     step meets no condition.
   - `"on_fail": [steps]` on a step runs those steps (reported as
     `[n.on_fail] …`) only when the step failed; the batch then goes on. Not
-    after a refusal by the allowlist, a declined confirmation or the user
-    taking over.
+    after a refusal by the allowlist (or a tier, or a password field), a
+    confirmation the user declined or was not asked for, or the user taking
+    over: then `[n.on_fail] not run (refused)`. Such a refusal also ends a
+    repeat, even in an optional step.
   - `{"repeat": {"steps": [...], "until": TEST, "max": 10}}` runs its steps
     (reported as `[n.k] …`, last run only) until TEST holds on the last of
     them, checked after each run; it fails after `max` runs (1 to 20, default
     10) or once it ran 10 minutes, and when a step in it fails that is not
     optional. `"$N"` and conditions on a repeat mean its last step's result in
-    the latest run.
+    the latest run. Its input steps without `observe` (and any such step a
+    condition tests) wait for the app to react, up to 150 ms (ending at its
+    first change events), before their reply is read: the focus a `key`
+    reports is the one it moved to.
   - `{"stop_if": {"step": N, TEST}}` ends the batch there, successfully.
   Steps are numbered at the top level only; steps inside `repeat` and
   `on_fail` take only `tool`, `args` and `optional` (no nesting). The whole
@@ -376,11 +381,14 @@ tool; `off` turns it off). Not available on Windows yet.
   and `"$N"` that do not name an earlier step or can never hold, `max` out of
   range): a mistake fails it with `not run (nothing sent): [n] …`. Its input
   lock, the takeover check, the allowlist and `observe` work per step as in a
-  plain batch. Example, scroll until a file shows, then click it:
+  plain batch. Example, scroll Dolphin's view of a folder "Reports" (the view
+  is named after the folder) until a file shows, then click it, once the
+  view stopped moving:
   `[{"repeat": {"steps": [{"tool": "scroll", "args": {"app": "dolphin",
-  "query": "Files"}}, {"tool": "find", "args": {"app": "dolphin", "query":
-  "report.pdf"}}], "until": {"found": true}}}, {"tool": "click", "args":
-  {"id": "$1"}}]`.
+  "query": "Reports", "role": "list"}}, {"tool": "wait_idle", "args": {"app":
+  "dolphin", "quiet_ms": 150}}, {"tool": "find", "args": {"app": "dolphin",
+  "query": "report.pdf"}}], "until": {"found": true}}}, {"tool": "click",
+  "args": {"id": "$1"}}]`.
 
 The `initialize` reply carries `instructions` (about 3 KB): the workflow,
 the targeting rules shared by the tools above, the allowlist and which tools

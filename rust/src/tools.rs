@@ -156,8 +156,11 @@ another call's.
 Control flow (the whole batch is checked first; a mistake runs nothing):
 - \"if\": COND on a step runs it only when COND holds, else `[N] skipped (if …)`.
 - \"on_fail\": [steps] on a step run only if it failed; then the batch goes on.
+  Not after a refusal (allowlist, declined confirmation, the user taking over):
+  `[N.on_fail] not run (refused)`.
 - {\"repeat\": {\"steps\": [...], \"until\": TEST, \"max\": 10}} runs its steps until
   TEST holds on the last of them, checked after each run; fails after `max` runs (1-20).
+  Its input steps, and those a COND tests, let the app react (<=150 ms) before replying.
 - {\"stop_if\": COND} ends the batch there, successfully, if COND holds.
 COND is {\"step\": N, TEST} on an earlier step. TEST is \"ok\": bool (succeeded),
 \"found\": bool (succeeded with an element; find: had a match) or
@@ -168,7 +171,8 @@ Steps in repeat and on_fail take only tool, args, optional.";
 
 /// The examples of the `batch` description (checked by a test).
 pub const BATCH_EXAMPLES: [&str; 2] = [
-    r#"[{"repeat": {"steps": [{"tool": "scroll", "args": {"app": "dolphin", "query": "Files"}},
+    r#"[{"repeat": {"steps": [{"tool": "scroll", "args": {"app": "dolphin", "query": "Reports", "role": "list"}},
+   {"tool": "wait_idle", "args": {"app": "dolphin", "quiet_ms": 150}},
    {"tool": "find", "args": {"app": "dolphin", "query": "report.pdf"}}], "until": {"found": true}}},
  {"tool": "click", "args": {"id": "$1"}}]"#,
     r#"[{"tool": "act", "args": {"app": "kate", "query": "Save", "window": "Kate"}},

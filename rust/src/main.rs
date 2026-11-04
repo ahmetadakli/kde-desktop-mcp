@@ -482,6 +482,9 @@ struct Gate {
     tool: String,
     args: Json,
     confirmed: bool,
+    /// The change mark taken before the input of a call whose reply a
+    /// batch tests, until `Server::settle` waited for it.
+    settle: Option<u64>,
 }
 
 tokio::task_local! {
@@ -586,11 +589,44 @@ fn note_step_element(rid: u64, replace: bool) {
     });
 }
 
+tokio::task_local! {
+    /// The refusals made while the running call (or batch step) ran: see
+    /// `refusal` and `with_refusals`.
+    static REFUSALS: std::cell::RefCell<Vec<String>>;
+}
+
+/// Note `e` as a refusal (by the allowlist, a tier, a confirmation the user
+/// declined or was not asked for, a password field, or the user taking
+/// over), for the batch (`with_refusals`); returns it. On_fail steps never
+/// run after one, and it ends a repeat.
+fn refusal(e: String) -> String {
+    let _ = REFUSALS.try_with(|r| r.borrow_mut().push(e.clone()));
+    e
+}
+
+/// Run `f`; its result, and whether its error is (or carries) a refusal
+/// made while it ran. A refusal a tool got past (one candidate refused,
+/// another taken) does not count: only one its error names.
+async fn with_refusals<T>(f: impl Future<Output = R<T>>) -> (R<T>, bool) {
+    REFUSALS
+        .scope(std::cell::RefCell::new(Vec::new()), async {
+            let r = f.await;
+            let refused = match &r {
+                Ok(_) => false,
+                Err(e) => REFUSALS.with(|v| v.borrow().iter().any(|m| e.contains(m.as_str()))),
+            };
+            (r, refused)
+        })
+        .await
+}
+
 /// What one tool call of a batch step left.
 struct StepResult {
     result: R<Out>,
     /// The element it produced (`STEP_ELEMENT`).
     element: Option<u64>,
+    /// It failed by a refusal (`with_refusals`).
+    refused: bool,
 }
 
 /// A running batch: its reply so far and what its steps left.
@@ -1307,6 +1343,24 @@ impl<B: Backend> Server<B> {
 
     // ------------------------------------------------------------ takeover
 
+    /// For a call whose reply a batch tests (`call_inner`'s `settle`), once
+    /// per call: wait up to SETTLE_MS for the app whose elements are `near`
+    /// to report a change since the input, and its burst of events to end.
+    /// True when it waited.
+    async fn settle(&self, near: &[B::Id]) -> bool {
+        let Some(mark) = GATE
+            .try_with(|g| g.borrow_mut().settle.take())
+            .ok()
+            .flatten()
+        else {
+            return false;
+        };
+        self.b
+            .wait_change(near, mark, Duration::from_millis(SETTLE_MS as u64))
+            .await;
+        true
+    }
+
     /// Note that a run of input starts now (the input lock was just taken).
     fn start_run(&self) {
         *self.run_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
@@ -1330,7 +1384,7 @@ impl<B: Backend> Server<B> {
             Ok(()) => Ok(()),
             Err(block) => {
                 self.b.indicate(&block.label()).await;
-                Err(block.message(t.window()))
+                Err(refusal(block.message(t.window())))
             }
         }
     }
@@ -1503,12 +1557,12 @@ impl<B: Backend> Server<B> {
         let tier = policy.tier(&app).ok_or_else(|| self.not_allowed(&app))?;
         let need = policy::needed_tier(&tool, &args);
         if tier < need {
-            return Err(format!(
+            return Err(refusal(format!(
                 "{tool} needs the {need} tier, but '{app}' is allowed with the {tier} tier \
                  ('{app}:{tier}' in {}), which allows {}; changing it is the user's decision",
                 self.allow_file.display(),
                 tier.allows()
-            ));
+            )));
         }
         if !confirmed && policy.needs_confirm(&tool, Some(&app)) {
             self.confirm(&tool, Some(&app), &args).await?;
@@ -1541,7 +1595,9 @@ impl<B: Backend> Server<B> {
                 .request("elicitation/create", params, CONFIRM_WAIT)
                 .await
                 .map_err(|e| {
-                    format!("{what} needs the user's confirmation, but asking failed: {e}")
+                    refusal(format!(
+                        "{what} needs the user's confirmation, but asking failed: {e}"
+                    ))
                 })?;
             let accepted = answer["action"] == "accept"
                 && answer.pointer("/content/confirm") != Some(&json!(false));
@@ -1550,18 +1606,18 @@ impl<B: Backend> Server<B> {
                     Some("accept" | "decline") => "declined",
                     _ => "dismissed",
                 };
-                return Err(format!("the user {how} {what}; nothing was done"));
+                return Err(refusal(format!("the user {how} {what}; nothing was done")));
             }
         } else if !arg_b(a, "confirm", false) {
             let why = match self.policy().needs_confirm(tool, app) {
                 true => format!("confirm list in {}", self.allow_file.display()),
                 false => "it may lose unsaved work".into(),
             };
-            return Err(format!(
+            return Err(refusal(format!(
                 "{what} needs the user's confirmation ({why}), and this client cannot ask \
                  (no elicitation): ask the user, and only if they agree call again with \
                  confirm: true"
-            ));
+            )));
         }
         let _ = GATE.try_with(|g| g.borrow_mut().confirmed = true);
         Ok(())
@@ -1624,7 +1680,10 @@ impl<B: Backend> Server<B> {
     }
 
     fn not_allowed(&self, app: &str) -> String {
-        format!("app '{app}' is not in {}", self.allow_file.display())
+        refusal(format!(
+            "app '{app}' is not in {}",
+            self.allow_file.display()
+        ))
     }
 
     async fn require_active_allowed(&self) -> R<String> {
@@ -1636,12 +1695,12 @@ impl<B: Backend> Server<B> {
                 Some(t) if !t.is_empty() => format!(" (last used: '{t}')"),
                 _ => String::new(),
             };
-            return Err(format!(
+            return Err(refusal(format!(
                 "active window app '{}' is not in {}; pass window=<title or app> to \
                  activate an allowed window first{hint}",
                 if name.is_empty() { "unknown" } else { &name },
                 self.allow_file.display()
-            ));
+            )));
         }
         self.permit(&name).await?;
         Ok(name)
@@ -3167,13 +3226,13 @@ impl<B: Backend> Server<B> {
 
     /// Why a password field is not filled in, and how the user can allow it.
     fn password_refusal(&self, tool: &str, app: &str) -> String {
-        format!(
+        refusal(format!(
             "{tool} refused: the target is a password field. Ask the user to type it \
              themselves; only they can allow agents to fill in passwords ('passwords: {app}' \
              in {}, or {}=1)",
             self.allow_file.display(),
             policy::PASSWORDS_ENV
-        )
+        ))
     }
 
     async fn get_text(&self, a: &Json) -> R<String> {
@@ -3702,7 +3761,13 @@ impl<B: Backend> Server<B> {
     /// input was sent to, when the input moved focus); nothing is reported,
     /// and no id issued, unless that app is allowed.
     async fn focus_note(&self, typing: bool) -> String {
-        let Some(Focused { id, info, app }) = self.b.focused().await else {
+        let mut focused = self.b.focused().await;
+        // Focus events arrive after the input: read it once they did.
+        let near: Vec<B::Id> = focused.iter().map(|f| f.id.clone()).collect();
+        if self.settle(&near).await {
+            focused = self.b.focused().await;
+        }
+        let Some(Focused { id, info, app }) = focused else {
             return String::new();
         };
         if !self.is_allowed(&app) {
@@ -3904,7 +3969,7 @@ impl<B: Backend> Server<B> {
         let d = self.b.active_file_dialog().await?;
         let allowed = self.allowed();
         let owner = file_dialog_owner(&d, &allowed)
-            .map_err(|e| format!("{e} (allowlist: {})", self.allow_file.display()))?;
+            .map_err(|e| refusal(format!("{e} (allowlist: {})", self.allow_file.display())))?;
         self.permit(&owner).await?;
         let text = path.display().to_string();
         if !self.b.set_text(&d.field, &text).await? {
@@ -4073,6 +4138,14 @@ impl<B: Backend> Server<B> {
         } else {
             None
         };
+        // Input steps a later condition tests settle before their reply.
+        let tested: Vec<usize> = steps
+            .iter()
+            .filter_map(|s| match (&s.cond, &s.body) {
+                (_, flow::Body::Stop(c)) | (Some(c), _) => Some(c.step),
+                _ => None,
+            })
+            .collect();
         let mut run = BatchRun::default();
         for (i, step) in steps.iter().enumerate() {
             let n = i + 1;
@@ -4099,8 +4172,9 @@ impl<B: Backend> Server<B> {
                     continue;
                 }
                 flow::Body::Tool(call) => {
-                    let r = self.batch_call(call, n, &run.done, input).await;
-                    let hard = r.result.as_ref().is_err_and(|e| self.refused(e));
+                    let settle = tested.contains(&n);
+                    let r = self.batch_call(call, n, &run.done, input, settle).await;
+                    let hard = r.refused;
                     let ok = r.result.is_ok();
                     run.print(&n.to_string(), call, &r, step.optional);
                     run.record(call.tool.clone(), ok, r);
@@ -4121,6 +4195,9 @@ impl<B: Backend> Server<B> {
             // Failed: its on_fail steps instead (never after a refusal or
             // the user taking over), else the batch stops unless optional.
             let mut handled = false;
+            if !step.on_fail.is_empty() && hard {
+                run.out.push(format!("[{n}.on_fail] not run (refused)"));
+            }
             if !step.on_fail.is_empty() && !hard {
                 handled = true;
                 for (k, call) in step.on_fail.iter().enumerate() {
@@ -4128,7 +4205,7 @@ impl<B: Backend> Server<B> {
                         1 => format!("{n}.on_fail"),
                         _ => format!("{n}.on_fail.{}", k + 1),
                     };
-                    let r = self.batch_call(call, n, &run.done, input).await;
+                    let r = self.batch_call(call, n, &run.done, input, false).await;
                     run.print(&label, call, &r, call.optional);
                     if r.result.is_err() && !call.optional {
                         handled = false;
@@ -4166,28 +4243,35 @@ impl<B: Backend> Server<B> {
     }
 
     /// One tool call of batch step `n`: its `"$N"` resolved, then run as a
-    /// call of its own, noting the element it produced.
+    /// call of its own, noting the element it produced and whether it was
+    /// refused. `settle`: its reply is tested (`call_inner`).
     async fn batch_call(
         &self,
         call: &flow::Call,
         n: usize,
         done: &[flow::Record],
         held: bool,
+        settle: bool,
     ) -> StepResult {
         let mut args = call.args.clone();
         if let Err(e) = flow::resolve_refs(&mut args, n, done) {
             return StepResult {
                 result: Err(e),
                 element: None,
+                refused: false,
             };
         }
-        let (result, element) = STEP_ELEMENT
+        let ((result, refused), element) = STEP_ELEMENT
             .scope(std::cell::Cell::new(None), async {
-                let r = self.call_inner(&call.tool, &args, held).await;
+                let r = with_refusals(self.call_inner(&call.tool, &args, held, settle)).await;
                 (r, STEP_ELEMENT.with(|e| e.get()))
             })
             .await;
-        StepResult { result, element }
+        StepResult {
+            result,
+            element,
+            refused,
+        }
     }
 
     /// Run a repeat (batch step `n`) until `until` holds on its last step,
@@ -4210,10 +4294,11 @@ impl<B: Backend> Server<B> {
             let mut last = None;
             let mut broke = None;
             for (k, call) in steps.iter().enumerate() {
-                let r = self.batch_call(call, n, &run.done, held).await;
+                // Its until (or a later step) tests what the input did.
+                let r = self.batch_call(call, n, &run.done, held, true).await;
                 let label = format!("{n}.{}", k + 1);
                 lines.print(&label, call, &r, call.optional);
-                let hard = r.result.as_ref().is_err_and(|e| self.refused(e));
+                let hard = r.refused;
                 if r.result.is_err() && (!call.optional || hard) {
                     broke = Some((label, hard));
                 }
@@ -4265,12 +4350,6 @@ impl<B: Backend> Server<B> {
         }
     }
 
-    /// Whether a failure is a refusal (allowlist, confirmation) or the user
-    /// taking over: on_fail does not run after it, and it ends a repeat.
-    fn refused(&self, e: &str) -> bool {
-        !wants_context(e, &self.allow_file.display().to_string())
-    }
-
     /// Run a tool. When it fails, everything held is released (keys and
     /// buttons left down by `hold` would otherwise go on acting on what
     /// the agent does next, after something went wrong).
@@ -4280,7 +4359,8 @@ impl<B: Backend> Server<B> {
         a: &'a Json,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         Box::pin(async move {
-            let result = trace::time(name, self.call_inner(name, a, false)).await;
+            let (result, refused) =
+                with_refusals(trace::time(name, self.call_inner(name, a, false, false))).await;
             let result = match result {
                 Err(e) if !self.held_names().is_empty() => {
                     let (names, released) = self.release_all().await;
@@ -4295,10 +4375,9 @@ impl<B: Backend> Server<B> {
             // What is on screen when it failed or found nothing, so the next
             // call needs no screenshot to see why.
             match result {
-                Err(e)
-                    if CONTEXT_TOOLS.contains(&name)
-                        && wants_context(&e, &self.allow_file.display().to_string()) =>
-                {
+                // Not after a refusal: that is about the allowlist, a
+                // confirmation or the user taking over, not the screen.
+                Err(e) if CONTEXT_TOOLS.contains(&name) && !refused => {
                     Err(format!("{e}{}", self.where_note().await))
                 }
                 Ok(mut o) if name == "find" && o.text.starts_with("no matches") => {
@@ -4311,17 +4390,22 @@ impl<B: Backend> Server<B> {
     }
 
     /// `call`, for a caller that may already hold the input lock (`held`: a
-    /// batch with input steps), which then is not taken again.
+    /// batch with input steps), which then is not taken again. `settle`: a
+    /// batch tests its reply (a repeat's until, a condition), so an input
+    /// tool without `observe` lets the app react first (`Server::settle`):
+    /// its focus note and the next step then see the input's effect.
     fn call_inner<'a>(
         &'a self,
         name: &'a str,
         a: &'a Json,
         held: bool,
+        settle: bool,
     ) -> Pin<Box<dyn Future<Output = R<Out>> + 'a>> {
         let gate = Gate {
             tool: name.to_string(),
             args: a.clone(),
             confirmed: false,
+            settle: None,
         };
         Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
             let window = window_arg(name, a)?;
@@ -4375,6 +4459,18 @@ impl<B: Backend> Server<B> {
                 )),
                 None => None,
             };
+            // What the app the focus is in reports from now on ends the
+            // settle; `focus_note` waits for it, or else the end of the call.
+            let settle_near = match observe {
+                None if settle && WINDOW_NOTE_TOOLS.contains(&name) => {
+                    let mark = self.b.change_mark();
+                    let near: Vec<B::Id> =
+                        self.b.focused().await.map(|f| f.id).into_iter().collect();
+                    let _ = GATE.try_with(|g| g.borrow_mut().settle = Some(mark));
+                    Some(near)
+                }
+                _ => None,
+            };
             // A window that came to the front since the last input (a dialog
             // that opened after its reply): said before this input's result.
             let pre_note = match observe {
@@ -4416,6 +4512,9 @@ impl<B: Backend> Server<B> {
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
             };
+            if let (Ok(_), Some(near)) = (&result, &settle_near) {
+                trace::time("settle", self.settle(near)).await;
+            }
             let result = match (result, observe, before) {
                 (Ok(mut o), Some(observe), Some((mark, before))) => {
                     let seen = trace::time(
@@ -4490,16 +4589,6 @@ const CONTEXT_TOOLS: [&str; 14] = [
     "mouse",
     "find",
 ];
-
-/// Whether a failure is about the screen (worth `where_note`), not the
-/// setup, the allowlist (`allow_file` named) or the user taking over.
-fn wants_context(e: &str, allow_file: &str) -> bool {
-    !(e.starts_with("paused")
-        || e.starts_with("interrupted")
-        || e.contains("stopped by the user")
-        || e.contains(allow_file)
-        || e.contains("confirmation"))
-}
 
 /// Input tools that, without `observe`, note when another window came to
 /// the front. activate_window says so itself; act, menu and close_window
@@ -4874,6 +4963,9 @@ mod tests {
         /// Scrolls left until "report.pdf" (REVEALED) shows under the
         /// focus element, when Some.
         reveal: Rc<std::cell::Cell<Option<u32>>>,
+        /// "down" moves the focus this many ms after the key is released
+        /// (as focus events arrive late), when not 0.
+        lag: Rc<std::cell::Cell<u64>>,
     }
 
     /// The fake's change events, for kept reads: off unless a test turns
@@ -5033,8 +5125,8 @@ mod tests {
         async fn press_combo(&self, combo: &str) -> R<()> {
             self.keys.borrow_mut().push(format!("down {combo}"));
             // A list whose focused "Item N" moves down.
-            if combo == "down" {
-                let mut focus = self.focus.borrow_mut();
+            let down = |focus: &RefCell<Info<u32>>| {
+                let mut focus = focus.borrow_mut();
                 if let Some(k) = focus
                     .name
                     .strip_prefix("Item ")
@@ -5042,9 +5134,20 @@ mod tests {
                 {
                     focus.name = format!("Item {}", k + 1);
                 }
+            };
+            let lag = self.lag.get();
+            if combo == "down" && lag == 0 {
+                down(&self.focus);
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
             self.keys.borrow_mut().push(format!("up {combo}"));
+            if combo == "down" && lag > 0 {
+                let focus = self.focus.clone();
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(lag)).await;
+                    down(&focus);
+                });
+            }
             Ok(())
         }
         async fn type_text(&self, text: &str) -> R<String> {
@@ -5202,6 +5305,7 @@ mod tests {
         nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
         reads: Rc<FakeReads>,
         reveal: Rc<std::cell::Cell<Option<u32>>>,
+        lag: Rc<std::cell::Cell<u64>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -5232,7 +5336,9 @@ mod tests {
         let nodes = Rc::new(RefCell::new(HashMap::new()));
         let reads = Rc::new(FakeReads::default());
         let reveal = Rc::new(std::cell::Cell::new(None));
+        let lag = Rc::new(std::cell::Cell::new(0));
         let server = Rc::new(Server::new(FakeBackend {
+            lag: lag.clone(),
             reveal: reveal.clone(),
             reads: reads.clone(),
             takeover: takeover.clone(),
@@ -5260,6 +5366,7 @@ mod tests {
             nodes,
             reads,
             reveal,
+            lag,
         }
     }
 
@@ -7271,7 +7378,8 @@ mod tests {
                 lines[0].starts_with("[1] key failed (optional): stopped by the user"),
                 "{lines:?}"
             );
-            assert!(lines[1].starts_with("now: "), "{lines:?}");
+            assert_eq!(lines[1], "[1.on_fail] not run (refused)");
+            assert!(lines[2].starts_with("now: "), "{lines:?}");
         });
     }
 
@@ -7427,6 +7535,156 @@ mod tests {
             assert!(!err, "{lines:?}");
             assert_eq!(lines[0], "[1] repeat: until met in run 2");
             assert_eq!(lines[1], "[1.1] mouse failed (optional): pointer failed");
+        });
+    }
+
+    #[test]
+    fn a_repeat_reads_the_focus_once_the_input_took_effect() {
+        local(async {
+            let mut s = session("batch-repeat-lag");
+            s.focus.borrow_mut().role = "list item".into();
+            s.focus.borrow_mut().name = "Item 1".into();
+            // The focus moves 30 ms after each key: read at once, the
+            // reply would name the item before it, and until would hold
+            // one press late, on Item 5.
+            s.lag.set(30);
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": {"steps": [{"tool": "key", "args": {"combo": "down"}}],
+                                "until": {"contains": "item 4\""}}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] repeat: until met in run 3");
+            assert!(lines[1].contains("\"Item 4\""), "{lines:?}");
+            assert_eq!(s.focus.borrow().name, "Item 4");
+            // A step a condition tests settles too; others do not wait.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"tool": "key", "args": {"combo": "down"}},
+                    {"tool": "key", "args": {"combo": "down"}},
+                    {"tool": "key", "args": {"combo": "x"}, "if": {"step": 2, "contains": "item 6\""}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(lines[2].starts_with("[3] key: sent x"), "{lines:?}");
+        });
+    }
+
+    #[test]
+    fn a_refused_step_runs_no_on_fail_and_ends_a_repeat() {
+        local(async {
+            let mut s = session("batch-refused");
+            // The allowlist refuses: on_fail does not run, and says so.
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "find", "args": {"app": "secret", "query": "Save"},
+                     "on_fail": [{"tool": "key", "args": {"combo": "ctrl+s"}}]},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(
+                lines[0].contains("[1] find failed: app 'secret' is not in"),
+                "{lines:?}"
+            );
+            assert_eq!(lines[1], "[1.on_fail] not run (refused)");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // A miss whose message echoes "confirmation" is no refusal:
+            // on_fail runs, and an optional one does not end a repeat.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"tool": "wait_for", "args": {"app": "fake", "query": "delete confirmation",
+                                                  "timeout_ms": 0},
+                     "on_fail": [{"tool": "key", "args": {"combo": "a"}}]},
+                    {"repeat": {"steps": [
+                        {"tool": "wait_for", "args": {"app": "fake", "query": "confirmation",
+                                                      "timeout_ms": 0}, "optional": true},
+                        {"tool": "key", "args": {"combo": "b"}},
+                    ], "until": {"contains": "never"}, "max": 2}, "optional": true},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(lines[1].starts_with("[1.on_fail] key: sent a"), "{lines:?}");
+            assert_eq!(
+                lines[2],
+                "[2] repeat failed (optional): until not met in 2 runs"
+            );
+            assert_eq!(
+                *s.keys.borrow(),
+                ["down a", "up a", "down b", "up b", "down b", "up b"]
+            );
+            // Nor does it lose the screen context of a plain call.
+            let r = call_tool(
+                &mut s,
+                4,
+                "wait_for",
+                json!({"app": "fake", "query": "delete confirmation", "timeout_ms": 0}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("\nnow: "), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_declined_confirmation_runs_no_on_fail_and_ends_a_repeat() {
+        local(async {
+            let mut s = session("batch-declined");
+            set_allow("batch-declined", "fake\nconfirm: key:fake\n");
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                    "protocolVersion": "2025-06-18",
+                    "capabilities": {"elicitation": {}},
+                    "clientInfo": {"name": "test", "version": "0"}}}),
+            )
+            .await;
+            replies_within(&mut s, Duration::from_millis(200)).await;
+            let batches = [
+                // A fallback must not do what the user just declined.
+                json!([{"tool": "key", "args": {"combo": "ctrl+s"},
+                        "on_fail": [{"tool": "mouse", "args": {"x": 5, "y": 5}}]}]),
+                // Asked once, not on every run.
+                json!([{"repeat": {"steps": [
+                    {"tool": "key", "args": {"combo": "down"}, "optional": true},
+                ], "until": {"contains": "never"}, "max": 20}}]),
+            ];
+            for (call, steps) in (2..).zip(batches) {
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": call, "method": "tools/call",
+                    "params": {"name": "batch", "arguments": {"steps": steps}}}),
+                )
+                .await;
+                let ask = next(&mut s).await;
+                assert_eq!(ask["method"], "elicitation/create", "{ask}");
+                send(
+                    &mut s,
+                    json!({"jsonrpc": "2.0", "id": ask["id"], "result": {"action": "decline"}}),
+                )
+                .await;
+                let r = next(&mut s).await;
+                assert_eq!(r["id"], call, "asked again: {r}");
+                assert_eq!(r["result"]["isError"], true, "{r}");
+                let text = reply_text(&r);
+                assert!(text.contains("the user declined key"), "{text}");
+                match call {
+                    2 => assert!(text.contains("[1.on_fail] not run (refused)"), "{text}"),
+                    _ => assert!(text.contains("step 1.1 failed in run 1"), "{text}"),
+                }
+                assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            }
         });
     }
 
