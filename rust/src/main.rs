@@ -7,6 +7,7 @@
 //! every call). Platform code lives behind the `Backend` trait.
 
 mod backend;
+mod flow;
 #[cfg(target_os = "linux")]
 mod linux;
 mod policy;
@@ -585,53 +586,63 @@ fn note_step_element(rid: u64, replace: bool) {
     });
 }
 
-/// What an earlier batch step left for `"$N"` references.
-enum StepElement {
-    Element(u64),
-    NoElement,
-    Failed,
+/// What one tool call of a batch step left.
+struct StepResult {
+    result: R<Out>,
+    /// The element it produced (`STEP_ELEMENT`).
+    element: Option<u64>,
 }
 
-/// Replace `"$N"` in the top-level id arguments (`id`, `*_id`) of step
-/// `step` (1-based) with the element step N produced.
-fn resolve_step_refs(args: &mut Json, step: usize, done: &[(String, StepElement)]) -> R<()> {
-    let Some(map) = args.as_object_mut() else {
-        return Ok(());
-    };
-    for (key, value) in map.iter_mut() {
-        if key != "id" && !key.ends_with("_id") {
-            continue;
-        }
-        let Some(text) = value.as_str().and_then(|v| v.strip_prefix('$')) else {
-            continue;
-        };
-        let n: usize = text
-            .parse()
-            .map_err(|_| format!("`{key}` {value}: use \"$N\" for the element step N produced"))?;
-        let (tool, produced) = match n.checked_sub(1).and_then(|i| done.get(i)) {
-            Some(d) if n < step => d,
-            _ => {
-                return Err(format!(
-                    "`{key}` \"${n}\": refer to an earlier step (1 to {})",
-                    step - 1
-                ));
-            }
-        };
-        *value = match produced {
-            StepElement::Element(rid) => json!(rid),
-            StepElement::Failed => {
-                return Err(format!("`{key}` \"${n}\": step {n} ({tool}) failed"));
-            }
-            StepElement::NoElement => {
-                return Err(format!(
-                    "`{key}` \"${n}\": step {n} ({tool}) produced no element \
-                     (find, wait_for, and tools given an element do)"
-                ));
-            }
-        };
-    }
-    Ok(())
+/// A running batch: its reply so far and what its steps left.
+#[derive(Default)]
+struct BatchRun {
+    out: Vec<String>,
+    images: Vec<String>,
+    /// Records of the top-level steps run so far, for `"$N"` and conditions.
+    done: Vec<flow::Record>,
+    /// A printed step failed.
+    failed: bool,
 }
+
+impl BatchRun {
+    /// The reply line of a call labelled `label` ("3", "2.1", "4.on_fail").
+    fn print(&mut self, label: &str, call: &flow::Call, r: &StepResult, optional: bool) {
+        let tool = &call.tool;
+        match &r.result {
+            Ok(o) => {
+                self.out.push(format!("[{label}] {tool}: {}", o.text));
+                self.images.extend(o.images.iter().cloned());
+            }
+            Err(e) => {
+                self.failed = true;
+                let opt = if optional { " (optional)" } else { "" };
+                self.out.push(format!("[{label}] {tool} failed{opt}: {e}"));
+            }
+        }
+    }
+
+    fn record(&mut self, tool: String, ok: bool, r: StepResult) {
+        let text = match r.result {
+            Ok(o) => o.text,
+            Err(e) => e,
+        };
+        let element = r.element;
+        self.done.push(flow::Record {
+            tool,
+            outcome: flow::Outcome::Ran { ok, element, text },
+        });
+    }
+
+    fn skip(&mut self, tool: &str) {
+        self.done.push(flow::Record {
+            tool: tool.into(),
+            outcome: flow::Outcome::Skipped,
+        });
+    }
+}
+
+/// Longest run of a batch's repeat: it starts no new run after this.
+const REPEAT_TIME: Duration = Duration::from_millis(MAX_WAIT_MS as u64);
 
 /// Longest `wait_for` / `pause`, in ms (10 minutes).
 const MAX_WAIT_MS: i64 = 600_000;
@@ -4037,25 +4048,23 @@ impl<B: Backend> Server<B> {
         })
     }
 
-    /// Run `steps` in order. A batch with any input step holds the input
-    /// lock for its whole run (its steps are called as already holding it),
-    /// so two batches' input never interleaves. A step's `id`/`*_id`
-    /// argument "$N" names the element step N produced (`STEP_ELEMENT`).
+    /// Run `steps` in order, with their control flow (`flow`: if, on_fail,
+    /// repeat, stop_if), all checked before anything runs. A batch with any
+    /// input step holds the input lock for its whole run (its steps are
+    /// called as already holding it), so two batches' input never
+    /// interleaves. A step's `id`/`*_id` argument "$N" names the element
+    /// step N produced (`STEP_ELEMENT`).
     async fn batch(&self, a: &Json) -> R<Out> {
-        let steps = a
+        let raw = a
             .get("steps")
             .and_then(Json::as_array)
             .ok_or("missing array argument 'steps'")?;
-        fn tool_of(step: &Json) -> &str {
-            step.get("tool").and_then(Json::as_str).unwrap_or("")
-        }
-        if steps.iter().any(|s| tool_of(s) == "batch") {
-            return Err("batch cannot contain batch".into());
-        }
+        let steps =
+            flow::parse(raw, tools::is_tool).map_err(|e| format!("not run (nothing sent): {e}"))?;
         // A step with `window` activates a window: input too.
-        let input = steps.iter().any(|s| {
-            let args = s.get("args").unwrap_or(&Json::Null);
-            INPUT_TOOLS.contains(&tool_of(s)) || matches!(window_arg(tool_of(s), args), Ok(Some(_)))
+        let input = steps.iter().flat_map(flow::Step::calls).any(|c| {
+            INPUT_TOOLS.contains(&c.tool.as_str())
+                || matches!(window_arg(&c.tool, &c.args), Ok(Some(_)))
         });
         let _input = if input {
             let guard = self.input.lock().await;
@@ -4064,61 +4073,202 @@ impl<B: Backend> Server<B> {
         } else {
             None
         };
-        let mut out = Vec::new();
-        let mut images = Vec::new();
-        let mut done: Vec<(String, StepElement)> = Vec::new();
+        let mut run = BatchRun::default();
         for (i, step) in steps.iter().enumerate() {
-            let tool = tool_of(step);
-            let mut args = step.get("args").cloned().unwrap_or_else(|| json!({}));
-            // An optional step (typically a wait) may fail without costing
-            // the steps after it, e.g. the final observation.
-            let optional = step.get("optional").and_then(Json::as_bool) == Some(true);
-            let result = match resolve_step_refs(&mut args, i + 1, &done) {
-                Ok(()) => {
-                    STEP_ELEMENT
-                        .scope(std::cell::Cell::new(None), async {
-                            let r = self.call_inner(tool, &args, input).await;
-                            (r, STEP_ELEMENT.with(|e| e.get()))
-                        })
-                        .await
-                }
-                Err(e) => (Err(e), None),
-            };
-            let produced = match (&result.0, result.1) {
-                (Err(_), _) => StepElement::Failed,
-                (Ok(_), Some(rid)) => StepElement::Element(rid),
-                (Ok(_), None) => StepElement::NoElement,
-            };
-            done.push((tool.to_string(), produced));
-            match result.0 {
-                Ok(o) => {
-                    out.push(format!("[{}] {tool}: {}", i + 1, o.text));
-                    images.extend(o.images);
-                }
-                Err(e) if optional => {
-                    out.push(format!("[{}] {tool} failed (optional): {e}", i + 1));
-                }
-                Err(e) => {
-                    out.push(format!("[{}] {tool} failed: {e}", i + 1));
-                    if i + 1 < steps.len() {
-                        out.push(format!("stopped; {} step(s) not run", steps.len() - i - 1));
+            let n = i + 1;
+            let left = steps.len() - n;
+            if let Some(c) = &step.cond
+                && !c.holds(&run.done)
+            {
+                run.out.push(format!("[{n}] skipped (if {})", c.describe()));
+                run.skip(step.name());
+                continue;
+            }
+            let (ok, hard) = match &step.body {
+                flow::Body::Stop(c) => {
+                    let stop = c.holds(&run.done);
+                    run.skip("stop_if");
+                    if stop {
+                        let rest = match left {
+                            0 => String::new(),
+                            k => format!("; {k} step(s) not run"),
+                        };
+                        run.out.push(format!("[{n}] stop ({}){rest}", c.describe()));
+                        break;
                     }
-                    return Err(format!("{}{}", out.join("\n"), self.where_note().await));
+                    continue;
+                }
+                flow::Body::Tool(call) => {
+                    let r = self.batch_call(call, n, &run.done, input).await;
+                    let hard = r.result.as_ref().is_err_and(|e| self.refused(e));
+                    let ok = r.result.is_ok();
+                    run.print(&n.to_string(), call, &r, step.optional);
+                    run.record(call.tool.clone(), ok, r);
+                    (ok, hard)
+                }
+                flow::Body::Repeat { steps, until, max } => {
+                    let r = flow::Repeat {
+                        steps,
+                        until,
+                        max: *max,
+                    };
+                    self.repeat(&mut run, n, r, step.optional, input).await
+                }
+            };
+            if ok {
+                continue;
+            }
+            // Failed: its on_fail steps instead (never after a refusal or
+            // the user taking over), else the batch stops unless optional.
+            let mut handled = false;
+            if !step.on_fail.is_empty() && !hard {
+                handled = true;
+                for (k, call) in step.on_fail.iter().enumerate() {
+                    let label = match step.on_fail.len() {
+                        1 => format!("{n}.on_fail"),
+                        _ => format!("{n}.on_fail.{}", k + 1),
+                    };
+                    let r = self.batch_call(call, n, &run.done, input).await;
+                    run.print(&label, call, &r, call.optional);
+                    if r.result.is_err() && !call.optional {
+                        handled = false;
+                        break;
+                    }
                 }
             }
+            if !handled && !step.optional {
+                if left > 0 {
+                    run.out.push(format!("stopped; {left} step(s) not run"));
+                }
+                return Err(format!("{}{}", run.out.join("\n"), self.where_note().await));
+            }
         }
-        let mut text = out.join("\n");
+        let mut text = run.out.join("\n");
         // A step failed or found nothing: say what is on screen once, unless
         // the batch ends with a look at it.
-        let failed = done.iter().any(|(_, e)| matches!(e, StepElement::Failed))
-            || out.iter().any(|l| l.ends_with(": no matches"));
-        let looked = steps
-            .last()
-            .is_some_and(|s| ["screenshot", "tree"].contains(&tool_of(s)));
+        let failed = run.failed || run.out.iter().any(|l| l.ends_with(": no matches"));
+        // (Run to the end, the last step not skipped.)
+        let looked = run.done.len() == steps.len()
+            && steps
+                .last()
+                .is_some_and(|s| ["screenshot", "tree"].contains(&s.name()))
+            && run
+                .done
+                .last()
+                .is_some_and(|r| !matches!(r.outcome, flow::Outcome::Skipped));
         if failed && !looked {
             text.push_str(&self.where_note().await);
         }
-        Ok(Out { text, images })
+        Ok(Out {
+            text,
+            images: run.images,
+        })
+    }
+
+    /// One tool call of batch step `n`: its `"$N"` resolved, then run as a
+    /// call of its own, noting the element it produced.
+    async fn batch_call(
+        &self,
+        call: &flow::Call,
+        n: usize,
+        done: &[flow::Record],
+        held: bool,
+    ) -> StepResult {
+        let mut args = call.args.clone();
+        if let Err(e) = flow::resolve_refs(&mut args, n, done) {
+            return StepResult {
+                result: Err(e),
+                element: None,
+            };
+        }
+        let (result, element) = STEP_ELEMENT
+            .scope(std::cell::Cell::new(None), async {
+                let r = self.call_inner(&call.tool, &args, held).await;
+                (r, STEP_ELEMENT.with(|e| e.get()))
+            })
+            .await;
+        StepResult { result, element }
+    }
+
+    /// Run a repeat (batch step `n`) until `until` holds on its last step,
+    /// at most `max` runs and REPEAT_TIME. Prints its header and its last
+    /// run's lines and records it. Returns (succeeded, failed by a refusal
+    /// or the user taking over).
+    async fn repeat(
+        &self,
+        run: &mut BatchRun,
+        n: usize,
+        flow::Repeat { steps, until, max }: flow::Repeat<'_>,
+        optional: bool,
+        held: bool,
+    ) -> (bool, bool) {
+        let start = Instant::now();
+        let mut runs = 0;
+        loop {
+            runs += 1;
+            let mut lines = BatchRun::default();
+            let mut last = None;
+            let mut broke = None;
+            for (k, call) in steps.iter().enumerate() {
+                let r = self.batch_call(call, n, &run.done, held).await;
+                let label = format!("{n}.{}", k + 1);
+                lines.print(&label, call, &r, call.optional);
+                let hard = r.result.as_ref().is_err_and(|e| self.refused(e));
+                if r.result.is_err() && (!call.optional || hard) {
+                    broke = Some((label, hard));
+                }
+                last = Some(r);
+                if broke.is_some() {
+                    break;
+                }
+            }
+            let last = last.expect("a repeat has steps");
+            let text = match &last.result {
+                Ok(o) => o.text.clone(),
+                Err(e) => e.clone(),
+            };
+            let in_runs = match runs {
+                1 => "1 run".to_string(),
+                k => format!("{k} runs"),
+            };
+            let (ok, head, hard) = match broke {
+                Some((label, hard)) => (false, format!("step {label} failed in run {runs}"), hard),
+                None if until.holds(last.result.is_ok(), last.element, &text) => {
+                    (true, format!("until met in run {runs}"), false)
+                }
+                None if runs >= max => (false, format!("until not met in {in_runs}"), false),
+                None if start.elapsed() >= REPEAT_TIME => (
+                    false,
+                    format!("until not met in {in_runs} (time limit)"),
+                    false,
+                ),
+                None => continue,
+            };
+            let head = match (ok, optional) {
+                (true, _) => format!("[{n}] repeat: {head}"),
+                (false, false) => format!("[{n}] repeat failed: {head}"),
+                (false, true) => format!("[{n}] repeat failed (optional): {head}"),
+            };
+            run.out.push(head);
+            run.out.append(&mut lines.out);
+            run.images.append(&mut lines.images);
+            run.failed |= lines.failed || !ok;
+            run.done.push(flow::Record {
+                tool: "repeat".into(),
+                outcome: flow::Outcome::Ran {
+                    ok,
+                    element: last.element,
+                    text,
+                },
+            });
+            return (ok, hard);
+        }
+    }
+
+    /// Whether a failure is a refusal (allowlist, confirmation) or the user
+    /// taking over: on_fail does not run after it, and it ends a repeat.
+    fn refused(&self, e: &str) -> bool {
+        !wants_context(e, &self.allow_file.display().to_string())
     }
 
     /// Run a tool. When it fails, everything held is released (keys and
@@ -4721,6 +4871,9 @@ mod tests {
         nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
         /// What kept reads see: see `FakeReads`.
         reads: Rc<FakeReads>,
+        /// Scrolls left until "report.pdf" (REVEALED) shows under the
+        /// focus element, when Some.
+        reveal: Rc<std::cell::Cell<Option<u32>>>,
     }
 
     /// The fake's change events, for kept reads: off unless a test turns
@@ -4879,6 +5032,17 @@ mod tests {
         }
         async fn press_combo(&self, combo: &str) -> R<()> {
             self.keys.borrow_mut().push(format!("down {combo}"));
+            // A list whose focused "Item N" moves down.
+            if combo == "down" {
+                let mut focus = self.focus.borrow_mut();
+                if let Some(k) = focus
+                    .name
+                    .strip_prefix("Item ")
+                    .and_then(|k| k.parse::<u32>().ok())
+                {
+                    focus.name = format!("Item {}", k + 1);
+                }
+            }
             tokio::time::sleep(Duration::from_millis(50)).await;
             self.keys.borrow_mut().push(format!("up {combo}"));
             Ok(())
@@ -4920,6 +5084,17 @@ mod tests {
             }
             if scroll != 0 {
                 self.keys.borrow_mut().push(format!("scroll {scroll}"));
+                match self.reveal.get() {
+                    Some(n) if n > 1 => self.reveal.set(Some(n - 1)),
+                    Some(_) => {
+                        self.reveal.set(None);
+                        self.focus.borrow_mut().children.push(REVEALED);
+                        self.nodes
+                            .borrow_mut()
+                            .insert(REVEALED, fake_node("list item", "report.pdf", &[]));
+                    }
+                    None => {}
+                }
             }
             Ok(())
         }
@@ -4997,6 +5172,8 @@ mod tests {
     }
 
     const FAKE_FOCUS: u32 = 7;
+    /// The element `FakeBackend::reveal` shows.
+    const REVEALED: u32 = 60;
     /// `pointer` at this x fails.
     const FAIL_X: i64 = 666;
     /// `pointer` at this x takes 5 s.
@@ -5024,6 +5201,7 @@ mod tests {
         takeover: std::sync::Arc<takeover::Takeover>,
         nodes: Rc<RefCell<HashMap<u32, Info<u32>>>>,
         reads: Rc<FakeReads>,
+        reveal: Rc<std::cell::Cell<Option<u32>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -5053,7 +5231,9 @@ mod tests {
         ));
         let nodes = Rc::new(RefCell::new(HashMap::new()));
         let reads = Rc::new(FakeReads::default());
+        let reveal = Rc::new(std::cell::Cell::new(None));
         let server = Rc::new(Server::new(FakeBackend {
+            reveal: reveal.clone(),
             reads: reads.clone(),
             takeover: takeover.clone(),
             allow_file,
@@ -5079,6 +5259,7 @@ mod tests {
             takeover,
             nodes,
             reads,
+            reveal,
         }
     }
 
@@ -6889,11 +7070,9 @@ mod tests {
                      "args": {"app": "fake", "query": "never there", "timeout_ms": 0}},
                     {"tool": "act", "args": {"id": "$1"}, "optional": true},
                     {"tool": "act", "args": {"id": "$2"}, "optional": true},
-                    {"tool": "act", "args": {"id": "$5"}, "optional": true},
-                    {"tool": "act", "args": {"id": "$x"}, "optional": true},
                     // Text arguments are never references.
                     {"tool": "clipboard_set", "args": {"text": "$1"}},
-                    {"tool": "act", "args": {"id": "$0"}},
+                    {"tool": "act", "args": {"id": "$2"}},
                     {"tool": "key", "args": {"combo": "a"}},
                 ]}),
             )
@@ -6909,21 +7088,458 @@ mod tests {
                 lines[3],
                 "[4] act failed (optional): `id` \"$2\": step 2 (wait_for) failed"
             );
-            assert_eq!(
-                lines[4],
-                "[5] act failed (optional): `id` \"$5\": refer to an earlier step (1 to 4)"
-            );
+            assert!(lines[4].starts_with("[5] clipboard_set: "), "{r}");
             assert_eq!(
                 lines[5],
-                "[6] act failed (optional): `id` \"$x\": use \"$N\" for the element step N produced"
+                "[6] act failed: `id` \"$2\": step 2 (wait_for) failed"
             );
-            assert!(lines[6].starts_with("[7] clipboard_set: "), "{r}");
-            assert_eq!(
-                lines[7],
-                "[8] act failed: `id` \"$0\": refer to an earlier step (1 to 7)"
-            );
-            assert_eq!(lines[8], "stopped; 1 step(s) not run");
+            assert_eq!(lines[6], "stopped; 1 step(s) not run");
             assert_eq!(actions_run(&s), 0);
+            assert!(s.keys.borrow().is_empty());
+            // A reference that can never work fails the whole batch before
+            // anything runs.
+            for (bad, why) in [
+                ("$3", "refer to an earlier step (1 to 1)"),
+                ("$0", "refer to an earlier step (1 to 1)"),
+                ("$x", "use \"$N\" for the element step N produced"),
+            ] {
+                let r = call_tool(
+                    &mut s,
+                    3,
+                    "batch",
+                    json!({"steps": [
+                        {"tool": "key", "args": {"combo": "a"}},
+                        {"tool": "act", "args": {"id": bad}},
+                    ]}),
+                )
+                .await;
+                assert_eq!(r["result"]["isError"], true, "{r}");
+                assert_eq!(
+                    reply_text(&r),
+                    format!(
+                        "Error executing tool batch: not run (nothing sent): [2] act: `id` \"{bad}\": {why}"
+                    ),
+                );
+            }
+            assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    /// Run a batch and return (is error, its lines).
+    async fn run_batch(s: &mut Session, id: u64, steps: Json) -> (bool, Vec<String>) {
+        let r = call_tool(s, id, "batch", json!({ "steps": steps })).await;
+        let lines = reply_text(&r).lines().map(String::from).collect();
+        (r["result"]["isError"] == true, lines)
+    }
+
+    #[test]
+    fn a_batch_step_with_if_runs_only_when_its_condition_holds() {
+        local(async {
+            let mut s = session("batch-if");
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                    {"tool": "act", "args": {"id": "$1"}, "if": {"step": 1, "found": true}},
+                    {"tool": "find", "args": {"app": "fake", "query": "zzz"}},
+                    {"tool": "key", "args": {"combo": "a"}, "if": {"step": 3, "found": true}},
+                    {"tool": "key", "args": {"combo": "b"}, "if": {"step": 3, "contains": "NO MATCHES"}},
+                    {"tool": "wait_for", "optional": true,
+                     "args": {"app": "fake", "query": "Overwrite?", "timeout_ms": 0}},
+                    {"tool": "key", "args": {"combo": "c"}, "if": {"step": 6, "ok": true}},
+                    {"tool": "key", "args": {"combo": "d"}, "if": {"step": 6, "ok": false}},
+                    // A skipped step meets no condition, and "$N" to it fails.
+                    {"tool": "key", "args": {"combo": "e"}, "if": {"step": 7, "found": false}},
+                    {"tool": "act", "args": {"id": "$4"}, "optional": true},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(lines[1].starts_with("[2] act: Press -> ok"), "{lines:?}");
+            assert_eq!(lines[3], "[4] skipped (if step 3 found)");
+            assert!(lines[4].starts_with("[5] key: sent b"), "{lines:?}");
+            assert!(
+                lines[5].starts_with("[6] wait_for failed (optional): "),
+                "{lines:?}"
+            );
+            assert_eq!(lines[6], "[7] skipped (if step 6 ok)");
+            assert!(lines[7].starts_with("[8] key: sent d"), "{lines:?}");
+            assert_eq!(lines[8], "[9] skipped (if step 7 not found)");
+            assert_eq!(
+                lines[9],
+                "[10] act failed (optional): `id` \"$4\": step 4 (key) was skipped"
+            );
+            assert!(lines[10].starts_with("now: "), "{lines:?}");
+            assert_eq!(lines.len(), 11, "{lines:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                ["action 0 on 7", "down b", "up b", "down d", "up d"]
+            );
+        });
+    }
+
+    #[test]
+    fn on_fail_steps_run_only_when_their_step_failed() {
+        local(async {
+            let mut s = session("batch-on-fail");
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "act", "args": {"app": "fake", "query": "Save"},
+                     "on_fail": [{"tool": "key", "args": {"combo": "ctrl+s"}}]},
+                    {"tool": "key", "args": {"combo": "a"},
+                     "on_fail": [{"tool": "key", "args": {"combo": "x"}}]},
+                    {"tool": "key", "args": {"combo": "b"}, "if": {"step": 1, "ok": false}},
+                    {"tool": "mouse", "args": {"x": FAIL_X, "y": 0},
+                     "on_fail": [
+                        {"tool": "act", "args": {"app": "fake", "query": "zzz"}, "optional": true},
+                        {"tool": "key", "args": {"combo": "c"}},
+                     ]},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(lines[0].starts_with("[1] act failed: "), "{lines:?}");
+            assert!(
+                lines[1].starts_with("[1.on_fail] key: sent ctrl+s"),
+                "{lines:?}"
+            );
+            assert!(lines[2].starts_with("[2] key: sent a"), "{lines:?}");
+            assert!(lines[3].starts_with("[3] key: sent b"), "{lines:?}");
+            assert_eq!(lines[4], "[4] mouse failed: pointer failed");
+            assert!(
+                lines[5].starts_with("[4.on_fail.1] act failed (optional): "),
+                "{lines:?}"
+            );
+            assert!(
+                lines[6].starts_with("[4.on_fail.2] key: sent c"),
+                "{lines:?}"
+            );
+            assert!(lines[7].starts_with("now: "), "{lines:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                [
+                    "down ctrl+s",
+                    "up ctrl+s",
+                    "down a",
+                    "up a",
+                    "down b",
+                    "up b",
+                    "down c",
+                    "up c"
+                ]
+            );
+            // An on_fail step failing stops the batch, and what is held is
+            // released.
+            s.keys.borrow_mut().clear();
+            call_tool(&mut s, 3, "hold", json!({"key": "shift"})).await;
+            let (err, lines) = run_batch(
+                &mut s,
+                4,
+                json!([
+                    {"tool": "act", "args": {"app": "fake", "query": "Save"},
+                     "on_fail": [{"tool": "act", "args": {"app": "fake", "query": "Save as"}}]},
+                    {"tool": "key", "args": {"combo": "a"}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(
+                lines[1].starts_with("[1.on_fail] act failed: "),
+                "{lines:?}"
+            );
+            assert_eq!(lines[2], "stopped; 1 step(s) not run");
+            assert!(lines[3].starts_with("now: "), "{lines:?}");
+            assert!(lines[3].ends_with("; released shift"), "{lines:?}");
+            assert_eq!(*s.keys.borrow(), ["keydown shift", "keyup shift"]);
+            // Never after the user stopped input: the failure stands.
+            s.keys.borrow_mut().clear();
+            s.takeover.stop();
+            let (err, lines) = run_batch(
+                &mut s,
+                5,
+                json!([
+                    {"tool": "key", "args": {"combo": "a"}, "optional": true,
+                     "on_fail": [{"tool": "find", "args": {"app": "fake", "query": "OK"}}]},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert!(
+                lines[0].starts_with("[1] key failed (optional): stopped by the user"),
+                "{lines:?}"
+            );
+            assert!(lines[1].starts_with("now: "), "{lines:?}");
+        });
+    }
+
+    #[test]
+    fn a_repeat_scrolls_until_an_element_shows_and_a_later_step_uses_it() {
+        local(async {
+            let mut s = session("batch-repeat-scroll");
+            s.reveal.set(Some(3));
+            let scroll_find = json!({"steps": [
+                {"tool": "scroll", "args": {"app": "fake", "query": "OK", "observe": "effect"}},
+                {"tool": "find", "args": {"app": "fake", "query": "report.pdf"}},
+            ], "until": {"found": true}, "max": 5});
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": scroll_find},
+                    {"tool": "act", "args": {"id": "$1"}},
+                    {"tool": "key", "args": {"combo": "a"}, "if": {"step": 1, "contains": "report"}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] repeat: until met in run 3");
+            assert!(
+                lines[1].starts_with("[1.1] scroll: ") && lines[1].contains("effect: "),
+                "{lines:?}"
+            );
+            let found = printed_ids(lines[2].strip_prefix("[1.2] find: ").unwrap())[0];
+            assert_eq!(
+                lines[2],
+                format!("[1.2] find: [{found}] list item \"report.pdf\" actions=Press")
+            );
+            assert!(lines[3].starts_with("[2] act: Press -> ok"), "{lines:?}");
+            assert!(lines[4].starts_with("[3] key: sent a"), "{lines:?}");
+            assert_eq!(lines.len(), 5, "{lines:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                [
+                    "scroll 3",
+                    "scroll 3",
+                    "scroll 3",
+                    "action 0 on 60",
+                    "down a",
+                    "up a"
+                ]
+            );
+            // Never there within `max` runs: the repeat fails.
+            let mut s = session("batch-repeat-max");
+            s.reveal.set(Some(10));
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "scroll", "args": {"app": "fake", "query": "OK"}},
+                        {"tool": "find", "args": {"app": "fake", "query": "report.pdf"}},
+                    ], "until": {"found": true}, "max": 2}},
+                    {"tool": "act", "args": {"id": "$1"}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert_eq!(
+                lines[0],
+                "Error executing tool batch: [1] repeat failed: until not met in 2 runs"
+            );
+            assert!(lines[1].starts_with("[1.1] scroll: "), "{lines:?}");
+            assert_eq!(lines[2], "[1.2] find: no matches");
+            assert_eq!(lines[3], "stopped; 1 step(s) not run");
+            assert!(lines[4].starts_with("now: "), "{lines:?}");
+            assert_eq!(*s.keys.borrow(), ["scroll 3", "scroll 3"]);
+            // Optional: the batch goes on, but "$1" names a failed step.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "find", "args": {"app": "fake", "query": "report.pdf"}},
+                    ], "until": {"found": true}, "max": 1}, "optional": true},
+                    {"tool": "act", "args": {"id": "$1"}, "optional": true},
+                    {"tool": "key", "args": {"combo": "a"}, "if": {"step": 1, "ok": false}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(
+                lines[0],
+                "[1] repeat failed (optional): until not met in 1 run"
+            );
+            assert_eq!(
+                lines[2],
+                "[2] act failed (optional): `id` \"$1\": step 1 (repeat) failed"
+            );
+            assert!(lines[3].starts_with("[3] key: sent a"), "{lines:?}");
+        });
+    }
+
+    #[test]
+    fn a_repeat_presses_down_until_the_focus_is_right() {
+        local(async {
+            let mut s = session("batch-repeat-key");
+            s.focus.borrow_mut().role = "list item".into();
+            s.focus.borrow_mut().name = "Item 1".into();
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": {"steps": [{"tool": "key", "args": {"combo": "down"}}],
+                                "until": {"contains": "item 4\""}}},
+                    {"tool": "key", "args": {"combo": "Return"}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] repeat: until met in run 3");
+            assert!(
+                lines[1].starts_with("[1.1] key: sent down") && lines[1].contains("\"Item 4\""),
+                "{lines:?}"
+            );
+            assert!(lines[2].starts_with("[2] key: sent Return"), "{lines:?}");
+            assert_eq!(s.keys.borrow().len(), 8);
+            // A failing inner step ends the repeat at once.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "key", "args": {"combo": "down"}},
+                        {"tool": "mouse", "args": {"x": FAIL_X, "y": 0}},
+                    ], "until": {"ok": true}}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert_eq!(
+                lines[0],
+                "Error executing tool batch: [1] repeat failed: step 1.2 failed in run 1"
+            );
+            assert_eq!(lines[2], "[1.2] mouse failed: pointer failed");
+            // An optional one does not.
+            let (err, lines) = run_batch(
+                &mut s,
+                4,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "mouse", "args": {"x": FAIL_X, "y": 0}, "optional": true},
+                        {"tool": "key", "args": {"combo": "down"}},
+                    ], "until": {"contains": "item 7"}}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] repeat: until met in run 2");
+            assert_eq!(lines[1], "[1.1] mouse failed (optional): pointer failed");
+        });
+    }
+
+    #[test]
+    fn user_input_during_a_repeat_ends_it_without_on_fail() {
+        local(async {
+            let mut s = session("batch-repeat-takeover");
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                t.user_input(Instant::now(), takeover::Device::Pointer);
+            });
+            // Only nested steps send input: the batch still holds the input
+            // lock and counts as one run.
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"repeat": {"steps": [
+                        {"tool": "key", "args": {"combo": "a"}, "optional": true},
+                        {"tool": "pause", "args": {"ms": 60}},
+                    ], "until": {"contains": "never"}, "max": 20},
+                     "on_fail": [{"tool": "key", "args": {"combo": "z"}}]},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(
+                lines[0].starts_with(
+                    "Error executing tool batch: [1] repeat failed: step 1.1 failed in run "
+                ),
+                "{lines:?}"
+            );
+            assert!(
+                lines[1].starts_with("[1.1] key failed (optional): interrupted: "),
+                "{lines:?}"
+            );
+            assert!(
+                !s.keys.borrow().iter().any(|k| k.contains('z')),
+                "{:?}",
+                s.keys.borrow()
+            );
+        });
+    }
+
+    #[test]
+    fn stop_if_ends_the_batch_early_and_successfully() {
+        local(async {
+            let mut s = session("batch-stop");
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "find", "args": {"app": "fake", "query": "zzz"}},
+                    {"stop_if": {"step": 1, "found": true}},
+                    {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                    {"stop_if": {"step": 3, "found": true}},
+                    {"tool": "key", "args": {"combo": "a"}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                ]),
+            )
+            .await;
+            assert!(!err, "{lines:?}");
+            assert_eq!(lines[0], "[1] find: no matches");
+            // A stop_if that does not hold says nothing.
+            assert!(lines[1].starts_with("[3] find: ["), "{lines:?}");
+            assert_eq!(lines[2], "[4] stop (step 3 found); 2 step(s) not run");
+            assert!(lines[3].starts_with("now: "), "{lines:?}");
+            assert_eq!(lines.len(), 4, "{lines:?}");
+            assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_bad_batch_is_refused_before_anything_runs() {
+        local(async {
+            let mut s = session("batch-invalid");
+            for (steps, why) in [
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}},
+                           {"tool": "key", "args": {"combo": "b"}, "if": {"step": 3, "ok": true}}]),
+                    "[2] if: `step` 3 is not an earlier step (1 to 1)",
+                ),
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}}, {"tool": "kye"}]),
+                    "[2] unknown tool 'kye'",
+                ),
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}},
+                           {"repeat": {"steps": [{"repeat": {}}], "until": {"ok": true}}}]),
+                    "[2] repeat step 1: repeat cannot be nested; put it at the top level",
+                ),
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}},
+                           {"tool": "key", "args": {"combo": "b"}, "if": {"step": 1, "ok": false}}]),
+                    "[2] if: {\"ok\": false} on step 1 never holds: the batch stops when it \
+                     fails; mark it \"optional\": true or give it on_fail",
+                ),
+                (
+                    json!([{"tool": "key", "args": {"combo": "a"}},
+                           {"repeat": {"steps": [{"tool": "key"}], "until": {"ok": true}, "max": 50}}]),
+                    "[2] repeat: `max` must be 1 to 20, not 50",
+                ),
+            ] {
+                let (err, lines) = run_batch(&mut s, 2, steps).await;
+                assert!(err);
+                assert_eq!(
+                    lines,
+                    [format!(
+                        "Error executing tool batch: not run (nothing sent): {why}"
+                    )]
+                );
+            }
             assert!(s.keys.borrow().is_empty());
         });
     }
