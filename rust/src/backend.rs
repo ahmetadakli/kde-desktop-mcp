@@ -363,6 +363,11 @@ pub trait Backend {
     }
 
     async fn actions(&self, id: &Self::Id) -> Vec<String>;
+    /// The toolkit's id of an element (Qt: object names joined by dots,
+    /// e.g. `…QMenuBar.file.file.file_save_as`); empty when it has none.
+    async fn object_id(&self, _id: &Self::Id) -> String {
+        String::new()
+    }
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
     /// Complete text content (falls back to the name).
     async fn full_text(&self, id: &Self::Id, limit: usize) -> R<String>;

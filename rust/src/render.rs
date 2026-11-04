@@ -1795,6 +1795,38 @@ pub fn pick_menu_item<Id: Clone + Eq + Hash>(
     }
 }
 
+/// The entry whose toolkit object name `want` names, for a path written in
+/// another language than the UI: KDE names its standard actions in English
+/// (`file`, `file_save_as`, `edit_copy`, `options_configure`). `ids` pairs
+/// each entry with its object id (dot-separated); `want` as a slug
+/// ("Save As…" → `save_as`) must equal the id's last part or end it after
+/// an underscore. None unless exactly one entry fits.
+pub fn pick_by_object_name<Id: Clone>(ids: &[(Id, String)], want: &str) -> Option<Id> {
+    let slug: String = menu_norm(want)
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .split('_')
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join("_");
+    if slug.is_empty() || !slug.is_ascii() {
+        return None;
+    }
+    let fits: Vec<&Id> = ids
+        .iter()
+        .filter(|(_, oid)| {
+            let last = oid.rsplit('.').next().unwrap_or("").to_lowercase();
+            last == slug || last.ends_with(&format!("_{slug}"))
+        })
+        .map(|(id, _)| id)
+        .collect();
+    match fits.as_slice() {
+        [one] => Some((*one).clone()),
+        _ => None,
+    }
+}
+
 /// A menu `path`: a list of labels, or one string split at `>`; empty for
 /// none.
 pub fn menu_path(path: Option<&Json>) -> Result<Vec<String>, String> {
@@ -1963,6 +1995,28 @@ mod tests {
         );
         let top = menu_items(&c, &"/mb").unwrap();
         assert_eq!(pick_menu_item(&c, &top, "dosya"), Ok("/file"));
+    }
+
+    #[test]
+    fn english_paths_find_kde_entries_by_object_name() {
+        let bar = "QApplication.MainWindow#1.QMenuBar";
+        let top = vec![(1, format!("{bar}.file")), (2, format!("{bar}.edit"))];
+        assert_eq!(pick_by_object_name(&top, "File"), Some(1));
+        assert_eq!(pick_by_object_name(&top, "Edit"), Some(2));
+        assert_eq!(pick_by_object_name(&top, "View"), None);
+        let file = vec![
+            (3, format!("{bar}.file.file.file_save")),
+            (4, format!("{bar}.file.file.file_save_as")),
+            (5, format!("{bar}.file.file.file_save_as_with_encoding")),
+            (6, format!("{bar}.file.file.file_close")),
+            (7, format!("{bar}.file.file.file_close_other")),
+        ];
+        assert_eq!(pick_by_object_name(&file, "Save As..."), Some(4));
+        assert_eq!(pick_by_object_name(&file, "Save As…"), Some(4));
+        assert_eq!(pick_by_object_name(&file, "save"), Some(3));
+        assert_eq!(pick_by_object_name(&file, "Close"), Some(6));
+        // Not ASCII: a translated label, never matched against object names.
+        assert_eq!(pick_by_object_name(&file, "Kaydet"), None);
     }
 
     #[test]

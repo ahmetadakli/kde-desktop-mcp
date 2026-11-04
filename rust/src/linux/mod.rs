@@ -118,8 +118,10 @@ const DIALOG_MAX_NODES: usize = 400;
 /// top. Qt builds accessible ids from object and class names, so this does
 /// not depend on the language.
 fn is_file_name_field(id: &str) -> bool {
+    // Qt 5 exposes the combo box's line edit; Qt 6 only the editable combo
+    // box itself (no text interface: it is typed into).
     id.contains("KFileWidget")
-        && id.ends_with("KUrlComboBox.KLineEdit")
+        && (id.ends_with("KUrlComboBox.KLineEdit") || id.ends_with("KUrlComboBox"))
         && !id.contains("KUrlNavigator")
 }
 
@@ -1183,6 +1185,10 @@ impl Backend for LinuxBackend {
         !self.toolkit(&id.bus).await.eq_ignore_ascii_case("gecko")
     }
 
+    async fn object_id(&self, id: &Obj) -> String {
+        self.a11y.accessible_id(id).await
+    }
+
     async fn actions(&self, id: &Obj) -> Vec<String> {
         self.a11y.actions(id).await
     }
@@ -2125,6 +2131,13 @@ mod tests {
         )));
         assert!(is_file_name_field(
             "QApplication.KDEPlatformFileDialog.KFileWidget.QSplitter.QWidget.KUrlComboBox.KLineEdit"
+        ));
+        // Kate's in-app dialog on Qt 6: only the editable combo box is there.
+        assert!(is_file_name_field(
+            "QApplication.KDEPlatformFileDialog.KFileWidget.QSplitter.QWidget.KUrlComboBox"
+        ));
+        assert!(!is_file_name_field(
+            "QApplication.KDEPlatformFileDialog.KFileWidget.QSplitter.QWidget.QWidget.KUrlNavigator.KUrlComboBox"
         ));
         // The URL navigator's edit, the filter combo, a search field.
         assert!(!is_file_name_field(&format!(

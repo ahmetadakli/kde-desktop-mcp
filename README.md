@@ -217,7 +217,10 @@ tool; `off` turns it off). Not available on Windows yet.
   saying what the field holds (a length limit, reformatting). Firefox's input
   fields report accessibility writes as successful and do nothing, so when
   single-line text does not take, it focuses the element, selects all with
-  Ctrl+A and types it. Password fields cannot be read back.
+  Ctrl+A and types it. An editable element without a text interface (Qt 6's
+  editable combo boxes, such as a KDE file dialog's name field) is typed into
+  the same way and read back from its name. Password fields cannot be read
+  back.
 - `scroll`: turns the wheel over an element (a list, a page, a panel).
 - Modifier clicks: `click`, `mouse` and `scroll` take `modifiers` (`ctrl`,
   `shift`, `alt`, `meta`), pressed before the pointer action and released in
@@ -343,7 +346,10 @@ tool; `off` turns it off). Not available on Windows yet.
   (`["Dosya", "Farklı Kaydet…"]`) or one string (`"Dosya > Farklı Kaydet"`).
   Labels are matched case-insensitively (Turkish dotted and dotless i
   alike), without `&`/`_` accelerator markers, a shortcut after a tab or a
-  trailing ellipsis; an exact label wins, else a unique part of one. Without
+  trailing ellipsis; an exact label wins, else a unique part of one. A label
+  that is not there is also tried against KDE's English action names
+  (`file`, `file_save_as`, `edit_copy`), so `"File > Save As"` works in a
+  Turkish Kate (it saved two turns per task in the e2e benchmark). Without
   `path` it lists the top level, and a path ending at a submenu lists that
   submenu's entries with ids (read-only where the app keeps closed submenus
   in the tree). Qt and GTK apps keep closed submenus' entries in the tree, so
@@ -366,7 +372,8 @@ tool; `off` turns it off). Not available on Windows yet.
   it shows. The terminal must be in the allowlist (e.g. `konsole`).
 - `file_dialog`: fills in the file Open/Save dialog in front: `path` (absolute
   or `~/…`) is written into its file name field, the default button (Open,
-  Save) is pressed and the dialog's closing is awaited. Works on an allowed
+  Save) is pressed and the dialog's closing is awaited (Qt 5's name field and
+  Qt 6's editable combo box alike). Works on an allowed
   app's own KDE dialog and on the portal dialog (`xdg-desktop-portal-kde`) a
   browser opens for uploads and downloads; a portal dialog is filled only when
   the parent window KWin reports for it belongs to an allowed app, and a

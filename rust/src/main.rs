@@ -2208,11 +2208,16 @@ impl<B: Backend> Server<B> {
             };
             return Ok((t, None));
         }
+        // `role` alone (no `query`) names the first element of that role,
+        // e.g. an editor's text: input tools still refuse a tie.
+        let has_role = !arg_s(a, "role", "").trim().is_empty();
         let (Some(app), Some(query)) = (
             a.get("app").and_then(Json::as_str),
-            a.get("query").and_then(Json::as_str),
+            a.get("query")
+                .and_then(Json::as_str)
+                .or(has_role.then_some("")),
         ) else {
-            return Err("pass `id` (from tree/find), or `app` and `query`".into());
+            return Err("pass `id` (from tree/find), or `app` and `query` (or `role`)".into());
         };
         if !self.is_allowed(app) {
             return Err(self.not_allowed(app));
@@ -3091,8 +3096,22 @@ impl<B: Backend> Server<B> {
                     .map_err(|e| format!("{}: {e}{}", where_(&trail), open_note(&opened)))?;
                 opened.push(render::json_str(trail.last().unwrap()));
             }
-            let item = render::pick_menu_item(&cache, &items, seg)
-                .map_err(|e| format!("in {}: {e}{}", where_(&trail), open_note(&opened)))?;
+            let item = match render::pick_menu_item(&cache, &items, seg) {
+                Ok(item) => item,
+                // A path in another language than the UI ("File > Save As"
+                // in a Turkish Kate): KDE's English object names.
+                Err(e) => {
+                    let ids = futures_util::future::join_all(
+                        items
+                            .iter()
+                            .map(|id| async { (id.clone(), self.b.object_id(id).await) }),
+                    )
+                    .await;
+                    render::pick_by_object_name(&ids, seg).ok_or_else(|| {
+                        format!("in {}: {e}{}", where_(&trail), open_note(&opened))
+                    })?
+                }
+            };
             trail.push(cache[&item].name.trim().to_string());
             node = item;
         }
@@ -3282,11 +3301,21 @@ impl<B: Backend> Server<B> {
         if t.protected() && !self.passwords_allowed(&t.app) {
             return Err(t.reply(&self.password_refusal("set_text", &t.app)));
         }
-        if !self.b.set_text(&t.id, &text).await? {
-            return Ok(t.reply("failed"));
-        }
+        let typed = match self.write_text(&t.id, &text).await? {
+            Written::Refused => return Ok(t.reply("failed")),
+            Written::Set => false,
+            Written::Typed => true,
+        };
         if t.protected() {
             return Ok(t.reply("ok (password field: contents cannot be read back)"));
+        }
+        if typed {
+            let how = "; typed: the element has no text interface";
+            return match self.read_back(&t.id, &text, SET_TEXT_VERIFY).await {
+                Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
+                Ok(Some(now)) => Err(t.reply(&written_mismatch(&now, &text, how))),
+                Err(e) => Ok(t.reply(&format!("ok (not verified: {e}{how})"))),
+            };
         }
         // Firefox reports success for accessibility writes and changes
         // nothing. Retype through the keyboard when the element takes focus;
@@ -3318,17 +3347,34 @@ impl<B: Backend> Server<B> {
         }
         match seen {
             Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
-            Ok(Some(now)) => {
-                let shown: String = now.chars().take(120).collect();
-                let more = if now.chars().count() > 120 { "…" } else { "" };
-                Err(t.reply(&format!(
-                    "written, but the field now holds {shown:?}{more} ({} chars, {} asked{how}); \
-                     it may limit or reformat input. Check with get_text before retrying.",
-                    now.chars().count(),
-                    text.chars().count()
-                )))
-            }
+            Ok(Some(now)) => Err(t.reply(&written_mismatch(&now, &text, how))),
             Err(e) => Ok(t.reply(&format!("ok (not verified: {e})"))),
+        }
+    }
+
+    /// Write `text` into an element: through its text interface, else, for an
+    /// editable element without one (Qt's editable combo boxes, e.g. a KDE
+    /// file dialog's name field), by focusing it, selecting all and typing.
+    /// Text with a newline is never typed: Enter would submit. Err when it
+    /// is neither, or typing could not start (nothing typed then).
+    async fn write_text(&self, id: &B::Id, text: &str) -> R<Written> {
+        match self.b.set_text(id, text).await {
+            Ok(true) => Ok(Written::Set),
+            Ok(false) => Ok(Written::Refused),
+            Err(e) => {
+                let editable = self.b.info(id, 0).await.states.contains(&"editable");
+                if text.contains('\n') || !editable {
+                    return Err(e);
+                }
+                if self.retype(id, text).await {
+                    Ok(Written::Typed)
+                } else {
+                    Err(format!(
+                        "{e}; typing into it failed too (it took no focus in an allowed \
+                         active window)"
+                    ))
+                }
+            }
         }
     }
 
@@ -4132,7 +4178,7 @@ impl<B: Backend> Server<B> {
             .map_err(|e| refusal(format!("{e} (allowlist: {})", self.allow_file.display())))?;
         self.permit(&owner).await?;
         let text = path.display().to_string();
-        if !self.b.set_text(&d.field, &text).await? {
+        if matches!(self.write_text(&d.field, &text).await?, Written::Refused) {
             return Err("the file name field refused the path".into());
         }
         if let Some(now) = self.read_back(&d.field, &text, SET_TEXT_VERIFY).await? {
@@ -4746,6 +4792,28 @@ impl<B: Backend> Server<B> {
             }
         }))
     }
+}
+
+/// How `Server::write_text` got the text in.
+enum Written {
+    /// Through the text interface.
+    Set,
+    /// Typed: the element had no text interface.
+    Typed,
+    /// The text interface refused it.
+    Refused,
+}
+
+/// The reply when a written field holds something else than `text`.
+fn written_mismatch(now: &str, text: &str, how: &str) -> String {
+    let shown: String = now.chars().take(120).collect();
+    let more = if now.chars().count() > 120 { "…" } else { "" };
+    format!(
+        "written, but the field now holds {shown:?}{more} ({} chars, {} asked{how}); \
+         it may limit or reformat input. Check with get_text before retrying.",
+        now.chars().count(),
+        text.chars().count()
+    )
 }
 
 /// Tools whose failure reply ends with what is on screen (`where_note`).
