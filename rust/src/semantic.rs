@@ -56,8 +56,15 @@ impl Verb {
     }
 }
 
+/// Whether `role` is one of `roles`, compared as `norm` does: Windows
+/// spells them without spaces ("checkbox", "listitem").
+fn role_in(role: &str, roles: &[&str]) -> bool {
+    let r = norm(role);
+    roles.iter().any(|x| norm(x) == r)
+}
+
 /// Roles that are checked or unchecked whatever the platform says.
-pub const CHECK_ROLES: [&str; 6] = [
+const CHECK_ROLES: [&str; 6] = [
     "check box",
     "check menu item",
     "radio button",
@@ -66,19 +73,26 @@ pub const CHECK_ROLES: [&str; 6] = [
     "switch",
 ];
 
+/// Whether an element of `role` is checked or unchecked whatever the
+/// platform says.
+pub fn is_check_role(role: &str) -> bool {
+    role_in(role, &CHECK_ROLES)
+}
+
 /// Roles unchecked only by checking another one.
 pub fn is_radio(role: &str) -> bool {
-    matches!(role, "radio button" | "radio menu item")
+    role_in(role, &["radio button", "radio menu item"])
 }
 
 /// Roles whose expanding opens a menu or popup.
 pub fn opens_menu(role: &str) -> bool {
-    matches!(role, "combo box" | "menu" | "menu item" | "menu bar")
+    role_in(role, &["combo box", "menu", "menu item", "menu bar"])
 }
 
 /// Entries of a list, menu or tab list: what `select` picks among. An
-/// item's own children are not entries of the control.
-pub const OPTION_ROLES: [&str; 9] = [
+/// item's own children are not entries of the control. "tab item" and
+/// "data item" are Windows' page tab and table cell.
+const OPTION_ROLES: [&str; 11] = [
     "list item",
     "menu item",
     "check menu item",
@@ -88,18 +102,57 @@ pub const OPTION_ROLES: [&str; 9] = [
     "table row",
     "page tab",
     "radio button",
+    "tab item",
+    "data item",
 ];
 
+/// Whether an element of `role` is an entry `select` picks among.
+pub fn is_option_role(role: &str) -> bool {
+    role_in(role, &OPTION_ROLES)
+}
+
 /// Roles whose generic press or click does something other than expand
-/// (open a file, select a row): only an action named for expanding does.
-const ITEM_ROLES: [&str; 6] = [
+/// or check (open a file, select a row): only an action named for that
+/// does.
+const ITEM_ROLES: [&str; 7] = [
     "list item",
     "tree item",
     "table cell",
     "table row",
     "tree table",
     "menu item",
+    "data item",
 ];
+
+/// Whether an element of `role` is a row or cell of a list, tree or table
+/// (or a menu entry), whose generic action opens or selects it.
+pub fn is_item_role(role: &str) -> bool {
+    role_in(role, &ITEM_ROLES)
+}
+
+/// Rows and cells, which never open a popup to select in: their generic
+/// action opens the file or selects the row.
+const ROW_ROLES: [&str; 6] = [
+    "list item",
+    "tree item",
+    "table cell",
+    "table row",
+    "tree table",
+    "data item",
+];
+
+/// Whether `select` may open the control (`role`, with `actions` and the
+/// AT-SPI HAS_POPUP state `popup`) to read its entries: a combo box, a
+/// menu, a button that says it has a popup, or one with an action named
+/// for opening. Never a row or cell, nor a plain button (OK, Delete).
+pub fn may_open(role: &str, actions: &[String], popup: bool) -> bool {
+    if role_in(role, &ROW_ROLES) {
+        return false;
+    }
+    role_in(role, &["combo box", "menu", "push button menu"])
+        || popup
+        || first_of(actions, &["showmenu", "open", "expand"]).is_some()
+}
 
 /// Index of the first of `names` (in `norm` form, in order of preference)
 /// that `actions` has; showContextMenu never.
@@ -110,8 +163,17 @@ fn first_of(actions: &[String], names: &[&str]) -> Option<usize> {
         .find_map(|want| normed.iter().position(|a| a == want))
 }
 
-/// The action that makes a checkable element `checked` (`want`).
-pub fn check_action(actions: &[String], want: bool) -> Option<usize> {
+/// The action that makes a checkable element of `role` `checked`
+/// (`want`). A row or cell (Qt's checkable item-view cells, GTK's toggle
+/// cells) only by an action named for checking, or toggle where that is
+/// not Qt's (`qt`), which flips the row's selection: press, click and
+/// activate select or open it.
+pub fn check_action(role: &str, actions: &[String], want: bool, qt: bool) -> Option<usize> {
+    if is_item_role(role) {
+        let named = if want { "check" } else { "uncheck" };
+        let names: &[&str] = if qt { &[named] } else { &[named, "toggle"] };
+        return first_of(actions, names);
+    }
     let names: &[&str] = if want {
         &[
             "check",
@@ -158,7 +220,7 @@ pub fn has_expand_action(actions: &[String]) -> bool {
 pub fn expand_action(role: &str, actions: &[String], want: bool) -> Option<usize> {
     let named: &[&str] = if want { &EXPAND_NAMES } else { &COLLAPSE_NAMES };
     first_of(actions, named).or_else(|| {
-        (!ITEM_ROLES.contains(&role))
+        (!is_item_role(role))
             .then(|| first_of(actions, &PRESS_NAMES))
             .flatten()
     })
@@ -173,7 +235,8 @@ pub fn item_action(actions: &[String]) -> Option<usize> {
     )
 }
 
-/// The action that opens a combo box's or menu button's popup.
+/// The action that opens a combo box's or menu button's popup (one that
+/// `may_open` allows).
 pub fn open_action(actions: &[String]) -> Option<usize> {
     first_of(
         actions,
@@ -200,7 +263,7 @@ pub fn walk_options<Id: Clone + Eq + Hash>(cache: &Cache<Id>, root: &Id) -> (Vec
             missing.push(id);
             continue;
         };
-        if OPTION_ROLES.contains(&info.role.as_str()) {
+        if is_option_role(&info.role) {
             if !info.name.trim().is_empty() {
                 out.push(id);
             }
@@ -229,20 +292,22 @@ pub fn named_option(name: &str, text: Option<&str>, labels: &[String]) -> Option
 }
 
 /// The entry `control` shows now: the one its name or text names
-/// (`named_option`), else the first selected (or checked) one.
+/// (`named_option`), else the one selected (or checked); None when
+/// several are (a multi-selection list).
 pub fn current<Id: Clone + Eq + Hash>(cache: &Cache<Id>, control: &Id, items: &[Id]) -> Option<Id> {
     let info = cache.get(control)?;
     let labels: Vec<String> = items.iter().map(|id| cache[id].name.clone()).collect();
     if let Some(i) = named_option(&info.name, info.text.as_deref(), &labels) {
         return Some(items[i].clone());
     }
-    items
-        .iter()
-        .find(|id| {
-            let st = &cache[*id].states;
-            st.contains(&"selected") || st.contains(&"checked")
-        })
-        .cloned()
+    let mut on = items.iter().filter(|id| {
+        let st = &cache[*id].states;
+        st.contains(&"selected") || st.contains(&"checked")
+    });
+    match (on.next(), on.next()) {
+        (Some(one), None) => Some(one.clone()),
+        _ => None,
+    }
 }
 
 /// Entries named in an error at most.
@@ -317,15 +382,83 @@ mod tests {
 
     #[test]
     fn check_actions_by_toolkit() {
+        let cb = "check box";
         // Qt check box.
-        assert_eq!(check_action(&names(&["Toggle", "Press"]), true), Some(0));
+        assert_eq!(
+            check_action(cb, &names(&["Toggle", "Press"]), true, true),
+            Some(0)
+        );
         // Firefox names the action after what it will do.
-        assert_eq!(check_action(&names(&["check"]), true), Some(0));
-        assert_eq!(check_action(&names(&["uncheck"]), false), Some(0));
-        assert_eq!(check_action(&names(&["uncheck"]), true), None);
+        assert_eq!(check_action(cb, &names(&["check"]), true, false), Some(0));
+        assert_eq!(
+            check_action(cb, &names(&["uncheck"]), false, false),
+            Some(0)
+        );
+        assert_eq!(check_action(cb, &names(&["uncheck"]), true, false), None);
         // GTK.
-        assert_eq!(check_action(&names(&["click"]), false), Some(0));
-        assert_eq!(check_action(&names(&["showContextMenu"]), true), None);
+        assert_eq!(check_action(cb, &names(&["click"]), false, false), Some(0));
+        assert_eq!(
+            check_action(cb, &names(&["showContextMenu"]), true, false),
+            None
+        );
+        // Windows: UI Automation's Toggle.
+        assert_eq!(
+            check_action("checkbox", &names(&["toggle"]), true, false),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn rows_are_checked_only_by_a_check_action() {
+        // A checkable Qt item-view cell: Toggle selects the row.
+        assert_eq!(
+            check_action("tree item", &names(&["Toggle"]), true, true),
+            None
+        );
+        // GTK's toggle cell: toggle checks it; activate opens the row.
+        let gtk = names(&["activate", "toggle"]);
+        assert_eq!(check_action("table cell", &gtk, true, false), Some(1));
+        assert_eq!(
+            check_action("list item", &names(&["activate", "click"]), true, false),
+            None
+        );
+        // Firefox.
+        assert_eq!(
+            check_action("list item", &names(&["check"]), true, false),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn windows_role_spellings() {
+        assert!(is_check_role("checkbox") && is_check_role("check box"));
+        assert!(is_radio("radiobutton"));
+        assert!(opens_menu("combobox"));
+        for r in ["listitem", "treeitem", "menuitem", "tabitem", "dataitem"] {
+            assert!(is_option_role(r), "{r}");
+        }
+        assert!(is_item_role("listitem") && is_item_role("dataitem"));
+        assert!(!is_item_role("button"));
+        assert_eq!(expand_action("treeitem", &names(&["invoke"]), true), None);
+    }
+
+    #[test]
+    fn only_popup_controls_are_opened_to_select() {
+        let press = names(&["Press"]);
+        assert!(!may_open("push button", &press, false));
+        assert!(may_open("push button", &press, true));
+        assert!(may_open(
+            "push button",
+            &names(&["Press", "Show Menu"]),
+            false
+        ));
+        assert!(may_open("combo box", &press, false));
+        assert!(may_open("combobox", &names(&["expand", "collapse"]), false));
+        // A row is never opened, whatever it says.
+        assert!(!may_open("list item", &names(&["activate"]), true));
+        assert!(!may_open("tree item", &names(&["expand"]), false));
+        assert!(!may_open("menu item", &names(&["click"]), false));
+        assert!(may_open("menu item", &names(&["click"]), true));
     }
 
     #[test]
@@ -384,6 +517,10 @@ mod tests {
         let c = combo("Encoding", Some(5));
         assert_eq!(current(&c, &1, &items), Some(5));
         let c = combo("Encoding", None);
+        assert_eq!(current(&c, &1, &items), None);
+        // Several selected (a multi-selection list): none is the one shown.
+        let mut c = combo("Encoding", Some(5));
+        c.get_mut(&3).unwrap().states.push("selected");
         assert_eq!(current(&c, &1, &items), None);
     }
 

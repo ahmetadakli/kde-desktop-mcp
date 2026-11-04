@@ -239,6 +239,8 @@ pub struct Toggles {
     pub expandable: bool,
     pub expanded: bool,
     pub selected: bool,
+    /// Says it opens a popup (AT-SPI HAS_POPUP: a menu button).
+    pub popup: bool,
     pub showing: bool,
     /// Not showing because it is scrolled out of view (visible), rather
     /// than hidden (a closed popup, a collapsed branch).
@@ -256,6 +258,7 @@ impl Toggles {
             expandable: false,
             expanded: has("expanded"),
             selected: has("selected"),
+            popup: has("has popup"),
             showing: info.showing,
             // The platform does not say: assume scrolled out of view.
             offscreen: !info.showing,
@@ -431,6 +434,17 @@ pub trait Backend {
     /// list, a web page), for a wheel over it; None when unknown.
     async fn scroll_container(&self, _id: &Self::Id) -> Option<Self::Id> {
         None
+    }
+    /// Where to turn the wheel over the container `pane`: the centre of
+    /// the part of it inside its window (a long list or web page reaches
+    /// past it). Err as `element_center`, or when none of it is inside.
+    async fn wheel_point(&self, pane: &Self::Id) -> R<(i32, i32)> {
+        self.element_center(pane).await
+    }
+    /// The toolkit of the element's app, lower case ("qt", "gtk", "gecko",
+    /// "chromium"); empty when unknown.
+    async fn toolkit_of(&self, _id: &Self::Id) -> String {
+        String::new()
     }
     /// Complete text content (falls back to the name).
     async fn full_text(&self, id: &Self::Id, limit: usize) -> R<String>;

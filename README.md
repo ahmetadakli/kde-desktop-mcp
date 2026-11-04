@@ -230,8 +230,13 @@ tool; `off` turns it off). Not available on Windows yet.
   - `action: "check"` / `"uncheck"`: a check box, check menu item, radio
     button (only checked: another one of its group unchecks it), toggle button
     or switch, or anything the platform marks checkable. Runs its check,
-    uncheck, toggle, press or click action. `"toggle"` flips it (or the
-    expansion of an element that is expandable, not checkable).
+    uncheck, toggle, press or click action. A checkable list or tree row
+    (Qt's item views, GTK's toggle cells) only through an action named
+    check/uncheck, or toggle outside Qt (Qt's Toggle selects the row);
+    otherwise focus through accessibility and Space (`full` tier).
+    `"toggle"` flips it, or the expansion of an element that is expandable,
+    not checkable, and has no action named Toggle (one that has it, a Qt
+    row, runs that action as before).
   - `action: "expand"` / `"collapse"`: a tree item, disclosure button,
     accordion or combo box through an action named for it (`expand`,
     `collapse`, GTK's `expand or contract`); buttons and combo boxes may use
@@ -245,25 +250,37 @@ tool; `off` turns it off). Not available on Windows yet.
     aside; a unique part is enough) in a combo box, list, tab list or menu
     button, from its entries in the tree even while it is closed. In order,
     each only while the one before is not verified: the list's AT-SPI
-    Selection (`SelectChild`), the entry's own select/click/press action (not
+    Selection (`SelectChild`, after `ClearSelection` in a multi-selection
+    list; skipped in Firefox and Chromium pages, whose scripts would not see
+    it), the entry's own select/click/press action (not
     Qt's Toggle, which only marks a row), then for a closed combo box (with the
     `full` tier) focus through accessibility and as many Down/Up presses as
     entries lie between the shown one and the wanted one. Verified by the
     value a combo box is named after (Qt, GTK), else the entry's `selected`
-    state (Firefox). A menu button that lists no entries is opened through its
-    action and the entry is taken from the popup menu.
+    state (Firefox); a list where other entries stay selected too says how
+    many. A control that lists no entries is opened through its action only
+    when it opens a popup (a combo box, a menu, a button marked as having a
+    popup or with a Show Menu/open/expand action) and the entry is taken from
+    the popup menu; anything else (a plain button, a row) fails with nothing
+    sent.
   - `action: "scroll_to"`: brings an element scrolled out of view (an id from
     the off-screen list of a miss) into view through AT-SPI
     `Component.ScrollTo` (on the element, else its nearest ancestors); when
     that is missing or does not show it, turns the wheel over its scrollable
     container (5 notches a turn, at most 10, toward the element) until it is
-    showing, and says that the pointer moved. An element that is hidden (not
-    visible: in a closed popup or a collapsed branch) gets no wheel.
+    showing, and says that the pointer moved. The wheel turns over the part of
+    the container inside its window (in a web page over the page, not a
+    `<ul>` or `<table>` in it), and stops when the user takes over. An element
+    that is hidden (not visible: in a closed popup or a collapsed branch; a Qt
+    row scrolled out of a showing list counts as scrolled away) gets no wheel.
 
   None of them opens a Firefox menu or `<select>` popup through accessibility
   (see `menu`): such a call fails with nothing sent and says to click the
-  control. On Windows, check/uncheck/expand/collapse use the UI Automation
-  Toggle and ExpandCollapse actions and `select` the entry's SelectionItem;
+  control. Their key fallbacks stop when the user takes over, and the act
+  call's confirmation covers them. On Windows (roles compared without
+  spaces: `checkbox`, `listitem`), check/uncheck/expand/collapse use the UI
+  Automation Toggle and ExpandCollapse actions and `select` the entry's
+  SelectionItem;
   Selection and ScrollTo are not supported there (untested on Windows).
   Verified so far with unit tests only; not yet tried against Kate, Dolphin
   or Firefox.

@@ -3074,9 +3074,11 @@ impl<B: Backend> Server<B> {
 
     async fn act(&self, a: &Json) -> R<String> {
         let action = arg_s(a, "action", "");
+        // Clients that fill every optional field send "": no option.
         let option = match a.get("option") {
             None | Some(Json::Null) => None,
-            Some(Json::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+            Some(Json::String(s)) if s.trim().is_empty() => None,
+            Some(Json::String(s)) => Some(s.trim().to_string()),
             Some(_) => return Err("option must be the label of the entry to select".into()),
         };
         let verb = match (Verb::parse(&action), option.is_some()) {
@@ -3187,11 +3189,16 @@ impl<B: Backend> Server<B> {
     async fn set_checked(&self, t: &Target<B::Id>, verb: Verb, action: &str) -> R<Option<String>> {
         let id = &t.id;
         let (info, now) = tokio::join!(self.b.info(id, 0), self.b.toggles(id));
-        let checkable = now.checkable || semantic::CHECK_ROLES.contains(&info.role.as_str());
+        let checkable = now.checkable || semantic::is_check_role(&info.role);
         if !checkable {
+            // An action of that name runs as before (Qt's Toggle on an
+            // item-view row selects it); toggle flips the expansion only
+            // of an element without one.
+            let want = semantic::norm(action);
+            let named = info.actions.iter().any(|a| semantic::norm(a) == want);
             let expandable =
                 now.expandable || now.expanded || semantic::has_expand_action(&info.actions);
-            if verb == Verb::Toggle && expandable {
+            if verb == Verb::Toggle && expandable && !named {
                 return self.set_expanded(t, None, action).await;
             }
             return not_of_kind(&info, action, "checkable");
@@ -3214,10 +3221,22 @@ impl<B: Backend> Server<B> {
         if now.disabled {
             return Err("it is disabled; nothing sent".into());
         }
-        let idx = semantic::check_action(&info.actions, want)
-            .ok_or_else(|| no_action(&info, if want { "check" } else { "uncheck" }))?;
-        let name = &info.actions[idx];
-        self.b.do_action(id, idx).await?;
+        // Qt's Toggle on a row selects it rather than check it.
+        let qt = semantic::is_item_role(&info.role) && self.b.toolkit_of(id).await == "qt";
+        let how = match semantic::check_action(&info.role, &info.actions, want, qt) {
+            Some(idx) => {
+                self.b.do_action(id, idx).await?;
+                info.actions[idx].clone()
+            }
+            // A checkable row or cell: its generic action would select or
+            // open it; space on it checks it.
+            None if semantic::is_item_role(&info.role) => {
+                let what = if want { "check it" } else { "uncheck it" };
+                self.key_on(t, "space", 1, what).await?
+            }
+            None => return Err(no_action(&info, if want { "check" } else { "uncheck" })),
+        };
+        let name = &how;
         let after = self
             .await_state(id, VERIFY_WAIT, |s| s.checked == want)
             .await;
@@ -3295,9 +3314,30 @@ impl<B: Backend> Server<B> {
                 t.app
             )));
         }
-        if policy.needs_confirm("key", Some(&t.app)) {
-            self.confirm("key", Some(&t.app), &json!({"combo": combo}))
-                .await?;
+        // One confirmation covers the whole call: the act call's own
+        // (by elicitation, or its confirm: true) covers its keys too.
+        let (confirmed, confirm_arg) = GATE
+            .try_with(|g| {
+                let g = g.borrow();
+                (g.confirmed, g.args.get("confirm").cloned())
+            })
+            .unwrap_or((false, None));
+        if !confirmed && policy.needs_confirm("key", Some(&t.app)) {
+            let mut args = json!({"combo": combo});
+            if let Some(c) = confirm_arg {
+                args["confirm"] = c;
+            }
+            self.confirm("key", Some(&t.app), &args).await?;
+        }
+        // A held key stays down: pressing it again would release it.
+        if chord_keys(combo)
+            .iter()
+            .any(|k| self.is_held(&Held::Key(k.clone())))
+        {
+            return Err(format!(
+                "there is no action to {what}, and the fallback, key {combo}, is held already \
+                 (hold with down=false releases it); nothing sent"
+            ));
         }
         let Some(method) = self.b.try_focus(&t.id).await? else {
             return Err(format!(
@@ -3315,7 +3355,11 @@ impl<B: Backend> Server<B> {
                 ));
             }
         }
-        for _ in 0..times {
+        for i in 0..times {
+            // The user may take over between presses.
+            if i > 0 {
+                self.gate(true).await?;
+            }
             self.b.press_combo(combo).await?;
         }
         let times = if times > 1 {
@@ -3422,11 +3466,19 @@ impl<B: Backend> Server<B> {
         }
         let mut tried: Vec<String> = Vec::new();
         let mut shows = String::new();
-        if !opened && self.b.select_item(&item).await.is_ok() {
+        // In a web page, Selection sets the entry's selected state without
+        // the events the page's script listens to: the entry's own action
+        // runs them.
+        let web = matches!(
+            self.b.toolkit_of(control).await.as_str(),
+            "gecko" | "chromium"
+        );
+        if !opened && !web && self.b.select_item(&item).await.is_ok() {
             tried.push("Selection".into());
             let (ok, s) = self.option_shown(control, &item, &label, &labels).await;
             if ok {
-                return Ok(format!("{quoted} selected (Selection; verified)"));
+                let more = self.also_selected(control, &item).await;
+                return Ok(format!("{quoted} selected (Selection; verified){more}"));
             }
             shows = s;
         }
@@ -3436,8 +3488,12 @@ impl<B: Backend> Server<B> {
             tried.push(format!("the entry's {} action", actions[idx]));
             let (ok, s) = self.option_shown(control, &item, &label, &labels).await;
             if ok {
+                let more = match opened {
+                    true => String::new(),
+                    false => self.also_selected(control, &item).await,
+                };
                 return Ok(format!(
-                    "{open_note}{quoted} selected ({}; verified)",
+                    "{open_note}{quoted} selected ({}; verified){more}",
                     actions[idx]
                 ));
             }
@@ -3521,6 +3577,22 @@ impl<B: Backend> Server<B> {
         ))
     }
 
+    /// After `item` was selected in `control`: "; N other entries stay
+    /// selected too" when a multi-selection list kept others selected
+    /// (a following Delete or Enter would act on all of them), else "".
+    async fn also_selected(&self, control: &B::Id, item: &B::Id) -> String {
+        let (cache, items) = self.read_options(control).await;
+        let others = items
+            .iter()
+            .filter(|id| *id != item && cache[*id].states.contains(&"selected"))
+            .count();
+        match others {
+            0 => String::new(),
+            1 => "; 1 other entry stays selected too".into(),
+            n => format!("; {n} other entries stay selected too"),
+        }
+    }
+
     /// For a control that lists no entries until opened (a menu button):
     /// open it through its action and wait for a popup menu of its app
     /// to show entries. The action that opened it, and the entries.
@@ -3530,16 +3602,23 @@ impl<B: Backend> Server<B> {
         cache: &mut Cache<B::Id>,
     ) -> R<(String, Vec<B::Id>)> {
         let id = &t.id;
+        // Only a control that opens a popup: pressing anything else (OK,
+        // Delete, a file's row) would do what it does.
+        let (info, now) = tokio::join!(self.b.info(id, 0), self.b.toggles(id));
+        if !semantic::may_open(&info.role, &info.actions, now.popup) {
+            return Err(format!(
+                "it lists no entries ({}): not a combo box, list or menu button; nothing sent",
+                info.role
+            ));
+        }
         if !self.b.may_open_menu(id).await {
             return Err(format!(
                 "it lists no entries until opened, and {NO_MENU_OPEN}"
             ));
         }
-        let actions = self.b.actions(id).await;
-        let idx = semantic::open_action(&actions).ok_or(
-            "it lists no entries (not a combo box, list or menu button?) and has no action \
-             to open; nothing sent",
-        )?;
+        let actions = info.actions;
+        let idx = semantic::open_action(&actions)
+            .ok_or("it lists no entries and has no action to open; nothing sent")?;
         let windows = self.app_windows(&t.app).await?;
         let how = actions[idx].clone();
         let mut mark = self.b.change_mark();
@@ -3633,8 +3712,14 @@ impl<B: Backend> Server<B> {
                  scroll on the list or page"
             ));
         };
-        let (pane_at, at) = tokio::join!(self.active_center(&pane), self.b.element_center(id));
-        let (x, y) = pane_at.map_err(|e| format!("{why}; the wheel fallback: {e}"))?;
+        let (active, pane_at, at) = tokio::join!(
+            self.require_active_allowed(),
+            self.b.wheel_point(&pane),
+            self.b.element_center(id)
+        );
+        let (x, y) = active
+            .and(pane_at)
+            .map_err(|e| format!("{why}; the wheel fallback: {e}"))?;
         // Off-screen elements still have a position: above or below.
         let dir = match at {
             Ok((_, ey)) if ey < y => -1,
@@ -3642,7 +3727,11 @@ impl<B: Backend> Server<B> {
         };
         let way = if dir > 0 { "down" } else { "up" };
         let mut total = 0;
-        for _ in 0..WHEEL_ROUNDS {
+        for round in 0..WHEEL_ROUNDS {
+            // The user may take over between turns.
+            if round > 0 {
+                self.gate(true).await?;
+            }
             self.b
                 .pointer(x as i64, y as i64, "left", 0, dir * WHEEL_STEP)
                 .await?;
@@ -5782,6 +5871,11 @@ mod tests {
         focusable: std::cell::Cell<bool>,
         /// `may_open_menu` says no (Firefox).
         no_menu_open: std::cell::Cell<bool>,
+        /// `toolkit_of` for every element ("" by default).
+        toolkit: RefCell<String>,
+        /// `select_item` adds to the selection, as AT-SPI's SelectChild
+        /// does in a multi-selection list that is not cleared first.
+        adds: std::cell::Cell<bool>,
     }
 
     /// The fake's node `id` (the focus element too), changed by `f`.
@@ -6000,6 +6094,7 @@ mod tests {
         async fn toggles(&self, id: &u32) -> backend::Toggles {
             let info = self.info(id, 0).await;
             backend::Toggles {
+                checkable: info.states.contains(&"checkable"),
                 expandable: info.operable,
                 // Hidden rather than scrolled away: named so.
                 offscreen: !info.showing && !info.name.contains("(hidden)"),
@@ -6013,8 +6108,17 @@ mod tests {
                 .get()
                 .ok_or("its list offers no accessibility selection")?;
             self.keys.borrow_mut().push(format!("select {item}"));
-            fake_pick(&self.focus, &self.nodes, *item, commit);
+            if self.sem.adds.get() {
+                fake_edit(&self.focus, &self.nodes, *item, |i| {
+                    i.states.push("selected")
+                });
+            } else {
+                fake_pick(&self.focus, &self.nodes, *item, commit);
+            }
             Ok(true)
+        }
+        async fn toolkit_of(&self, _: &u32) -> String {
+            self.sem.toolkit.borrow().clone()
         }
         async fn scroll_into_view(&self, id: &u32) -> R<bool> {
             let works = self.sem.scroll_to.get().ok_or(backend::NO_SCROLL_TO)?;
@@ -6044,7 +6148,7 @@ mod tests {
             let info = self.info(id, 0).await;
             let action = info.actions.get(index).map(|a| semantic::norm(a));
             if !info.name.to_lowercase().contains("stuck") {
-                if semantic::CHECK_ROLES.contains(&info.role.as_str()) {
+                if semantic::is_check_role(&info.role) || info.states.contains(&"checkable") {
                     fake_edit(&self.focus, &self.nodes, *id, |i| {
                         flip(&mut i.states, "checked")
                     });
@@ -6125,6 +6229,7 @@ mod tests {
             let role = self.focus.borrow().role.clone();
             match (role.as_str(), combo) {
                 ("tree item", "right") => self.focus.borrow_mut().states.push("expanded"),
+                ("tree item", "space") => flip(&mut self.focus.borrow_mut().states, "checked"),
                 ("tree item", "left") => {
                     self.focus.borrow_mut().states.retain(|s| *s != "expanded")
                 }
@@ -8271,7 +8376,15 @@ mod tests {
             );
             let r = call_tool(&mut s, 4, "act", q("src", "collapse")).await;
             assert!(reply_text(&r).contains("collapsed (verified)"), "{r}");
-            assert_eq!(actions_run(&s), 2);
+            // toggle on an expandable element without a Toggle flips it.
+            let r = call_tool(&mut s, 12, "act", q("src", "toggle")).await;
+            assert!(
+                reply_text(&r).contains(": expand or contract -> expanded (verified)"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 13, "act", q("src", "collapse")).await;
+            assert!(reply_text(&r).contains("collapsed (verified)"), "{r}");
+            assert_eq!(actions_run(&s), 4);
             // Firefox: no menu is opened through accessibility.
             s.sem.no_menu_open.set(true);
             let r = call_tool(&mut s, 5, "act", q("Mode", "expand")).await;
@@ -8280,7 +8393,7 @@ mod tests {
                 reply_text(&r).contains("can hang or crash this app (Firefox); nothing sent"),
                 "{r}"
             );
-            assert_eq!(actions_run(&s), 2);
+            assert_eq!(actions_run(&s), 4);
             // A Qt tree item: only Toggle (which selects), so focus + key.
             let mut qt = with_actions(fake_node("tree item", "docs", &[]), &["Toggle"]);
             qt.operable = true;
@@ -8301,20 +8414,32 @@ mod tests {
                 reply_text(&r).starts_with("focus (grab_focus) + key right -> expanded (verified)"),
                 "{r}"
             );
-            // toggle on an expandable element flips its expansion.
-            let r = call_tool(&mut s, 9, "act", json!({"id": id, "action": "toggle"})).await;
+            let r = call_tool(&mut s, 9, "act", json!({"id": id, "action": "collapse"})).await;
             assert!(
                 reply_text(&r).starts_with("focus (grab_focus) + key left -> collapsed (verified)"),
                 "{r}"
             );
-            assert_eq!(actions_run(&s), 2, "Toggle never ran");
+            assert_eq!(actions_run(&s), 4, "Toggle never ran");
+            // Its own Toggle (which selects the row) still runs as asked.
+            let keys = s.keys.borrow().len();
+            let r = call_tool(&mut s, 11, "act", json!({"id": id, "action": "Toggle"})).await;
+            assert!(reply_text(&r).starts_with("Toggle -> ok"), "{r}");
+            assert_eq!(actions_run(&s), 5);
+            assert!(
+                !s.keys.borrow()[keys..]
+                    .iter()
+                    .any(|k| k.starts_with("down")),
+                "no key sent: {:?}",
+                &s.keys.borrow()[keys..]
+            );
             // Keys need the full tier.
             let allow = std::env::temp_dir().join(format!(
                 "desktop-mcp-test-{}-expand.txt",
                 std::process::id()
             ));
             std::fs::write(&allow, "fake:click\n").unwrap();
-            let r = call_tool(&mut s, 10, "act", json!({"id": id, "action": "expand"})).await;
+            // (The fake's Toggle expanded it.)
+            let r = call_tool(&mut s, 10, "act", json!({"id": id, "action": "collapse"})).await;
             assert!(is_error(&r), "{r}");
             assert!(
                 reply_text(&r).contains("needs the full tier ('fake' has click); nothing sent"),
@@ -8580,6 +8705,279 @@ mod tests {
                 "{r}"
             );
             assert_eq!(s.keys.borrow()[before..], ["scroll_to 42".to_string()]);
+        });
+    }
+
+    #[test]
+    fn select_never_presses_a_control_that_lists_no_entries() {
+        local(async {
+            let mut s = session("select-plain");
+            fake_window(&s, &[10, 11]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(
+                    10,
+                    with_actions(fake_node("push button", "Apply", &[]), &["Press"]),
+                );
+                n.insert(
+                    11,
+                    with_actions(fake_node("list item", "report.pdf", &[]), &["activate"]),
+                );
+            }
+            for (i, (query, role)) in [("Apply", "push button"), ("report.pdf", "list item")]
+                .into_iter()
+                .enumerate()
+            {
+                let r = call_tool(
+                    &mut s,
+                    2 + i as u64,
+                    "act",
+                    json!({"app": "fake", "query": query, "option": "x"}),
+                )
+                .await;
+                assert!(is_error(&r), "{r}");
+                assert!(
+                    reply_text(&r).contains(&format!(
+                        "it lists no entries ({role}): not a combo box, list or menu button; \
+                         nothing sent"
+                    )),
+                    "{r}"
+                );
+            }
+            assert_eq!(actions_run(&s), 0);
+            // A button that says it has a popup is opened.
+            s.nodes
+                .borrow_mut()
+                .get_mut(&10)
+                .unwrap()
+                .states
+                .push("has popup");
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"app": "fake", "query": "Apply", "option": "x"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("opened it (Press)"), "{r}");
+            // An empty option is no option: a plain act.
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                json!({"app": "fake", "query": "report.pdf", "option": "", "action": ""}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("activate -> ok"), "{r}");
+        });
+    }
+
+    #[test]
+    fn select_in_a_multi_selection_list_says_what_else_stays_selected() {
+        local(async {
+            let mut s = session("select-multi");
+            fake_window(&s, &[40]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("list", "Files", &[41, 42, 43]));
+                n.insert(
+                    41,
+                    with_states(fake_node("list item", "a.txt", &[]), &["selected"]),
+                );
+                n.insert(
+                    42,
+                    with_states(fake_node("list item", "b.txt", &[]), &["selected"]),
+                );
+                n.insert(43, fake_node("list item", "c.txt", &[]));
+            }
+            s.sem.selection.set(Some(true));
+            s.sem.adds.set(true);
+            let q = |option: &str| json!({"app": "fake", "query": "Files", "role": "list", "option": option});
+            // b.txt is selected, but along with a.txt: not "already".
+            let r = call_tool(&mut s, 2, "act", q("b.txt")).await;
+            assert!(
+                reply_text(&r).contains(
+                    "\"b.txt\" selected (Selection; verified); 1 other entry stays selected too"
+                ),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 3, "act", q("c.txt")).await;
+            assert!(
+                reply_text(&r).contains("; 2 other entries stay selected too"),
+                "{r}"
+            );
+            // A list that keeps one selected says nothing more.
+            s.sem.adds.set(false);
+            let r = call_tool(&mut s, 4, "act", q("a.txt")).await;
+            assert!(
+                reply_text(&r).contains("\"a.txt\" selected (Selection; verified); effect"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn select_in_a_web_page_runs_the_entry_action_not_selection() {
+        local(async {
+            let mut s = session("select-web");
+            fake_combo(&s, false, "Encoding", &["select"]);
+            s.sem.selection.set(Some(true));
+            *s.sem.toolkit.borrow_mut() = "gecko".into();
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "Encoding", "option": "UTF-16"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(": \"UTF-16\" selected (select; verified)"),
+                "{r}"
+            );
+            assert!(!s.keys.borrow().iter().any(|k| k.starts_with("select ")));
+        });
+    }
+
+    #[test]
+    fn a_checkable_row_is_checked_by_space_not_its_toggle() {
+        local(async {
+            let mut s = session("check-row");
+            let mut qt = with_actions(fake_node("tree item", "Plugin", &[]), &["Toggle"]);
+            qt.states = vec!["checkable"];
+            *s.focus.borrow_mut() = qt;
+            *s.sem.toolkit.borrow_mut() = "qt".into();
+            let id = focus_id(&mut s, 2).await;
+            let r = call_tool(&mut s, 3, "act", json!({"id": id, "action": "check"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "there is no action to check it, and it cannot be focused without the \
+                     pointer; nothing sent: click it, then key space"
+                ),
+                "{r}"
+            );
+            s.sem.focusable.set(true);
+            let r = call_tool(&mut s, 4, "act", json!({"id": id, "action": "check"})).await;
+            assert!(
+                reply_text(&r).starts_with("focus (grab_focus) + key space -> checked (verified)"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0, "Toggle (select the row) never ran");
+            // GTK's toggle cell checks with its toggle; Windows spells the
+            // check box role without a space.
+            fake_window(&s, &[10, 11]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                let mut cell = with_actions(
+                    fake_node("table cell", "Enabled", &[]),
+                    &["activate", "toggle"],
+                );
+                cell.states = vec!["checkable"];
+                n.insert(10, cell);
+                n.insert(
+                    11,
+                    with_actions(fake_node("checkbox", "Wrap", &[]), &["toggle"]),
+                );
+            }
+            *s.sem.toolkit.borrow_mut() = "gtk".into();
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                json!({"app": "fake", "query": "Enabled", "action": "check"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(": toggle -> checked (verified)"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 1 on 10");
+            let r = call_tool(
+                &mut s,
+                6,
+                "act",
+                json!({"app": "fake", "query": "Wrap", "action": "check"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(": toggle -> checked (verified)"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_key_fallback_is_covered_by_the_act_calls_confirmation() {
+        local(async {
+            let mut s = session("confirm-key-on");
+            let mut qt = with_actions(fake_node("tree item", "docs", &[]), &["Toggle"]);
+            qt.operable = true;
+            *s.focus.borrow_mut() = qt;
+            s.sem.focusable.set(true);
+            let id = focus_id(&mut s, 2).await;
+            set_allow("confirm-key-on", "fake\nconfirm: key:fake\n");
+            let r = call_tool(&mut s, 3, "act", json!({"id": id, "action": "expand"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(reply_text(&r).contains("confirm: true"), "{r}");
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("right")));
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"id": id, "action": "expand", "confirm": true}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with("focus (grab_focus) + key right -> expanded (verified)"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn user_input_stops_the_key_and_wheel_fallbacks() {
+        local(async {
+            let mut s = session("takeover-semantic");
+            fake_combo(&s, true, "UTF-8", &["Toggle"]);
+            s.sem.focusable.set(true);
+            let id = focus_id(&mut s, 2).await;
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                t.user_input(Instant::now(), takeover::Device::Keyboard);
+            });
+            let r = call_tool(&mut s, 3, "act", json!({"id": id, "option": "ISO-8859-1"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(reply_text(&r).contains("interrupted"), "{r}");
+            let downs = s.keys.borrow().iter().filter(|k| *k == "down down").count();
+            assert_eq!(downs, 1);
+        });
+        local(async {
+            let mut s = session("takeover-wheel");
+            fake_window(&s, &[40]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(40, fake_node("list", "Files", &[42]));
+                let mut far = fake_node("list item", "far.txt", &[]);
+                far.showing = false;
+                n.insert(42, far);
+            }
+            let id = hidden_id(&mut s, 2, "far.txt").await;
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                t.user_input(Instant::now(), takeover::Device::Pointer);
+            });
+            let r = call_tool(&mut s, 3, "act", json!({"id": id, "action": "scroll_to"})).await;
+            assert!(is_error(&r), "{r}");
+            assert!(reply_text(&r).contains("interrupted"), "{r}");
+            let turns = s
+                .keys
+                .borrow()
+                .iter()
+                .filter(|k| k.starts_with("scroll "))
+                .count();
+            assert_eq!(turns, 1);
         });
     }
 
