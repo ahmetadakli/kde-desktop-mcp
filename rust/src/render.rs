@@ -1890,7 +1890,8 @@ const LIST_ENTRY_ROLES: [&str; 6] = [
 ];
 
 /// Roles of a dialog's buttons, listed before its other controls.
-const DIALOG_BUTTON_ROLES: [&str; 2] = ["push button", "toggle button"];
+/// AT-SPI 2.5x names a push button's role "button" (Qt 6 dialogs).
+const DIALOG_BUTTON_ROLES: [&str; 3] = ["push button", "button", "toggle button"];
 
 /// Roles of a dialog's other controls listed after its buttons.
 const DIALOG_CONTROL_ROLES: [&str; 10] = [
@@ -3624,6 +3625,25 @@ mod tests {
         let mut hidden = sample();
         hidden.get_mut("/h").unwrap().name = "other".into();
         assert_eq!(fp, fingerprint(&hidden, &["/w"]));
+    }
+
+    #[test]
+    fn dialog_buttons_named_button_are_listed() {
+        // Kate's save prompt (Qt 6): "button" roles in a panel, a hidden tree.
+        let mut c = Cache::new();
+        c.insert(
+            "/d",
+            node("dialog", "Close — Kate", true, &[], &["/l", "/t", "/p"]),
+        );
+        c.insert("/l", node("label", "Save changes?", true, &[], &[]));
+        c.insert("/t", node("tree", "", false, &[], &[]));
+        c.insert("/p", node("panel", "", true, &[], &["/s", "/x", "/c"]));
+        c.insert("/s", node("button", "Save", true, &[], &[]));
+        c.insert("/x", node("button", "Discard", true, &[], &[]));
+        c.insert("/c", node("button", "Cancel", true, &[], &[]));
+        let (l, _) = surface_entries(&c, &"/d", Surface::Dialog);
+        assert_eq!(l.entries, vec!["/s", "/x", "/c"]);
+        assert_eq!(l.message.as_deref(), Some("Save changes?"));
     }
 
     #[test]

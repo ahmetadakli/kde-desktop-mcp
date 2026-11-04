@@ -3632,6 +3632,41 @@ impl<B: Backend> Server<B> {
     /// focus cannot be moved there or its window is not in front. The
     /// reply says what was done.
     async fn key_on(&self, t: &Target<B::Id>, combo: &str, times: usize, what: &str) -> R<String> {
+        self.keys_permitted(t, combo, what).await?;
+        let Some(method) = self.b.try_focus(&t.id).await? else {
+            return Err(format!(
+                "there is no action to {what}, and it cannot be focused without the \
+                 pointer; nothing sent: click it, then key {combo}"
+            ));
+        };
+        // Keys go to the focused element of the window in front.
+        match self.b.focused().await {
+            Some(f) if f.id == t.id => {}
+            _ => {
+                return Err(format!(
+                    "focused it ({method}) to {what}, but its window is not in front; no key \
+                     sent: pass window=…"
+                ));
+            }
+        }
+        for i in 0..times {
+            // The user may take over between presses.
+            if i > 0 {
+                self.gate(true).await?;
+            }
+            self.b.press_combo(combo).await?;
+        }
+        let times = if times > 1 {
+            format!(" x{times}")
+        } else {
+            String::new()
+        };
+        Ok(format!("focus ({method}) + key {combo}{times}"))
+    }
+
+    /// Whether the key fallback may press `combo` for `t`'s app: the full
+    /// tier, its confirmation, and the key not held already.
+    async fn keys_permitted(&self, t: &Target<B::Id>, combo: &str, what: &str) -> R<()> {
         let policy = self.policy();
         let tier = policy.tier(&t.app).unwrap_or(Tier::View);
         if tier < Tier::Full {
@@ -3666,35 +3701,82 @@ impl<B: Backend> Server<B> {
                  (hold with down=false releases it); nothing sent"
             ));
         }
-        let Some(method) = self.b.try_focus(&t.id).await? else {
-            return Err(format!(
-                "there is no action to {what}, and it cannot be focused without the \
-                 pointer; nothing sent: click it, then key {combo}"
-            ));
-        };
-        // Keys go to the focused element of the window in front.
-        match self.b.focused().await {
-            Some(f) if f.id == t.id => {}
-            _ => {
+        Ok(())
+    }
+
+    /// The fallback for a closed combo box that takes no focus without the
+    /// pointer (Qt's): open its list through its own action (a shown popup
+    /// takes the keyboard), press down or up from the entry it highlights
+    /// (selected or focused there, else the current value) to `want`, and
+    /// Enter. Needs the full tier, like `key_on`.
+    async fn select_in_popup(&self, t: &Target<B::Id>, want: &str) -> R<String> {
+        self.keys_permitted(t, "enter", "select it").await?;
+        let control = &t.id;
+        if !self.b.may_open_menu(control).await {
+            return Err(NO_MENU_OPEN.into());
+        }
+        let actions = self.b.actions(control).await;
+        let open = actions
+            .iter()
+            .position(|a| semantic::norm(a) == "showmenu")
+            .or_else(|| actions.iter().position(|a| semantic::norm(a) == "press"))
+            .ok_or("it has no action that opens its list")?;
+        self.b.do_action(control, open).await?;
+        // Keys go to the popup once its list shows (Qt reports no focus
+        // for it): wait for that.
+        let start = Instant::now();
+        let (cache, items) = loop {
+            let (cache, items) = self.read_options(control).await;
+            if items.iter().any(|id| cache[id].showing) {
+                break (cache, items);
+            }
+            if start.elapsed() >= VERIFY_WAIT {
                 return Err(format!(
-                    "focused it ({method}) to {what}, but its window is not in front; no key \
-                     sent: pass window=…"
+                    "opened its list ({}), but no list showed; no key sent (it may still be \
+                     open: key escape closes it)",
+                    actions[open]
                 ));
             }
-        }
-        for i in 0..times {
-            // The user may take over between presses.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let enabled: Vec<&B::Id> = items
+            .iter()
+            .filter(|id| !cache[*id].states.contains(&"disabled"))
+            .collect();
+        let at = |id: &B::Id| enabled.iter().position(|e| *e == id);
+        let wanted = enabled
+            .iter()
+            .position(|id| render::menu_norm(&cache[*id].name) == render::menu_norm(want))
+            .ok_or("its list does not show that entry; no key sent (key escape closes it)")?;
+        let lit = |state: &str| {
+            enabled
+                .iter()
+                .position(|id| cache[*id].states.contains(&state))
+        };
+        let from = lit("focused")
+            .or_else(|| lit("selected"))
+            .or_else(|| semantic::current(&cache, control, &items).and_then(|c| at(&c)))
+            .ok_or(
+                "cannot tell which entry its list highlights; no key sent (key escape closes it)",
+            )?;
+        let steps = wanted as i64 - from as i64;
+        let key = if steps > 0 { "down" } else { "up" };
+        for i in 0..steps.unsigned_abs() {
             if i > 0 {
                 self.gate(true).await?;
             }
-            self.b.press_combo(combo).await?;
+            self.b.press_combo(key).await?;
         }
-        let times = if times > 1 {
-            format!(" x{times}")
-        } else {
-            String::new()
-        };
-        Ok(format!("focus ({method}) + key {combo}{times}"))
+        self.gate(true).await?;
+        self.b.press_combo("enter").await?;
+        Ok(match steps {
+            0 => format!("{} + key enter", actions[open]),
+            n => format!(
+                "{} + key {key} x{} + enter",
+                actions[open],
+                n.unsigned_abs()
+            ),
+        })
     }
 
     /// The control's subtree, hidden parts included (a closed combo box's
@@ -3877,6 +3959,30 @@ impl<B: Backend> Server<B> {
                         return Ok(format!("{quoted} selected ({how}; verified)"));
                     }
                     shows = s;
+                }
+                // Qt's combo boxes take no focus without the pointer:
+                // open the list through its action and pick from there.
+                Err(e) if e.contains("cannot be focused without the pointer") => {
+                    match self.select_in_popup(t, &label).await {
+                        Ok(how) => {
+                            tried.push(how.clone());
+                            let (ok, s) = self.option_shown(control, &item, &label, &labels).await;
+                            if ok {
+                                return Ok(format!("{quoted} selected ({how}; verified)"));
+                            }
+                            return Err(format!(
+                                "{}, but {s} afterwards (check with get_text before retrying)",
+                                sent(&tried)
+                            ));
+                        }
+                        Err(e2) if tried.is_empty() => return Err(e2),
+                        Err(e2) => {
+                            return Err(format!(
+                                "{}, but {shows} afterwards; the key fallback: {e2}",
+                                sent(&tried)
+                            ));
+                        }
+                    }
                 }
                 Err(e) if tried.is_empty() => return Err(e),
                 Err(e) => {
@@ -9127,11 +9233,12 @@ mod tests {
             assert!(is_error(&r), "{r}");
             assert!(
                 reply_text(&r).contains(
-                    "sent Selection, but it shows \"UTF-8\" afterwards; the key fallback: there is no action to select it, and it cannot be focused without the pointer"
+                    "sent Selection, but it shows \"UTF-8\" afterwards; the key fallback: opened its list (Show Menu), but no list showed"
                 ),
                 "{r}"
             );
-            assert_eq!(actions_run(&s), 1, "only the Firefox step's action");
+            // The Firefox step's action, and Show Menu opening the list.
+            assert_eq!(actions_run(&s), 2);
         });
     }
 
