@@ -3699,7 +3699,9 @@ impl<B: Backend> Server<B> {
         for i in 0..times {
             // The user may take over between presses.
             if i > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after {i} of {times} presses of {combo}"))?;
             }
             self.b.press_combo(combo).await?;
         }
@@ -3808,13 +3810,19 @@ impl<B: Backend> Server<B> {
             )?;
         let steps = wanted as i64 - from as i64;
         let key = if steps > 0 { "down" } else { "up" };
-        for i in 0..steps.unsigned_abs() {
+        let n = steps.unsigned_abs();
+        let open_note = "; its list may still be open: key escape closes it";
+        for i in 0..n {
             if i > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after {i} of {n} presses of {key}{open_note}"))?;
             }
             self.b.press_combo(key).await?;
         }
-        self.gate(true).await?;
+        self.gate(true)
+            .await
+            .map_err(|e| format!("{e} after opening its list, before enter{open_note}"))?;
         self.b.press_combo("enter").await?;
         Ok(match steps {
             0 => format!("{} + key enter", actions[open]),
@@ -3917,8 +3925,21 @@ impl<B: Backend> Server<B> {
         if !opened && current.as_ref() == Some(&item) {
             return Ok(format!("already {quoted}; nothing sent"));
         }
+        // Opened, its menu may still show: the opening was sent.
+        let still_open = if opened {
+            " (it may still be open: key escape closes it)"
+        } else {
+            ""
+        };
+        let none = if opened {
+            "nothing selected"
+        } else {
+            "nothing sent"
+        };
         if cache[&item].states.contains(&"disabled") {
-            return Err(format!("{open_note}{quoted} is disabled; nothing sent"));
+            return Err(format!(
+                "{open_note}{quoted} is disabled; {none}{still_open}"
+            ));
         }
         let mut tried: Vec<String> = Vec::new();
         let mut shows = String::new();
@@ -4037,15 +4058,10 @@ impl<B: Backend> Server<B> {
                 }
             }
         }
-        let still_open = if opened {
-            " (it may still be open: key escape closes it)"
-        } else {
-            ""
-        };
         if tried.is_empty() {
             return Err(format!(
                 "{open_note}found {quoted}, but no way to select it without the pointer; \
-                 nothing sent: click the control, then click the entry{still_open}"
+                 {none}: click the control, then click the entry{still_open}"
             ));
         }
         Err(format!(
@@ -4207,7 +4223,9 @@ impl<B: Backend> Server<B> {
         for round in 0..WHEEL_ROUNDS {
             // The user may take over between turns.
             if round > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after wheel {total} {way} at {x},{y}"))?;
             }
             self.b
                 .pointer(x as i64, y as i64, "left", 0, dir * WHEEL_STEP)
@@ -5031,7 +5049,12 @@ impl<B: Backend> Server<B> {
             let x = x0 + (x1 - x0) * i / DRAG_STEPS;
             let y = y0 + (y1 - y0) * i / DRAG_STEPS;
             // The user took over (or pressed the stop shortcut): let go.
-            moved = self.gate(true).await;
+            moved = self.gate(true).await.map_err(|e| {
+                format!(
+                    "{e} after {} of {DRAG_STEPS} moves from ({x0},{y0}); the button was released",
+                    i - 1
+                )
+            });
             if moved.is_err() {
                 break;
             }
@@ -5076,9 +5099,12 @@ impl<B: Backend> Server<B> {
         }
         let send = keys.join("+");
         let app = self.require_active_allowed().await?;
-        for i in 0..repeat.clamp(1, 100) {
+        let times = repeat.clamp(1, 100);
+        for i in 0..times {
             if i > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after {i} of {times} presses of {send}"))?;
             }
             self.b.press_combo(&send).await?;
         }
@@ -6545,6 +6571,8 @@ mod tests {
         /// `select_item` adds to the selection, as AT-SPI's SelectChild
         /// does in a multi-selection list that is not cleared first.
         adds: std::cell::Cell<bool>,
+        /// The user types once this many more key presses went out.
+        user_after_presses: std::cell::Cell<Option<usize>>,
     }
 
     /// The fake's node `id` (the focus element too), changed by `f`.
@@ -6857,11 +6885,9 @@ mod tests {
             }
         }
         async fn select_item(&self, item: &u32) -> R<bool> {
-            let commit = self
-                .sem
-                .selection
-                .get()
-                .ok_or("its list offers no accessibility selection")?;
+            let commit = self.sem.selection.get().ok_or_else(|| {
+                delivery::nothing_sent("its list offers no accessibility selection")
+            })?;
             self.keys.borrow_mut().push(format!("select {item}"));
             if self.sem.adds.get() {
                 fake_edit(&self.focus, &self.nodes, *item, |i| {
@@ -6973,6 +6999,15 @@ mod tests {
         async fn press_combo(&self, combo: &str) -> R<()> {
             self.keys.borrow_mut().push(format!("down {combo}"));
             self.shown.input();
+            if let Some(n) = self.sem.user_after_presses.get() {
+                if n <= 1 {
+                    self.sem.user_after_presses.set(None);
+                    self.takeover
+                        .user_input(Instant::now(), takeover::Device::Keyboard);
+                } else {
+                    self.sem.user_after_presses.set(Some(n - 1));
+                }
+            }
             // A list whose focused "Item N" moves down.
             let down = |focus: &RefCell<Info<u32>>| {
                 let mut focus = focus.borrow_mut();
@@ -8041,7 +8076,7 @@ mod tests {
                 "{r}"
             );
             assert!(lines[1].starts_with("[2] wait_for failed: "), "{r}");
-            assert_eq!(lines[2], "stopped; sent: [1]; not run: [3]");
+            assert_eq!(lines[2], "stopped; sent: [1]; not sent: [2..3]");
             assert_eq!(*s.keys.borrow(), ["down a", "up a"]);
         });
     }
@@ -10484,7 +10519,7 @@ mod tests {
                 lines[5],
                 "[6] act failed: `id` \"$2\": step 2 (wait_for) failed"
             );
-            assert_eq!(lines[6], "stopped; sent: [5]; not run: [7]");
+            assert_eq!(lines[6], "stopped; sent: [5]; not sent: [6..7]");
             assert_eq!(actions_run(&s), 0);
             assert!(s.keys.borrow().is_empty());
             // A reference that can never work fails the whole batch before
@@ -10644,7 +10679,7 @@ mod tests {
                 lines[1].starts_with("[1.on_fail] act failed: "),
                 "{lines:?}"
             );
-            assert_eq!(lines[2], "stopped; nothing sent; not run: [2]");
+            assert_eq!(lines[2], "stopped; nothing sent");
             assert!(lines[3].starts_with("now: "), "{lines:?}");
             assert!(lines[3].ends_with("; released shift"), "{lines:?}");
             assert_eq!(*s.keys.borrow(), ["keydown shift", "keyup shift"]);
@@ -10736,7 +10771,7 @@ mod tests {
             );
             assert!(lines[1].starts_with("[1.1] scroll: "), "{lines:?}");
             assert_eq!(lines[2], "[1.2] find: no matches");
-            assert_eq!(lines[3], "stopped; sent: [1]; not run: [2]");
+            assert_eq!(lines[3], "stopped; maybe sent: [1]; not sent: [2]");
             assert!(lines[4].starts_with("now: "), "{lines:?}");
             assert_eq!(*s.keys.borrow(), ["scroll 3", "scroll 3"]);
             // Optional: the batch goes on, but "$1" names a failed step.
@@ -11291,7 +11326,7 @@ mod tests {
             );
             assert_eq!(
                 lines[3],
-                "stopped; sent: [1]; maybe sent: [3]; not run: [4..5]"
+                "stopped; sent: [1]; maybe sent: [3]; not sent: [4..5]"
             );
             // A step that sent nothing before any input: the batch says so.
             let (err, lines) = run_batch(
@@ -11305,7 +11340,111 @@ mod tests {
             .await;
             assert!(err, "{lines:?}");
             assert!(lines[0].contains("; nothing sent"), "{lines:?}");
-            assert_eq!(lines[1], "stopped; nothing sent; not run: [2]");
+            assert_eq!(lines[1], "stopped; nothing sent");
+        });
+    }
+
+    #[test]
+    fn a_call_that_wrote_never_says_nothing_sent() {
+        local(async {
+            // A menu button opened through its action (sent), then its
+            // entry is disabled: nothing selected, but the menu is open.
+            let mut s = session("delivery-opened");
+            fake_window(&s, &[10, 20]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(
+                    10,
+                    with_actions(
+                        fake_node("push button", "Sort", &[]),
+                        &["Press", "Show Menu"],
+                    ),
+                );
+                n.insert(20, fake_node("popup menu", "", &[21, 22]));
+                n.insert(
+                    21,
+                    with_actions(fake_node("radio menu item", "By name", &[]), &["click"]),
+                );
+                let mut date =
+                    with_actions(fake_node("radio menu item", "By date", &[]), &["click"]);
+                date.states = vec!["disabled"];
+                n.insert(22, date);
+            }
+            let q = json!({"app": "fake", "query": "Sort", "option": "date"});
+            let r = call_tool(&mut s, 2, "act", q).await;
+            assert!(is_error(&r), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "opened it (Show Menu); \"By date\" is disabled; nothing selected (it may \
+                     still be open: key escape closes it); maybe sent: look before retrying"
+                ),
+                "{text}"
+            );
+            assert_eq!(marker(text), "maybe", "{text}");
+            // Selection sent but not shown, then the key fallback refused
+            // by the tier: the Selection may have acted.
+            let mut s = session("delivery-fallback");
+            fake_combo(&s, false, "UTF-8", &["Toggle"]);
+            s.sem.selection.set(Some(false));
+            let allow = std::env::temp_dir().join(format!(
+                "desktop-mcp-test-{}-delivery-fallback.txt",
+                std::process::id()
+            ));
+            std::fs::write(&allow, "fake:click\n").unwrap();
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "UTF-8", "role": "combo box", "option": "UTF-16"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "sent Selection, but it shows \"UTF-8\" afterwards; the key fallback:"
+                ) && text.contains(
+                    "needs the full tier ('fake' has click); nothing more sent; \
+                         maybe sent: look before retrying"
+                ),
+                "{text}"
+            );
+            assert_eq!(marker(text), "maybe", "{text}");
+            // No Selection interface: nothing went out, and the refusal
+            // says so.
+            s.sem.selection.set(None);
+            let r = call_tool(
+                &mut s,
+                3,
+                "act",
+                json!({"app": "fake", "query": "UTF-8", "role": "combo box", "option": "UTF-16"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            assert_eq!(marker(reply_text(&r)), "no", "{r}");
+        });
+    }
+
+    #[test]
+    fn input_interrupted_part_way_says_how_far_it_got() {
+        local(async {
+            let mut s = session("delivery-interrupted");
+            s.sem.user_after_presses.set(Some(2));
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "down", "repeat": 5})).await;
+            assert!(is_error(&r), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "key: interrupted: the user started using the keyboard; input stopped there \
+                     after 2 of 5 presses of down; maybe sent: look before retrying"
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("Retry when they stop"), "{text}");
+            assert_eq!(marker(text), "maybe", "{text}");
+            let downs = s.keys.borrow().iter().filter(|k| *k == "down down").count();
+            assert_eq!(downs, 2);
         });
     }
 
@@ -11361,7 +11500,7 @@ mod tests {
             let text = reply_text(&r);
             assert!(
                 text.contains("[1] activate_window failed: stopped by the user")
-                    && text.contains("\nstopped; nothing sent; not run: [2]"),
+                    && text.contains("\nstopped; nothing sent\n"),
                 "{text}"
             );
             // Neither does `window` on an input tool.
@@ -11411,9 +11550,9 @@ mod tests {
             let text = reply_text(&r);
             assert!(
                 text.contains(
-                    "[3] key failed: interrupted: the user started using the mouse. \
-                     Retry when they stop; nothing sent\n\
-                     stopped; sent: [1]; not run: [4]"
+                    "[3] key failed: interrupted: the user started using the mouse; input \
+                     stopped there; nothing sent\n\
+                     stopped; sent: [1]; not sent: [3..4]"
                 ),
                 "{text}"
             );

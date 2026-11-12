@@ -78,8 +78,10 @@ impl Block {
                 ago.as_millis(),
                 window.saturating_sub(*ago).as_millis().max(100)
             ),
+            // Whether a retry is safe is the call's marker ("nothing sent"
+            // or "maybe sent"): input may have gone out before this.
             Block::Interrupted(dev) => format!(
-                "interrupted: the user started using the {}. Retry when they stop",
+                "interrupted: the user started using the {}; input stopped there",
                 dev.noun()
             ),
         }

@@ -99,7 +99,7 @@ verified.
 only if nothing else does or `role` names them. Ties favor the active window, a dialog, an \
 operable element; input tools refuse other ties, listing ids. The reply starts with \
 the element picked; a miss lists near or off-screen matches.
-- batch runs steps in one call; with if, on_fail, repeat and stop_if (see batch) a small \
+- batch runs steps in one call; with if, on_fail, repeat and stop_if a small \
 procedure fits in one. Mark waits \"optional\": true and end with an observation step, or \
 give the last input `observe`. A later step's `id`/`*_id` may be \"$N\": the element step \
 N found or acted on.
@@ -107,17 +107,18 @@ N found or acted on.
 take `window` (title or app substring) to activate that window first unless it is in \
 front. Without it, input fails while the user's terminal is in front.
 - click, mouse and scroll take `modifiers`; hold keeps keys down.
-- Retry an input only if its reply says \"nothing sent\"; else look first.
-- If the user takes over keyboard and mouse, input fails with \"paused\" or \
-\"interrupted\": pause ~2 s and retry. \"stopped by the user\": \
+- Retry input only if its reply says \"nothing sent\" (a stopped batch: its \
+\"not sent\" steps); else look first.
+- If the user takes over, input fails with \"paused\" or \"interrupted\": pause ~2 s, \
+then the rule above. \"stopped by the user\": \
 stop and ask them; once they agree, a standalone activate_window call resumes input.
-- After opening a page, wait_idle(app) waits for it to load (not pause). wait_for: something \
+- After opening a page, wait_idle(app) waits for the load (not pause). wait_for: something \
 that appears or goes away (gone=true), a state or a window; never as a sleep. \
 tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
 view. On Linux, menus, lists and dialogs an input opened come with ids (`opened:`). Failures \
 end with the active window and focus.
-- menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
+- menu (app + path, e.g. \"File > Save As\") runs a menu entry.
 - screenshot is a last resort. To click something seen \
 only in it, pass its pixels to mouse (image_x/image_y); `region`=[x, y, w, h] zooms in.
 
@@ -125,7 +126,7 @@ Allowlist: only apps in the user's allowlist file can be read, activated or sent
 input only goes to an allowed active window. An app may be limited to a tier: view \
 (read only) or click (no typing or keys). When a refusal says to, ask the user and retry with \
 confirm: true only if they agree. Password fields are never read, and filled in only if the \
-user allowed it. Changing the file is the user's decision. If the setup seems \
+user allowed it. Only the user changes the file. If the setup seems \
 broken (AT-SPI, input, KWin), run doctor.
 
 Clients loading schemas on demand: load in one search: batch, find, \
@@ -166,7 +167,8 @@ list of {\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.
  {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].
 Stops at the first failing step unless it is `optional`: then it is reported
 as failed (optional) and the rest still runs. A stop says which steps sent
-input: `stopped; sent: [1..2]; maybe sent: [3]; not run: [4]`. Mark waits optional and end
+input and which are still to run: `stopped; sent: [1..2]; maybe sent: [3];
+not sent: [4]`. Mark waits optional and end
 with an observation step (find, get_text, screenshot). Give the first
 input step `window` when input goes to an app. Ids from earlier tree/find work.
 An `id`/`*_id` arg of \"$N\" is the element step N produced: find's first
@@ -587,6 +589,13 @@ pub fn is_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_instructions_stay_short() {
+        // Every session pays for them: keep them under 3000 characters.
+        let n = INSTRUCTIONS.chars().count();
+        assert!(n < 3000, "INSTRUCTIONS has {n} characters");
+    }
 
     #[test]
     fn the_common_tools_load_up_front() {

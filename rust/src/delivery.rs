@@ -87,9 +87,12 @@ async fn write<T>(f: impl Future<Output = R<T>>) -> R<T> {
 }
 
 /// The error `e` of an input tool with its marker: MAYBE_SENT when the call
-/// wrote anything, else NOTHING_SENT; once only.
+/// wrote anything, else NOTHING_SENT; once only. The call's marker decides:
+/// after a write, an inner "nothing sent" (a fallback refused after an
+/// earlier write) becomes "nothing more sent", so a reply never carries both.
 pub fn error(e: String, wrote: bool) -> String {
     let marker = if wrote { MAYBE_SENT } else { NOTHING_SENT };
+    let e = if wrote { unsay_nothing(e) } else { e };
     if e.contains(marker) {
         e
     } else {
@@ -98,12 +101,23 @@ pub fn error(e: String, wrote: bool) -> String {
 }
 
 /// The successful reply `text` of an input tool: says NOTHING_SENT when the
-/// call wrote nothing (and does not say so already).
+/// call wrote nothing (and does not say so already); never says it when the
+/// call wrote.
 pub fn reply(text: &mut String, wrote: bool) {
-    if !wrote && !text.contains(NOTHING_SENT) {
+    if wrote {
+        if text.contains(NOTHING_SENT) {
+            *text = unsay_nothing(std::mem::take(text));
+        }
+    } else if !text.contains(NOTHING_SENT) {
         text.push_str("; ");
         text.push_str(NOTHING_SENT);
     }
+}
+
+/// `text` without NOTHING_SENT, for a call that did write: "nothing more
+/// sent" (the part that said it sent nothing, after what came before).
+fn unsay_nothing(text: String) -> String {
+    text.replace(NOTHING_SENT, "nothing more sent")
 }
 
 /// Batch step numbers as "[1..3] [5]".
@@ -126,24 +140,41 @@ pub fn steps(ns: &[usize]) -> String {
 
 /// What a batch that stopped at step `at` of `total` delivered: the steps
 /// that sent input (`sent`), the ones that failed after writing (`maybe`),
-/// the ones not run. `input`: the batch has input steps (else only the
-/// steps not run are named).
+/// and the ones a retry still has to run (`not sent`: the steps after `at`,
+/// and `at` itself when it wrote nothing). `at` counts as maybe sent when
+/// it wrote anything, since it failed. `input`: the batch has input steps
+/// (else only the steps not run are named).
 pub fn stopped(sent: &[usize], maybe: &[usize], at: usize, total: usize, input: bool) -> String {
     let mut parts = vec!["stopped".to_string()];
-    if input {
-        if sent.is_empty() && maybe.is_empty() {
-            parts.push(NOTHING_SENT.into());
+    if !input {
+        if at < total {
+            let rest: Vec<usize> = (at + 1..=total).collect();
+            parts.push(format!("not run: {}", steps(&rest)));
         }
-        if !sent.is_empty() {
-            parts.push(format!("sent: {}", steps(sent)));
-        }
-        if !maybe.is_empty() {
-            parts.push(format!("maybe sent: {}", steps(maybe)));
-        }
+        return parts.join("; ");
     }
-    if at < total {
-        let rest: Vec<usize> = (at + 1..=total).collect();
-        parts.push(format!("not run: {}", steps(&rest)));
+    if sent.is_empty() && maybe.is_empty() {
+        // Nothing reached the desktop: the whole batch may run again.
+        parts.push(NOTHING_SENT.into());
+        return parts.join("; ");
+    }
+    let wrote_at = sent.contains(&at) || maybe.contains(&at);
+    let sent: Vec<usize> = sent.iter().copied().filter(|&k| k != at).collect();
+    let mut maybe: Vec<usize> = maybe.iter().copied().filter(|&k| k != at).collect();
+    if wrote_at {
+        maybe.push(at);
+        maybe.sort_unstable();
+    }
+    if !sent.is_empty() {
+        parts.push(format!("sent: {}", steps(&sent)));
+    }
+    if !maybe.is_empty() {
+        parts.push(format!("maybe sent: {}", steps(&maybe)));
+    }
+    let first = if wrote_at { at + 1 } else { at };
+    if first <= total {
+        let rest: Vec<usize> = (first..=total).collect();
+        parts.push(format!("not sent: {}", steps(&rest)));
     }
     parts.join("; ")
 }
@@ -241,6 +272,20 @@ mod tests {
             error("DoAction got no reply".into(), true),
             "DoAction got no reply; maybe sent: look before retrying"
         );
+        // After a write, the call's marker decides: an inner "nothing
+        // sent" (a fallback refused after an earlier write) is not left in.
+        assert_eq!(
+            error(
+                "sent Selection, but ...; the key fallback: needs the full tier; nothing sent"
+                    .into(),
+                true
+            ),
+            "sent Selection, but ...; the key fallback: needs the full tier; nothing more sent; \
+             maybe sent: look before retrying"
+        );
+        let mut t = "already \"A\"; nothing sent".to_string();
+        reply(&mut t, true);
+        assert_eq!(t, "already \"A\"; nothing more sent");
         let mut t = "Press -> ok".to_string();
         reply(&mut t, true);
         assert_eq!(t, "Press -> ok");
@@ -257,12 +302,23 @@ mod tests {
         assert_eq!(steps(&[1, 2, 3, 5, 7, 8]), "[1..3] [5] [7..8]");
         assert_eq!(
             stopped(&[1, 2], &[3], 3, 5, true),
-            "stopped; sent: [1..2]; maybe sent: [3]; not run: [4..5]"
+            "stopped; sent: [1..2]; maybe sent: [3]; not sent: [4..5]"
+        );
+        // The failing step sent nothing: it is still to send.
+        assert_eq!(
+            stopped(&[1], &[], 3, 4, true),
+            "stopped; sent: [1]; not sent: [3..4]"
         );
         assert_eq!(
-            stopped(&[], &[], 1, 2, true),
-            "stopped; nothing sent; not run: [2]"
+            stopped(&[1], &[], 2, 2, true),
+            "stopped; sent: [1]; not sent: [2]"
         );
+        // It failed after writing (its on_fail sent): maybe sent.
+        assert_eq!(
+            stopped(&[1, 2], &[], 2, 3, true),
+            "stopped; sent: [1]; maybe sent: [2]; not sent: [3]"
+        );
+        assert_eq!(stopped(&[], &[], 1, 2, true), "stopped; nothing sent");
         assert_eq!(stopped(&[], &[], 2, 2, true), "stopped; nothing sent");
         assert_eq!(stopped(&[], &[], 1, 3, false), "stopped; not run: [2..3]");
     }
