@@ -159,10 +159,18 @@ The agent and the user share one keyboard and mouse. Input tools (`act`,
 `window`) wait for the user:
 
 - **Pause.** While the user typed or moved the pointer in the last 1.5 s,
-  they fail with `paused: the user is using the keyboard ...` without
-  sending anything; the agent retries once the user stops. User input during
-  a batch, a drag or a repeated `key` stops the remaining input
-  (`interrupted: ...`). Read tools and the clipboard tools keep working.
+  an input tool waits, sending nothing, for the user to stop: when the
+  pause ends within 2.5 s all told (say, the call came right after the user
+  pressed Enter in their terminal) it then goes ahead and its reply starts
+  with `waited N ms for the user's input to stop; `. While the user keeps
+  going, it fails with `paused: the user is using the keyboard ... (last
+  input N ms ago; waited M ms for them to stop); nothing was sent` and the
+  agent retries later. Cancelling the call ends the wait. User input during
+  a batch (once it sent input), a drag or a repeated `key` stops the
+  remaining input at once (`interrupted: ...`): those steps were planned
+  for the screen as it was. User input while a batch only read so far
+  pauses its first input like a call of its own. Read tools and the
+  clipboard tools keep working.
 - **Stop shortcut: Meta+Alt+Esc.** It ends a running drag or batch and refuses
   every input tool with `stopped by the user` until the agent calls
   `activate_window` on its own (not as a batch step and not through
@@ -356,6 +364,23 @@ tool; `off` turns it off). Not available on Windows yet.
   window now '<title>'`) or came to the front since the previous input (`;
   before it, '<title>' had come to the front`: a dialog that opened after
   that reply); about 3 ms per input.
+- Waiting for a web page (Linux, apps that send accessibility change events):
+  after a press (`act` with the element's own action), a plain left `click`
+  on an element, or `key` Enter, alt+left, alt+right or F5, in an app that
+  shows web pages (Firefox, Thunderbird, Chromium, Electron apps), the reply
+  waits for the page to change in place (a next page, a tab, search
+  results, a mail opened): up to `settle_ms` (default 1500 here; 0 turns it
+  off) for the first change, then until its events are quiet for 150 ms and
+  no page of the app is loading, within the same limit. The reply says
+  `; page changed (settled after N ms)`, `; page changed, still loading
+  after N ms` (or `still changing`) or `; page unchanged after N ms`, and the
+  next `get_text` or `find` reads the new content (reads kept from before the
+  input are dropped when it starts and ends, and a read kept afterwards is
+  dropped by the app's next change event). Not for clicks into text fields,
+  combo boxes, menus, sliders or a whole document, nor for other keys or
+  apps: there it costs nothing beyond one cached toolkit lookup. When the
+  page does not change, the call takes the whole `settle_ms`. `mouse`
+  clicks at coordinates do not wait.
 - What an input opened (Linux): after `act`, `menu`, `close_window` and the
   input tools given `observe`, and after `click`, `key`, `mouse` and
   `type_text` without it, the reply lists the menus, popup menus, combo box

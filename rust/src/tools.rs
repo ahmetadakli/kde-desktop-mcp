@@ -103,14 +103,14 @@ the element picked; a miss lists near or off-screen matches.
 procedure fits in one. Mark waits \"optional\": true and end with an observation step, or \
 give the last input `observe`. A later step's `id`/`*_id` may be \"$N\": the element step \
 N found or acted on.
-- Input tools (key, type_text, click, mouse, scroll, focus, drag, set_text, act, screenshot) \
-take `window` (title or app substring) to activate that window first unless it is in \
-front. Without it, input fails while the user's terminal is in front.
+- Input tools and screenshot take `window` (title or app substring) to bring that \
+window to the front first. Without it, input fails while the user's terminal is in front.
 - click, mouse and scroll take `modifiers`; hold keeps keys down.
-- If the user takes over keyboard and mouse, input fails with \"paused\" (or \
-\"interrupted\" mid-batch) without acting: pause ~2 s and retry. \"stopped by the user\": \
+- While the user types or moves the mouse, input waits up to 2.5 s, then fails \
+\"paused\" (or \"interrupted\" mid-batch) without acting: pause ~2 s and retry. \"stopped by the user\": \
 stop and ask them; once they agree, a standalone activate_window call resumes input.
-- After opening a page, wait_idle(app) waits for it to load (not pause). wait_for: something \
+- After opening a page, wait_idle(app) waits for it to load (not pause); a click, press \
+or Enter on a web page waits for its change. wait_for: something \
 that appears or goes away (gone=true), a state or a window; never as a sleep. \
 tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
@@ -538,7 +538,7 @@ pub fn tools() -> Json {
             props["settle_ms"] = json!({
                 "type": "integer",
                 "default": 150,
-                "description": "Longest wait for the app to react before the effect line and observation; ends early once it changed."
+                "description": "Longest wait for the app to react before the effect line and observation; ends early once it changed. After a press, a left click or Enter on a web page (Linux): longest wait for the page to change and settle (default there 1500; 0: no wait)."
             });
         }
         let name = tool["name"].as_str().unwrap().to_string();
