@@ -283,6 +283,25 @@ pub struct WindowEntry {
     pub active: bool,
 }
 
+/// The web page a browser window shows, as `Backend::page` reads it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Page {
+    /// The document's name: the page title.
+    pub title: String,
+    /// Its address when the browser says (AT-SPI Document "DocURL"), else "".
+    pub url: String,
+    /// The document says it is still loading (BUSY).
+    pub busy: bool,
+}
+
+impl Page {
+    /// Whether `other` is another page (or the same one renamed): title or
+    /// address differ. Loading alone is no change of page.
+    pub fn differs(&self, other: &Page) -> bool {
+        self.title != other.title || self.url != other.url
+    }
+}
+
 pub struct AppEntry {
     pub name: String,
     pub windows: Vec<WindowEntry>,
@@ -437,6 +456,13 @@ pub trait Backend {
     /// one call (Firefox: the window's EMBEDS relation names the current
     /// tab's page). None to search the window for it instead.
     async fn embedded_document(&self, _window: &Self::Id) -> Option<Self::Id> {
+        None
+    }
+
+    /// The web page `doc` (a document element) is: title, address and
+    /// whether it loads. None when it is no document or no longer shows
+    /// (gone, a tab in the background), and on platforms that do not say.
+    async fn page(&self, _doc: &Self::Id) -> Option<Page> {
         None
     }
 

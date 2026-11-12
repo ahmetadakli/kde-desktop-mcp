@@ -87,6 +87,25 @@ fn search_fetch(text_limit: usize, limit: usize) -> Fetch {
     }
 }
 
+/// `render::locate_all`, and when nothing of `role` matches, again with its
+/// synonyms (`render::with_role_synonyms`; `by_synonym` set then).
+fn locate_with_synonyms<Id: Clone + Eq + std::hash::Hash>(
+    cache: &Cache<Id>,
+    windows: &[Id],
+    query: &str,
+    role: &str,
+    titles: bool,
+    window: &str,
+) -> Result<Option<render::Matches<Id>>, Vec<Id>> {
+    let (m, by_synonym) = render::with_role_synonyms(role, Option::is_some, |r| {
+        render::locate_all(cache, windows, query, r, titles, window)
+    })?;
+    Ok(m.map(|mut m| {
+        m.by_synonym = by_synonym;
+        m
+    }))
+}
+
 /// How long a read of an app's tree is reused at most, even when the app
 /// reported no change: a safety net for changes no event announces.
 const READ_MAX_AGE: Duration = Duration::from_secs(2);
@@ -396,6 +415,9 @@ struct Server<B: Backend> {
     /// Reads of apps' trees kept for the next calls (`Server::read_app`).
     /// Never locked across an await.
     reads: std::sync::Mutex<Reads<B::Id>>,
+    /// The web page document last found per app (`Server::page_of`), read
+    /// again while it still shows. Never locked across an await.
+    page_docs: std::sync::Mutex<HashMap<String, B::Id>>,
 }
 
 /// A key or mouse button the server pressed and has not released.
@@ -911,36 +933,87 @@ const MAX_SETTLE_MS: i64 = 5000;
 const OBSERVE_TREE_NODES: i64 = 150;
 const OBSERVE_TREE_CHARS: usize = 6000;
 
-/// What an input is compared on: the active window (app, title) and the
-/// focused element (id, role, name, states). Two reads, about 1 ms.
+/// What an input is compared on: the active window (app, title), the
+/// focused element (id, role, name, states) and, for the allowed app the
+/// input goes to, the web page its window shows. Two reads, about 1 ms,
+/// and three more for the page.
 #[derive(Clone, Debug, PartialEq)]
 struct Fingerprint<Id> {
     window: Option<(String, String)>,
     focus: Option<(Id, String, String, Vec<&'static str>)>,
+    /// The allowed app the input goes to (lower case) and its windows,
+    /// whose change events count for the effect; None when not read.
+    app: Option<(String, Vec<Id>)>,
+    /// The page the app's window shows (`Backend::page`).
+    page: Option<backend::Page>,
+}
+
+/// After an input to a window showing a web page, how much longer than
+/// the settle the effect line waits for the app to report a change: a
+/// link or a web app's row starts loading the next page only after a
+/// round trip of its own.
+const PAGE_SETTLE: Duration = Duration::from_millis(400);
+
+/// Toolkits (lower case) whose windows show web pages: Firefox's and
+/// Chromium's (Chrome, Electron apps).
+const WEB_TOOLKITS: [&str; 2] = ["gecko", "chromium"];
+
+/// How the effect line names a page: its title, else its address.
+fn page_name(p: &backend::Page) -> String {
+    match (p.title.is_empty(), p.url.is_empty()) {
+        (false, _) => render::py_repr(&p.title),
+        (true, false) => p.url.clone(),
+        (true, true) => "an untitled page".into(),
+    }
 }
 
 /// The effect line: how `after` differs from `before`. `events`: whether
 /// the app reported changes meanwhile (None: the backend cannot tell).
-/// Titles of windows of apps not `allowed` are not named.
+/// Titles of windows of apps not `allowed` are not named. A page that is
+/// loading after the input is said so, as reading it now reads the old
+/// or a half page.
 fn effect_text<Id: PartialEq>(
     before: &Fingerprint<Id>,
     after: &Fingerprint<Id>,
     events: Option<bool>,
     allowed: impl Fn(&str) -> bool,
 ) -> String {
-    if before.window != after.window {
-        let same_app = matches!((&before.window, &after.window),
-            (Some((a, _)), Some((b, _))) if a == b);
-        return match &after.window {
+    let loading = if after.page.as_ref().is_some_and(|p| p.busy) {
+        " (still loading: wait_idle before reading it)"
+    } else {
+        ""
+    };
+    let page = match (&before.page, &after.page) {
+        (Some(b), Some(a)) if b.differs(a) => {
+            let mut out = format!("page changed to {}", page_name(a));
+            // The same title: the address tells the pages apart.
+            if a.title == b.title && !a.title.is_empty() && !a.url.is_empty() {
+                out.push_str(&format!(" ({})", a.url));
+            }
+            Some(out)
+        }
+        _ => None,
+    };
+    let same_app = matches!((&before.window, &after.window),
+        (Some((a, _)), Some((b, _))) if a == b);
+    if before.window != after.window && !(same_app && page.is_some()) {
+        let text = match &after.window {
             Some((app, title)) if allowed(app) && same_app => {
                 format!("changed (window title now {})", render::py_repr(title))
             }
             Some((app, title)) if allowed(app) => {
                 format!("window changed to {}", render::py_repr(title))
             }
-            Some((app, _)) => format!("window changed to one of '{app}' (not allowed)"),
-            None => "window changed (none active now)".into(),
+            Some((app, _)) => return format!("window changed to one of '{app}' (not allowed)"),
+            None => return "window changed (none active now)".into(),
         };
+        return format!("{text}{loading}");
+    }
+    if let Some(page) = page {
+        return format!("{page}{loading}");
+    }
+    if !loading.is_empty() {
+        return format!("changed: the page is loading{loading}");
     }
     if before.focus != after.focus || events == Some(true) {
         "changed".into()
@@ -1438,6 +1511,7 @@ impl<B: Backend> Server<B> {
             run_start: std::sync::Mutex::new(None),
             link: Default::default(),
             reads: std::sync::Mutex::new(Reads::new()),
+            page_docs: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2097,7 +2171,7 @@ impl<B: Backend> Server<B> {
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::locate_all(c, &windows, query, role, titles, window),
+                |c| locate_with_synonyms(c, &windows, query, role, titles, window),
             )
             .await;
         Ok(match found {
@@ -2107,14 +2181,15 @@ impl<B: Backend> Server<B> {
     }
 
     /// `locate` in the app windows `windows`, read afresh: the first
-    /// element picked (a read takes the first of a tie).
+    /// element picked (a read takes the first of a tie), and whether it
+    /// matched the synonyms of `role` rather than `role` itself.
     async fn locate_in(
         &self,
         windows: Vec<B::Id>,
         query: &str,
         role: &str,
         titles: bool,
-    ) -> Option<(B::Id, Cache<B::Id>)> {
+    ) -> Option<(B::Id, Cache<B::Id>, bool)> {
         let (found, cache, _) = self
             .read_app(
                 None,
@@ -2122,16 +2197,17 @@ impl<B: Backend> Server<B> {
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::locate_all(c, &windows, query, role, titles, ""),
+                |c| locate_with_synonyms(c, &windows, query, role, titles, ""),
             )
             .await;
-        found.map(|m| (m.first().clone(), cache))
+        found.map(|m| (m.first().clone(), cache, m.by_synonym))
     }
 
     /// What to offer when nothing visible in `windows` matches `query`:
-    /// matches scrolled out of view in the page (web documents only), else
-    /// the visible elements with the closest names, with their ids; empty
-    /// when there are none. `cache` holds the visible part of `windows`.
+    /// with `role` given, the visible elements of other roles that match
+    /// (with their roles), else matches scrolled out of view in the page
+    /// (web documents only), else the visible elements with the closest
+    /// names, with their ids; empty when there are none. `cache` holds the visible part of `windows`.
     async fn miss_report(
         &self,
         windows: &[B::Id],
@@ -2145,6 +2221,27 @@ impl<B: Backend> Server<B> {
                 .map(|id| Line::Node { depth: 0, id })
                 .collect()
         };
+        // Visible elements the query names in other roles: the role asked
+        // for (and its synonyms) was the miss.
+        if !role.trim().is_empty()
+            && !query.trim().is_empty()
+            && let Ok(other) = render::find(cache, windows, query, "", MISS_SUGGESTIONS)
+            && !other.is_empty()
+        {
+            let mut roles: Vec<String> = Vec::new();
+            for id in &other {
+                let r = render::py_repr(&cache[id].role);
+                if !roles.contains(&r) {
+                    roles.push(r);
+                }
+            }
+            self.b.fill_actions(cache, &other).await;
+            let (text, _) = self.print(as_lines(other), cache, app).await;
+            return format!(
+                "; it matches elements of role {} (pass that role, or none):\n{text}",
+                roles.join(", ")
+            );
+        }
         let docs = render::showing_documents(cache, windows);
         if !docs.is_empty() {
             let mut off = Cache::new();
@@ -2311,7 +2408,7 @@ impl<B: Backend> Server<B> {
         let window = a.get("window").and_then(Json::as_str).unwrap_or("");
         let app_key = app.to_lowercase();
         let mut kept = true;
-        let (id, cache, at, ties) = loop {
+        let (id, cache, at, ties, synonym) = loop {
             let located = self.locate(app, query, &role, true, kept, window);
             let located = trace::time("locate", located).await?;
             let (mut m, mut cache, cached) = match located {
@@ -2340,6 +2437,12 @@ impl<B: Backend> Server<B> {
                 self.untie(&mut m, &mut cache, app, query, &role).await?;
             }
             let ties = m.picked.len();
+            let roles: Vec<&str> = m
+                .picked
+                .iter()
+                .map(|(id, _)| cache[id].role.as_str())
+                .collect();
+            let synonym = render::synonym_note(&role, m.by_synonym, &roles);
             let id = m.first().clone();
             // The window it is in, from the nodes read: no walk up to it.
             let frame = if center { frame_in(&cache, &id) } else { None };
@@ -2365,7 +2468,7 @@ impl<B: Backend> Server<B> {
                 }
             );
             if there {
-                break (id, cache, at, ties);
+                break (id, cache, at, ties, synonym);
             }
             // Gone or hidden without an event: read afresh.
             self.forget_reads(&app_key);
@@ -2376,6 +2479,9 @@ impl<B: Backend> Server<B> {
         let mut found = render::describe(&cache[&id], rid);
         if ties > 1 {
             found.push_str(&format!(" (first of {ties} matches)"));
+        }
+        if !synonym.is_empty() {
+            found.push_str(&format!(" ({synonym})"));
         }
         let found = Some(found);
         let role = cache[&id].role.clone();
@@ -2718,8 +2824,7 @@ impl<B: Backend> Server<B> {
             .map(|w| w.title)
     }
 
-    /// The active window and focused element, compared before and after
-    /// an input for its effect line.
+    /// The active window and focused element (no app, no page).
     async fn fingerprint(&self) -> Fingerprint<B::Id> {
         let (apps, focus) = tokio::join!(self.b.list_apps(), self.b.focused());
         let window = apps.into_iter().find_map(|a| {
@@ -2732,7 +2837,65 @@ impl<B: Backend> Server<B> {
         Fingerprint {
             window,
             focus: focus.map(|f| (f.id, f.info.role, f.info.name, f.info.states)),
+            app: None,
+            page: None,
         }
+    }
+
+    /// What an input's effect line compares before and after it: the
+    /// `fingerprint`, and for `app` (the app the input names, else the
+    /// active window's), when allowed, its windows and the page shown.
+    async fn input_fingerprint(&self, app: Option<String>) -> Fingerprint<B::Id> {
+        let mut print = self.fingerprint().await;
+        let app = app
+            .or_else(|| print.window.as_ref().map(|(a, _)| a.clone()))
+            .map(|a| a.to_lowercase())
+            .filter(|a| self.is_allowed(a));
+        if let Some(app) = app
+            && let Some(windows) = self.b.app_windows(&app).await
+        {
+            print.page = trace::time("page", self.page_of(&app, &windows)).await;
+            print.app = Some((app, windows));
+        }
+        print
+    }
+
+    /// The web page a browser `app` (Firefox, Chromium and Electron apps)
+    /// shows in its active window (`active_document`), for the effect line:
+    /// the document found last is read again while it shows (one round
+    /// trip), else searched for. None for other apps.
+    async fn page_of(&self, app: &str, windows: &[B::Id]) -> Option<backend::Page> {
+        let known = self.page_docs.lock().unwrap().get(app).cloned();
+        if let Some(doc) = known
+            && let Some(page) = self.b.page(&doc).await
+        {
+            return Some(page);
+        }
+        let toolkit = self.b.toolkit_of(windows.first()?).await;
+        if !WEB_TOOLKITS.contains(&toolkit.to_lowercase().as_str()) {
+            return None;
+        }
+        let mut cache = Cache::new();
+        let doc = self
+            .active_document(app, windows.to_vec(), &mut cache)
+            .await
+            .ok()?;
+        let page = self.b.page(&doc).await?;
+        self.page_docs.lock().unwrap().insert(app.to_string(), doc);
+        Some(page)
+    }
+
+    /// The app an input tool's arguments name: `app`, else the app of the
+    /// element `id` refers to; None for neither.
+    async fn input_app(&self, a: &Json) -> Option<String> {
+        if let Some(app) = a.get("app").and_then(Json::as_str)
+            && !app.trim().is_empty()
+        {
+            return Some(app.trim().to_lowercase());
+        }
+        let rid = a.get("id").and_then(Json::as_i64)?;
+        let refs = self.refs.lock().await;
+        refs.map.get(&(rid as u64)).map(|r| r.app.clone())
     }
 
     /// After an input tool ran: wait up to `settle_ms` for the app to react
@@ -2747,15 +2910,25 @@ impl<B: Backend> Server<B> {
         before: Fingerprint<B::Id>,
     ) -> Out {
         let settle = arg_i(a, "settle_ms", SETTLE_MS).clamp(0, MAX_SETTLE_MS) as u64;
-        // The focused element's app is the one that reacts (its bus, on Linux).
-        let near: Vec<B::Id> = before.focus.iter().map(|f| f.0.clone()).collect();
+        // The focused element's app reacts (its bus, on Linux), and the app
+        // the input went to: `act` reaches a browser behind the terminal.
+        let mut near: Vec<B::Id> = before.focus.iter().map(|f| f.0.clone()).collect();
+        if let Some((_, windows)) = &before.app {
+            near.extend(windows.iter().cloned());
+        }
         if settle > 0 {
             self.b
                 .wait_change(&near, mark, Duration::from_millis(settle))
                 .await;
         }
-        let events = self.b.changed_since(&near, mark);
-        let after = self.fingerprint().await;
+        let mut events = self.b.changed_since(&near, mark);
+        // A page answers late: wait a little longer for it to start.
+        if settle > 0 && before.page.is_some() && events != Some(true) {
+            trace::time("page settle", self.b.wait_change(&near, mark, PAGE_SETTLE)).await;
+            events = self.b.changed_since(&near, mark);
+        }
+        let app = before.app.as_ref().map(|(app, _)| app.clone());
+        let after = self.input_fingerprint(app).await;
         let allowed = self.allowed();
         let is_allowed = |app: &str| allowed.contains(&app.to_lowercase());
         let mut text = format!(
@@ -3366,14 +3539,20 @@ impl<B: Backend> Server<B> {
         let role = arg_s(a, "role", "");
         let max_results = arg_i(a, "max_results", 30).max(0) as usize;
         let windows = trace::time("app_windows", self.app_windows(&app)).await?;
-        let (hits, mut cache, _) = self
+        let ((hits, by_synonym), mut cache, _) = self
             .read_app(
                 Some(&app.to_lowercase()),
                 &windows,
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::find(c, &windows, &query, &role, max_results),
+                |c| {
+                    render::with_role_synonyms(
+                        &role,
+                        |h: &Vec<B::Id>| !h.is_empty(),
+                        |r| render::find(c, &windows, &query, r, max_results),
+                    )
+                },
             )
             .await;
         if hits.is_empty() {
@@ -3385,9 +3564,16 @@ impl<B: Backend> Server<B> {
             } else {
                 "no matches"
             };
-            return Ok(format!("{head}{report}"));
+            let with_role = if role.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" with role '{}'", role.trim())
+            };
+            return Ok(format!("{head}{with_role}{report}"));
         }
         self.b.fill_actions(&mut cache, &hits).await;
+        let roles: Vec<&str> = hits.iter().map(|id| cache[id].role.as_str()).collect();
+        let synonym = render::synonym_note(&role, by_synonym, &roles);
         let lines = hits
             .into_iter()
             .map(|id| Line::Node { depth: 0, id })
@@ -3396,7 +3582,11 @@ impl<B: Backend> Server<B> {
         if let Some(rid) = first {
             note_step_element(rid, true);
         }
-        Ok(text)
+        Ok(if synonym.is_empty() {
+            text
+        } else {
+            format!("{synonym}:\n{text}")
+        })
     }
 
     async fn act(&self, a: &Json) -> R<String> {
@@ -4661,12 +4851,16 @@ impl<B: Backend> Server<B> {
             // With `state`, a match without it counts as no match.
             let has = |info: &Info<B::Id>| state.is_none_or(|s| s.holds(&info.states));
             match found {
-                Some((id, mut cache)) if gone != has(&cache[&id]) => {
+                Some((id, mut cache, by_synonym)) if gone != has(&cache[&id]) => {
                     self.b
                         .fill_actions(&mut cache, std::slice::from_ref(&id))
                         .await;
                     let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
-                    let line = render::describe(&cache[&id], rid);
+                    let mut line = render::describe(&cache[&id], rid);
+                    let synonym = render::synonym_note(&role, by_synonym, &[&cache[&id].role]);
+                    if !synonym.is_empty() {
+                        line.push_str(&format!(" ({synonym})"));
+                    }
                     if gone {
                         let s = state.map_or("", WaitState::name);
                         return Ok(format!("no longer {s} after {ms} ms{note}: {line}"));
@@ -5818,7 +6012,11 @@ impl<B: Backend> Server<B> {
             let before = match observe {
                 Some(_) => Some((
                     self.b.change_mark(),
-                    trace::time("fingerprint before", self.fingerprint()).await,
+                    trace::time(
+                        "fingerprint before",
+                        self.input_fingerprint(self.input_app(a).await),
+                    )
+                    .await,
                 )),
                 None => None,
             };
@@ -6605,6 +6803,13 @@ mod tests {
         prefetches: std::cell::Cell<u32>,
         /// `still_there` calls so far.
         checks: std::cell::Cell<u32>,
+        /// The page the app's window shows (`page`), when Some.
+        page: RefCell<Option<backend::Page>>,
+        /// The page the next action leaves shown (a link followed).
+        page_next: RefCell<Option<backend::Page>>,
+        /// `changed_since` says the app changed when asked about this
+        /// element of it (the app's windows), when Some.
+        events_on: std::cell::Cell<Option<u32>>,
     }
 
     /// Windows on the fake desktop: (app, title).
@@ -6725,6 +6930,15 @@ mod tests {
         fn unchanged_since(&self, _: &[u32], mark: u64) -> bool {
             self.reads.live.get() && self.reads.changes.get() == mark
         }
+        async fn page(&self, doc: &u32) -> Option<backend::Page> {
+            let info = self.info(doc, 0).await;
+            (info.showing && render::DOCUMENT_ROLES.contains(&info.role.as_str()))
+                .then(|| self.reads.page.borrow().clone())
+                .flatten()
+        }
+        fn changed_since(&self, near: &[u32], _: u64) -> Option<bool> {
+            self.reads.events_on.get().map(|w| near.contains(&w))
+        }
         async fn may_keep(&self, _: &[u32]) -> bool {
             self.reads.live.get() && !self.reads.loading.get()
         }
@@ -6833,6 +7047,9 @@ mod tests {
                 .borrow_mut()
                 .push(format!("action {index} on {id}"));
             self.shown.input();
+            if let Some(next) = self.reads.page_next.take() {
+                *self.reads.page.borrow_mut() = Some(next);
+            }
             let info = self.info(id, 0).await;
             let action = info.actions.get(index).map(|a| semantic::norm(a));
             if !info.name.to_lowercase().contains("stuck") {
@@ -8120,6 +8337,8 @@ mod tests {
         let fp = |window: Option<(&str, &str)>, focus: Option<&str>| Fingerprint {
             window: window.map(|(a, t)| (a.to_string(), t.to_string())),
             focus: focus.map(|n| (1u32, "push button".to_string(), n.to_string(), vec![])),
+            app: None,
+            page: None,
         };
         let allowed = |app: &str| app != "secret";
         let kate = Some(("kate", "a.txt — Kate"));
@@ -11949,5 +12168,223 @@ mod tests {
         cache.insert(7, node("panel", &[8]));
         cache.insert(8, node("panel", &[7]));
         assert_eq!(frame_in(&cache, &8), None);
+    }
+
+    /// A web mail page in the fake: a table of rows and cells.
+    fn fake_mail(s: &Session) {
+        *s.focus.borrow_mut() = Info {
+            role: "frame".into(),
+            name: "Inbox — Mail".into(),
+            showing: true,
+            children: vec![39],
+            ..Info::default()
+        };
+        *s.sem.toolkit.borrow_mut() = "Gecko".into();
+        let mut nodes = s.nodes.borrow_mut();
+        nodes.insert(39, fake_node("document web", "Inbox", &[40]));
+        nodes.insert(40, fake_node("table", "", &[41, 43]));
+        nodes.insert(41, fake_node("table row", "Invoice March", &[42]));
+        nodes.insert(42, fake_node("table cell", "Invoice March", &[]));
+        nodes.insert(43, fake_node("table row", "Lunch", &[]));
+        nodes.insert(44, fake_node("link", "Archive", &[]));
+        nodes.get_mut(&40).unwrap().children.push(44);
+    }
+
+    #[test]
+    fn a_role_that_names_nothing_matches_through_its_synonyms() {
+        local(async {
+            let mut s = session("role-synonyms");
+            fake_mail(&s);
+            let r = call_tool(
+                &mut s,
+                2,
+                "find",
+                json!({"app": "fake", "query": "invoice", "role": "row"}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "role 'row' matched as 'table row':\n[1] table row \"Invoice March\" actions=Press",
+                "{r}"
+            );
+            // The role as given wins: no note.
+            let r = call_tool(
+                &mut s,
+                3,
+                "find",
+                json!({"app": "fake", "query": "invoice", "role": "Table Cell"}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "[2] table cell \"Invoice March\" actions=Press",
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"app": "fake", "query": "invoice", "role": "gridcell"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with(
+                    "[2] table cell \"Invoice March\" actions=Press (role 'gridcell' matched as 'table cell'): Press -> ok"
+                ),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                5,
+                "wait_for",
+                json!({"app": "fake", "query": "lunch", "role": "listitem", "timeout_ms": 200}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).ends_with(
+                    "[3] table row \"Lunch\" actions=Press (role 'listitem' matched as 'table row')"
+                ),
+                "{r}"
+            );
+            // A role nothing of the query has: the roles it has instead.
+            let r = call_tool(
+                &mut s,
+                6,
+                "find",
+                json!({"app": "fake", "query": "archive", "role": "button"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with(
+                    "no matches with role 'button'; it matches elements of role 'link' \
+                     (pass that role, or none):\n[4] link \"Archive\" actions=Press\n"
+                ),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                7,
+                "act",
+                json!({"app": "fake", "query": "archive", "role": "checkbox"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(
+                    "no visible element in 'fake' matches 'archive' with role 'checkbox'; \
+                     it matches elements of role 'link'"
+                ),
+                "{r}"
+            );
+        });
+    }
+
+    fn page(title: &str, url: &str, busy: bool) -> backend::Page {
+        backend::Page {
+            title: title.into(),
+            url: url.into(),
+            busy,
+        }
+    }
+
+    #[test]
+    fn the_effect_line_names_a_page_that_changed_or_loads() {
+        local(async {
+            let mut s = session("page-effect");
+            fake_mail(&s);
+            *s.reads.page.borrow_mut() = Some(page("Inbox (3)", "https://mail/#inbox", false));
+            let act = json!({"app": "fake", "query": "Invoice March", "role": "table row", "settle_ms": 0});
+            let effect = |r: &Json| {
+                let t = reply_text(r);
+                t[t.find("effect: ").expect(t) + 8..].to_string()
+            };
+            // Nothing changed: still "no visible change".
+            let r = call_tool(&mut s, 2, "act", act.clone()).await;
+            assert_eq!(effect(&r), "no visible change", "{r}");
+            // The row opened its mail: the page's title changed, though
+            // the window's did not (yet).
+            *s.reads.page_next.borrow_mut() =
+                Some(page("Invoice March - Mail", "https://mail/#inbox/1", false));
+            let r = call_tool(&mut s, 3, "act", act.clone()).await;
+            assert_eq!(effect(&r), "page changed to 'Invoice March - Mail'", "{r}");
+            // The next page of results: same title, another address, loading.
+            *s.reads.page_next.borrow_mut() =
+                Some(page("Invoice March - Mail", "https://mail/#inbox/2", true));
+            let r = call_tool(&mut s, 4, "act", act.clone()).await;
+            assert_eq!(
+                effect(&r),
+                "page changed to 'Invoice March - Mail' (https://mail/#inbox/2) \
+                 (still loading: wait_idle before reading it)",
+                "{r}"
+            );
+            // Still loading, same page: never "no visible change".
+            let r = call_tool(&mut s, 5, "act", act.clone()).await;
+            assert_eq!(
+                effect(&r),
+                "changed: the page is loading (still loading: wait_idle before reading it)",
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_effect_line_hears_the_app_the_input_went_to() {
+        local(async {
+            let mut s = session("effect-app");
+            fake_mail(&s);
+            // The app reports changes on a window of its own, not on the
+            // focused element (the terminal had focus).
+            s.more_windows.borrow_mut().push(60);
+            s.nodes
+                .borrow_mut()
+                .insert(60, fake_node("frame", "Other — Mail", &[]));
+            s.reads.events_on.set(Some(60));
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "Lunch", "settle_ms": 0}),
+            )
+            .await;
+            assert!(reply_text(&r).ends_with("; effect: changed"), "{r}");
+            // Without an app named: the active window's app.
+            let r = call_tool(
+                &mut s,
+                3,
+                "key",
+                json!({"combo": "a", "observe": "effect", "settle_ms": 0}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("; effect: changed"), "{r}");
+        });
+    }
+
+    #[test]
+    fn effect_prefers_the_page_to_the_window_title() {
+        let fp = |title: &str, page: Option<backend::Page>| Fingerprint {
+            window: Some(("firefox".to_string(), format!("{title} — Mozilla Firefox"))),
+            focus: None::<(u32, String, String, Vec<&'static str>)>,
+            app: None,
+            page,
+        };
+        let allowed = |_: &str| true;
+        let before = fp("Inbox", Some(page("Inbox", "u1", false)));
+        let after = fp("Mail 1", Some(page("Mail 1", "u2", false)));
+        assert_eq!(
+            effect_text(&before, &after, Some(true), allowed),
+            "page changed to 'Mail 1'"
+        );
+        // A new page without a title yet: its address.
+        let after = fp("Inbox", Some(page("", "https://x/2", true)));
+        assert_eq!(
+            effect_text(&before, &after, None, allowed),
+            "page changed to https://x/2 (still loading: wait_idle before reading it)"
+        );
+        // Another app's window in front: the window line.
+        let mut other = fp("x", None);
+        other.window = Some(("kate".into(), "a.txt — Kate".into()));
+        assert_eq!(
+            effect_text(&before, &other, None, allowed),
+            "window changed to 'a.txt — Kate'"
+        );
     }
 }

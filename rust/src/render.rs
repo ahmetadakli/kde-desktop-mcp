@@ -918,11 +918,240 @@ impl Query {
     }
 }
 
-/// Whether `info` matches query `q` and the exact `role` filter. The role
-/// name is searched only when `role` is given: otherwise a short query
-/// ("a") would match every frame, panel and alert.
+/// A role name as roles compare: lower case without spaces, `_` and `-`
+/// ("Push_Button", "push button" and UIA's "pushbutton" alike).
+fn role_key(role: &str) -> impl Iterator<Item = char> + '_ {
+    role.chars()
+        .filter(|c| !matches!(c, ' ' | '_' | '-'))
+        .map(|c| c.to_ascii_lowercase())
+}
+
+/// Whether an element of role `actual` passes the `role` filter: "" for
+/// any role, else one or more role names separated by `|` (a synonym set,
+/// `role_synonyms`), compared as `role_key` does.
+pub fn role_matches(actual: &str, role: &str) -> bool {
+    role.is_empty() || role.split('|').any(|r| role_key(r).eq(role_key(actual)))
+}
+
+/// Role names models pass (ARIA, HTML, UIA, everyday words) and the
+/// AT-SPI and UIA roles they mean, in `role_key` form. A `role` that names
+/// nothing is tried again as its set (see `role_synonyms`).
+const ROLE_SYNONYMS: &[(&[&str], &[&str])] = &[
+    (
+        &[
+            "row", "tablerow", "datarow", "dataitem", "treerow", "listitem", "treeitem",
+        ],
+        &["table row", "list item", "tree item", "dataitem"],
+    ),
+    (
+        &["cell", "gridcell", "tablecell", "td", "th", "dataitem"],
+        &["table cell", "dataitem", "column header", "row header"],
+    ),
+    (
+        &["columnheader", "rowheader", "headeritem", "header"],
+        &[
+            "column header",
+            "row header",
+            "table column header",
+            "headeritem",
+        ],
+    ),
+    (
+        &["button", "pushbutton", "btn", "togglebutton", "splitbutton"],
+        &[
+            "push button",
+            "button",
+            "toggle button",
+            "splitbutton",
+            "push button menu",
+        ],
+    ),
+    (
+        &[
+            "textbox",
+            "input",
+            "entry",
+            "field",
+            "textfield",
+            "textarea",
+            "edit",
+            "text",
+            "searchbox",
+            "search",
+            "editbox",
+            "passwordtext",
+            "password",
+        ],
+        &["entry", "text", "password text", "edit"],
+    ),
+    (
+        &["link", "hyperlink", "a", "anchor"],
+        &["link", "hyperlink"],
+    ),
+    (
+        &[
+            "checkbox",
+            "check",
+            "checkmenuitem",
+            "menuitemcheckbox",
+            "switch",
+            "toggle",
+        ],
+        &["check box", "check menu item", "switch", "toggle button"],
+    ),
+    (
+        &["radio", "radiobutton", "radiomenuitem", "menuitemradio"],
+        &["radio button", "radio menu item", "radiobutton"],
+    ),
+    (
+        &["dropdown", "select", "combobox", "combo", "picker"],
+        &["combo box", "combobox"],
+    ),
+    (&["listbox"], &["list box", "list"]),
+    (&["tab", "pagetab", "tabitem"], &["page tab", "tabitem"]),
+    (
+        &["tablist", "pagetablist", "tabs", "tabbar"],
+        &["page tab list", "tab"],
+    ),
+    (
+        &["menuitem", "item", "option", "menuentry"],
+        &[
+            "menu item",
+            "check menu item",
+            "radio menu item",
+            "menuitem",
+        ],
+    ),
+    (
+        &["option", "listitem", "item", "treeitem"],
+        &["list item", "tree item", "listitem", "treeitem"],
+    ),
+    (
+        &["heading", "h1", "h2", "h3", "h4", "h5", "h6", "title"],
+        &["heading"],
+    ),
+    (
+        &["image", "img", "picture", "icon", "graphic"],
+        &["image", "icon"],
+    ),
+    (
+        &["spinbutton", "spinner", "number", "spin"],
+        &["spin button", "spinner"],
+    ),
+    (&["slider", "range"], &["slider"]),
+    (
+        &["dialog", "alertdialog", "modal", "alert"],
+        &["dialog", "alert"],
+    ),
+    (&["window", "frame"], &["frame", "window", "dialog"]),
+    (
+        &["menu", "popupmenu", "contextmenu"],
+        &["menu", "popup menu"],
+    ),
+    (&["menubar"], &["menu bar"]),
+    (&["toolbar"], &["tool bar", "toolbar"]),
+    (&["statusbar", "status"], &["status bar", "statusbar"]),
+    (
+        &["progressbar", "progress"],
+        &["progress bar", "progressbar"],
+    ),
+    (&["scrollbar"], &["scroll bar", "scrollbar"]),
+    (
+        &["label", "statictext", "static"],
+        &["label", "static", "text"],
+    ),
+    (&["paragraph", "p"], &["paragraph"]),
+    (
+        &[
+            "document",
+            "page",
+            "webpage",
+            "documentweb",
+            "web",
+            "article",
+        ],
+        &["document web", "document frame", "document", "article"],
+    ),
+    (&["list", "ul", "ol"], &["list", "list box"]),
+    (&["tree", "treeview", "treegrid"], &["tree", "tree table"]),
+    (
+        &["table", "grid", "datagrid", "treetable"],
+        &["table", "tree table", "datagrid"],
+    ),
+    (
+        &["group", "section", "region", "panel", "pane", "grouping"],
+        &["section", "panel", "grouping", "group", "pane"],
+    ),
+    (&["terminal", "console"], &["terminal"]),
+];
+
+/// The roles `role` stands for besides itself, as a `role_matches` filter
+/// (`a|b|c`); None when it stands for none. Tried when nothing of `role`
+/// itself matches: "row" finds a "table row", "list item" or "tree item",
+/// "textbox" an "entry" or "text".
+pub fn role_synonyms(role: &str) -> Option<String> {
+    let key: String = role_key(role.trim()).collect();
+    if key.is_empty() {
+        return None;
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for (keys, roles) in ROLE_SYNONYMS {
+        if keys.contains(&key.as_str()) {
+            for r in *roles {
+                if !out.contains(r) && !role_key(r).eq(key.chars()) {
+                    out.push(r);
+                }
+            }
+        }
+    }
+    (!out.is_empty()).then(|| out.join("|"))
+}
+
+/// Run `f` with the `role` filter, and when it finds nothing (`found`
+/// false) with `role_synonyms(role)`. Also the filter the result came
+/// from when it was the synonyms (for the "matched as" note). `f` errs
+/// with the nodes it still needs (as `find` and `locate_all` do).
+pub fn with_role_synonyms<T, Id>(
+    role: &str,
+    found: impl Fn(&T) -> bool,
+    mut f: impl FnMut(&str) -> Result<T, Vec<Id>>,
+) -> Result<(T, bool), Vec<Id>> {
+    let first = f(role)?;
+    if found(&first) {
+        return Ok((first, false));
+    }
+    match role_synonyms(role) {
+        Some(set) => {
+            let again = f(&set)?;
+            let by_synonym = found(&again);
+            Ok((if by_synonym { again } else { first }, by_synonym))
+        }
+        None => Ok((first, false)),
+    }
+}
+
+/// "; role 'row' matched as 'table row'" when a match came through the
+/// synonyms of `role` (`roles`: the roles of the elements picked, in
+/// order), else "".
+pub fn synonym_note(role: &str, by_synonym: bool, roles: &[&str]) -> String {
+    if !by_synonym {
+        return String::new();
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for r in roles {
+        if !seen.contains(r) {
+            seen.push(r);
+        }
+    }
+    let list: Vec<String> = seen.iter().map(|r| format!("'{r}'")).collect();
+    format!("role '{}' matched as {}", role.trim(), list.join(", "))
+}
+
+/// Whether `info` matches query `q` and the `role` filter (`role_matches`).
+/// The role name is searched only when `role` is given: otherwise a short
+/// query ("a") would match every frame, panel and alert.
 fn matches<Id>(info: &Info<Id>, q: &Query, role: &str) -> Option<Hit> {
-    if !role.is_empty() && info.role != role {
+    if !role_matches(&info.role, role) {
         return None;
     }
     let name = fold(&info.name);
@@ -1054,6 +1283,9 @@ pub struct Matches<Id> {
     /// the window (one of the roots) it is in; never empty. More than one:
     /// the query is ambiguous.
     pub picked: Vec<(Id, Id)>,
+    /// They matched the synonyms of the `role` asked for, not the role
+    /// itself (`with_role_synonyms`); set by the caller.
+    pub by_synonym: bool,
 }
 
 impl<Id> Matches<Id> {
@@ -1185,7 +1417,13 @@ pub fn locate_all<Id: Clone + Eq + Hash>(
         .into_iter()
         .map(|(id, w)| (id.clone(), roots[w].clone()))
         .collect();
-    done(Some(Matches { picked }), missing)
+    done(
+        Some(Matches {
+            picked,
+            by_synonym: false,
+        }),
+        missing,
+    )
 }
 
 /// Elements of `roots` that match `query` (and `role`) but are not
@@ -2536,6 +2774,101 @@ mod tests {
         assert_eq!(hits, vec!["/p", "/b2", "/b1", "/w"]);
         let hits = find(&cache, &["/w"], "KAYDET", "push button", 10).unwrap();
         assert_eq!(hits, vec!["/b1"]);
+    }
+
+    #[test]
+    fn roles_compare_without_case_spaces_or_dashes() {
+        assert!(role_matches("push button", ""));
+        assert!(role_matches("push button", "push button"));
+        assert!(role_matches("push button", "Push_Button"));
+        assert!(role_matches("push button", "pushbutton"));
+        assert!(role_matches("checkbox", "check box"));
+        assert!(role_matches("table row", "list item|table row"));
+        assert!(!role_matches("table row", "row"));
+        assert!(!role_matches("push button", "button"));
+    }
+
+    #[test]
+    fn role_synonyms_name_the_platform_roles() {
+        let set = |r: &str| role_synonyms(r).unwrap_or_default();
+        assert_eq!(set("row"), "table row|list item|tree item|dataitem");
+        assert!(set("cell").starts_with("table cell"));
+        assert!(set("gridcell").starts_with("table cell"));
+        // "button" itself is a role (Qt 6): its set leaves it out.
+        assert_eq!(
+            set("button"),
+            "push button|toggle button|splitbutton|push button menu"
+        );
+        assert!(set("Push Button").contains("toggle button"));
+        for r in ["textbox", "input", "entry", "field"] {
+            let s = set(r);
+            assert!(
+                s.contains("text") && s.contains("password text"),
+                "{r}: {s}"
+            );
+        }
+        assert!(set("entry").starts_with("text|"), "{}", set("entry"));
+        assert_eq!(set("link"), "hyperlink");
+        assert_eq!(set("checkbox"), "check menu item|switch|toggle button");
+        assert_eq!(set("dropdown"), "combo box|combobox");
+        assert_eq!(set("select"), "combo box|combobox");
+        assert_eq!(set("tab"), "page tab|tabitem");
+        // "menuitem" is "menu item" already (`role_key`): the others.
+        assert!(set("menuitem").starts_with("check menu item|"));
+        assert!(role_matches("menu item", "menuitem"));
+        assert_eq!(set("heading"), "");
+        assert_eq!(set("h2"), "heading");
+        assert!(set("listitem").starts_with("table row|tree item|"));
+        let option = set("option");
+        assert!(option.contains("list item") && option.contains("menu item"));
+        assert_eq!(role_synonyms(""), None);
+        assert_eq!(role_synonyms("frobnicator"), None);
+    }
+
+    #[test]
+    fn a_role_that_matches_nothing_is_tried_as_its_synonyms() {
+        let mut c = Cache::new();
+        c.insert("/w", node("frame", "Inbox", true, &["active"], &["/t"]));
+        c.insert("/t", node("table", "", true, &[], &["/r1", "/r2"]));
+        c.insert(
+            "/r1",
+            node("table row", "Invoice March", true, &[], &["/c1"]),
+        );
+        c.insert("/c1", node("table cell", "Invoice March", true, &[], &[]));
+        c.insert("/r2", node("table row", "Lunch", true, &[], &[]));
+        let roots = ["/w"];
+        let locate = |role: &str| {
+            with_role_synonyms(role, Option::is_some, |r| {
+                locate_all(&c, &roots, "invoice", r, true, "")
+            })
+            .unwrap()
+        };
+        // The role as given first: an exact hit is no synonym.
+        let (m, syn) = locate("table cell");
+        assert_eq!((m.unwrap().first(), syn), (&"/c1", false));
+        let (m, syn) = locate("Table_Row");
+        assert_eq!((m.unwrap().first(), syn), (&"/r1", false));
+        let (m, syn) = locate("row");
+        let m = m.unwrap();
+        assert_eq!((m.first(), syn), (&"/r1", true));
+        assert_eq!(
+            synonym_note("row", syn, &["table row"]),
+            "role 'row' matched as 'table row'"
+        );
+        let (m, syn) = locate("gridcell");
+        assert_eq!((m.unwrap().first(), syn), (&"/c1", true));
+        // Nothing in the synonyms either: no match, no note.
+        let (m, syn) = locate("button");
+        assert!(m.is_none() && !syn);
+        assert_eq!(synonym_note("button", syn, &[]), "");
+        // find: every synonym role in one pass (its usual order).
+        let (hits, syn) = with_role_synonyms(
+            "row",
+            |h: &Vec<_>| !h.is_empty(),
+            |r| find(&c, &roots, "", r, 10),
+        )
+        .unwrap();
+        assert_eq!((hits, syn), (vec!["/r2", "/r1"], true));
     }
 
     #[test]

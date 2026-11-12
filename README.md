@@ -314,6 +314,20 @@ tool; `off` turns it off). Not available on Windows yet.
   tab, and a web page's document) count only when nothing else matches or
   `role` names that role; `wait_for` skips them unless `role` names them.
   Last come elements holding every word of the query, accents aside.
+- `role` (in `find`, `wait_for` and the `app` + `query` targets) compares
+  without case, spaces, `_` or `-` (`Push_Button`, `pushbutton` and UIA's
+  `checkbox` for `check box`). A role that matches nothing is tried again as
+  the platform roles it stands for, and the reply says so (`role 'row'
+  matched as 'table row'`): `row` (table row, list item, tree item), `cell`
+  / `gridcell` (table cell), `button` (push button, toggle button),
+  `textbox` / `input` / `entry` / `field` (entry, text, password text),
+  `checkbox` (check box, check menu item, switch), `dropdown` / `select`
+  (combo box), `tab` (page tab), `menuitem` / `option` / `listitem` (menu
+  item, list item), `h1`…`h6` (heading), `link` (UIA hyperlink) and more
+  (`ROLE_SYNONYMS` in `render.rs`). When nothing of that role or its
+  synonyms matches but elements of other roles do, the miss lists them with
+  their roles (`it matches elements of role 'link' (pass that role, or
+  none)`).
 - Ties: when several elements match equally well (the best of those tiers),
   these tie-breaks apply in turn, while the matches are in several windows of
   the app: (1) a window whose title contains the call's `window` argument
@@ -343,11 +357,22 @@ tool; `off` turns it off). Not available on Windows yet.
   `key`, `type_text`, `mouse`, `drag`, `scroll`, `set_text`): with
   `observe` (and by default for `act`, `menu` and `close_window`) the reply
   ends with an `effect:` line comparing the active window before and after the
-  input (its title, the focused element, and on Linux the app's accessibility
-  change events): `changed`, `no visible change`, or `window changed to
-  '<title>'` (a dialog opened, a window closed). It waits for the app to react
-  up to `settle_ms` (default 150), returning as soon as it reported a change;
-  the fingerprint itself costs about 1 ms. A canvas that draws without
+  input (its title, the focused element, and on Linux the accessibility
+  change events of the app the input went to: the one `app`/`id` names, else
+  the active window's, besides the focused element's): `changed`, `no
+  visible change`, or `window changed to '<title>'` (a dialog opened, a
+  window closed). When that app is a browser (Linux: Firefox, Chromium and
+  Electron apps), the web page of its active window (the showing document,
+  as `tree(document=true)` finds it, then remembered while it shows) is
+  compared too, by title and address (`DocURL`): `page changed to '<title>'` (the
+  address added when the title stayed the same), and a page still loading
+  (BUSY) adds `(still loading: wait_idle before reading it)` and is never
+  `no visible change`. It waits for the app to react up to `settle_ms`
+  (default 150), returning as soon as it reported a change, and for a web
+  page up to 400 ms more when nothing came yet (a link or a web app's row
+  starts loading after a round trip of its own); the fingerprint costs
+  about 1 ms, the remembered page one more round trip (a search of the
+  browser's window when it changed). A canvas that draws without
   accessibility events may report `no visible change`. `observe` adds a view
   in the same reply: `focus` (the focused element), `tree` (compact tree of
   the active window, or of `app`'s, at most 6000 characters) or `screenshot`

@@ -1270,6 +1270,24 @@ impl Backend for LinuxBackend {
         self.a11y.relation(window, atspi::RELATION_EMBEDS).await
     }
 
+    async fn page(&self, doc: &Obj) -> Option<crate::backend::Page> {
+        let (role, states, title, url) = tokio::join!(
+            self.a11y.role(doc),
+            self.a11y.states(doc),
+            self.a11y.name(doc),
+            self.a11y.document_url(doc)
+        );
+        let states = states?;
+        let shown = atspi::has(states, atspi::SHOWING) && !atspi::has(states, atspi::DEFUNCT);
+        (shown && crate::render::DOCUMENT_ROLES.contains(&role.as_str())).then(|| {
+            crate::backend::Page {
+                title: title.trim().to_string(),
+                url,
+                busy: atspi::has(states, atspi::BUSY),
+            }
+        })
+    }
+
     async fn loading(&self, windows: &[Obj]) -> bool {
         let busy = futures_util::future::join_all(windows.iter().map(|w| async move {
             match self.embedded_document(w).await {

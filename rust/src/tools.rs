@@ -154,6 +154,7 @@ const CONFIRM: &str =
 /// Shared by the tools that take a target; the matching rules are in
 /// INSTRUCTIONS.
 const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`); rules in the server instructions. \
+A `role` that names nothing is tried as its synonyms (row: table row, list item; textbox: entry, text). \
 A tie left after them: input tools list the candidates' ids and send nothing; get_text reads the first.";
 
 /// The `batch` description, before its examples (BATCH_EXAMPLES).
@@ -263,7 +264,7 @@ pub fn tools() -> Json {
         ),
         t(
             "find",
-            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree; with\n`role`, the role name is searched too. Window, tab and page titles (frame,\nwindow, page tab, document web) are listed after all other matches. Without\nany, elements holding every word of `query` (any order, accents aside) are.\nWith no visible match, lists matches scrolled out of the page's view (act\nand get_text work on them), else the elements with the closest names.\nLines read as in tree (actions the role implies omitted). Usually cheaper\nthan tree.",
+            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by role as tree shows it (case, spaces aside;\none that names nothing is tried as its synonyms: row, cell, button, textbox,\ndropdown, tab…, and the reply says which matched); with `role`, the role name\nis searched too. Window, tab and page titles (frame,\nwindow, page tab, document web) are listed after all other matches. Without\nany, elements holding every word of `query` (any order, accents aside) are.\nWith no visible match, lists matches scrolled out of the page's view (act\nand get_text work on them), else the elements with the closest names.\nLines read as in tree (actions the role implies omitted). Usually cheaper\nthan tree.",
             schema(&[
                 ("query", "string", None),
                 ("app", "string", None),
@@ -274,7 +275,7 @@ pub fn tools() -> Json {
         t(
             "act",
             &d(
-                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nVerified actions, preferred over toggling or clicking: `action` check, uncheck,\nexpand, collapse (already so: \"nothing sent\"), toggle; `option` (with action\nselect, or alone) picks the entry with that label in a combo box, list, tab list\nor menu button, without opening it where it can; scroll_to brings an element\nscrolled out of view (an id from a miss list) into view, else turns the wheel\nover its list (the pointer moves). Each reads the state back: the reply gives\nit, or fails saying what was sent and what it reads instead.\nThe effect line says when the active window changed; a menu, combo box\nlist or dialog the action opened follows with its entries' ids (opened: …;\nLinux)."
+                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nVerified actions, preferred over toggling or clicking: `action` check, uncheck,\nexpand, collapse (already so: \"nothing sent\"), toggle; `option` (with action\nselect, or alone) picks the entry with that label in a combo box, list, tab list\nor menu button, without opening it where it can; scroll_to brings an element\nscrolled out of view (an id from a miss list) into view, else turns the wheel\nover its list (the pointer moves). Each reads the state back: the reply gives\nit, or fails saying what was sent and what it reads instead.\nThe effect line says when the active window or the web page changed (or the\npage still loads: wait_idle before reading it); a menu, combo box\nlist or dialog the action opened follows with its entries' ids (opened: …;\nLinux)."
             ),
             target(&[
                 ("action", "string", Some(json!(""))),
@@ -533,7 +534,7 @@ pub fn tools() -> Json {
                 "type": "string",
                 "enum": OBSERVE_KINDS,
                 "default": "none",
-                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds no effect line or view (on Linux, click, key, mouse and type_text still list a menu or dialog they opened, at no cost when none did); act, menu and close_window report the effect line, and what opened, by default."
+                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed / page changed, loading), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds no effect line or view (on Linux, click, key, mouse and type_text still list a menu or dialog they opened, at no cost when none did); act, menu and close_window report the effect line, and what opened, by default."
             });
             props["settle_ms"] = json!({
                 "type": "integer",
