@@ -1004,7 +1004,9 @@ const CONTENT_QUIET: Duration = Duration::from_millis(150);
 /// CONTENT_QUIET_EARLY of quiet, as when the app was already changing
 /// before the input.
 const CONTENT_EARLY: Duration = Duration::from_millis(100);
-const CONTENT_QUIET_EARLY: Duration = Duration::from_millis(350);
+/// 600 ms: a page that answers a press after a short delay (a script's
+/// timer, a fast fetch, 400 ms in a test page) was read stale with 350.
+const CONTENT_QUIET_EARLY: Duration = Duration::from_millis(600);
 /// Longest wait past the first change (or past the end of loading) while
 /// no page of the app loads: events of other tabs or a live page (a clock,
 /// a video) never go quiet.
