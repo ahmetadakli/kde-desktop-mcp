@@ -151,6 +151,41 @@ server starts the indicator on the first action as `desktop-mcp --indicator`;
 it exits with the server. To turn it off, set the environment variable
 `DESKTOP_MCP_INDICATOR=0` in the MCP configuration.
 
+## Was the input sent?
+
+Every reply and error of an input tool (`act`, `click`, `focus`, `key`,
+`type_text`, `set_text`, `mouse`, `drag`, `scroll`, `hold`, `menu`,
+`close_window`, `file_dialog`, `activate_window`, `move_window`, `launch`,
+`clipboard_set`) says whether its input reached the desktop, so the agent
+knows whether repeating the call can click, type or toggle twice:
+
+- `nothing sent`: refused or failed before anything was written: the
+  allowlist, a tier, a declined confirmation, the user taking over before
+  it (`paused`, `stopped by the user`, `interrupted` before a batch step), a
+  stale id, no element or
+  window matching, an ambiguous target, a bad argument, or a verified action
+  already in the asked state. Safe to retry.
+- `maybe sent: look before retrying`: an error after input was written: an
+  action whose reply did not come (AT-SPI DoAction timeout), text partly
+  typed, a pointer or key event failing, a drag the user interrupted half
+  way, a `set_text` that retyped and did not take, a verified action that
+  reads otherwise afterwards.
+- No marker: it succeeded and sent its input; `verified` where the result was
+  read back (`set_text`, `act`'s check, expand and select).
+
+This is decided where the input is written, not from the message: the server
+reaches the desktop only through a wrapper of the backend that notes every
+write of the running call (an action, a text write, a key, a pointer event, a
+window change). A backend that rejects a write before sending (an unknown key
+name, no window matching) says so. Bringing a tool's `window` to the front
+does not count: repeating it is harmless.
+
+A stopped batch says which steps sent input, so a retry can start after
+them: `stopped; sent: [1..2]; maybe sent: [3]; not run: [4..5]`, or
+`stopped; nothing sent; not run: [2]`. The server instructions carry one
+rule: retry an input only when its reply says `nothing sent`; otherwise look
+first.
+
 ## When the user takes over
 
 The agent and the user share one keyboard and mouse. Input tools (`act`,
@@ -159,8 +194,7 @@ The agent and the user share one keyboard and mouse. Input tools (`act`,
 `window`) wait for the user:
 
 - **Pause.** While the user typed or moved the pointer in the last 1.5 s,
-  they fail with `paused: the user is using the keyboard ...` without
-  sending anything; the agent retries once the user stops. User input during
+  they fail with `paused: the user is using the keyboard ...; nothing sent`; the agent retries once the user stops. User input during
   a batch, a drag or a repeated `key` stops the remaining input
   (`interrupted: ...`). Read tools and the clipboard tools keep working.
 - **Stop shortcut: Meta+Alt+Esc.** It ends a running drag or batch and refuses

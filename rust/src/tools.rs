@@ -93,7 +93,7 @@ Workflow:
 - apps lists running apps. find (app + query) locates elements; act, click, focus, \
 get_text, set_text and scroll take the target themselves. tree shows structure; find is \
 cheaper. act also does check, uncheck, expand, collapse, select (+ `option`) and scroll_to, \
-verified; already so: nothing sent.
+verified.
 - Target: `id` from tree/find, or `app` + `query` (+ `role`): a visible element named \
 `query` (case-insensitive), else one whose name or text has it; titles (window, tab, page) \
 only if nothing else does or `role` names them. Ties favor the active window, a dialog, an \
@@ -107,8 +107,9 @@ N found or acted on.
 take `window` (title or app substring) to activate that window first unless it is in \
 front. Without it, input fails while the user's terminal is in front.
 - click, mouse and scroll take `modifiers`; hold keeps keys down.
-- If the user takes over keyboard and mouse, input fails with \"paused\" (or \
-\"interrupted\" mid-batch) without acting: pause ~2 s and retry. \"stopped by the user\": \
+- Retry an input only if its reply says \"nothing sent\"; else look first.
+- If the user takes over keyboard and mouse, input fails with \"paused\" or \
+\"interrupted\": pause ~2 s and retry. \"stopped by the user\": \
 stop and ask them; once they agree, a standalone activate_window call resumes input.
 - After opening a page, wait_idle(app) waits for it to load (not pause). wait_for: something \
 that appears or goes away (gone=true), a state or a window; never as a sleep. \
@@ -118,14 +119,14 @@ view. On Linux, menus, lists and dialogs an input opened come with ids (`opened:
 end with the active window and focus.
 - menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
 - screenshot is a last resort. To click something seen \
-only in it, pass its pixels to mouse as image_x/image_y; `region`=[x, y, w, h] zooms in.
+only in it, pass its pixels to mouse (image_x/image_y); `region`=[x, y, w, h] zooms in.
 
 Allowlist: only apps in the user's allowlist file can be read, activated or sent input, and \
 input only goes to an allowed active window. An app may be limited to a tier: view \
 (read only) or click (no typing or keys). When a refusal says to, ask the user and retry with \
 confirm: true only if they agree. Password fields are never read, and filled in only if the \
-user allowed it. Changing the file is the user's decision. When tools fail \
-as if the setup were broken (AT-SPI, input, KWin), run doctor.
+user allowed it. Changing the file is the user's decision. If the setup seems \
+broken (AT-SPI, input, KWin), run doctor.
 
 Clients loading schemas on demand: load in one search: batch, find, \
 act, activate_window, key, type_text, wait_for, wait_idle, screenshot, apps.";
@@ -164,7 +165,8 @@ list of {\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.
  {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},
  {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].
 Stops at the first failing step unless it is `optional`: then it is reported
-as failed (optional) and the rest still runs. Mark waits optional and end
+as failed (optional) and the rest still runs. A stop says which steps sent
+input: `stopped; sent: [1..2]; maybe sent: [3]; not run: [4]`. Mark waits optional and end
 with an observation step (find, get_text, screenshot). Give the first
 input step `window` when input goes to an app. Ids from earlier tree/find work.
 An `id`/`*_id` arg of \"$N\" is the element step N produced: find's first

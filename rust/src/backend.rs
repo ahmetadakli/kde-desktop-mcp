@@ -467,13 +467,13 @@ pub trait Backend {
     /// interface (AT-SPI Selection.SelectChild): no pointer, no focus.
     /// Err when the platform or the container offers none.
     async fn select_item(&self, _item: &Self::Id) -> R<bool> {
-        Err(NO_SELECTION.into())
+        Err(crate::delivery::nothing_sent(NO_SELECTION))
     }
     /// Ask the app to scroll the element into view (AT-SPI
     /// Component.ScrollTo, else on its parent): no pointer. Ok(false) when
     /// the app declined.
     async fn scroll_into_view(&self, _id: &Self::Id) -> R<bool> {
-        Err(NO_SCROLL_TO.into())
+        Err(crate::delivery::nothing_sent(NO_SCROLL_TO))
     }
     /// The nearest scrollable ancestor that is on screen (a scroll pane, a
     /// list, a web page), for a wheel over it; None when unknown.
@@ -653,16 +653,19 @@ pub trait Backend {
 // The Windows backend has no window control yet.
 #[cfg_attr(windows, allow(dead_code))]
 pub fn not_one_window(query: &str, matches: &[WindowGeo]) -> String {
+    // Nothing was closed: the caller's write sent nothing.
     if matches.is_empty() {
-        return format!("no window of an allowed app matches '{query}'");
+        return crate::delivery::nothing_sent(format!(
+            "no window of an allowed app matches '{query}'"
+        ));
     }
     let list: Vec<String> = matches
         .iter()
         .map(|w| format!("{:?} [{}]", w.title, w.app))
         .collect();
-    format!(
+    crate::delivery::nothing_sent(format!(
         "{} windows match '{query}': {}; pass more of the title so only one does",
         matches.len(),
         list.join(", ")
-    )
+    ))
 }

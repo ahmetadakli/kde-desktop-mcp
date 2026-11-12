@@ -72,15 +72,14 @@ impl Block {
                  called again. Ask the user before resuming"
             ),
             Block::Paused(dev, ago) => format!(
-                "paused: the user is using the {} (last input {} ms ago); nothing was sent. \
+                "paused: the user is using the {} (last input {} ms ago); nothing sent. \
                  Retry when they stop (pause {} ms first)",
                 dev.noun(),
                 ago.as_millis(),
                 window.saturating_sub(*ago).as_millis().max(100)
             ),
             Block::Interrupted(dev) => format!(
-                "interrupted: the user started using the {}; the rest of the input was not \
-                 sent. Retry when they stop",
+                "interrupted: the user started using the {}. Retry when they stop",
                 dev.noun()
             ),
         }

@@ -193,7 +193,7 @@ impl Input {
     }
 
     pub async fn press_combo(&self, combo: &str) -> R<()> {
-        let codes = parse_combo(combo)?;
+        let codes = parse_combo(combo).map_err(crate::delivery::nothing_sent)?;
         let down: Vec<InputEvent> = codes.iter().map(|c| ev(EventType::KEY, c.0, 1)).collect();
         let up: Vec<InputEvent> = codes
             .iter()
@@ -213,7 +213,7 @@ impl Input {
 
     /// Press (`down`) or release one key and leave it so.
     pub async fn key(&self, name: &str, down: bool) -> R<()> {
-        let code = keycode(name)?;
+        let code = keycode(name).map_err(crate::delivery::nothing_sent)?;
         if !down {
             tokio::time::sleep(CROSS_DEVICE_SETTLE).await;
         }
@@ -253,7 +253,7 @@ impl Input {
     /// press waits (the hold before what follows); events of the device
     /// stay in order, so nothing needs to wait after a release.
     pub async fn button(&self, button: &str, down: bool) -> R<()> {
-        let btn = button_code(button)?;
+        let btn = button_code(button).map_err(crate::delivery::nothing_sent)?;
         self.with_ptr(|d| {
             d.emit(&[ev(EventType::KEY, btn.0, i32::from(down))])
                 .map_err(io)
@@ -266,7 +266,7 @@ impl Input {
 
     /// Click and/or scroll at the current cursor position.
     pub async fn buttons(&self, button: &str, clicks: i64, scroll: i64) -> R<()> {
-        let btn = button_code(button)?;
+        let btn = button_code(button).map_err(crate::delivery::nothing_sent)?;
         let clicks = clicks.clamp(0, 3);
         for i in 0..clicks {
             if i > 0 {
