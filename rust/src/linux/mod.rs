@@ -1354,20 +1354,20 @@ impl Backend for LinuxBackend {
     /// SelectChild adds to a multi-selection list's selection: cleared
     /// first there, so the entry ends up the only one selected.
     async fn select_item(&self, item: &Obj) -> R<bool> {
-        let parent = self
-            .a11y
-            .parent(item)
-            .await
-            .ok_or("the entry has no parent to select it in")?;
+        let parent = self.a11y.parent(item).await.ok_or_else(|| {
+            crate::delivery::nothing_sent("the entry has no parent to select it in")
+        })?;
         let (ifaces, index, st) = tokio::join!(
             self.a11y.interfaces(&parent),
             self.a11y.index_in_parent(item),
             self.a11y.states(&parent)
         );
         if !ifaces.iter().any(|i| i == "org.a11y.atspi.Selection") {
-            return Err("its list offers no accessibility selection".into());
+            return Err(crate::delivery::nothing_sent(
+                "its list offers no accessibility selection",
+            ));
         }
-        let index = index?;
+        let index = index.map_err(crate::delivery::nothing_sent)?;
         if st.is_some_and(|s| atspi::has(s, atspi::MULTISELECTABLE)) {
             self.a11y.clear_selection(&parent).await?;
         }
@@ -1716,7 +1716,7 @@ impl Backend for LinuxBackend {
     }
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {
-        input::button_code(button)?;
+        input::button_code(button).map_err(crate::delivery::nothing_sent)?;
         crate::trace::time("move_pointer", self.move_pointer(x, y)).await?;
         crate::trace::time("buttons", self.input.buttons(button, clicks, scroll)).await
     }
@@ -1789,7 +1789,9 @@ impl Backend for LinuxBackend {
                 let apps = self.apps_with_pids().await;
                 let allow = Self::allow_of(allowed, &apps);
                 let Some(raised) = kwin.activate(query, &allow).await? else {
-                    return Err(format!("no window of an allowed app matches '{query}'"));
+                    return Err(crate::delivery::nothing_sent(format!(
+                        "no window of an allowed app matches '{query}'"
+                    )));
                 };
                 // KWin switches at once; the toolkit reports ACTIVE a moment later.
                 if apps.iter().any(|(pid, ..)| *pid == Some(raised.pid)) {
@@ -1828,7 +1830,9 @@ impl Backend for LinuxBackend {
                     title.contains(&q) || app.contains(&q) || class.contains(&q)
                 });
                 let Some(c) = found else {
-                    return Err(format!("no window of an allowed app matches '{query}'"));
+                    return Err(crate::delivery::nothing_sent(format!(
+                        "no window of an allowed app matches '{query}'"
+                    )));
                 };
                 let addr = c["address"].as_str().unwrap_or("");
                 h.dispatch(&format!("focuswindow address:{addr}")).await?;
@@ -1935,7 +1939,11 @@ impl Backend for LinuxBackend {
             Compositor::Kde(kwin) => kwin
                 .set_window(query, &self.kwin_allow(allowed).await, change)
                 .await?
-                .ok_or_else(|| format!("no window of an allowed app matches '{query}'")),
+                .ok_or_else(|| {
+                    crate::delivery::nothing_sent(format!(
+                        "no window of an allowed app matches '{query}'"
+                    ))
+                }),
             Compositor::Hyprland(h) => {
                 let (snap, clients) = self.hypr_clients(h, query, allowed).await?;
                 // The active window when it matches, else the first.
@@ -1943,7 +1951,11 @@ impl Backend for LinuxBackend {
                     .iter()
                     .find(|c| c.geo.active)
                     .or(clients.first())
-                    .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
+                    .ok_or_else(|| {
+                        crate::delivery::nothing_sent(format!(
+                            "no window of an allowed app matches '{query}'"
+                        ))
+                    })?;
                 let back = hyprland::monitor_workspace(&snap.monitors, c.monitor);
                 let desk = match &change.desktop {
                     Some(d) => Some(hyprland::workspace_target(&snap, d)?),
@@ -1996,10 +2008,12 @@ impl Backend for LinuxBackend {
         let (name, argv) = (app.to_string(), args.to_vec());
         let r = tokio::task::spawn_blocking(move || launch::resolve(&name, &argv))
             .await
-            .map_err(|e| e.to_string())??;
+            .map_err(|e| e.to_string())?
+            // Not found or not allowed to start: nothing started.
+            .map_err(crate::delivery::nothing_sent)?;
         // Windows already open, to tell a new one of a running instance.
         let before = self.all_windows(allowed).await.unwrap_or_default();
-        let (pid, exit) = launch::spawn(&r)?;
+        let (pid, exit) = launch::spawn(&r).map_err(crate::delivery::nothing_sent)?;
         let mut out = Launched {
             command: launch::describe(&r),
             pid,

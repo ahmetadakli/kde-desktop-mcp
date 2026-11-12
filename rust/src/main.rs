@@ -7,6 +7,7 @@
 //! every call). Platform code lives behind the `Backend` trait.
 
 mod backend;
+mod delivery;
 mod flow;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -374,7 +375,8 @@ fn apps_text(
 }
 
 struct Server<B: Backend> {
-    b: B,
+    /// The backend; what writes to the desktop is noted (`delivery`).
+    b: delivery::Sends<B>,
     refs: Mutex<Refs<B::Id>>,
     allow_file: PathBuf,
     /// Title of the active window as last reported, to mention changes.
@@ -625,6 +627,29 @@ const GATED_TOOLS: [&str; 16] = [
     "launch",
 ];
 
+/// Tools whose replies and errors say whether input was sent (`delivery`):
+/// the gated ones and clipboard_set. A batch says it per step and when it
+/// stops.
+const DELIVERY_TOOLS: [&str; 17] = [
+    "act",
+    "menu",
+    "close_window",
+    "hold",
+    "set_text",
+    "focus",
+    "click",
+    "drag",
+    "scroll",
+    "key",
+    "type_text",
+    "mouse",
+    "activate_window",
+    "file_dialog",
+    "move_window",
+    "launch",
+    "clipboard_set",
+];
+
 /// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
 /// when absent, empty, or the tool takes none.
 fn window_arg(tool: &str, a: &Json) -> R<Option<String>> {
@@ -698,6 +723,8 @@ struct StepResult {
     element: Option<u64>,
     /// It failed by a refusal (`with_refusals`).
     refused: bool,
+    /// It sent input (`delivery::track`).
+    wrote: bool,
 }
 
 /// A running batch: its reply so far and what its steps left.
@@ -709,9 +736,29 @@ struct BatchRun {
     done: Vec<flow::Record>,
     /// A printed step failed.
     failed: bool,
+    /// Top-level steps that sent input, and those that failed after
+    /// sending some (`delivery::stopped`).
+    sent: Vec<usize>,
+    maybe: Vec<usize>,
 }
 
 impl BatchRun {
+    /// Note what a call of top-level step `n` sent: maybe once one of its
+    /// calls failed after writing, else sent once one wrote.
+    fn deliver(&mut self, n: usize, r: &StepResult) {
+        if !r.wrote {
+            return;
+        }
+        if r.result.is_err() {
+            self.sent.retain(|&k| k != n);
+            if !self.maybe.contains(&n) {
+                self.maybe.push(n);
+            }
+        } else if !self.sent.contains(&n) && !self.maybe.contains(&n) {
+            self.sent.push(n);
+        }
+    }
+
     /// The reply line of a call labelled `label` ("3", "2.1", "4.on_fail").
     fn print(&mut self, label: &str, call: &flow::Call, r: &StepResult, optional: bool) {
         let tool = &call.tool;
@@ -1598,7 +1645,7 @@ impl<B: Backend> Server<B> {
         let allow_file = b.allow_file();
         let b_takeover = b.takeover();
         Server {
-            b,
+            b: delivery::Sends(b),
             refs: Mutex::new(Refs {
                 map: HashMap::new(),
                 index: HashMap::new(),
@@ -4275,7 +4322,9 @@ impl<B: Backend> Server<B> {
         for i in 0..times {
             // The user may take over between presses.
             if i > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after {i} of {times} presses of {combo}"))?;
             }
             self.b.press_combo(combo).await?;
         }
@@ -4384,13 +4433,19 @@ impl<B: Backend> Server<B> {
             )?;
         let steps = wanted as i64 - from as i64;
         let key = if steps > 0 { "down" } else { "up" };
-        for i in 0..steps.unsigned_abs() {
+        let n = steps.unsigned_abs();
+        let open_note = "; its list may still be open: key escape closes it";
+        for i in 0..n {
             if i > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after {i} of {n} presses of {key}{open_note}"))?;
             }
             self.b.press_combo(key).await?;
         }
-        self.gate(true).await?;
+        self.gate(true)
+            .await
+            .map_err(|e| format!("{e} after opening its list, before enter{open_note}"))?;
         self.b.press_combo("enter").await?;
         Ok(match steps {
             0 => format!("{} + key enter", actions[open]),
@@ -4493,8 +4548,21 @@ impl<B: Backend> Server<B> {
         if !opened && current.as_ref() == Some(&item) {
             return Ok(format!("already {quoted}; nothing sent"));
         }
+        // Opened, its menu may still show: the opening was sent.
+        let still_open = if opened {
+            " (it may still be open: key escape closes it)"
+        } else {
+            ""
+        };
+        let none = if opened {
+            "nothing selected"
+        } else {
+            "nothing sent"
+        };
         if cache[&item].states.contains(&"disabled") {
-            return Err(format!("{open_note}{quoted} is disabled; nothing sent"));
+            return Err(format!(
+                "{open_note}{quoted} is disabled; {none}{still_open}"
+            ));
         }
         let mut tried: Vec<String> = Vec::new();
         let mut shows = String::new();
@@ -4593,10 +4661,7 @@ impl<B: Backend> Server<B> {
                             if ok {
                                 return Ok(format!("{quoted} selected ({how}; verified)"));
                             }
-                            return Err(format!(
-                                "{}, but {s} afterwards (check with get_text before retrying)",
-                                sent(&tried)
-                            ));
+                            return Err(format!("{}, but {s} afterwards", sent(&tried)));
                         }
                         Err(e2) if tried.is_empty() => return Err(e2),
                         Err(e2) => {
@@ -4616,15 +4681,10 @@ impl<B: Backend> Server<B> {
                 }
             }
         }
-        let still_open = if opened {
-            " (it may still be open: key escape closes it)"
-        } else {
-            ""
-        };
         if tried.is_empty() {
             return Err(format!(
                 "{open_note}found {quoted}, but no way to select it without the pointer; \
-                 nothing sent: click the control, then click the entry{still_open}"
+                 {none}: click the control, then click the entry{still_open}"
             ));
         }
         Err(format!(
@@ -4786,7 +4846,9 @@ impl<B: Backend> Server<B> {
         for round in 0..WHEEL_ROUNDS {
             // The user may take over between turns.
             if round > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after wheel {total} {way} at {x},{y}"))?;
             }
             self.b
                 .pointer(x as i64, y as i64, "left", 0, dir * WHEEL_STEP)
@@ -5619,7 +5681,12 @@ impl<B: Backend> Server<B> {
             let x = x0 + (x1 - x0) * i / DRAG_STEPS;
             let y = y0 + (y1 - y0) * i / DRAG_STEPS;
             // The user took over (or pressed the stop shortcut): let go.
-            moved = self.gate(true).await;
+            moved = self.gate(true).await.map_err(|e| {
+                format!(
+                    "{e} after {} of {DRAG_STEPS} moves from ({x0},{y0}); the button was released",
+                    i - 1
+                )
+            });
             if moved.is_err() {
                 break;
             }
@@ -5670,9 +5737,12 @@ impl<B: Backend> Server<B> {
             false => None,
         };
         let pre = self.pre_content(content.as_ref().map(|(id, _)| id));
-        for i in 0..repeat.clamp(1, 100) {
+        let times = repeat.clamp(1, 100);
+        for i in 0..times {
             if i > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after {i} of {times} presses of {send}"))?;
             }
             self.b.press_combo(&send).await?;
         }
@@ -6175,6 +6245,7 @@ impl<B: Backend> Server<B> {
                 flow::Body::Tool(call) => {
                     let settle = tested.contains(&n);
                     let r = self.batch_call(call, n, &run.done, input, settle).await;
+                    run.deliver(n, &r);
                     let hard = r.refused;
                     let ok = r.result.is_ok();
                     run.print(&n.to_string(), call, &r, step.optional);
@@ -6207,6 +6278,7 @@ impl<B: Backend> Server<B> {
                         _ => format!("{n}.on_fail.{}", k + 1),
                     };
                     let r = self.batch_call(call, n, &run.done, input, false).await;
+                    run.deliver(n, &r);
                     run.print(&label, call, &r, call.optional);
                     if r.result.is_err() && !call.optional {
                         handled = false;
@@ -6215,8 +6287,10 @@ impl<B: Backend> Server<B> {
                 }
             }
             if !handled && !step.optional {
-                if left > 0 {
-                    run.out.push(format!("stopped; {left} step(s) not run"));
+                // What reached the desktop, so a retry repeats none of it.
+                if input || left > 0 {
+                    let line = delivery::stopped(&run.sent, &run.maybe, n, steps.len(), input);
+                    run.out.push(line);
                 }
                 return Err(format!("{}{}", run.out.join("\n"), self.where_note().await));
             }
@@ -6260,18 +6334,20 @@ impl<B: Backend> Server<B> {
                 result: Err(e),
                 element: None,
                 refused: false,
+                wrote: false,
             };
         }
-        let ((result, refused), element) = STEP_ELEMENT
-            .scope(std::cell::Cell::new(None), async {
+        let (((result, refused), element), wrote) =
+            delivery::track(STEP_ELEMENT.scope(std::cell::Cell::new(None), async {
                 let r = with_refusals(self.call_inner(&call.tool, &args, held, settle)).await;
                 (r, STEP_ELEMENT.with(|e| e.get()))
-            })
+            }))
             .await;
         StepResult {
             result,
             element,
             refused,
+            wrote,
         }
     }
 
@@ -6297,6 +6373,7 @@ impl<B: Backend> Server<B> {
             for (k, call) in steps.iter().enumerate() {
                 // Its until (or a later step) tests what the input did.
                 let r = self.batch_call(call, n, &run.done, held, true).await;
+                run.deliver(n, &r);
                 let label = format!("{n}.{}", k + 1);
                 lines.print(&label, call, &r, call.optional);
                 let hard = r.refused;
@@ -6413,242 +6490,258 @@ impl<B: Backend> Server<B> {
             before: String::new(),
         };
         Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
-            let window = window_arg(name, a)?;
-            // Tools that reach no app through `permit` are confirmed here,
-            // by their `app` argument if any.
-            if NO_PERMIT_TOOLS.contains(&name) {
-                let app = a.get("app").and_then(Json::as_str);
-                if self.policy().needs_confirm(name, app) {
-                    self.confirm(name, app, a).await?;
-                }
+            let (result, wrote) = delivery::track(self.call_body(name, a, held, settle)).await;
+            if !DELIVERY_TOOLS.contains(&name) {
+                return result;
             }
-            let observe = observe_arg(name, a)?;
-            // Reads kept from before are not reused once this may have
-            // changed what an app shows, nor while it runs.
-            let _changes = (!READ_ONLY_TOOLS.contains(&name) || window.is_some())
-                .then(|| InputRun::start(&self.reads));
-            // What the input sets for the content wait (input tools run one
-            // at a time: the input lock is held).
-            let input_tool = INPUT_TOOLS.contains(&name);
-            if input_tool {
-                self.content
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take();
-            }
-            // A screenshot sends no input, but activating its window does. A
-            // batch that holds the input lock already runs its steps `held`.
-            let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
-                let guard = trace::time("input lock", self.input.lock()).await;
-                self.start_run();
-                Some(guard)
-            } else {
-                None
-            };
-            let gated = GATED_TOOLS.contains(&name) || window.is_some();
-            // Only an activate_window call of its own resumes after the stop
-            // shortcut, never a step of a batch that was running then.
-            let resumed = name == "activate_window"
-                && !held
-                && self.takeover.as_ref().is_some_and(|t| t.resume());
-            let waited = match gated {
-                true => trace::time("gate", self.gate_wait(held)).await?,
-                false => None,
-            };
-            let _ours = match &self.takeover {
-                Some(t) if gated => Some(t.ours()),
-                _ => None,
-            };
-            if let Some(label) = indicator_label(name, a) {
-                trace::time("indicate", self.b.indicate(&label)).await;
-            }
-            let activated = match &window {
-                Some(q) => trace::time("ensure_window", self.ensure_window(q)).await?,
-                None => None,
-            };
-            if input_tool {
-                // An activation's own events would count as the app's.
-                let base = activated.is_none().then(|| self.b.change_mark());
-                *self.content_base.lock().unwrap_or_else(|e| e.into_inner()) = base;
-            }
-            // Taken once the window is in front, before the input.
-            let before = match observe {
-                Some(_) => Some((
-                    self.b.change_mark(),
-                    trace::time(
-                        "fingerprint before",
-                        self.input_fingerprint(self.input_app(a).await),
-                    )
-                    .await,
-                )),
-                None => None,
-            };
-            // What the app the focus is in reports from now on ends the
-            // settle; `focus_note` waits for it, or else the end of the call.
-            let settle_near = match observe {
-                None if settle && WINDOW_NOTE_TOOLS.contains(&name) => {
-                    let mark = self.b.change_mark();
-                    let near: Vec<B::Id> =
-                        self.b.focused().await.map(|f| f.id).into_iter().collect();
-                    let _ = GATE.try_with(|g| g.borrow_mut().settle = Some(mark));
-                    Some(near)
-                }
-                _ => None,
-            };
-            // A window that came to the front since the last input (a dialog
-            // that opened after its reply): said before this input's result.
-            let pre_note = match observe {
-                None if WINDOW_NOTE_TOOLS.contains(&name) && window.is_none() => {
-                    self.window_change_note().await
-                }
-                _ => String::new(),
-            };
-            // Before the input: what shows after it was opened by it.
-            let shown_mark =
-                (observe.is_none() && SURFACE_TOOLS.contains(&name)).then(|| self.b.change_mark());
-            // What showed after the last input's reply, said with this
-            // one's "opened:" lines (`surfaces_note`).
-            if observe.is_some() || shown_mark.is_some() {
-                let before = trace::time("opened before", self.opened_before()).await;
-                let _ = GATE.try_with(|g| g.borrow_mut().before = before);
-            }
-            let result = match name {
-                "apps" => self.apps().await.map(Out::from),
-                "tree" => self.tree(a).await,
-                "find" => self.find(a).await.map(Out::from),
-                "act" => self.act(a).await.map(Out::from),
-                "set_text" => self.set_text(a).await.map(Out::from),
-                "get_text" => self.get_text(a).await.map(Out::from),
-                "wait_for" => self.wait_for(a).await.map(Out::from),
-                "wait_idle" => self.wait_idle(a).await.map(Out::from),
-                "pause" => self.pause(a).await.map(Out::from),
-                "focus" => self.focus(a).await.map(Out::from),
-                "click" => self.click(a).await.map(Out::from),
-                "drag" => self.drag(a).await.map(Out::from),
-                "windows" => self.windows(a).await.map(Out::from),
-                "move_window" => self.move_window(a).await.map(Out::from),
-                "close_window" => self.close_window(a).await.map(Out::from),
-                "menu" => self.menu(a).await.map(Out::from),
-                "launch" => self.launch(a).await.map(Out::from),
-                "doctor" => self.doctor().await.map(Out::from),
-                "scroll" => self.scroll(a).await.map(Out::from),
-                "key" => self.key(a).await.map(Out::from),
-                "type_text" => self.type_text(a).await.map(Out::from),
-                "clipboard_get" => self.clipboard_get(a).await.map(Out::from),
-                "clipboard_set" => self.clipboard_set(a).await.map(Out::from),
-                "mouse" => self.mouse(a).await.map(Out::from),
-                "hold" => self.hold(a).await.map(Out::from),
-                "cursor_position" => self.cursor_position().await.map(Out::from),
-                "activate_window" => self.activate_window(a).await.map(Out::from),
-                "file_dialog" => self.file_dialog(a).await.map(Out::from),
-                "screenshot" => self.screenshot(a).await,
-                "batch" => self.batch(a).await,
-                _ => Err(format!("Unknown tool: {name}")),
-            };
-            // A web page the input changes in place: wait for its new
-            // content, so the next read does not see the old one.
-            let content = match (&result, input_tool) {
-                (Ok(_), true) => self
-                    .content
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .take(),
-                _ => None,
-            };
-            let limit = match a.get("settle_ms").is_some_and(|v| !v.is_null()) {
-                true => arg_i(a, "settle_ms", CONTENT_MS),
-                false => CONTENT_MS,
-            }
-            .clamp(0, MAX_SETTLE_MS) as u64;
-            let content = content.filter(|_| limit > 0);
-            let mut result = result;
-            if let (Ok(o), Some(c)) = (&mut result, &content) {
-                let limit = Duration::from_millis(limit);
-                let note = trace::time("content", self.content_wait(c, limit)).await;
-                o.text.push_str(&note);
-                // Waited already: no settle on top.
-                let _ = GATE.try_with(|g| g.borrow_mut().settle = None);
-            }
-            if let (Ok(_), Some(near)) = (&result, &settle_near) {
-                trace::time("settle", self.settle(near)).await;
-            }
-            let content_id = content.map(|c| c.id);
-            let result = match (result, observe, before) {
-                (Ok(mut o), Some(observe), Some((mark, before))) => {
-                    // A verified act that found it so already sent nothing.
-                    let sent = !o.text.contains("nothing sent");
-                    let seen = trace::time(
-                        "after_input",
-                        self.after_input(name, a, observe, mark, before, sent, content_id),
-                    )
-                    .await;
-                    o.text.push_str(&seen.text);
-                    o.images.extend(seen.images);
+            match result {
+                Ok(mut o) => {
+                    delivery::reply(&mut o.text, wrote);
                     Ok(o)
                 }
-                // Without `observe`, still say when another window came to
-                // the front (a dialog, a new browser window).
-                (Ok(mut o), None, _) if WINDOW_NOTE_TOOLS.contains(&name) => {
-                    let opened = match shown_mark {
-                        Some(mark) => {
-                            trace::time("surfaces", self.opened_note(name, a, mark)).await
-                        }
-                        None => String::new(),
-                    };
-                    if let Some(before) = pre_note.strip_prefix("; active window now ") {
-                        o.text
-                            .push_str(&format!("; before it, {before} had come to the front"));
-                    }
-                    o.text.push_str(&self.window_change_note().await);
-                    o.text.push_str(&opened);
-                    Ok(o)
-                }
-                (result, _, _) => result,
-            };
-            // What is still held, after every input step but a batch (its
-            // steps say it).
-            let note = if name == "batch" {
-                String::new()
-            } else {
-                self.held_note()
-            };
-            let result = result.map(|mut o| {
-                o.text.push_str(&note);
-                o
-            });
-            let result = match activated {
-                Some(title) => {
-                    let done = format!("activated {}; ", render::short_title(&title));
-                    result
-                        .map(|mut o| {
-                            o.text.insert_str(0, &done);
-                            o
-                        })
-                        .map_err(|e| format!("{done}{e}"))
-                }
-                None => result,
-            };
-            let result = match waited {
-                Some(w) => {
-                    let done =
-                        format!("waited {} ms for the user's input to stop; ", w.as_millis());
-                    result
-                        .map(|mut o| {
-                            o.text.insert_str(0, &done);
-                            o
-                        })
-                        .map_err(|e| format!("{done}{e}"))
-                }
-                None => result,
-            };
-            match resumed {
-                true => result.map(|mut o| {
-                    o.text.insert_str(0, "resumed after the user's stop; ");
-                    o
-                }),
-                false => result,
+                Err(e) => Err(delivery::error(e, wrote)),
             }
         }))
+    }
+
+    /// `call_inner`'s work, inside its GATE scope.
+    async fn call_body(&self, name: &str, a: &Json, held: bool, settle: bool) -> R<Out> {
+        let window = window_arg(name, a)?;
+        // Tools that reach no app through `permit` are confirmed here,
+        // by their `app` argument if any.
+        if NO_PERMIT_TOOLS.contains(&name) {
+            let app = a.get("app").and_then(Json::as_str);
+            if self.policy().needs_confirm(name, app) {
+                self.confirm(name, app, a).await?;
+            }
+        }
+        let observe = observe_arg(name, a)?;
+        // Reads kept from before are not reused once this may have
+        // changed what an app shows, nor while it runs.
+        let _changes = (!READ_ONLY_TOOLS.contains(&name) || window.is_some())
+            .then(|| InputRun::start(&self.reads));
+        // What the input sets for the content wait (input tools run one
+        // at a time: the input lock is held).
+        let input_tool = INPUT_TOOLS.contains(&name);
+        if input_tool {
+            self.content
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+        }
+        // A screenshot sends no input, but activating its window does. A
+        // batch that holds the input lock already runs its steps `held`.
+        let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
+            let guard = trace::time("input lock", self.input.lock()).await;
+            self.start_run();
+            Some(guard)
+        } else {
+            None
+        };
+        let gated = GATED_TOOLS.contains(&name) || window.is_some();
+        // Only an activate_window call of its own resumes after the stop
+        // shortcut, never a step of a batch that was running then.
+        let resumed = name == "activate_window"
+            && !held
+            && self.takeover.as_ref().is_some_and(|t| t.resume());
+        let waited = match gated {
+            true => trace::time("gate", self.gate_wait(held)).await?,
+            false => None,
+        };
+        let _ours = match &self.takeover {
+            Some(t) if gated => Some(t.ours()),
+            _ => None,
+        };
+        if let Some(label) = indicator_label(name, a) {
+            trace::time("indicate", self.b.indicate(&label)).await;
+        }
+        let activated = match &window {
+            Some(q) => {
+                // Bringing it to the front again is harmless: not
+                // counted as sent.
+                let ensured = delivery::untracked(self.ensure_window(q));
+                trace::time("ensure_window", ensured).await?
+            }
+            None => None,
+        };
+        if input_tool {
+            // An activation's own events would count as the app's.
+            let base = activated.is_none().then(|| self.b.change_mark());
+            *self.content_base.lock().unwrap_or_else(|e| e.into_inner()) = base;
+        }
+        // Taken once the window is in front, before the input.
+        let before = match observe {
+            Some(_) => Some((
+                self.b.change_mark(),
+                trace::time(
+                    "fingerprint before",
+                    self.input_fingerprint(self.input_app(a).await),
+                )
+                .await,
+            )),
+            None => None,
+        };
+        // What the app the focus is in reports from now on ends the
+        // settle; `focus_note` waits for it, or else the end of the call.
+        let settle_near = match observe {
+            None if settle && WINDOW_NOTE_TOOLS.contains(&name) => {
+                let mark = self.b.change_mark();
+                let near: Vec<B::Id> = self.b.focused().await.map(|f| f.id).into_iter().collect();
+                let _ = GATE.try_with(|g| g.borrow_mut().settle = Some(mark));
+                Some(near)
+            }
+            _ => None,
+        };
+        // A window that came to the front since the last input (a dialog
+        // that opened after its reply): said before this input's result.
+        let pre_note = match observe {
+            None if WINDOW_NOTE_TOOLS.contains(&name) && window.is_none() => {
+                self.window_change_note().await
+            }
+            _ => String::new(),
+        };
+        // Before the input: what shows after it was opened by it.
+        let shown_mark =
+            (observe.is_none() && SURFACE_TOOLS.contains(&name)).then(|| self.b.change_mark());
+        // What showed after the last input's reply, said with this
+        // one's "opened:" lines (`surfaces_note`).
+        if observe.is_some() || shown_mark.is_some() {
+            let before = trace::time("opened before", self.opened_before()).await;
+            let _ = GATE.try_with(|g| g.borrow_mut().before = before);
+        }
+        let result = match name {
+            "apps" => self.apps().await.map(Out::from),
+            "tree" => self.tree(a).await,
+            "find" => self.find(a).await.map(Out::from),
+            "act" => self.act(a).await.map(Out::from),
+            "set_text" => self.set_text(a).await.map(Out::from),
+            "get_text" => self.get_text(a).await.map(Out::from),
+            "wait_for" => self.wait_for(a).await.map(Out::from),
+            "wait_idle" => self.wait_idle(a).await.map(Out::from),
+            "pause" => self.pause(a).await.map(Out::from),
+            "focus" => self.focus(a).await.map(Out::from),
+            "click" => self.click(a).await.map(Out::from),
+            "drag" => self.drag(a).await.map(Out::from),
+            "windows" => self.windows(a).await.map(Out::from),
+            "move_window" => self.move_window(a).await.map(Out::from),
+            "close_window" => self.close_window(a).await.map(Out::from),
+            "menu" => self.menu(a).await.map(Out::from),
+            "launch" => self.launch(a).await.map(Out::from),
+            "doctor" => self.doctor().await.map(Out::from),
+            "scroll" => self.scroll(a).await.map(Out::from),
+            "key" => self.key(a).await.map(Out::from),
+            "type_text" => self.type_text(a).await.map(Out::from),
+            "clipboard_get" => self.clipboard_get(a).await.map(Out::from),
+            "clipboard_set" => self.clipboard_set(a).await.map(Out::from),
+            "mouse" => self.mouse(a).await.map(Out::from),
+            "hold" => self.hold(a).await.map(Out::from),
+            "cursor_position" => self.cursor_position().await.map(Out::from),
+            "activate_window" => self.activate_window(a).await.map(Out::from),
+            "file_dialog" => self.file_dialog(a).await.map(Out::from),
+            "screenshot" => self.screenshot(a).await,
+            "batch" => self.batch(a).await,
+            _ => Err(format!("Unknown tool: {name}")),
+        };
+        // A web page the input changes in place: wait for its new
+        // content, so the next read does not see the old one.
+        let content = match (&result, input_tool) {
+            (Ok(_), true) => self
+                .content
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+            _ => None,
+        };
+        let limit = match a.get("settle_ms").is_some_and(|v| !v.is_null()) {
+            true => arg_i(a, "settle_ms", CONTENT_MS),
+            false => CONTENT_MS,
+        }
+        .clamp(0, MAX_SETTLE_MS) as u64;
+        let content = content.filter(|_| limit > 0);
+        let mut result = result;
+        if let (Ok(o), Some(c)) = (&mut result, &content) {
+            let limit = Duration::from_millis(limit);
+            let note = trace::time("content", self.content_wait(c, limit)).await;
+            o.text.push_str(&note);
+            // Waited already: no settle on top.
+            let _ = GATE.try_with(|g| g.borrow_mut().settle = None);
+        }
+        if let (Ok(_), Some(near)) = (&result, &settle_near) {
+            trace::time("settle", self.settle(near)).await;
+        }
+        let content_id = content.map(|c| c.id);
+        let result = match (result, observe, before) {
+            (Ok(mut o), Some(observe), Some((mark, before))) => {
+                // A verified act that found it so already sent nothing.
+                let sent = !o.text.contains("nothing sent");
+                let seen = trace::time(
+                    "after_input",
+                    self.after_input(name, a, observe, mark, before, sent, content_id),
+                )
+                .await;
+                o.text.push_str(&seen.text);
+                o.images.extend(seen.images);
+                Ok(o)
+            }
+            // Without `observe`, still say when another window came to
+            // the front (a dialog, a new browser window).
+            (Ok(mut o), None, _) if WINDOW_NOTE_TOOLS.contains(&name) => {
+                let opened = match shown_mark {
+                    Some(mark) => trace::time("surfaces", self.opened_note(name, a, mark)).await,
+                    None => String::new(),
+                };
+                if let Some(before) = pre_note.strip_prefix("; active window now ") {
+                    o.text
+                        .push_str(&format!("; before it, {before} had come to the front"));
+                }
+                o.text.push_str(&self.window_change_note().await);
+                o.text.push_str(&opened);
+                Ok(o)
+            }
+            (result, _, _) => result,
+        };
+        // What is still held, after every input step but a batch (its
+        // steps say it).
+        let note = if name == "batch" {
+            String::new()
+        } else {
+            self.held_note()
+        };
+        let result = result.map(|mut o| {
+            o.text.push_str(&note);
+            o
+        });
+        let result = match activated {
+            Some(title) => {
+                let done = format!("activated {}; ", render::short_title(&title));
+                result
+                    .map(|mut o| {
+                        o.text.insert_str(0, &done);
+                        o
+                    })
+                    .map_err(|e| format!("{done}{e}"))
+            }
+            None => result,
+        };
+        let result = match waited {
+            Some(w) => {
+                let done = format!("waited {} ms for the user's input to stop; ", w.as_millis());
+                result
+                    .map(|mut o| {
+                        o.text.insert_str(0, &done);
+                        o
+                    })
+                    .map_err(|e| format!("{done}{e}"))
+            }
+            None => result,
+        };
+        match resumed {
+            true => result.map(|mut o| {
+                o.text.insert_str(0, "resumed after the user's stop; ");
+                o
+            }),
+            false => result,
+        }
     }
 }
 
@@ -6668,7 +6761,7 @@ fn written_mismatch(now: &str, text: &str, how: &str) -> String {
     let more = if now.chars().count() > 120 { "…" } else { "" };
     format!(
         "written, but the field now holds {shown:?}{more} ({} chars, {} asked{how}); \
-         it may limit or reformat input. Check with get_text before retrying.",
+         it may limit or reformat input",
         now.chars().count(),
         text.chars().count()
     )
@@ -7178,6 +7271,8 @@ mod tests {
         /// `select_item` adds to the selection, as AT-SPI's SelectChild
         /// does in a multi-selection list that is not cleared first.
         adds: std::cell::Cell<bool>,
+        /// The user types once this many more key presses went out.
+        user_after_presses: std::cell::Cell<Option<usize>>,
     }
 
     /// The fake's node `id` (the focus element too), changed by `f`.
@@ -7586,11 +7681,9 @@ mod tests {
             }
         }
         async fn select_item(&self, item: &u32) -> R<bool> {
-            let commit = self
-                .sem
-                .selection
-                .get()
-                .ok_or("its list offers no accessibility selection")?;
+            let commit = self.sem.selection.get().ok_or_else(|| {
+                delivery::nothing_sent("its list offers no accessibility selection")
+            })?;
             self.keys.borrow_mut().push(format!("select {item}"));
             if self.sem.adds.get() {
                 fake_edit(&self.focus, &self.nodes, *item, |i| {
@@ -7640,6 +7733,10 @@ mod tests {
             }
             self.content_input();
             let info = self.info(id, 0).await;
+            // As AT-SPI's DoAction when the app does not reply in time.
+            if info.name.contains("timeout") {
+                return Err("DoAction got no reply in 2 s".into());
+            }
             let action = info.actions.get(index).map(|a| semantic::norm(a));
             if !info.name.to_lowercase().contains("stuck") {
                 if semantic::is_check_role(&info.role) || info.states.contains(&"checkable") {
@@ -7708,6 +7805,15 @@ mod tests {
             self.keys.borrow_mut().push(format!("down {combo}"));
             self.shown.input();
             self.content_input();
+            if let Some(n) = self.sem.user_after_presses.get() {
+                if n <= 1 {
+                    self.sem.user_after_presses.set(None);
+                    self.takeover
+                        .user_input(Instant::now(), takeover::Device::Keyboard);
+                } else {
+                    self.sem.user_after_presses.set(Some(n - 1));
+                }
+            }
             // A list whose focused "Item N" moves down.
             let down = |focus: &RefCell<Info<u32>>| {
                 let mut focus = focus.borrow_mut();
@@ -7850,7 +7956,9 @@ mod tests {
                     allowed.iter().any(|a| a == app)
                         && (title.to_lowercase().contains(&q) || app.contains(&q))
                 })
-                .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
+                .ok_or_else(|| {
+                    delivery::nothing_sent(format!("no window of an allowed app matches '{query}'"))
+                })?;
             self.keys.borrow_mut().push(format!("activate {title}"));
             *self.active.borrow_mut() = (app.into(), title.into());
             Ok(Some(backend::Activated {
@@ -8775,7 +8883,7 @@ mod tests {
                 "{r}"
             );
             assert!(lines[1].starts_with("[2] wait_for failed: "), "{r}");
-            assert_eq!(lines[2], "stopped; 1 step(s) not run");
+            assert_eq!(lines[2], "stopped; sent: [1]; not sent: [2..3]");
             assert_eq!(*s.keys.borrow(), ["down a", "up a"]);
         });
     }
@@ -9300,7 +9408,7 @@ mod tests {
             let r = call_tool(&mut s, 9, "hold", json!({"down": false})).await;
             assert_eq!(reply_text(&r), "released left; nothing held");
             let r = call_tool(&mut s, 10, "hold", json!({"down": false})).await;
-            assert_eq!(reply_text(&r), "nothing was held");
+            assert_eq!(reply_text(&r), "nothing was held; nothing sent");
             assert_eq!(
                 log(&s),
                 [
@@ -9366,7 +9474,8 @@ mod tests {
             .await;
             assert_eq!(
                 reply_text(&r).lines().next().unwrap(),
-                "Error executing tool mouse: pointer failed; released ctrl"
+                "Error executing tool mouse: pointer failed; maybe sent: look before retrying; \
+                 released ctrl"
             );
             assert_eq!(
                 log(&s),
@@ -10985,7 +11094,7 @@ mod tests {
                 reply_text(&r).lines().next().unwrap(),
                 format!(
                     "Error executing tool act: stale id {id} (was push button \"OK\", \
-                     now push button \"Cancel\"); call tree/find again"
+                     now push button \"Cancel\"); call tree/find again; nothing sent"
                 )
             );
             assert!(reply_text(&r).contains("\nnow: "), "{r}");
@@ -11219,7 +11328,7 @@ mod tests {
                 lines[5],
                 "[6] act failed: `id` \"$2\": step 2 (wait_for) failed"
             );
-            assert_eq!(lines[6], "stopped; 1 step(s) not run");
+            assert_eq!(lines[6], "stopped; sent: [5]; not sent: [6..7]");
             assert_eq!(actions_run(&s), 0);
             assert!(s.keys.borrow().is_empty());
             // A reference that can never work fails the whole batch before
@@ -11334,7 +11443,10 @@ mod tests {
             );
             assert!(lines[2].starts_with("[2] key: sent a"), "{lines:?}");
             assert!(lines[3].starts_with("[3] key: sent b"), "{lines:?}");
-            assert_eq!(lines[4], "[4] mouse failed: pointer failed");
+            assert_eq!(
+                lines[4],
+                "[4] mouse failed: pointer failed; maybe sent: look before retrying"
+            );
             assert!(
                 lines[5].starts_with("[4.on_fail.1] act failed (optional): "),
                 "{lines:?}"
@@ -11376,7 +11488,7 @@ mod tests {
                 lines[1].starts_with("[1.on_fail] act failed: "),
                 "{lines:?}"
             );
-            assert_eq!(lines[2], "stopped; 1 step(s) not run");
+            assert_eq!(lines[2], "stopped; nothing sent");
             assert!(lines[3].starts_with("now: "), "{lines:?}");
             assert!(lines[3].ends_with("; released shift"), "{lines:?}");
             assert_eq!(*s.keys.borrow(), ["keydown shift", "keyup shift"]);
@@ -11468,7 +11580,7 @@ mod tests {
             );
             assert!(lines[1].starts_with("[1.1] scroll: "), "{lines:?}");
             assert_eq!(lines[2], "[1.2] find: no matches");
-            assert_eq!(lines[3], "stopped; 1 step(s) not run");
+            assert_eq!(lines[3], "stopped; maybe sent: [1]; not sent: [2]");
             assert!(lines[4].starts_with("now: "), "{lines:?}");
             assert_eq!(*s.keys.borrow(), ["scroll 3", "scroll 3"]);
             // Optional: the batch goes on, but "$1" names a failed step.
@@ -11538,7 +11650,10 @@ mod tests {
                 lines[0],
                 "Error executing tool batch: [1] repeat failed: step 1.2 failed in run 1"
             );
-            assert_eq!(lines[2], "[1.2] mouse failed: pointer failed");
+            assert_eq!(
+                lines[2],
+                "[1.2] mouse failed: pointer failed; maybe sent: look before retrying"
+            );
             // An optional one does not.
             let (err, lines) = run_batch(
                 &mut s,
@@ -11553,7 +11668,10 @@ mod tests {
             .await;
             assert!(!err, "{lines:?}");
             assert_eq!(lines[0], "[1] repeat: until met in run 2");
-            assert_eq!(lines[1], "[1.1] mouse failed (optional): pointer failed");
+            assert_eq!(
+                lines[1],
+                "[1.1] mouse failed (optional): pointer failed; maybe sent: look before retrying"
+            );
         });
     }
 
@@ -11950,6 +12068,206 @@ mod tests {
         });
     }
 
+    /// The one delivery marker of `text`: "nothing sent", "maybe sent" or
+    /// none (sent), failing when it has several.
+    fn marker(text: &str) -> &'static str {
+        let none = text.matches(delivery::NOTHING_SENT).count();
+        let maybe = text.matches(delivery::MAYBE_SENT).count();
+        assert!(none + maybe <= 1, "{text}");
+        match (none, maybe) {
+            (1, _) => "no",
+            (_, 1) => "maybe",
+            _ => "yes",
+        }
+    }
+
+    #[test]
+    fn every_input_reply_says_whether_input_was_sent() {
+        local(async {
+            let mut s = session("delivery");
+            // Sent: no marker.
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "OK"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert_eq!(marker(reply_text(&r)), "yes", "{r}");
+            // Refused before sending: lookup miss, validation, a window
+            // that does not match, the allowlist.
+            for (n, tool, args) in [
+                (3, "act", json!({"app": "fake", "query": "Nowhere"})),
+                (4, "key", json!({})),
+                (5, "hold", json!({"key": "a", "button": "left"})),
+                (6, "activate_window", json!({"query": "zzz"})),
+                (7, "click", json!({"app": "konsole", "query": "x"})),
+                (8, "click", json!({"id": 999})),
+            ] {
+                let r = call_tool(&mut s, n, tool, args).await;
+                assert_eq!(r["result"]["isError"], true, "{r}");
+                assert_eq!(marker(reply_text(&r)), "no", "{tool}: {r}");
+            }
+            // A DoAction that got no reply may have acted: never "nothing".
+            s.focus.borrow_mut().name = "Send timeout".into();
+            let r = call_tool(&mut s, 9, "act", json!({"app": "fake", "query": "Send"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert_eq!(marker(reply_text(&r)), "maybe", "{r}");
+            assert!(
+                reply_text(&r)
+                    .contains("DoAction got no reply in 2 s; maybe sent: look before retrying"),
+                "{r}"
+            );
+            // The user keeps typing: refused, nothing sent, said once.
+            keep_typing(&s.takeover, 4000);
+            let r = call_tool(&mut s, 10, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert_eq!(marker(reply_text(&r)), "no", "{r}");
+        });
+    }
+
+    #[test]
+    fn a_stopped_batch_says_which_steps_sent_input() {
+        local(async {
+            let mut s = session("delivery-batch");
+            s.focus.borrow_mut().name = "Send timeout".into();
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "key", "args": {"combo": "a"}},
+                    {"tool": "find", "args": {"app": "fake", "query": "Send"}},
+                    {"tool": "act", "args": {"app": "fake", "query": "Send"}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                    {"tool": "key", "args": {"combo": "c"}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(
+                lines[2]
+                    .ends_with("DoAction got no reply in 2 s; maybe sent: look before retrying"),
+                "{lines:?}"
+            );
+            assert_eq!(
+                lines[3],
+                "stopped; sent: [1]; maybe sent: [3]; not sent: [4..5]"
+            );
+            // A step that sent nothing before any input: the batch says so.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"tool": "act", "args": {"app": "fake", "query": "Nowhere"}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(lines[0].contains("; nothing sent"), "{lines:?}");
+            assert_eq!(lines[1], "stopped; nothing sent");
+        });
+    }
+
+    #[test]
+    fn a_call_that_wrote_never_says_nothing_sent() {
+        local(async {
+            // A menu button opened through its action (sent), then its
+            // entry is disabled: nothing selected, but the menu is open.
+            let mut s = session("delivery-opened");
+            fake_window(&s, &[10, 20]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(
+                    10,
+                    with_actions(
+                        fake_node("push button", "Sort", &[]),
+                        &["Press", "Show Menu"],
+                    ),
+                );
+                n.insert(20, fake_node("popup menu", "", &[21, 22]));
+                n.insert(
+                    21,
+                    with_actions(fake_node("radio menu item", "By name", &[]), &["click"]),
+                );
+                let mut date =
+                    with_actions(fake_node("radio menu item", "By date", &[]), &["click"]);
+                date.states = vec!["disabled"];
+                n.insert(22, date);
+            }
+            let q = json!({"app": "fake", "query": "Sort", "option": "date"});
+            let r = call_tool(&mut s, 2, "act", q).await;
+            assert!(is_error(&r), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "opened it (Show Menu); \"By date\" is disabled; nothing selected (it may \
+                     still be open: key escape closes it); maybe sent: look before retrying"
+                ),
+                "{text}"
+            );
+            assert_eq!(marker(text), "maybe", "{text}");
+            // Selection sent but not shown, then the key fallback refused
+            // by the tier: the Selection may have acted.
+            let mut s = session("delivery-fallback");
+            fake_combo(&s, false, "UTF-8", &["Toggle"]);
+            s.sem.selection.set(Some(false));
+            let allow = std::env::temp_dir().join(format!(
+                "desktop-mcp-test-{}-delivery-fallback.txt",
+                std::process::id()
+            ));
+            std::fs::write(&allow, "fake:click\n").unwrap();
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "UTF-8", "role": "combo box", "option": "UTF-16"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "sent Selection, but it shows \"UTF-8\" afterwards; the key fallback:"
+                ) && text.contains(
+                    "needs the full tier ('fake' has click); nothing more sent; \
+                         maybe sent: look before retrying"
+                ),
+                "{text}"
+            );
+            assert_eq!(marker(text), "maybe", "{text}");
+            // No Selection interface: nothing went out, and the refusal
+            // says so.
+            s.sem.selection.set(None);
+            let r = call_tool(
+                &mut s,
+                3,
+                "act",
+                json!({"app": "fake", "query": "UTF-8", "role": "combo box", "option": "UTF-16"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            assert_eq!(marker(reply_text(&r)), "no", "{r}");
+        });
+    }
+
+    #[test]
+    fn input_interrupted_part_way_says_how_far_it_got() {
+        local(async {
+            let mut s = session("delivery-interrupted");
+            s.sem.user_after_presses.set(Some(2));
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "down", "repeat": 5})).await;
+            assert!(is_error(&r), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "key: interrupted: the user started using the keyboard; input stopped there \
+                     after 2 of 5 presses of down; maybe sent: look before retrying"
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("Retry when they stop"), "{text}");
+            assert_eq!(marker(text), "maybe", "{text}");
+            let downs = s.keys.borrow().iter().filter(|k| *k == "down down").count();
+            assert_eq!(downs, 2);
+        });
+    }
+
     #[test]
     fn input_waits_out_a_pause_that_ends_soon() {
         local(async {
@@ -11996,7 +12314,7 @@ mod tests {
             let text = reply_text(&r);
             assert!(
                 text.contains("paused: the user is using the keyboard")
-                    && text.contains("ms for them to stop); nothing was sent"),
+                    && text.contains("ms for them to stop); nothing sent"),
                 "{text}"
             );
             // Given up once the pause could not end within the limit.
@@ -12126,7 +12444,7 @@ mod tests {
             let text = reply_text(&r);
             assert!(
                 text.contains("[1] activate_window failed: stopped by the user")
-                    && text.contains("1 step(s) not run"),
+                    && text.contains("\nstopped; nothing sent\n"),
                 "{text}"
             );
             // Neither does `window` on an input tool.
@@ -12175,8 +12493,11 @@ mod tests {
             assert_eq!(r["result"]["isError"], true, "{r}");
             let text = reply_text(&r);
             assert!(
-                text.contains("[3] key failed: interrupted: the user started using the mouse")
-                    && text.contains("stopped; 1 step(s) not run"),
+                text.contains(
+                    "[3] key failed: interrupted: the user started using the mouse; input \
+                     stopped there; nothing sent\n\
+                     stopped; sent: [1]; not sent: [3..4]"
+                ),
                 "{text}"
             );
             assert_eq!(
