@@ -324,10 +324,14 @@ tool; `off` turns it off). Not available on Windows yet.
   `checkbox` (check box, check menu item, switch), `dropdown` / `select`
   (combo box), `tab` (page tab), `menuitem` / `option` / `listitem` (menu
   item, list item), `h1`…`h6` (heading), `link` (UIA hyperlink) and more
-  (`ROLE_SYNONYMS` in `render.rs`). When nothing of that role or its
-  synonyms matches but elements of other roles do, the miss lists them with
-  their roles (`it matches elements of role 'link' (pass that role, or
-  none)`).
+  (`ROLE_SYNONYMS` in `render.rs`). An input tool never takes a synonym's
+  element while one of the role itself is only scrolled out of view in the
+  web page: that is a miss offering it. A miss with a role lists, first found
+  first: matches of the role (else its synonyms) scrolled out of view in the
+  page; visible elements of other roles the query names, with their roles
+  (`it matches elements of role 'link' (pass that role, or none)`); then
+  off-screen ones of other roles (`off-screen, scrolled out of view, of role
+  'link' …`).
 - Ties: when several elements match equally well (the best of those tiers),
   these tie-breaks apply in turn, while the matches are in several windows of
   the app: (1) a window whose title contains the call's `window` argument
@@ -362,17 +366,25 @@ tool; `off` turns it off). Not available on Windows yet.
   the active window's, besides the focused element's): `changed`, `no
   visible change`, or `window changed to '<title>'` (a dialog opened, a
   window closed). When that app is a browser (Linux: Firefox, Chromium and
-  Electron apps), the web page of its active window (the showing document,
-  as `tree(document=true)` finds it, then remembered while it shows) is
-  compared too, by title and address (`DocURL`): `page changed to '<title>'` (the
-  address added when the title stayed the same), and a page still loading
-  (BUSY) adds `(still loading: wait_idle before reading it)` and is never
-  `no visible change`. It waits for the app to react up to `settle_ms`
-  (default 150), returning as soon as it reported a change, and for a web
-  page up to 400 ms more when nothing came yet (a link or a web app's row
-  starts loading after a round trip of its own); the fingerprint costs
-  about 1 ms, the remembered page one more round trip (a search of the
-  browser's window when it changed). A canvas that draws without
+  Electron apps), the web page of its active window (else of its only
+  showing window; none is compared when several show and none is active) is
+  compared too: the showing document there, as `tree(document=true)` finds
+  it, remembered while that window is the one and it shows, by title and
+  address (`DocURL`): `page changed to '<title>'` (the address added when
+  the title stayed the same). A page loading (BUSY) after the input adds
+  `(still loading: wait_idle before reading it)`; one that started loading
+  is `changed: the page started loading (wait_idle before reading it)`; one
+  that was loading before the input already is `no visible change (the page
+  was already loading: …)`, or `not known: …` when the app sent events,
+  since they may be the load's. It waits for the app to react up to
+  `settle_ms` (default 150), returning as soon as it reported a change, and
+  for a web page up to 400 ms more when nothing came yet and input was sent
+  (a link or a web app's row starts loading after a round trip of its own).
+  The fingerprint costs about 1 ms, plus for the app the input goes to a
+  walk of the apps (alongside, when `app`/`id` names it) and, for a
+  browser, a read of its windows' states and the remembered page (one round
+  trip each); a search of the window (up to 20000 nodes) when that window
+  changed, at most every 5 s for a window found without a page. A canvas that draws without
   accessibility events may report `no visible change`. `observe` adds a view
   in the same reply: `focus` (the focused element), `tree` (compact tree of
   the active window, or of `app`'s, at most 6000 characters) or `screenshot`
