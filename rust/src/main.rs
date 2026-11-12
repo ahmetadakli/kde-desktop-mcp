@@ -400,9 +400,22 @@ struct Server<B: Backend> {
     inert_writes: Mutex<HashSet<String>>,
     /// The user's input and the stop shortcut, when the backend watches them.
     takeover: Option<std::sync::Arc<takeover::Takeover>>,
-    /// When the current holder of `input` took it: user input after this
-    /// interrupts the rest of its run (a batch's later steps, a drag).
+    /// When the current holder of `input` took it, then when its first
+    /// gated input went ahead: user input after this interrupts the rest of
+    /// its run (a batch's later steps, a drag).
     run_start: std::sync::Mutex<Option<Instant>>,
+    /// A gated input of the current run went ahead (`Server::gate_wait`):
+    /// until then, the user's input only pauses the run.
+    run_acted: std::sync::atomic::AtomicBool,
+    /// Set by an input that likely changes a web page in place (a press,
+    /// a click, Enter), for `call_inner`'s content wait
+    /// (`Server::content_wait`).
+    content: std::sync::Mutex<Option<ContentNote<B::Id>>>,
+    /// Change mark taken when the current input call started (with its
+    /// window in front): an app that changed between it and the input was
+    /// already changing (`Server::pre_content`). None after an activation,
+    /// whose own events would count.
+    content_base: std::sync::Mutex<Option<u64>>,
     /// Keys and buttons down now, in the order they were pressed: held by
     /// `hold` across calls, or by an input tool for the length of its
     /// action (a click's modifiers, a drag's button). A cancelled call
@@ -932,9 +945,85 @@ fn observe_arg(tool: &str, a: &Json) -> R<Option<Observe>> {
 /// Default and longest settle before the effect line and observation.
 const SETTLE_MS: i64 = 150;
 const MAX_SETTLE_MS: i64 = 5000;
+/// Default (unless `settle_ms` says otherwise) and longest wait for a web
+/// page to change after an input that likely changes it in place
+/// (`Server::content_wait`); once it changed, the wait ends when its events
+/// went quiet and no page of the app is loading.
+const CONTENT_MS: i64 = 1500;
+/// Quiet that ends a content wait.
+const CONTENT_QUIET: Duration = Duration::from_millis(150);
+/// A first change this soon after the input may be a placeholder or a
+/// spinner put up before a network round trip: the wait then needs
+/// CONTENT_QUIET_EARLY of quiet, as when the app was already changing
+/// before the input.
+const CONTENT_EARLY: Duration = Duration::from_millis(100);
+const CONTENT_QUIET_EARLY: Duration = Duration::from_millis(350);
+/// Longest wait past the first change (or past the end of loading) while
+/// no page of the app loads: events of other tabs or a live page (a clock,
+/// a video) never go quiet.
+const CONTENT_BURST: Duration = Duration::from_millis(500);
+/// Toolkits (`toolkit_of`) of apps that show web pages, whose content
+/// changes in place after a press, a click or Enter, often only after a
+/// network round trip.
+const WEB_TOOLKITS: [&str; 2] = ["gecko", "chromium"];
+/// Keys (`chord_keys`, joined) that submit a form or move to another page.
+const CONTENT_KEYS: [&str; 5] = ["enter", "kpenter", "alt+left", "alt+right", "f5"];
+/// Roles a press or click on rarely changes a page's content: text fields
+/// (a click there is for typing; editable elements of other roles are
+/// skipped by their state), lists and menus that open (listed with
+/// `opened:` instead), controls that only toggle (their state change is no
+/// change event: the wait would always run out), sliders, and whole
+/// documents and windows.
+const NO_CONTENT_ROLES: [&str; 22] = [
+    "entry",
+    "text",
+    "password text",
+    "editbar",
+    "terminal",
+    "document text",
+    "spin button",
+    "combo box",
+    "push button menu",
+    "menu",
+    "check box",
+    "radio button",
+    "toggle button",
+    "switch",
+    "check menu item",
+    "radio menu item",
+    "slider",
+    "scroll bar",
+    "document web",
+    "document frame",
+    "frame",
+    "window",
+];
+/// Roles of a focused element where Enter types (a new line, a command),
+/// besides multi-line text fields: no content wait.
+const NO_CONTENT_KEY_ROLES: [&str; 2] = ["terminal", "document text"];
 /// Size of the tree `observe: "tree"` returns.
 const OBSERVE_TREE_NODES: i64 = 150;
 const OBSERVE_TREE_CHARS: usize = 6000;
+
+/// Taken just before an input that may change a web page in place
+/// (`Server::pre_content`).
+#[derive(Clone, Copy)]
+struct PreContent {
+    /// Change mark before the input.
+    mark: u64,
+    /// The element's app sent change events since the call started.
+    busy: bool,
+}
+
+/// An input whose page change `Server::content_wait` waits for.
+#[derive(Clone)]
+struct ContentNote<Id> {
+    pre: PreContent,
+    /// The element the input went to.
+    id: Id,
+    /// When the input was sent.
+    at: Instant,
+}
 
 /// What an input is compared on: the active window (app, title), the
 /// focused element (id, role, name, states) and, for the allowed app the
@@ -961,10 +1050,6 @@ const PAGE_SETTLE: Duration = Duration::from_millis(400);
 /// dialog, a mail app's window without a web view) before searching it
 /// again: the search reads up to FIND_MAX_SEEN nodes.
 const NO_PAGE_RECHECK: Duration = Duration::from_secs(5);
-
-/// Toolkits (lower case) whose windows show web pages: Firefox's and
-/// Chromium's (Chrome, Electron apps).
-const WEB_TOOLKITS: [&str; 2] = ["gecko", "chromium"];
 
 /// How the effect line names a page: its title, else its address.
 fn page_name(p: &backend::Page) -> String {
@@ -1530,6 +1615,9 @@ impl<B: Backend> Server<B> {
             held: std::sync::Mutex::new(Vec::new()),
             takeover: b_takeover,
             run_start: std::sync::Mutex::new(None),
+            run_acted: std::sync::atomic::AtomicBool::new(false),
+            content: std::sync::Mutex::new(None),
+            content_base: std::sync::Mutex::new(None),
             link: Default::default(),
             reads: std::sync::Mutex::new(Reads::new()),
             page_docs: std::sync::Mutex::new(HashMap::new()),
@@ -1559,6 +1647,60 @@ impl<B: Backend> Server<B> {
     /// Note that a run of input starts now (the input lock was just taken).
     fn start_run(&self) {
         *self.run_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        self.run_acted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `gate` at the start of a gated call. While the user's input is
+    /// recent but the pause would end within takeover::WAIT_LIMIT all told,
+    /// it waits (holding the input lock, sending nothing) and lets the call
+    /// go on; the time waited, if any. The stop shortcut and an
+    /// interruption of a run that already sent input (a batch step after
+    /// the user started using the seat) are refused at once: the run's
+    /// later steps were planned for what the screen showed before. Until
+    /// a run's first gated input went ahead, the user's input since its
+    /// start (during a batch's reads) only pauses it, and the run starts
+    /// over once the wait is done. Cancelling the call ends the wait.
+    async fn gate_wait(&self, in_run: bool) -> R<Option<Duration>> {
+        let Some(t) = &self.takeover else {
+            return Ok(None);
+        };
+        let began = Instant::now();
+        let mut shown = false;
+        loop {
+            let acted = self.run_acted.load(std::sync::atomic::Ordering::SeqCst);
+            let start = match in_run && acted {
+                true => *self.run_start.lock().unwrap_or_else(|e| e.into_inner()),
+                false => None,
+            };
+            let now = Instant::now();
+            match t.plan(start, now.saturating_duration_since(began), now) {
+                Ok(None) => {
+                    if !acted {
+                        // The run's input starts now: user input before
+                        // (waited out) does not interrupt it.
+                        *self.run_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+                        self.run_acted
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    return Ok(shown.then(|| began.elapsed()));
+                }
+                Ok(Some(next)) => {
+                    if !shown {
+                        // Shown while it waits, so the user sees why.
+                        if let Err(block) = t.check_since(start, now) {
+                            self.b.indicate(&block.label()).await;
+                        }
+                        shown = true;
+                    }
+                    tokio::time::sleep(next).await;
+                }
+                Err(block) => {
+                    self.b.indicate(&block.label()).await;
+                    return Err(refusal(block.message(t.window())));
+                }
+            }
+        }
     }
 
     /// Whether a gated tool may act now: not after the stop shortcut, not
@@ -1581,6 +1723,126 @@ impl<B: Backend> Server<B> {
                 self.b.indicate(&block.label()).await;
                 Err(refusal(block.message(t.window())))
             }
+        }
+    }
+
+    // ------------------------------------------------------------ content wait
+
+    /// Just before an input that may change a web page in place: the
+    /// change mark, and whether the app of `id` was already changing since
+    /// the call started (`content_base`).
+    fn pre_content(&self, id: Option<&B::Id>) -> PreContent {
+        let mark = self.b.change_mark();
+        let base = *self.content_base.lock().unwrap_or_else(|e| e.into_inner());
+        let busy = match (id, base) {
+            (Some(id), Some(base)) if base < mark => {
+                self.b.changed_since(std::slice::from_ref(id), base) == Some(true)
+            }
+            _ => false,
+        };
+        PreContent { mark, busy }
+    }
+
+    /// After an input to `id` (of `role`) that likely changes a web page in
+    /// place (a press, a plain left click, or with `key` Enter to the
+    /// focused element): when its app shows web pages and change events
+    /// are heard, note it for `call_inner`'s content wait. Not after a
+    /// click or press on an editable element (for typing), nor after Enter
+    /// in a multi-line one or a terminal (it types a line). Cheap: the
+    /// toolkit is read once per app, the states once.
+    async fn note_content(&self, pre: PreContent, id: &B::Id, role: &str, key: bool) {
+        let at = Instant::now();
+        let skip = match key {
+            true => NO_CONTENT_KEY_ROLES.contains(&role),
+            false => NO_CONTENT_ROLES.contains(&role),
+        };
+        if !self.b.changes_live() || skip {
+            return;
+        }
+        let toolkit = self.b.toolkit_of(id).await;
+        if !WEB_TOOLKITS.contains(&toolkit.as_str()) {
+            return;
+        }
+        let typing = match self.b.edit_states(id).await {
+            Some((_, true)) => true,
+            Some((editable, false)) => editable && !key,
+            None => false,
+        };
+        if !typing {
+            *self.content.lock().unwrap_or_else(|e| e.into_inner()) = Some(ContentNote {
+                pre,
+                id: id.clone(),
+                at,
+            });
+        }
+    }
+
+    /// Wait up to `limit` after the input `c` (`note_content`) for the app
+    /// of its element to report a change; once it did, until its events
+    /// were quiet for CONTENT_QUIET (CONTENT_QUIET_EARLY when the change
+    /// came at once, or the app was already changing) and no page of it is
+    /// loading. While none loads, at most CONTENT_BURST past the first
+    /// change: other tabs and live pages keep sending events. Reads made
+    /// after this see the new content. The reply's note.
+    async fn content_wait(&self, c: &ContentNote<B::Id>, limit: Duration) -> String {
+        let near = std::slice::from_ref(&c.id);
+        let left = || limit.saturating_sub(c.at.elapsed());
+        let ms = || c.at.elapsed().as_millis();
+        if !c.pre.busy && !self.b.wait_change(near, c.pre.mark, left()).await {
+            return format!("; no page change seen in {} ms", ms());
+        }
+        let quiet = match c.pre.busy || c.at.elapsed() < CONTENT_EARLY {
+            true => CONTENT_QUIET_EARLY,
+            false => CONTENT_QUIET,
+        };
+        let mut cap = Instant::now() + CONTENT_BURST;
+        let mut windows: Option<Vec<B::Id>> = None;
+        let mut loading = false;
+        loop {
+            let wait = quiet.min(left());
+            if wait.is_zero() {
+                break;
+            }
+            let m = self.b.change_mark();
+            let changed = self.b.wait_change(near, m, wait).await;
+            if changed && Instant::now() < cap {
+                continue;
+            }
+            // Quiet (or changing past the cap): unless a page waits for
+            // the network.
+            if windows.is_none() {
+                windows = Some(match self.b.app_name(&c.id).await {
+                    Some(app) => self
+                        .b
+                        .app_windows(&app.to_lowercase())
+                        .await
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                });
+            }
+            loading = self.b.loading(windows.as_deref().unwrap_or_default()).await;
+            if loading {
+                // Once it loaded, its page renders: another burst's time.
+                tokio::time::sleep(IDLE_POLL.min(left())).await;
+                cap = Instant::now() + CONTENT_BURST;
+                continue;
+            }
+            // A quiet cut short by the limit is no quiet.
+            if changed || wait < quiet {
+                break;
+            }
+            return match c.pre.busy {
+                true => format!("; app was already changing; quiet after {} ms", ms()),
+                false => format!("; page changed (settled after {} ms)", ms()),
+            };
+        }
+        let still = if loading { "loading" } else { "changing" };
+        match c.pre.busy {
+            true => format!(
+                "; app was already changing; still {still} after {} ms",
+                ms()
+            ),
+            false => format!("; page changed, still {still} after {} ms", ms()),
         }
     }
 
@@ -3058,6 +3320,8 @@ impl<B: Backend> Server<B> {
     /// (ending early once it reported a change since `mark`), then the
     /// effect line and what `observe` asks for. `sent`: the tool sent
     /// input (a verified act may find the state there already).
+    /// `content`: the element whose page the content wait waited for
+    /// (`content_wait`): no settle on top, and its app's changes count.
     async fn after_input(
         &self,
         tool: &str,
@@ -3066,14 +3330,20 @@ impl<B: Backend> Server<B> {
         mark: u64,
         before: Fingerprint<B::Id>,
         sent: bool,
+        content: Option<B::Id>,
     ) -> Out {
-        let settle = arg_i(a, "settle_ms", SETTLE_MS).clamp(0, MAX_SETTLE_MS) as u64;
-        // The focused element's app reacts (its bus, on Linux), and the app
-        // the input went to: `act` reaches a browser behind the terminal.
+        let settle = match content {
+            Some(_) => 0,
+            None => arg_i(a, "settle_ms", SETTLE_MS).clamp(0, MAX_SETTLE_MS) as u64,
+        };
+        // The focused element's app reacts (its bus, on Linux), the app the
+        // input went to (`act` reaches a browser behind the terminal), and
+        // the element whose page the content wait watched.
         let mut near: Vec<B::Id> = before.focus.iter().map(|f| f.0.clone()).collect();
         if let Some((_, windows)) = &before.app {
             near.extend(windows.iter().cloned());
         }
+        near.extend(content);
         if settle > 0 {
             self.b
                 .wait_change(&near, mark, Duration::from_millis(settle))
@@ -3805,7 +4075,11 @@ impl<B: Backend> Server<B> {
                     format!("action '{action}' not in [{}]", list.join(", "))
                 })?;
         }
+        let pre = self.pre_content(Some(id));
         let ok = self.b.do_action(id, idx).await?;
+        if ok && !names[idx].eq_ignore_ascii_case("showcontextmenu") {
+            self.note_content(pre, id, &t.role, false).await;
+        }
         // A window that opened or closed shows in the effect line.
         Ok(t.reply(&format!(
             "{} -> {}",
@@ -5227,11 +5501,16 @@ impl<B: Backend> Server<B> {
         if clicks > 0 && OPENER_ROLES.contains(&t.role.as_str()) {
             let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
         }
+        let pre = self.pre_content(Some(&t.id));
         self.with_modifiers(
             &mods,
             self.b.pointer(x as i64, y as i64, &button, clicks, 0),
         )
         .await?;
+        // A plain left click: with modifiers it opens a new tab or selects.
+        if button == "left" && clicks > 0 && mods.is_empty() {
+            self.note_content(pre, &t.id, &t.role, false).await;
+        }
         let m = with_modifiers_note(&mods);
         Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}{m}")))
     }
@@ -5385,11 +5664,21 @@ impl<B: Backend> Server<B> {
         }
         let send = keys.join("+");
         let app = self.require_active_allowed().await?;
+        // Enter submits, alt+left goes back: the page may change.
+        let content = match CONTENT_KEYS.contains(&send.as_str()) && self.b.changes_live() {
+            true => self.b.focused().await.map(|f| (f.id, f.info.role)),
+            false => None,
+        };
+        let pre = self.pre_content(content.as_ref().map(|(id, _)| id));
         for i in 0..repeat.clamp(1, 100) {
             if i > 0 {
                 self.gate(true).await?;
             }
             self.b.press_combo(&send).await?;
+        }
+        if let Some((id, role)) = &content {
+            // Enter in a search field submits it.
+            self.note_content(pre, id, role, true).await;
         }
         let focus = self.focus_note(false).await;
         Ok(format!("sent {combo} x{repeat} to {app}{focus}"))
@@ -6138,6 +6427,15 @@ impl<B: Backend> Server<B> {
             // changed what an app shows, nor while it runs.
             let _changes = (!READ_ONLY_TOOLS.contains(&name) || window.is_some())
                 .then(|| InputRun::start(&self.reads));
+            // What the input sets for the content wait (input tools run one
+            // at a time: the input lock is held).
+            let input_tool = INPUT_TOOLS.contains(&name);
+            if input_tool {
+                self.content
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take();
+            }
             // A screenshot sends no input, but activating its window does. A
             // batch that holds the input lock already runs its steps `held`.
             let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
@@ -6153,9 +6451,10 @@ impl<B: Backend> Server<B> {
             let resumed = name == "activate_window"
                 && !held
                 && self.takeover.as_ref().is_some_and(|t| t.resume());
-            if gated {
-                trace::time("gate", self.gate(held)).await?;
-            }
+            let waited = match gated {
+                true => trace::time("gate", self.gate_wait(held)).await?,
+                false => None,
+            };
             let _ours = match &self.takeover {
                 Some(t) if gated => Some(t.ours()),
                 _ => None,
@@ -6167,6 +6466,11 @@ impl<B: Backend> Server<B> {
                 Some(q) => trace::time("ensure_window", self.ensure_window(q)).await?,
                 None => None,
             };
+            if input_tool {
+                // An activation's own events would count as the app's.
+                let base = activated.is_none().then(|| self.b.change_mark());
+                *self.content_base.lock().unwrap_or_else(|e| e.into_inner()) = base;
+            }
             // Taken once the window is in front, before the input.
             let before = match observe {
                 Some(_) => Some((
@@ -6241,16 +6545,41 @@ impl<B: Backend> Server<B> {
                 "batch" => self.batch(a).await,
                 _ => Err(format!("Unknown tool: {name}")),
             };
+            // A web page the input changes in place: wait for its new
+            // content, so the next read does not see the old one.
+            let content = match (&result, input_tool) {
+                (Ok(_), true) => self
+                    .content
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .take(),
+                _ => None,
+            };
+            let limit = match a.get("settle_ms").is_some_and(|v| !v.is_null()) {
+                true => arg_i(a, "settle_ms", CONTENT_MS),
+                false => CONTENT_MS,
+            }
+            .clamp(0, MAX_SETTLE_MS) as u64;
+            let content = content.filter(|_| limit > 0);
+            let mut result = result;
+            if let (Ok(o), Some(c)) = (&mut result, &content) {
+                let limit = Duration::from_millis(limit);
+                let note = trace::time("content", self.content_wait(c, limit)).await;
+                o.text.push_str(&note);
+                // Waited already: no settle on top.
+                let _ = GATE.try_with(|g| g.borrow_mut().settle = None);
+            }
             if let (Ok(_), Some(near)) = (&result, &settle_near) {
                 trace::time("settle", self.settle(near)).await;
             }
+            let content_id = content.map(|c| c.id);
             let result = match (result, observe, before) {
                 (Ok(mut o), Some(observe), Some((mark, before))) => {
                     // A verified act that found it so already sent nothing.
                     let sent = !o.text.contains("nothing sent");
                     let seen = trace::time(
                         "after_input",
-                        self.after_input(name, a, observe, mark, before, sent),
+                        self.after_input(name, a, observe, mark, before, sent, content_id),
                     )
                     .await;
                     o.text.push_str(&seen.text);
@@ -6290,6 +6619,19 @@ impl<B: Backend> Server<B> {
             let result = match activated {
                 Some(title) => {
                     let done = format!("activated {}; ", render::short_title(&title));
+                    result
+                        .map(|mut o| {
+                            o.text.insert_str(0, &done);
+                            o
+                        })
+                        .map_err(|e| format!("{done}{e}"))
+                }
+                None => result,
+            };
+            let result = match waited {
+                Some(w) => {
+                    let done =
+                        format!("waited {} ms for the user's input to stop; ", w.as_millis());
                     result
                         .map(|mut o| {
                             o.text.insert_str(0, &done);
@@ -6948,6 +7290,9 @@ mod tests {
         }
     }
 
+    /// A change an input makes: after this many ms, renaming an element.
+    type FakeChange = (u64, Option<(u32, String)>);
+
     /// The fake's change events, for kept reads: off unless a test turns
     /// them on.
     #[derive(Default)]
@@ -6971,6 +7316,15 @@ mod tests {
         /// `changed_since` says the app changed when asked about this
         /// element of it (the app's windows), when Some.
         events_on: std::cell::Cell<Option<u32>>,
+        /// `wait_change` hears of changes (`changes_live`): each bumps the
+        /// change mark (`FakeShown::seq`) and `changes`.
+        events: std::cell::Cell<bool>,
+        /// Changes the next input (action, click, key) makes, each this
+        /// many ms after it, renaming an element when Some.
+        next: RefCell<Vec<FakeChange>>,
+        /// The app changes on each read of an element's actions, as a live
+        /// page does between an input call's start and its input.
+        noise: std::cell::Cell<bool>,
     }
 
     /// Windows on the fake desktop: (app, title).
@@ -6979,6 +7333,24 @@ mod tests {
         ("fake", "notes.txt — Fake"),
         ("fake", "todo.txt — Fake"),
     ];
+
+    impl FakeBackend {
+        /// The changes an input makes (`FakeReads::next`), each later.
+        fn content_input(&self) {
+            for (ms, name) in self.reads.next.take() {
+                let (reads, shown) = (self.reads.clone(), self.shown.clone());
+                let (focus, nodes) = (self.focus.clone(), self.nodes.clone());
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    if let Some((id, n)) = name {
+                        fake_edit(&focus, &nodes, id, |i| i.name = n);
+                    }
+                    shown.seq.set(shown.seq.get() + 1);
+                    reads.changes.set(reads.changes.get() + 1);
+                });
+            }
+        }
+    }
 
     impl Backend for FakeBackend {
         type Id = u32;
@@ -7088,6 +7460,44 @@ mod tests {
         fn read_mark(&self) -> Option<u64> {
             self.reads.live.get().then(|| self.reads.changes.get())
         }
+        fn changes_live(&self) -> bool {
+            self.reads.events.get()
+        }
+        fn changed_since(&self, near: &[u32], mark: u64) -> Option<bool> {
+            // Events on one element of the app (its windows), when set;
+            // else any change since `mark` while events are on.
+            if let Some(w) = self.reads.events_on.get() {
+                return Some(near.contains(&w));
+            }
+            self.reads.events.get().then(|| self.shown.seq.get() > mark)
+        }
+        /// As on Linux: returns once a change came and its burst settled.
+        async fn wait_change(&self, _: &[u32], mark: u64, timeout: Duration) -> bool {
+            if !self.reads.events.get() {
+                tokio::time::sleep(timeout.min(Duration::from_millis(50))).await;
+                return true;
+            }
+            let start = Instant::now();
+            loop {
+                if self.shown.seq.get() > mark {
+                    loop {
+                        let seq = self.shown.seq.get();
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        if self.shown.seq.get() == seq {
+                            return true;
+                        }
+                    }
+                }
+                let left = timeout.saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    return false;
+                }
+                tokio::time::sleep(left.min(Duration::from_millis(5))).await;
+            }
+        }
+        async fn loading(&self, _: &[u32]) -> bool {
+            self.reads.loading.get()
+        }
         fn unchanged_since(&self, _: &[u32], mark: u64) -> bool {
             self.reads.live.get() && self.reads.changes.get() == mark
         }
@@ -7096,9 +7506,6 @@ mod tests {
             (info.showing && render::DOCUMENT_ROLES.contains(&info.role.as_str()))
                 .then(|| self.reads.page.borrow().clone())
                 .flatten()
-        }
-        fn changed_since(&self, near: &[u32], _: u64) -> Option<bool> {
-            self.reads.events_on.get().map(|w| near.contains(&w))
         }
         async fn may_keep(&self, _: &[u32]) -> bool {
             self.reads.live.get() && !self.reads.loading.get()
@@ -7163,6 +7570,9 @@ mod tests {
             }
         }
         async fn actions(&self, id: &u32) -> Vec<String> {
+            if self.reads.noise.get() {
+                self.shown.seq.set(self.shown.seq.get() + 1);
+            }
             self.info(id, 0).await.actions
         }
         async fn toggles(&self, id: &u32) -> backend::Toggles {
@@ -7194,6 +7604,11 @@ mod tests {
         async fn toolkit_of(&self, _: &u32) -> String {
             self.sem.toolkit.borrow().clone()
         }
+        /// "multi line" stands for the state tree and find do not show.
+        async fn edit_states(&self, id: &u32) -> Option<(bool, bool)> {
+            let st = self.info(id, 0).await.states;
+            Some((st.contains(&"editable"), st.contains(&"multi line")))
+        }
         async fn scroll_into_view(&self, id: &u32) -> R<bool> {
             let works = self.sem.scroll_to.get().ok_or(backend::NO_SCROLL_TO)?;
             self.keys.borrow_mut().push(format!("scroll_to {id}"));
@@ -7223,6 +7638,7 @@ mod tests {
             if let Some(next) = self.reads.page_next.take() {
                 *self.reads.page.borrow_mut() = Some(next);
             }
+            self.content_input();
             let info = self.info(id, 0).await;
             let action = info.actions.get(index).map(|a| semantic::norm(a));
             if !info.name.to_lowercase().contains("stuck") {
@@ -7291,6 +7707,7 @@ mod tests {
         async fn press_combo(&self, combo: &str) -> R<()> {
             self.keys.borrow_mut().push(format!("down {combo}"));
             self.shown.input();
+            self.content_input();
             // A list whose focused "Item N" moves down.
             let down = |focus: &RefCell<Info<u32>>| {
                 let mut focus = focus.borrow_mut();
@@ -7378,6 +7795,7 @@ mod tests {
                     .borrow_mut()
                     .push(format!("click {button} x{clicks}"));
                 self.shown.input();
+                self.content_input();
             }
             if scroll != 0 {
                 self.keys.borrow_mut().push(format!("scroll {scroll}"));
@@ -11520,36 +11938,172 @@ mod tests {
             assert_eq!(*s.keys.borrow(), ["down a", "up a", "down c", "up c"]);
         });
     }
+    /// The user types every 100 ms for `ms`.
+    fn keep_typing(t: &std::sync::Arc<takeover::Takeover>, ms: u64) {
+        let t = t.clone();
+        tokio::task::spawn_local(async move {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                t.user_input(Instant::now(), takeover::Device::Keyboard);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
     #[test]
-    fn input_pauses_while_the_user_is_active_and_reads_go_on() {
+    fn input_waits_out_a_pause_that_ends_soon() {
+        local(async {
+            let mut s = session("takeover-wait");
+            // The user pressed Enter in their terminal 1.2 s ago.
+            s.takeover.user_input(
+                Instant::now() - Duration::from_millis(1200),
+                takeover::Device::Keyboard,
+            );
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with("waited ")
+                    && text.contains(" ms for the user's input to stop; sent a x1"),
+                "{text}"
+            );
+            let took = start.elapsed();
+            assert!(took >= Duration::from_millis(250), "{took:?}");
+            assert!(took < Duration::from_millis(1000), "{took:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                [
+                    "indicate paused while you use the keyboard",
+                    "down a",
+                    "up a"
+                ]
+            );
+            // Nothing recent: no wait, no note.
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "b"})).await;
+            assert!(reply_text(&r).starts_with("sent b x1"), "{r}");
+        });
+    }
+
+    #[test]
+    fn input_pauses_while_the_user_keeps_typing_and_reads_go_on() {
         local(async {
             let mut s = session("takeover-pause");
-            s.takeover
-                .user_input(Instant::now(), takeover::Device::Keyboard);
+            keep_typing(&s.takeover, 4000);
+            let start = Instant::now();
             let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
             assert_eq!(r["result"]["isError"], true, "{r}");
             let text = reply_text(&r);
             assert!(
-                text.contains("paused: the user is using the keyboard"),
+                text.contains("paused: the user is using the keyboard")
+                    && text.contains("ms for them to stop); nothing was sent"),
                 "{text}"
             );
-            assert_eq!(
-                *s.keys.borrow(),
-                ["indicate paused while you use the keyboard"]
+            // Given up once the pause could not end within the limit.
+            let took = start.elapsed();
+            assert!(took >= Duration::from_millis(900), "{took:?}");
+            assert!(took <= takeover::WAIT_LIMIT, "{took:?}");
+            assert!(
+                s.keys
+                    .borrow()
+                    .iter()
+                    .all(|k| k.starts_with("indicate paused")),
+                "{:?}",
+                s.keys.borrow()
             );
             // Reading and the clipboard are not held up.
+            let start = Instant::now();
             let r = call_tool(&mut s, 3, "find", json!({"app": "fake", "query": "OK"})).await;
             assert_eq!(r["result"]["isError"], false, "{r}");
             let r = call_tool(&mut s, 4, "clipboard_set", json!({"text": "x"})).await;
             assert_eq!(r["result"]["isError"], false, "{r}");
-            // Once the window passed, input goes through.
-            let mut s = session("takeover-pause-2");
-            s.takeover.user_input(
-                Instant::now() - Duration::from_millis(1600),
-                takeover::Device::Keyboard,
+            assert!(start.elapsed() < Duration::from_millis(300));
+        });
+    }
+
+    #[test]
+    fn the_stop_shortcut_ends_a_wait_for_the_user() {
+        local(async {
+            let mut s = session("takeover-wait-stop");
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Pointer);
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                t.stop();
+            });
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "click", json!({"x": 1, "y": 2})).await;
+            assert!(reply_text(&r).contains("stopped by the user"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(600));
+            assert!(
+                !s.keys.borrow().iter().any(|k| k.starts_with("click")),
+                "{:?}",
+                s.keys.borrow()
             );
-            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+        });
+    }
+
+    #[test]
+    fn a_cancelled_wait_for_the_user_sends_nothing() {
+        local(async {
+            let mut s = session("takeover-wait-cancel");
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Keyboard);
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "key", "arguments": {"combo": "a"}}}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"requestId": 2}}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            assert!(
+                !s.keys.borrow().iter().any(|k| k == "down a"),
+                "{:?}",
+                s.keys.borrow()
+            );
+        });
+    }
+
+    #[test]
+    fn user_input_before_a_batch_sends_anything_only_pauses_it() {
+        local(async {
+            let mut s = session("takeover-batch-wait");
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                t.user_input(Instant::now(), takeover::Device::Keyboard);
+            });
+            // The user typed while the batch read: its first input waits,
+            // and the run starts then, so later steps go on.
+            let steps = json!({"steps": [
+                {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                {"tool": "pause", "args": {"ms": 100}},
+                {"tool": "key", "args": {"combo": "a"}},
+                {"tool": "key", "args": {"combo": "b"}},
+            ]});
+            let r = call_tool(&mut s, 2, "batch", steps).await;
             assert_eq!(r["result"]["isError"], false, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("[3] key: waited ") && text.contains("[4] key: sent b"),
+                "{text}"
+            );
+            let keys: Vec<String> = s
+                .keys
+                .borrow()
+                .iter()
+                .filter(|k| !k.starts_with("indicate"))
+                .cloned()
+                .collect();
+            assert_eq!(keys, ["down a", "up a", "down b", "up b"]);
         });
     }
 
@@ -12056,6 +12610,291 @@ mod tests {
             let read = prefetches(&s);
             call_tool(&mut s, 7, "find", find.clone()).await;
             assert_eq!(prefetches(&s), read);
+        });
+    }
+
+    /// `fake_reads`, as a web page (Firefox's toolkit) whose app sends
+    /// change events.
+    fn fake_page(s: &Session) {
+        fake_reads(s);
+        s.reads.events.set(true);
+        *s.sem.toolkit.borrow_mut() = "gecko".into();
+    }
+
+    #[test]
+    fn a_press_on_a_web_page_waits_for_its_new_content() {
+        local(async {
+            let mut s = session("content-act");
+            fake_page(&s);
+            let save = json!({"app": "fake", "query": "Save"});
+            call_tool(&mut s, 2, "find", save.clone()).await;
+            // "Next page": the page changes after a network round trip.
+            s.reads
+                .next
+                .replace(vec![(250, Some((30, "Saved".into()))), (300, None)]);
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Open"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("Press -> ok; page changed (settled after ")
+                    && text.ends_with("; effect: changed"),
+                "{text}"
+            );
+            let took = start.elapsed();
+            assert!(took >= Duration::from_millis(450), "{took:?}");
+            assert!(took < Duration::from_millis(1200), "{took:?}");
+            // The next read sees the new content, not the kept old read.
+            let r = call_tool(&mut s, 4, "find", json!({"app": "fake", "query": "Saved"})).await;
+            assert!(reply_text(&r).contains("push button \"Saved\""), "{r}");
+        });
+    }
+
+    #[test]
+    fn without_a_web_page_input_does_not_wait_for_content() {
+        local(async {
+            let mut s = session("content-native");
+            fake_page(&s);
+            *s.sem.toolkit.borrow_mut() = "qt".into();
+            call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "Save"})).await;
+            s.reads
+                .next
+                .replace(vec![(250, Some((30, "Saved".into())))]);
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Open"})).await;
+            let text = reply_text(&r);
+            assert!(!text.contains("page"), "{text}");
+            // Read before the app changed: what it showed then...
+            let saved = json!({"app": "fake", "query": "Saved"});
+            let r = call_tool(&mut s, 4, "find", saved.clone()).await;
+            assert!(reply_text(&r).starts_with("no matches"), "{r}");
+            // ...and the change event drops that read once it comes.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let r = call_tool(&mut s, 5, "find", saved).await;
+            assert!(reply_text(&r).contains("push button \"Saved\""), "{r}");
+        });
+    }
+
+    #[test]
+    fn content_waits_are_short_or_absent_when_nothing_changes() {
+        local(async {
+            let mut s = session("content-cost");
+            fake_page(&s);
+            // A plain key: no wait at all (the fake key takes 50 ms).
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(150));
+            // Enter submits: waits for the page.
+            s.reads.next.replace(vec![(100, None)]);
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "Return"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+            // Nothing changes: bounded by settle_ms.
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"app": "fake", "query": "Open", "settle_ms": 200}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("; no page change seen in 2"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(500));
+            // settle_ms 0: no content wait.
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                json!({"app": "fake", "query": "Open", "settle_ms": 0}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            // A click into a text field is for typing: no wait.
+            s.nodes
+                .borrow_mut()
+                .insert(30, fake_node("entry", "Search", &[]));
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                6,
+                "click",
+                json!({"app": "fake", "query": "Search"}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(150));
+            // A click on a button waits.
+            s.reads.next.replace(vec![(100, None)]);
+            let r = call_tool(&mut s, 7, "click", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_content_wait_goes_on_while_the_page_loads() {
+        local(async {
+            let mut s = session("content-loading");
+            fake_page(&s);
+            s.reads.next.replace(vec![(50, None)]);
+            s.reads.loading.set(true);
+            let reads = s.reads.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                reads.loading.set(false);
+            });
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(600));
+            // Still loading at the limit: said so.
+            s.reads.next.replace(vec![(50, None)]);
+            s.reads.loading.set(true);
+            let r = call_tool(
+                &mut s,
+                3,
+                "act",
+                json!({"app": "fake", "query": "Open", "settle_ms": 400}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("; page changed, still loading after 4"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn toggles_and_typing_get_no_content_wait() {
+        local(async {
+            let mut s = session("content-toggles");
+            fake_page(&s);
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.insert(30, fake_node("check box", "Remember me", &[]));
+                let mut body = fake_node("section", "Message body", &[]);
+                body.states = vec!["editable", "multi line"];
+                nodes.insert(31, body);
+            }
+            // A check box only toggles: its state change is no change event.
+            for (i, tool) in [(2, "act"), (3, "click")] {
+                let start = Instant::now();
+                let r = call_tool(
+                    &mut s,
+                    i,
+                    tool,
+                    json!({"app": "fake", "query": "Remember me"}),
+                )
+                .await;
+                assert!(!reply_text(&r).contains("page"), "{r}");
+                assert!(start.elapsed() < Duration::from_millis(300), "{tool}");
+            }
+            // A click into an editable section (a rich text editor) is for
+            // typing.
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                4,
+                "click",
+                json!({"app": "fake", "query": "Message body"}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(300));
+            // Enter in a terminal or a multi-line field types a line...
+            for (i, role, states) in [
+                (5, "terminal", vec!["focused", "editable"]),
+                (6, "entry", vec!["focused", "editable", "multi line"]),
+            ] {
+                {
+                    let mut f = s.focus.borrow_mut();
+                    f.role = role.into();
+                    f.states = states;
+                }
+                s.reads.next.replace(vec![(100, None)]);
+                let start = Instant::now();
+                let r = call_tool(&mut s, i, "key", json!({"combo": "Return"})).await;
+                assert!(!reply_text(&r).contains("page"), "{role}: {r}");
+                assert!(start.elapsed() < Duration::from_millis(250), "{role}");
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            // ...in a single-line one (a search field) it submits.
+            s.focus.borrow_mut().states = vec!["focused", "editable"];
+            s.reads.next.replace(vec![(150, None)]);
+            let r = call_tool(&mut s, 7, "key", json!({"combo": "Return"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_content_wait_outlasts_a_placeholder_before_the_new_content() {
+        local(async {
+            let mut s = session("content-early");
+            fake_page(&s);
+            call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "Save"})).await;
+            // A spinner at once, the content after a network round trip.
+            s.reads
+                .next
+                .replace(vec![(10, None), (300, Some((30, "Saved".into())))]);
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(600));
+            let r = call_tool(&mut s, 4, "find", json!({"app": "fake", "query": "Saved"})).await;
+            assert!(reply_text(&r).contains("push button \"Saved\""), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_content_wait_is_short_while_the_app_never_goes_quiet() {
+        local(async {
+            let mut s = session("content-noise");
+            fake_page(&s);
+            // Another tab's clock or video: a change every 20 ms.
+            let shown = s.shown.clone();
+            let ticking = Rc::new(std::cell::Cell::new(true));
+            let ticks = ticking.clone();
+            tokio::task::spawn_local(async move {
+                while ticks.get() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    shown.seq.set(shown.seq.get() + 1);
+                }
+            });
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "Open"})).await;
+            let took = start.elapsed();
+            assert!(reply_text(&r).contains("still changing after "), "{r}");
+            assert!(took < Duration::from_millis(900), "{took:?}");
+            // The app changed between the call's start and the input: that
+            // is not the page's change.
+            s.reads.noise.set(true);
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; app was already changing; still changing after "),
+                "{r}"
+            );
+            assert!(start.elapsed() < Duration::from_millis(900));
+            ticking.set(false);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Once it is quiet, the wait ends at the first quiet.
+            let r = call_tool(&mut s, 4, "act", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; app was already changing; quiet after "),
+                "{r}"
+            );
         });
     }
 
