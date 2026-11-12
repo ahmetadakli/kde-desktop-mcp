@@ -491,6 +491,12 @@ pub trait Backend {
     async fn toolkit_of(&self, _id: &Self::Id) -> String {
         String::new()
     }
+    /// Whether the element is editable and whether it holds more than one
+    /// line (a text area, a rich text editor), in one read; None when
+    /// unknown.
+    async fn edit_states(&self, _id: &Self::Id) -> Option<(bool, bool)> {
+        None
+    }
     /// Complete text content (falls back to the name).
     async fn full_text(&self, id: &Self::Id, limit: usize) -> R<String>;
     /// Replace the contents; Err when the element is not editable.

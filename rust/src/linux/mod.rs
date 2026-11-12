@@ -1426,6 +1426,12 @@ impl Backend for LinuxBackend {
         self.toolkit(&id.bus).await.to_lowercase()
     }
 
+    async fn edit_states(&self, id: &Obj) -> Option<(bool, bool)> {
+        let st = self.a11y.states(id).await?;
+        let bit = |b: u32| st & (1u64 << b) != 0;
+        Some((bit(atspi::EDITABLE), bit(atspi::MULTI_LINE)))
+    }
+
     async fn full_text(&self, id: &Obj, limit: usize) -> R<String> {
         if self
             .a11y

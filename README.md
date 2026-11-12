@@ -370,17 +370,28 @@ tool; `off` turns it off). Not available on Windows yet.
   shows web pages (Firefox, Thunderbird, Chromium, Electron apps), the reply
   waits for the page to change in place (a next page, a tab, search
   results, a mail opened): up to `settle_ms` (default 1500 here; 0 turns it
-  off) for the first change, then until its events are quiet for 150 ms and
-  no page of the app is loading, within the same limit. The reply says
-  `; page changed (settled after N ms)`, `; page changed, still loading
-  after N ms` (or `still changing`) or `; page unchanged after N ms`, and the
-  next `get_text` or `find` reads the new content (reads kept from before the
-  input are dropped when it starts and ends, and a read kept afterwards is
-  dropped by the app's next change event). Not for clicks into text fields,
-  combo boxes, menus, sliders or a whole document, nor for other keys or
-  apps: there it costs nothing beyond one cached toolkit lookup. When the
-  page does not change, the call takes the whole `settle_ms`. `mouse`
-  clicks at coordinates do not wait.
+  off) for the first change, then until its events are quiet for 150 ms
+  (350 ms when the first change came within 100 ms, as a placeholder or
+  spinner before a network round trip does) and no page of the app is
+  loading, within the same limit. While no page loads, the wait ends at
+  most 500 ms after the first change: change events are per app, so other
+  tabs and live pages (a clock, a video) count and may never go quiet. The
+  reply says `; page changed (settled after N ms)`, `; page changed, still
+  loading after N ms` (or `still changing`) or `; no page change seen in N
+  ms`. When the app already sent change events between the call's start and
+  the input, the first change says nothing: the wait goes straight to the
+  quiet and says `; app was already changing; quiet after N ms` (or `still
+  changing`/`still loading`), so check the new content before relying on it.
+  The next `get_text` or `find` reads the new content (reads kept from
+  before the input are dropped when it starts and ends, and a read kept
+  afterwards is dropped by the app's next change event). Not for clicks
+  into text fields or other editable elements, check boxes, radio and
+  toggle buttons, switches, check and radio menu items (their state change
+  is no change event), combo boxes, menus, sliders or a whole document, nor
+  for Enter in a terminal or a multi-line field, nor for other keys or
+  apps: there it costs nothing beyond one cached toolkit lookup (and on a
+  web page one state read). When the page does not change, the call takes the whole
+  `settle_ms`. `mouse` clicks at coordinates do not wait.
 - What an input opened (Linux): after `act`, `menu`, `close_window` and the
   input tools given `observe`, and after `click`, `key`, `mouse` and
   `type_text` without it, the reply lists the menus, popup menus, combo box
