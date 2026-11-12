@@ -3374,8 +3374,7 @@ impl<B: Backend> Server<B> {
         tool: &str,
         a: &Json,
         observe: Observe,
-        mark: u64,
-        before: Fingerprint<B::Id>,
+        (mark, before): (u64, Fingerprint<B::Id>),
         sent: bool,
         content: Option<B::Id>,
     ) -> Out {
@@ -6676,7 +6675,7 @@ impl<B: Backend> Server<B> {
                 let sent = !o.text.contains("nothing sent");
                 let seen = trace::time(
                     "after_input",
-                    self.after_input(name, a, observe, mark, before, sent, content_id),
+                    self.after_input(name, a, observe, (mark, before), sent, content_id),
                 )
                 .await;
                 o.text.push_str(&seen.text);
