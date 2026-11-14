@@ -807,6 +807,26 @@ Building for Windows on Linux also works (`mingw-w64-gcc` and
 `rustup target add x86_64-pc-windows-gnu`, then
 `cargo build --release --target x86_64-pc-windows-gnu`).
 
+### Updating
+
+Claude Code runs the binary you built; reconnecting (`/mcp`) restarts that same
+file, so a new version needs a pull and a build. In the clone (no need to clone
+again or to run `claude mcp add` again; the path stays the same):
+
+```bash
+cd kde-desktop-mcp
+git pull
+cd rust
+cargo build --release
+```
+
+Then reconnect the server in Claude Code (`/mcp`, select `desktop`, reconnect)
+or restart Claude Code. On Windows the same commands work in PowerShell
+(`cd kde-desktop-mcp\rust`). The version is in `rust/Cargo.toml` and in the
+server's `initialize` reply (`serverInfo.version`). New versions are announced
+as [GitHub releases](https://github.com/ahmetadakli/kde-desktop-mcp/releases);
+to be notified, watch the repository with "Custom → Releases".
+
 ### Speed: tools loaded up front
 
 Claude Code defers MCP tools behind a tool search, which costs a model turn at
