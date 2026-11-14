@@ -325,6 +325,22 @@ impl A11y {
         )
     }
 
+    /// A document's address: its Document interface's "DocURL" attribute
+    /// (Firefox), else "URI"; "" when it names none.
+    pub async fn document_url(&self, o: &Obj) -> String {
+        const DOC: &str = "org.a11y.atspi.Document";
+        for key in ["DocURL", "URI"] {
+            if let Ok(url) = self
+                .call::<String>(o, DOC, "GetAttributeValue", &(key,))
+                .await
+                && !url.is_empty()
+            {
+                return url;
+            }
+        }
+        String::new()
+    }
+
     pub async fn has_state(&self, o: &Obj, state: u32) -> bool {
         let st = self.states(o).await.unwrap_or(0);
         self.note_states(o, st);

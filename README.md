@@ -151,6 +151,50 @@ server starts the indicator on the first action as `desktop-mcp --indicator`;
 it exits with the server. To turn it off, set the environment variable
 `DESKTOP_MCP_INDICATOR=0` in the MCP configuration.
 
+## Was the input sent?
+
+Every reply and error of an input tool (`act`, `click`, `focus`, `key`,
+`type_text`, `set_text`, `mouse`, `drag`, `scroll`, `hold`, `menu`,
+`close_window`, `file_dialog`, `activate_window`, `move_window`, `launch`,
+`clipboard_set`) says whether its input reached the desktop, so the agent
+knows whether repeating the call can click, type or toggle twice:
+
+- `nothing sent`: refused or failed before anything was written: the
+  allowlist, a tier, a declined confirmation, the user taking over before
+  it (`paused`, `stopped by the user`, `interrupted` before a batch step), a
+  stale id, no element or
+  window matching, an ambiguous target, a bad argument, or a verified action
+  already in the asked state. Safe to retry.
+- `maybe sent: look before retrying`: an error after input was written: an
+  action whose reply did not come (AT-SPI DoAction timeout), text partly
+  typed, a pointer or key event failing, a drag or repeated key the user
+  interrupted part way (`... after 2 of 5 presses of down`), a `set_text`
+  that retyped and did not take, a verified action that reads otherwise
+  afterwards, a `select` that opened a menu and then found its entry
+  disabled.
+- No marker: it succeeded and sent its input; `verified` where the result was
+  read back (`set_text`, `act`'s check, expand and select).
+
+A reply carries one marker, decided by the whole call: once anything was
+written, a part that sent nothing (a key fallback refused after a Selection
+was tried) says `nothing more sent`, never `nothing sent`.
+
+This is decided where the input is written, not from the message: the server
+reaches the desktop only through a wrapper of the backend that notes every
+write of the running call (an action, a text write, a key, a pointer event, a
+window change). A backend that rejects a write before sending (an unknown key
+name, no window matching) says so. Bringing a tool's `window` to the front
+does not count: repeating it is harmless.
+
+A stopped batch says which steps sent input and which a retry still has to
+run: `stopped; sent: [1..2]; maybe sent: [3]; not sent: [4..5]`. The step
+that stopped it is under `maybe sent` when it wrote anything (it failed), else
+under `not sent`, with the steps after it: `stopped; sent: [1]; not sent:
+[3..4]`. When no step sent anything, it says `stopped; nothing sent`: the
+whole batch can run again. The server instructions carry one rule: retry an
+input only when its reply says `nothing sent` (a stopped batch: only its `not
+sent` steps); otherwise look first.
+
 ## When the user takes over
 
 The agent and the user share one keyboard and mouse. Input tools (`act`,
@@ -159,10 +203,19 @@ The agent and the user share one keyboard and mouse. Input tools (`act`,
 `window`) wait for the user:
 
 - **Pause.** While the user typed or moved the pointer in the last 1.5 s,
-  they fail with `paused: the user is using the keyboard ...` without
-  sending anything; the agent retries once the user stops. User input during
-  a batch, a drag or a repeated `key` stops the remaining input
-  (`interrupted: ...`). Read tools and the clipboard tools keep working.
+  an input tool waits, sending nothing, for the user to stop: when the
+  pause ends within 2.5 s all told (say, the call came right after the user
+  pressed Enter in their terminal) it then goes ahead and its reply starts
+  with `waited N ms for the user's input to stop; `. While the user keeps
+  going, it fails with `paused: the user is using the keyboard ... (last
+  input N ms ago; waited M ms for them to stop); nothing sent`; the agent retries
+  once the user stops (a retry is safe only after `nothing sent`). Cancelling the call ends the wait. User input during
+  a batch (once it sent input), a drag or a repeated `key` stops the
+  remaining input at once (`interrupted: ...`, then `nothing sent` or
+  `maybe sent` when part of it went out): those steps were planned
+  for the screen as it was. User input while a batch only read so far
+  pauses its first input like a call of its own. Read tools and the
+  clipboard tools keep working.
 - **Stop shortcut: Meta+Alt+Esc.** It ends a running drag or batch and refuses
   every input tool with `stopped by the user` until the agent calls
   `activate_window` on its own (not as a batch step and not through
@@ -314,6 +367,24 @@ tool; `off` turns it off). Not available on Windows yet.
   tab, and a web page's document) count only when nothing else matches or
   `role` names that role; `wait_for` skips them unless `role` names them.
   Last come elements holding every word of the query, accents aside.
+- `role` (in `find`, `wait_for` and the `app` + `query` targets) compares
+  without case, spaces, `_` or `-` (`Push_Button`, `pushbutton` and UIA's
+  `checkbox` for `check box`). A role that matches nothing is tried again as
+  the platform roles it stands for, and the reply says so (`role 'row'
+  matched as 'table row'`): `row` (table row, list item, tree item), `cell`
+  / `gridcell` (table cell), `button` (push button, toggle button),
+  `textbox` / `input` / `entry` / `field` (entry, text, password text),
+  `checkbox` (check box, check menu item, switch), `dropdown` / `select`
+  (combo box), `tab` (page tab), `menuitem` / `option` / `listitem` (menu
+  item, list item), `h1`…`h6` (heading), `link` (UIA hyperlink) and more
+  (`ROLE_SYNONYMS` in `render.rs`). An input tool never takes a synonym's
+  element while one of the role itself is only scrolled out of view in the
+  web page: that is a miss offering it. A miss with a role lists, first found
+  first: matches of the role (else its synonyms) scrolled out of view in the
+  page; visible elements of other roles the query names, with their roles
+  (`it matches elements of role 'link' (pass that role, or none)`); then
+  off-screen ones of other roles (`off-screen, scrolled out of view, of role
+  'link' …`).
 - Ties: when several elements match equally well (the best of those tiers),
   these tie-breaks apply in turn, while the matches are in several windows of
   the app: (1) a window whose title contains the call's `window` argument
@@ -343,11 +414,30 @@ tool; `off` turns it off). Not available on Windows yet.
   `key`, `type_text`, `mouse`, `drag`, `scroll`, `set_text`): with
   `observe` (and by default for `act`, `menu` and `close_window`) the reply
   ends with an `effect:` line comparing the active window before and after the
-  input (its title, the focused element, and on Linux the app's accessibility
-  change events): `changed`, `no visible change`, or `window changed to
-  '<title>'` (a dialog opened, a window closed). It waits for the app to react
-  up to `settle_ms` (default 150), returning as soon as it reported a change;
-  the fingerprint itself costs about 1 ms. A canvas that draws without
+  input (its title, the focused element, and on Linux the accessibility
+  change events of the app the input went to: the one `app`/`id` names, else
+  the active window's, besides the focused element's): `changed`, `no
+  visible change`, or `window changed to '<title>'` (a dialog opened, a
+  window closed). When that app is a browser (Linux: Firefox, Chromium and
+  Electron apps), the web page of its active window (else of its only
+  showing window; none is compared when several show and none is active) is
+  compared too: the showing document there, as `tree(document=true)` finds
+  it, remembered while that window is the one and it shows, by title and
+  address (`DocURL`): `page changed to '<title>'` (the address added when
+  the title stayed the same). A page loading (BUSY) after the input adds
+  `(still loading: wait_idle before reading it)`; one that started loading
+  is `changed: the page started loading (wait_idle before reading it)`; one
+  that was loading before the input already is `no visible change (the page
+  was already loading: …)`, or `not known: …` when the app sent events,
+  since they may be the load's. It waits for the app to react up to
+  `settle_ms` (default 150), returning as soon as it reported a change, and
+  for a web page up to 400 ms more when nothing came yet and input was sent
+  (a link or a web app's row starts loading after a round trip of its own).
+  The fingerprint costs about 1 ms, plus for the app the input goes to a
+  walk of the apps (alongside, when `app`/`id` names it) and, for a
+  browser, a read of its windows' states and the remembered page (one round
+  trip each); a search of the window (up to 20000 nodes) when that window
+  changed, at most every 5 s for a window found without a page. A canvas that draws without
   accessibility events may report `no visible change`. `observe` adds a view
   in the same reply: `focus` (the focused element), `tree` (compact tree of
   the active window, or of `app`'s, at most 6000 characters) or `screenshot`
@@ -356,6 +446,34 @@ tool; `off` turns it off). Not available on Windows yet.
   window now '<title>'`) or came to the front since the previous input (`;
   before it, '<title>' had come to the front`: a dialog that opened after
   that reply); about 3 ms per input.
+- Waiting for a web page (Linux, apps that send accessibility change events):
+  after a press (`act` with the element's own action), a plain left `click`
+  on an element, or `key` Enter, alt+left, alt+right or F5, in an app that
+  shows web pages (Firefox, Thunderbird, Chromium, Electron apps), the reply
+  waits for the page to change in place (a next page, a tab, search
+  results, a mail opened): up to `settle_ms` (default 1500 here; 0 turns it
+  off) for the first change, then until its events are quiet for 150 ms
+  (350 ms when the first change came within 100 ms, as a placeholder or
+  spinner before a network round trip does) and no page of the app is
+  loading, within the same limit. While no page loads, the wait ends at
+  most 500 ms after the first change: change events are per app, so other
+  tabs and live pages (a clock, a video) count and may never go quiet. The
+  reply says `; page changed (settled after N ms)`, `; page changed, still
+  loading after N ms` (or `still changing`) or `; no page change seen in N
+  ms`. When the app already sent change events between the call's start and
+  the input, the first change says nothing: the wait goes straight to the
+  quiet and says `; app was already changing; quiet after N ms` (or `still
+  changing`/`still loading`), so check the new content before relying on it.
+  The next `get_text` or `find` reads the new content (reads kept from
+  before the input are dropped when it starts and ends, and a read kept
+  afterwards is dropped by the app's next change event). Not for clicks
+  into text fields or other editable elements, check boxes, radio and
+  toggle buttons, switches, check and radio menu items (their state change
+  is no change event), combo boxes, menus, sliders or a whole document, nor
+  for Enter in a terminal or a multi-line field, nor for other keys or
+  apps: there it costs nothing beyond one cached toolkit lookup (and on a
+  web page one state read). When the page does not change, the call takes the whole
+  `settle_ms`. `mouse` clicks at coordinates do not wait.
 - What an input opened (Linux): after `act`, `menu`, `close_window` and the
   input tools given `observe`, and after `click`, `key`, `mouse` and
   `type_text` without it, the reply lists the menus, popup menus, combo box

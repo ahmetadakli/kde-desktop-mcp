@@ -93,39 +93,41 @@ Workflow:
 - apps lists running apps. find (app + query) locates elements; act, click, focus, \
 get_text, set_text and scroll take the target themselves. tree shows structure; find is \
 cheaper. act also does check, uncheck, expand, collapse, select (+ `option`) and scroll_to, \
-verified; already so: nothing sent.
+verified.
 - Target: `id` from tree/find, or `app` + `query` (+ `role`): a visible element named \
 `query` (case-insensitive), else one whose name or text has it; titles (window, tab, page) \
 only if nothing else does or `role` names them. Ties favor the active window, a dialog, an \
 operable element; input tools refuse other ties, listing ids. The reply starts with \
 the element picked; a miss lists near or off-screen matches.
-- batch runs steps in one call; with if, on_fail, repeat and stop_if (see batch) a small \
+- batch runs steps in one call; with if, on_fail, repeat and stop_if a small \
 procedure fits in one. Mark waits \"optional\": true and end with an observation step, or \
 give the last input `observe`. A later step's `id`/`*_id` may be \"$N\": the element step \
 N found or acted on.
-- Input tools (key, type_text, click, mouse, scroll, focus, drag, set_text, act, screenshot) \
-take `window` (title or app substring) to activate that window first unless it is in \
-front. Without it, input fails while the user's terminal is in front.
+- Input tools and screenshot take `window` (title or app substring) to bring that \
+window to the front first. Without it, input fails while the user's terminal is in front.
 - click, mouse and scroll take `modifiers`; hold keeps keys down.
-- If the user takes over keyboard and mouse, input fails with \"paused\" (or \
-\"interrupted\" mid-batch) without acting: pause ~2 s and retry. \"stopped by the user\": \
+- Retry input only if its reply says \"nothing sent\" (a stopped batch: its \
+\"not sent\" steps); else look first.
+- While the user types, input waits up to 2.5 s, then fails \"paused\" or \
+\"interrupted\": pause ~2 s, then the rule above. \"stopped by the user\": \
 stop and ask them; once they agree, a standalone activate_window call resumes input.
-- After opening a page, wait_idle(app) waits for it to load (not pause). wait_for: something \
+- After opening a page, wait_idle(app) waits for the load (not pause); a click, press \
+or Enter on a web page waits for its change. wait_for: something \
 that appears or goes away (gone=true), a state or a window; never as a sleep. \
 tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
 view. On Linux, menus, lists and dialogs an input opened come with ids (`opened:`). Failures \
 end with the active window and focus.
-- menu (app + path, e.g. \"File > Save As\") runs a menu bar entry.
+- menu (app + path, e.g. \"File > Save As\") runs a menu entry.
 - screenshot is a last resort. To click something seen \
-only in it, pass its pixels to mouse as image_x/image_y; `region`=[x, y, w, h] zooms in.
+only in it, pass its pixels to mouse (image_x/image_y); `region`=[x, y, w, h] zooms in.
 
 Allowlist: only apps in the user's allowlist file can be read, activated or sent input, and \
 input only goes to an allowed active window. An app may be limited to a tier: view \
 (read only) or click (no typing or keys). When a refusal says to, ask the user and retry with \
 confirm: true only if they agree. Password fields are never read, and filled in only if the \
-user allowed it. Changing the file is the user's decision. When tools fail \
-as if the setup were broken (AT-SPI, input, KWin), run doctor.
+user allowed it. Only the user changes the file. If the setup seems \
+broken (AT-SPI, input, KWin), run doctor.
 
 Clients loading schemas on demand: load in one search: batch, find, \
 act, activate_window, key, type_text, wait_for, wait_idle, screenshot, apps.";
@@ -154,6 +156,7 @@ const CONFIRM: &str =
 /// Shared by the tools that take a target; the matching rules are in
 /// INSTRUCTIONS.
 const TARGET: &str = "\nTarget: `id` from tree/find, or `app` + `query` (+ `role`); rules in the server instructions. \
+A `role` that names nothing is tried as its synonyms (row: table row, list item; textbox: entry, text). \
 A tie left after them: input tools list the candidates' ids and send nothing; get_text reads the first.";
 
 /// The `batch` description, before its examples (BATCH_EXAMPLES).
@@ -164,7 +167,9 @@ list of {\"tool\": name, \"args\": {...}, \"optional\": bool}, e.g.
  {\"tool\": \"wait_for\", \"args\": {\"app\": \"kate\", \"query\": \"Open File\"}, \"optional\": true},
  {\"tool\": \"find\", \"args\": {\"app\": \"kate\", \"query\": \"File name\"}}].
 Stops at the first failing step unless it is `optional`: then it is reported
-as failed (optional) and the rest still runs. Mark waits optional and end
+as failed (optional) and the rest still runs. A stop says which steps sent
+input and which are still to run: `stopped; sent: [1..2]; maybe sent: [3];
+not sent: [4]`. Mark waits optional and end
 with an observation step (find, get_text, screenshot). Give the first
 input step `window` when input goes to an app. Ids from earlier tree/find work.
 An `id`/`*_id` arg of \"$N\" is the element step N produced: find's first
@@ -263,7 +268,7 @@ pub fn tools() -> Json {
         ),
         t(
             "find",
-            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by exact role name as shown by tree; with\n`role`, the role name is searched too. Window, tab and page titles (frame,\nwindow, page tab, document web) are listed after all other matches. Without\nany, elements holding every word of `query` (any order, accents aside) are.\nWith no visible match, lists matches scrolled out of the page's view (act\nand get_text work on them), else the elements with the closest names.\nLines read as in tree (actions the role implies omitted). Usually cheaper\nthan tree.",
+            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by role as tree shows it (case, spaces aside;\none that names nothing is tried as its synonyms: row, cell, button, textbox,\ndropdown, tab…, and the reply says which matched); with `role`, the role name\nis searched too. Window, tab and page titles (frame,\nwindow, page tab, document web) are listed after all other matches. Without\nany, elements holding every word of `query` (any order, accents aside) are.\nWith no visible match, lists matches scrolled out of the page's view (act\nand get_text work on them), else the elements with the closest names.\nLines read as in tree (actions the role implies omitted). Usually cheaper\nthan tree.",
             schema(&[
                 ("query", "string", None),
                 ("app", "string", None),
@@ -274,7 +279,7 @@ pub fn tools() -> Json {
         t(
             "act",
             &d(
-                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nVerified actions, preferred over toggling or clicking: `action` check, uncheck,\nexpand, collapse (already so: \"nothing sent\"), toggle; `option` (with action\nselect, or alone) picks the entry with that label in a combo box, list, tab list\nor menu button, without opening it where it can; scroll_to brings an element\nscrolled out of view (an id from a miss list) into view, else turns the wheel\nover its list (the pointer moves). Each reads the state back: the reply gives\nit, or fails saying what was sent and what it reads instead.\nThe effect line says when the active window changed; a menu, combo box\nlist or dialog the action opened follows with its entries' ids (opened: …;\nLinux)."
+                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nVerified actions, preferred over toggling or clicking: `action` check, uncheck,\nexpand, collapse (already so: \"nothing sent\"), toggle; `option` (with action\nselect, or alone) picks the entry with that label in a combo box, list, tab list\nor menu button, without opening it where it can; scroll_to brings an element\nscrolled out of view (an id from a miss list) into view, else turns the wheel\nover its list (the pointer moves). Each reads the state back: the reply gives\nit, or fails saying what was sent and what it reads instead.\nThe effect line says when the active window or the web page changed (or the\npage still loads: wait_idle before reading it); a menu, combo box\nlist or dialog the action opened follows with its entries' ids (opened: …;\nLinux)."
             ),
             target(&[
                 ("action", "string", Some(json!(""))),
@@ -533,12 +538,12 @@ pub fn tools() -> Json {
                 "type": "string",
                 "enum": OBSERVE_KINDS,
                 "default": "none",
-                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds no effect line or view (on Linux, click, key, mouse and type_text still list a menu or dialog they opened, at no cost when none did); act, menu and close_window report the effect line, and what opened, by default."
+                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed / page changed, loading), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds no effect line or view (on Linux, click, key, mouse and type_text still list a menu or dialog they opened, at no cost when none did); act, menu and close_window report the effect line, and what opened, by default."
             });
             props["settle_ms"] = json!({
                 "type": "integer",
                 "default": 150,
-                "description": "Longest wait for the app to react before the effect line and observation; ends early once it changed."
+                "description": "Longest wait for the app to react before the effect line and observation; ends early once it changed. After a press, a left click or Enter on a web page (Linux): longest wait for the page to change and settle (default there 1500; 0: no wait)."
             });
         }
         let name = tool["name"].as_str().unwrap().to_string();
@@ -585,6 +590,13 @@ pub fn is_tool(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_instructions_stay_short() {
+        // Every session pays for them: keep them under 3000 characters.
+        let n = INSTRUCTIONS.chars().count();
+        assert!(n < 3000, "INSTRUCTIONS has {n} characters");
+    }
 
     #[test]
     fn the_common_tools_load_up_front() {

@@ -24,6 +24,14 @@ use std::time::{Duration, Instant};
 /// How recent user input pauses the input tools, unless
 /// DESKTOP_MCP_TAKEOVER_MS says otherwise (0 turns pausing off).
 pub const DEFAULT_WINDOW: Duration = Duration::from_millis(1500);
+/// The longest an input tool waits, all told, for the user's input to
+/// stop before it refuses with "paused": a pause that ends within this is
+/// waited out (`Takeover::plan`), so a call made just after the user
+/// pressed Enter in their terminal goes through instead of costing a turn.
+pub const WAIT_LIMIT: Duration = Duration::from_millis(2500);
+/// How often a waiting input tool looks again (the stop shortcut ends the
+/// wait at the next look).
+pub const WAIT_POLL: Duration = Duration::from_millis(100);
 /// The stop shortcut unless DESKTOP_MCP_STOP_KEY says otherwise ("off"
 /// turns it off). Plasma 6 binds Meta+Esc to System Monitor, Meta+Shift+Esc
 /// and Meta+Ctrl+Esc to KWin actions; Meta+Alt+Esc is free on KDE and
@@ -58,8 +66,9 @@ impl Device {
 pub enum Block {
     /// The stop shortcut (its name) was pressed.
     Stopped(String),
-    /// The user's last input, this long ago.
-    Paused(Device, Duration),
+    /// The user's last input, this long ago; how long the tool waited for
+    /// it to stop before giving up.
+    Paused(Device, Duration, Duration),
     /// The user started using the seat after this run of input began.
     Interrupted(Device),
 }
@@ -71,16 +80,21 @@ impl Block {
                 "stopped by the user ({key}): no input is sent until activate_window is \
                  called again. Ask the user before resuming"
             ),
-            Block::Paused(dev, ago) => format!(
-                "paused: the user is using the {} (last input {} ms ago); nothing was sent. \
+            Block::Paused(dev, ago, waited) => format!(
+                "paused: the user is using the {} (last input {} ms ago{}); nothing sent. \
                  Retry when they stop (pause {} ms first)",
                 dev.noun(),
                 ago.as_millis(),
+                match waited.as_millis() {
+                    0 => String::new(),
+                    ms => format!("; waited {ms} ms for them to stop"),
+                },
                 window.saturating_sub(*ago).as_millis().max(100)
             ),
+            // Whether a retry is safe is the call's marker ("nothing sent"
+            // or "maybe sent"): input may have gone out before this.
             Block::Interrupted(dev) => format!(
-                "interrupted: the user started using the {}; the rest of the input was not \
-                 sent. Retry when they stop",
+                "interrupted: the user started using the {}; input stopped there",
                 dev.noun()
             ),
         }
@@ -90,7 +104,7 @@ impl Block {
     pub fn label(&self) -> String {
         match self {
             Block::Stopped(key) => format!("stopped ({key})"),
-            Block::Paused(dev, _) | Block::Interrupted(dev) => {
+            Block::Paused(dev, ..) | Block::Interrupted(dev) => {
                 format!("paused while you use the {}", dev.noun())
             }
         }
@@ -293,9 +307,33 @@ impl Takeover {
         }
         let ago = now.saturating_duration_since(t);
         if ago < self.window {
-            return Err(Block::Paused(dev, ago));
+            return Err(Block::Paused(dev, ago, Duration::ZERO));
         }
         Ok(())
+    }
+
+    /// What an input tool about to start does, having waited `waited` so
+    /// far: go (Ok(None)), look again after the returned time (the user's
+    /// input is recent, but the pause ends within WAIT_LIMIT all told), or
+    /// refuse. A stop and an interruption are refused at once.
+    pub fn plan(
+        &self,
+        start: Option<Instant>,
+        waited: Duration,
+        now: Instant,
+    ) -> Result<Option<Duration>, Block> {
+        match self.check_since(start, now) {
+            Ok(()) => Ok(None),
+            Err(Block::Paused(dev, ago, _)) => {
+                let left = self.window.saturating_sub(ago);
+                if waited + left > WAIT_LIMIT {
+                    return Err(Block::Paused(dev, ago, waited));
+                }
+                // A little past the end, so the next look finds it over.
+                Ok(Some((left + Duration::from_millis(5)).min(WAIT_POLL)))
+            }
+            Err(b) => Err(b),
+        }
     }
 
     pub fn set_activity_source(&self, ok: bool, text: String) {
@@ -378,17 +416,45 @@ mod tests {
         t.user_input(t0, Device::Pointer);
         assert_eq!(
             t.check(t0 + ms(400)),
-            Err(Block::Paused(Device::Pointer, ms(400)))
+            Err(Block::Paused(Device::Pointer, ms(400), ms(0)))
         );
-        let msg = Block::Paused(Device::Pointer, ms(400)).message(ms(1500));
+        let msg = Block::Paused(Device::Pointer, ms(400), ms(0)).message(ms(1500));
         assert!(msg.contains("mouse") && msg.contains("1100 ms"), "{msg}");
         assert_eq!(t.check(t0 + ms(1500)), Ok(()));
         // An older event does not move the last input back.
         t.user_input(t0 - ms(5000), Device::Keyboard);
         assert_eq!(
             t.check(t0 + ms(10)),
-            Err(Block::Paused(Device::Pointer, ms(10)))
+            Err(Block::Paused(Device::Pointer, ms(10), ms(0)))
         );
+    }
+
+    #[test]
+    fn a_pause_that_ends_soon_is_waited_out() {
+        let t = Takeover::new(ms(1500), Some("meta+alt+esc"));
+        let t0 = Instant::now();
+        assert_eq!(t.plan(None, ms(0), t0), Ok(None));
+        t.user_input(t0, Device::Keyboard);
+        // Just typed: the pause ends in 1500 ms, within the limit.
+        assert_eq!(t.plan(None, ms(0), t0), Ok(Some(WAIT_POLL)));
+        assert_eq!(t.plan(None, ms(0), t0 + ms(1450)), Ok(Some(ms(55))));
+        assert_eq!(t.plan(None, ms(1450), t0 + ms(1500)), Ok(None));
+        // Still typing after a long wait: it would not end in time.
+        let late = t0 + ms(1200);
+        t.user_input(late, Device::Keyboard);
+        let err = t.plan(None, ms(1200), late).unwrap_err();
+        assert_eq!(err, Block::Paused(Device::Keyboard, ms(0), ms(1200)));
+        let msg = err.message(t.window());
+        assert!(msg.contains("waited 1200 ms for them to stop"), "{msg}");
+        // Exactly at the limit still waits.
+        assert_eq!(t.plan(None, ms(1000), late), Ok(Some(WAIT_POLL)));
+        // A stop and an interruption are not waited for.
+        assert_eq!(
+            t.plan(Some(t0 - ms(1)), ms(0), late),
+            Err(Block::Interrupted(Device::Keyboard))
+        );
+        t.stop();
+        assert!(matches!(t.plan(None, ms(0), late), Err(Block::Stopped(_))));
     }
 
     #[test]
@@ -444,7 +510,7 @@ mod tests {
         // Our input ended long enough ago that "idled" should have come:
         // someone else keeps it going.
         let late = end + IDLE_TIMEOUT + OURS_SLACK + ms(50);
-        assert!(matches!(t.check(late), Err(Block::Paused(Device::Any, _))));
+        assert!(matches!(t.check(late), Err(Block::Paused(Device::Any, ..))));
         // It went idle soon after ours: nothing of the user's.
         let t = Takeover::new(ms(1500), None);
         {

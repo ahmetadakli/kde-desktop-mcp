@@ -283,6 +283,25 @@ pub struct WindowEntry {
     pub active: bool,
 }
 
+/// The web page a browser window shows, as `Backend::page` reads it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Page {
+    /// The document's name: the page title.
+    pub title: String,
+    /// Its address when the browser says (AT-SPI Document "DocURL"), else "".
+    pub url: String,
+    /// The document says it is still loading (BUSY).
+    pub busy: bool,
+}
+
+impl Page {
+    /// Whether `other` is another page (or the same one renamed): title or
+    /// address differ. Loading alone is no change of page.
+    pub fn differs(&self, other: &Page) -> bool {
+        self.title != other.title || self.url != other.url
+    }
+}
+
 pub struct AppEntry {
     pub name: String,
     pub windows: Vec<WindowEntry>,
@@ -440,6 +459,13 @@ pub trait Backend {
         None
     }
 
+    /// The web page `doc` (a document element) is: title, address and
+    /// whether it loads. None when it is no document or no longer shows
+    /// (gone, a tab in the background), and on platforms that do not say.
+    async fn page(&self, _doc: &Self::Id) -> Option<Page> {
+        None
+    }
+
     /// Whether a document in `windows` says it is still loading (a
     /// browser page waiting for the network sends no change events).
     async fn loading(&self, _windows: &[Self::Id]) -> bool {
@@ -467,13 +493,13 @@ pub trait Backend {
     /// interface (AT-SPI Selection.SelectChild): no pointer, no focus.
     /// Err when the platform or the container offers none.
     async fn select_item(&self, _item: &Self::Id) -> R<bool> {
-        Err(NO_SELECTION.into())
+        Err(crate::delivery::nothing_sent(NO_SELECTION))
     }
     /// Ask the app to scroll the element into view (AT-SPI
     /// Component.ScrollTo, else on its parent): no pointer. Ok(false) when
     /// the app declined.
     async fn scroll_into_view(&self, _id: &Self::Id) -> R<bool> {
-        Err(NO_SCROLL_TO.into())
+        Err(crate::delivery::nothing_sent(NO_SCROLL_TO))
     }
     /// The nearest scrollable ancestor that is on screen (a scroll pane, a
     /// list, a web page), for a wheel over it; None when unknown.
@@ -490,6 +516,12 @@ pub trait Backend {
     /// "chromium"); empty when unknown.
     async fn toolkit_of(&self, _id: &Self::Id) -> String {
         String::new()
+    }
+    /// Whether the element is editable and whether it holds more than one
+    /// line (a text area, a rich text editor), in one read; None when
+    /// unknown.
+    async fn edit_states(&self, _id: &Self::Id) -> Option<(bool, bool)> {
+        None
     }
     /// Complete text content (falls back to the name).
     async fn full_text(&self, id: &Self::Id, limit: usize) -> R<String>;
@@ -653,16 +685,19 @@ pub trait Backend {
 // The Windows backend has no window control yet.
 #[cfg_attr(windows, allow(dead_code))]
 pub fn not_one_window(query: &str, matches: &[WindowGeo]) -> String {
+    // Nothing was closed: the caller's write sent nothing.
     if matches.is_empty() {
-        return format!("no window of an allowed app matches '{query}'");
+        return crate::delivery::nothing_sent(format!(
+            "no window of an allowed app matches '{query}'"
+        ));
     }
     let list: Vec<String> = matches
         .iter()
         .map(|w| format!("{:?} [{}]", w.title, w.app))
         .collect();
-    format!(
+    crate::delivery::nothing_sent(format!(
         "{} windows match '{query}': {}; pass more of the title so only one does",
         matches.len(),
         list.join(", ")
-    )
+    ))
 }

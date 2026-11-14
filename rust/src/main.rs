@@ -7,6 +7,7 @@
 //! every call). Platform code lives behind the `Backend` trait.
 
 mod backend;
+mod delivery;
 mod flow;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -85,6 +86,25 @@ fn search_fetch(text_limit: usize, limit: usize) -> Fetch {
         stop_roles: &[],
         offscreen: false,
     }
+}
+
+/// `render::locate_all`, and when nothing of `role` matches, again with its
+/// synonyms (`render::with_role_synonyms`; `by_synonym` set then).
+fn locate_with_synonyms<Id: Clone + Eq + std::hash::Hash>(
+    cache: &Cache<Id>,
+    windows: &[Id],
+    query: &str,
+    role: &str,
+    titles: bool,
+    window: &str,
+) -> Result<Option<render::Matches<Id>>, Vec<Id>> {
+    let (m, by_synonym) = render::with_role_synonyms(role, Option::is_some, |r| {
+        render::locate_all(cache, windows, query, r, titles, window)
+    })?;
+    Ok(m.map(|mut m| {
+        m.by_synonym = by_synonym;
+        m
+    }))
 }
 
 /// How long a read of an app's tree is reused at most, even when the app
@@ -355,7 +375,8 @@ fn apps_text(
 }
 
 struct Server<B: Backend> {
-    b: B,
+    /// The backend; what writes to the desktop is noted (`delivery`).
+    b: delivery::Sends<B>,
     refs: Mutex<Refs<B::Id>>,
     allow_file: PathBuf,
     /// Title of the active window as last reported, to mention changes.
@@ -381,9 +402,22 @@ struct Server<B: Backend> {
     inert_writes: Mutex<HashSet<String>>,
     /// The user's input and the stop shortcut, when the backend watches them.
     takeover: Option<std::sync::Arc<takeover::Takeover>>,
-    /// When the current holder of `input` took it: user input after this
-    /// interrupts the rest of its run (a batch's later steps, a drag).
+    /// When the current holder of `input` took it, then when its first
+    /// gated input went ahead: user input after this interrupts the rest of
+    /// its run (a batch's later steps, a drag).
     run_start: std::sync::Mutex<Option<Instant>>,
+    /// A gated input of the current run went ahead (`Server::gate_wait`):
+    /// until then, the user's input only pauses the run.
+    run_acted: std::sync::atomic::AtomicBool,
+    /// Set by an input that likely changes a web page in place (a press,
+    /// a click, Enter), for `call_inner`'s content wait
+    /// (`Server::content_wait`).
+    content: std::sync::Mutex<Option<ContentNote<B::Id>>>,
+    /// Change mark taken when the current input call started (with its
+    /// window in front): an app that changed between it and the input was
+    /// already changing (`Server::pre_content`). None after an activation,
+    /// whose own events would count.
+    content_base: std::sync::Mutex<Option<u64>>,
     /// Keys and buttons down now, in the order they were pressed: held by
     /// `hold` across calls, or by an input tool for the length of its
     /// action (a click's modifiers, a drag's button). A cancelled call
@@ -396,6 +430,12 @@ struct Server<B: Backend> {
     /// Reads of apps' trees kept for the next calls (`Server::read_app`).
     /// Never locked across an await.
     reads: std::sync::Mutex<Reads<B::Id>>,
+    /// Per app, the window `Server::page_of` last looked in and the web
+    /// page document it found there (None: none), read again while that
+    /// window is the one and the document shows (None: for up to
+    /// NO_PAGE_RECHECK after that look). Never locked across an await.
+    #[allow(clippy::type_complexity)]
+    page_docs: std::sync::Mutex<HashMap<String, (B::Id, Option<B::Id>, Instant)>>,
 }
 
 /// A key or mouse button the server pressed and has not released.
@@ -587,6 +627,29 @@ const GATED_TOOLS: [&str; 16] = [
     "launch",
 ];
 
+/// Tools whose replies and errors say whether input was sent (`delivery`):
+/// the gated ones and clipboard_set. A batch says it per step and when it
+/// stops.
+const DELIVERY_TOOLS: [&str; 17] = [
+    "act",
+    "menu",
+    "close_window",
+    "hold",
+    "set_text",
+    "focus",
+    "click",
+    "drag",
+    "scroll",
+    "key",
+    "type_text",
+    "mouse",
+    "activate_window",
+    "file_dialog",
+    "move_window",
+    "launch",
+    "clipboard_set",
+];
+
 /// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
 /// when absent, empty, or the tool takes none.
 fn window_arg(tool: &str, a: &Json) -> R<Option<String>> {
@@ -660,6 +723,8 @@ struct StepResult {
     element: Option<u64>,
     /// It failed by a refusal (`with_refusals`).
     refused: bool,
+    /// It sent input (`delivery::track`).
+    wrote: bool,
 }
 
 /// A running batch: its reply so far and what its steps left.
@@ -671,9 +736,29 @@ struct BatchRun {
     done: Vec<flow::Record>,
     /// A printed step failed.
     failed: bool,
+    /// Top-level steps that sent input, and those that failed after
+    /// sending some (`delivery::stopped`).
+    sent: Vec<usize>,
+    maybe: Vec<usize>,
 }
 
 impl BatchRun {
+    /// Note what a call of top-level step `n` sent: maybe once one of its
+    /// calls failed after writing, else sent once one wrote.
+    fn deliver(&mut self, n: usize, r: &StepResult) {
+        if !r.wrote {
+            return;
+        }
+        if r.result.is_err() {
+            self.sent.retain(|&k| k != n);
+            if !self.maybe.contains(&n) {
+                self.maybe.push(n);
+            }
+        } else if !self.sent.contains(&n) && !self.maybe.contains(&n) {
+            self.sent.push(n);
+        }
+    }
+
     /// The reply line of a call labelled `label` ("3", "2.1", "4.on_fail").
     fn print(&mut self, label: &str, call: &flow::Call, r: &StepResult, optional: bool) {
         let tool = &call.tool;
@@ -907,45 +992,188 @@ fn observe_arg(tool: &str, a: &Json) -> R<Option<Observe>> {
 /// Default and longest settle before the effect line and observation.
 const SETTLE_MS: i64 = 150;
 const MAX_SETTLE_MS: i64 = 5000;
+/// Default (unless `settle_ms` says otherwise) and longest wait for a web
+/// page to change after an input that likely changes it in place
+/// (`Server::content_wait`); once it changed, the wait ends when its events
+/// went quiet and no page of the app is loading.
+const CONTENT_MS: i64 = 1500;
+/// Quiet that ends a content wait.
+const CONTENT_QUIET: Duration = Duration::from_millis(150);
+/// A first change this soon after the input may be a placeholder or a
+/// spinner put up before a network round trip: the wait then needs
+/// CONTENT_QUIET_EARLY of quiet, as when the app was already changing
+/// before the input.
+const CONTENT_EARLY: Duration = Duration::from_millis(100);
+/// 600 ms: a page that answers a press after a short delay (a script's
+/// timer, a fast fetch, 400 ms in a test page) was read stale with 350.
+const CONTENT_QUIET_EARLY: Duration = Duration::from_millis(600);
+/// Longest wait past the first change (or past the end of loading) while
+/// no page of the app loads: events of other tabs or a live page (a clock,
+/// a video) never go quiet.
+const CONTENT_BURST: Duration = Duration::from_millis(500);
+/// Toolkits (`toolkit_of`) of apps that show web pages, whose content
+/// changes in place after a press, a click or Enter, often only after a
+/// network round trip.
+const WEB_TOOLKITS: [&str; 2] = ["gecko", "chromium"];
+/// Keys (`chord_keys`, joined) that submit a form or move to another page.
+const CONTENT_KEYS: [&str; 5] = ["enter", "kpenter", "alt+left", "alt+right", "f5"];
+/// Roles a press or click on rarely changes a page's content: text fields
+/// (a click there is for typing; editable elements of other roles are
+/// skipped by their state), lists and menus that open (listed with
+/// `opened:` instead), controls that only toggle (their state change is no
+/// change event: the wait would always run out), sliders, and whole
+/// documents and windows.
+const NO_CONTENT_ROLES: [&str; 22] = [
+    "entry",
+    "text",
+    "password text",
+    "editbar",
+    "terminal",
+    "document text",
+    "spin button",
+    "combo box",
+    "push button menu",
+    "menu",
+    "check box",
+    "radio button",
+    "toggle button",
+    "switch",
+    "check menu item",
+    "radio menu item",
+    "slider",
+    "scroll bar",
+    "document web",
+    "document frame",
+    "frame",
+    "window",
+];
+/// Roles of a focused element where Enter types (a new line, a command),
+/// besides multi-line text fields: no content wait.
+const NO_CONTENT_KEY_ROLES: [&str; 2] = ["terminal", "document text"];
 /// Size of the tree `observe: "tree"` returns.
 const OBSERVE_TREE_NODES: i64 = 150;
 const OBSERVE_TREE_CHARS: usize = 6000;
 
-/// What an input is compared on: the active window (app, title) and the
-/// focused element (id, role, name, states). Two reads, about 1 ms.
+/// Taken just before an input that may change a web page in place
+/// (`Server::pre_content`).
+#[derive(Clone, Copy)]
+struct PreContent {
+    /// Change mark before the input.
+    mark: u64,
+    /// The element's app sent change events since the call started.
+    busy: bool,
+}
+
+/// An input whose page change `Server::content_wait` waits for.
+#[derive(Clone)]
+struct ContentNote<Id> {
+    pre: PreContent,
+    /// The element the input went to.
+    id: Id,
+    /// When the input was sent.
+    at: Instant,
+}
+
+/// What an input is compared on: the active window (app, title), the
+/// focused element (id, role, name, states) and, for the allowed app the
+/// input goes to, the web page its window shows. Two reads, about 1 ms,
+/// and three more for the page.
 #[derive(Clone, Debug, PartialEq)]
 struct Fingerprint<Id> {
     window: Option<(String, String)>,
     focus: Option<(Id, String, String, Vec<&'static str>)>,
+    /// The allowed app the input goes to (lower case) and its windows,
+    /// whose change events count for the effect; None when not read.
+    app: Option<(String, Vec<Id>)>,
+    /// The page the app's window shows (`Backend::page`).
+    page: Option<backend::Page>,
+}
+
+/// After an input to a window showing a web page, how much longer than
+/// the settle the effect line waits for the app to report a change: a
+/// link or a web app's row starts loading the next page only after a
+/// round trip of its own.
+const PAGE_SETTLE: Duration = Duration::from_millis(400);
+
+/// How long `page_of` trusts that a browser's window shows no web page (a
+/// dialog, a mail app's window without a web view) before searching it
+/// again: the search reads up to FIND_MAX_SEEN nodes.
+const NO_PAGE_RECHECK: Duration = Duration::from_secs(5);
+
+/// How the effect line names a page: its title, else its address.
+fn page_name(p: &backend::Page) -> String {
+    match (p.title.is_empty(), p.url.is_empty()) {
+        (false, _) => render::py_repr(&p.title),
+        (true, false) => p.url.clone(),
+        (true, true) => "an untitled page".into(),
+    }
 }
 
 /// The effect line: how `after` differs from `before`. `events`: whether
 /// the app reported changes meanwhile (None: the backend cannot tell).
-/// Titles of windows of apps not `allowed` are not named.
+/// Titles of windows of apps not `allowed` are not named. A page that is
+/// loading after the input is said so, as reading it now reads the old
+/// or a half page; one that was loading already makes no change of its
+/// own (its events are the load's).
 fn effect_text<Id: PartialEq>(
     before: &Fingerprint<Id>,
     after: &Fingerprint<Id>,
     events: Option<bool>,
     allowed: impl Fn(&str) -> bool,
 ) -> String {
-    if before.window != after.window {
-        let same_app = matches!((&before.window, &after.window),
-            (Some((a, _)), Some((b, _))) if a == b);
-        return match &after.window {
+    let loading = if after.page.as_ref().is_some_and(|p| p.busy) {
+        " (still loading: wait_idle before reading it)"
+    } else {
+        ""
+    };
+    let page = match (&before.page, &after.page) {
+        (Some(b), Some(a)) if b.differs(a) => {
+            let mut out = format!("page changed to {}", page_name(a));
+            // The same title: the address tells the pages apart.
+            if a.title == b.title && !a.title.is_empty() && !a.url.is_empty() {
+                out.push_str(&format!(" ({})", a.url));
+            }
+            Some(out)
+        }
+        _ => None,
+    };
+    let same_app = matches!((&before.window, &after.window),
+        (Some((a, _)), Some((b, _))) if a == b);
+    if before.window != after.window && !(same_app && page.is_some()) {
+        let text = match &after.window {
             Some((app, title)) if allowed(app) && same_app => {
                 format!("changed (window title now {})", render::py_repr(title))
             }
             Some((app, title)) if allowed(app) => {
                 format!("window changed to {}", render::py_repr(title))
             }
-            Some((app, _)) => format!("window changed to one of '{app}' (not allowed)"),
-            None => "window changed (none active now)".into(),
+            Some((app, _)) => return format!("window changed to one of '{app}' (not allowed)"),
+            None => return "window changed (none active now)".into(),
+        };
+        return format!("{text}{loading}");
+    }
+    if let Some(page) = page {
+        return format!("{page}{loading}");
+    }
+    let was_busy = before.page.as_ref().is_some_and(|p| p.busy);
+    if before.focus != after.focus {
+        return match loading.is_empty() {
+            true => "changed".into(),
+            false => "changed (the page is still loading: wait_idle before reading it)".into(),
         };
     }
-    if before.focus != after.focus || events == Some(true) {
-        "changed".into()
-    } else {
-        "no visible change".into()
+    match (was_busy, !loading.is_empty()) {
+        // The input started it.
+        (false, true) => "changed: the page started loading (wait_idle before reading it)".into(),
+        // Loading before the input: its own changes tell nothing.
+        (true, true) if events == Some(true) => {
+            "not known: the page was already loading (wait_idle before reading it)".into()
+        }
+        (true, true) => {
+            "no visible change (the page was already loading: wait_idle before reading it)".into()
+        }
+        _ if events == Some(true) => "changed".into(),
+        _ => "no visible change".into(),
     }
 }
 
@@ -1419,7 +1647,7 @@ impl<B: Backend> Server<B> {
         let allow_file = b.allow_file();
         let b_takeover = b.takeover();
         Server {
-            b,
+            b: delivery::Sends(b),
             refs: Mutex::new(Refs {
                 map: HashMap::new(),
                 index: HashMap::new(),
@@ -1436,8 +1664,12 @@ impl<B: Backend> Server<B> {
             held: std::sync::Mutex::new(Vec::new()),
             takeover: b_takeover,
             run_start: std::sync::Mutex::new(None),
+            run_acted: std::sync::atomic::AtomicBool::new(false),
+            content: std::sync::Mutex::new(None),
+            content_base: std::sync::Mutex::new(None),
             link: Default::default(),
             reads: std::sync::Mutex::new(Reads::new()),
+            page_docs: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -1464,6 +1696,60 @@ impl<B: Backend> Server<B> {
     /// Note that a run of input starts now (the input lock was just taken).
     fn start_run(&self) {
         *self.run_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(Instant::now());
+        self.run_acted
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// `gate` at the start of a gated call. While the user's input is
+    /// recent but the pause would end within takeover::WAIT_LIMIT all told,
+    /// it waits (holding the input lock, sending nothing) and lets the call
+    /// go on; the time waited, if any. The stop shortcut and an
+    /// interruption of a run that already sent input (a batch step after
+    /// the user started using the seat) are refused at once: the run's
+    /// later steps were planned for what the screen showed before. Until
+    /// a run's first gated input went ahead, the user's input since its
+    /// start (during a batch's reads) only pauses it, and the run starts
+    /// over once the wait is done. Cancelling the call ends the wait.
+    async fn gate_wait(&self, in_run: bool) -> R<Option<Duration>> {
+        let Some(t) = &self.takeover else {
+            return Ok(None);
+        };
+        let began = Instant::now();
+        let mut shown = false;
+        loop {
+            let acted = self.run_acted.load(std::sync::atomic::Ordering::SeqCst);
+            let start = match in_run && acted {
+                true => *self.run_start.lock().unwrap_or_else(|e| e.into_inner()),
+                false => None,
+            };
+            let now = Instant::now();
+            match t.plan(start, now.saturating_duration_since(began), now) {
+                Ok(None) => {
+                    if !acted {
+                        // The run's input starts now: user input before
+                        // (waited out) does not interrupt it.
+                        *self.run_start.lock().unwrap_or_else(|e| e.into_inner()) = Some(now);
+                        self.run_acted
+                            .store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    return Ok(shown.then(|| began.elapsed()));
+                }
+                Ok(Some(next)) => {
+                    if !shown {
+                        // Shown while it waits, so the user sees why.
+                        if let Err(block) = t.check_since(start, now) {
+                            self.b.indicate(&block.label()).await;
+                        }
+                        shown = true;
+                    }
+                    tokio::time::sleep(next).await;
+                }
+                Err(block) => {
+                    self.b.indicate(&block.label()).await;
+                    return Err(refusal(block.message(t.window())));
+                }
+            }
+        }
     }
 
     /// Whether a gated tool may act now: not after the stop shortcut, not
@@ -1486,6 +1772,126 @@ impl<B: Backend> Server<B> {
                 self.b.indicate(&block.label()).await;
                 Err(refusal(block.message(t.window())))
             }
+        }
+    }
+
+    // ------------------------------------------------------------ content wait
+
+    /// Just before an input that may change a web page in place: the
+    /// change mark, and whether the app of `id` was already changing since
+    /// the call started (`content_base`).
+    fn pre_content(&self, id: Option<&B::Id>) -> PreContent {
+        let mark = self.b.change_mark();
+        let base = *self.content_base.lock().unwrap_or_else(|e| e.into_inner());
+        let busy = match (id, base) {
+            (Some(id), Some(base)) if base < mark => {
+                self.b.changed_since(std::slice::from_ref(id), base) == Some(true)
+            }
+            _ => false,
+        };
+        PreContent { mark, busy }
+    }
+
+    /// After an input to `id` (of `role`) that likely changes a web page in
+    /// place (a press, a plain left click, or with `key` Enter to the
+    /// focused element): when its app shows web pages and change events
+    /// are heard, note it for `call_inner`'s content wait. Not after a
+    /// click or press on an editable element (for typing), nor after Enter
+    /// in a multi-line one or a terminal (it types a line). Cheap: the
+    /// toolkit is read once per app, the states once.
+    async fn note_content(&self, pre: PreContent, id: &B::Id, role: &str, key: bool) {
+        let at = Instant::now();
+        let skip = match key {
+            true => NO_CONTENT_KEY_ROLES.contains(&role),
+            false => NO_CONTENT_ROLES.contains(&role),
+        };
+        if !self.b.changes_live() || skip {
+            return;
+        }
+        let toolkit = self.b.toolkit_of(id).await;
+        if !WEB_TOOLKITS.contains(&toolkit.as_str()) {
+            return;
+        }
+        let typing = match self.b.edit_states(id).await {
+            Some((_, true)) => true,
+            Some((editable, false)) => editable && !key,
+            None => false,
+        };
+        if !typing {
+            *self.content.lock().unwrap_or_else(|e| e.into_inner()) = Some(ContentNote {
+                pre,
+                id: id.clone(),
+                at,
+            });
+        }
+    }
+
+    /// Wait up to `limit` after the input `c` (`note_content`) for the app
+    /// of its element to report a change; once it did, until its events
+    /// were quiet for CONTENT_QUIET (CONTENT_QUIET_EARLY when the change
+    /// came at once, or the app was already changing) and no page of it is
+    /// loading. While none loads, at most CONTENT_BURST past the first
+    /// change: other tabs and live pages keep sending events. Reads made
+    /// after this see the new content. The reply's note.
+    async fn content_wait(&self, c: &ContentNote<B::Id>, limit: Duration) -> String {
+        let near = std::slice::from_ref(&c.id);
+        let left = || limit.saturating_sub(c.at.elapsed());
+        let ms = || c.at.elapsed().as_millis();
+        if !c.pre.busy && !self.b.wait_change(near, c.pre.mark, left()).await {
+            return format!("; no page change seen in {} ms", ms());
+        }
+        let quiet = match c.pre.busy || c.at.elapsed() < CONTENT_EARLY {
+            true => CONTENT_QUIET_EARLY,
+            false => CONTENT_QUIET,
+        };
+        let mut cap = Instant::now() + CONTENT_BURST;
+        let mut windows: Option<Vec<B::Id>> = None;
+        let mut loading = false;
+        loop {
+            let wait = quiet.min(left());
+            if wait.is_zero() {
+                break;
+            }
+            let m = self.b.change_mark();
+            let changed = self.b.wait_change(near, m, wait).await;
+            if changed && Instant::now() < cap {
+                continue;
+            }
+            // Quiet (or changing past the cap): unless a page waits for
+            // the network.
+            if windows.is_none() {
+                windows = Some(match self.b.app_name(&c.id).await {
+                    Some(app) => self
+                        .b
+                        .app_windows(&app.to_lowercase())
+                        .await
+                        .unwrap_or_default(),
+                    None => Vec::new(),
+                });
+            }
+            loading = self.b.loading(windows.as_deref().unwrap_or_default()).await;
+            if loading {
+                // Once it loaded, its page renders: another burst's time.
+                tokio::time::sleep(IDLE_POLL.min(left())).await;
+                cap = Instant::now() + CONTENT_BURST;
+                continue;
+            }
+            // A quiet cut short by the limit is no quiet.
+            if changed || wait < quiet {
+                break;
+            }
+            return match c.pre.busy {
+                true => format!("; app was already changing; quiet after {} ms", ms()),
+                false => format!("; page changed (settled after {} ms)", ms()),
+            };
+        }
+        let still = if loading { "loading" } else { "changing" };
+        match c.pre.busy {
+            true => format!(
+                "; app was already changing; still {still} after {} ms",
+                ms()
+            ),
+            false => format!("; page changed, still {still} after {} ms", ms()),
         }
     }
 
@@ -2097,24 +2503,56 @@ impl<B: Backend> Server<B> {
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::locate_all(c, &windows, query, role, titles, window),
+                |c| locate_with_synonyms(c, &windows, query, role, titles, window),
             )
             .await;
         Ok(match found {
+            // Matched through the synonyms of `role` while an element of
+            // `role` itself is only scrolled out of view: that one is
+            // meant, and the miss offers it.
+            Some(m)
+                if m.by_synonym && self.offscreen_of_role(&windows, &cache, query, role).await =>
+            {
+                Located::Missed(windows, cache)
+            }
             Some(m) => Located::Found(m, cache, cached),
             None => Located::Missed(windows, cache),
         })
     }
 
+    /// Whether an element of `role` exactly (no synonyms) that `query`
+    /// names is scrolled out of view in a web page of `windows` (whose
+    /// visible part `cache` holds).
+    async fn offscreen_of_role(
+        &self,
+        windows: &[B::Id],
+        cache: &Cache<B::Id>,
+        query: &str,
+        role: &str,
+    ) -> bool {
+        let docs = render::showing_documents(cache, windows);
+        if docs.is_empty() {
+            return false;
+        }
+        let mut off = Cache::new();
+        let fetch = Fetch {
+            offscreen: true,
+            ..search_fetch(render::FIND_TEXT_LIMIT, OFFSCREEN_FETCH)
+        };
+        self.b.prefetch_with(&mut off, docs.clone(), &fetch).await;
+        !render::find_offscreen(&off, &docs, query, role, 1).is_empty()
+    }
+
     /// `locate` in the app windows `windows`, read afresh: the first
-    /// element picked (a read takes the first of a tie).
+    /// element picked (a read takes the first of a tie), and whether it
+    /// matched the synonyms of `role` rather than `role` itself.
     async fn locate_in(
         &self,
         windows: Vec<B::Id>,
         query: &str,
         role: &str,
         titles: bool,
-    ) -> Option<(B::Id, Cache<B::Id>)> {
+    ) -> Option<(B::Id, Cache<B::Id>, bool)> {
         let (found, cache, _) = self
             .read_app(
                 None,
@@ -2122,15 +2560,18 @@ impl<B: Backend> Server<B> {
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::locate_all(c, &windows, query, role, titles, ""),
+                |c| locate_with_synonyms(c, &windows, query, role, titles, ""),
             )
             .await;
-        found.map(|m| (m.first().clone(), cache))
+        found.map(|m| (m.first().clone(), cache, m.by_synonym))
     }
 
-    /// What to offer when nothing visible in `windows` matches `query`:
-    /// matches scrolled out of view in the page (web documents only), else
-    /// the visible elements with the closest names, with their ids; empty
+    /// What to offer when nothing visible in `windows` matches `query`
+    /// (and `role`, nor its synonyms), first found first: matches of `role`
+    /// (or its synonyms) scrolled out of view in the page (web documents
+    /// only); with `role` given, the visible elements of other roles that
+    /// match, then off-screen ones of other roles (with their roles); else
+    /// the visible elements with the closest names, with their ids. Empty
     /// when there are none. `cache` holds the visible part of `windows`.
     async fn miss_report(
         &self,
@@ -2145,9 +2586,20 @@ impl<B: Backend> Server<B> {
                 .map(|id| Line::Node { depth: 0, id })
                 .collect()
         };
+        let roles_of = |c: &Cache<B::Id>, ids: &[B::Id]| -> String {
+            let mut roles: Vec<String> = Vec::new();
+            for id in ids {
+                let r = render::py_repr(&c[id].role);
+                if !roles.contains(&r) {
+                    roles.push(r);
+                }
+            }
+            roles.join(", ")
+        };
+        let with_role = !role.trim().is_empty() && !query.trim().is_empty();
         let docs = render::showing_documents(cache, windows);
+        let mut off = Cache::new();
         if !docs.is_empty() {
-            let mut off = Cache::new();
             let fetch = Fetch {
                 offscreen: true,
                 ..search_fetch(render::FIND_TEXT_LIMIT, OFFSCREEN_FETCH)
@@ -2157,13 +2609,59 @@ impl<B: Backend> Server<B> {
                 self.b.prefetch_with(&mut off, docs.clone(), &fetch),
             )
             .await;
-            let hits = render::find_offscreen(&off, &docs, query, role, MISS_SUGGESTIONS);
+            // The role asked for, else its synonyms: the element wanted
+            // may just be scrolled out of view.
+            let (hits, by_synonym) = render::with_role_synonyms(
+                role,
+                |h: &Vec<B::Id>| !h.is_empty(),
+                |r| {
+                    Ok::<_, Vec<B::Id>>(render::find_offscreen(
+                        &off,
+                        &docs,
+                        query,
+                        r,
+                        MISS_SUGGESTIONS,
+                    ))
+                },
+            )
+            .unwrap_or_default();
             if !hits.is_empty() {
+                let roles: Vec<&str> = hits.iter().map(|id| off[id].role.as_str()).collect();
+                let note = render::synonym_note(role, by_synonym, &roles);
+                let note = if note.is_empty() {
+                    note
+                } else {
+                    format!(" ({note})")
+                };
                 self.b.fill_actions(&mut off, &hits).await;
                 let (text, _) = self.print(as_lines(hits), &off, app).await;
                 return format!(
-                    "\noff-screen, scrolled out of view (act and get_text work on them; \
-                     act action=scroll_to before click):\n{text}"
+                    "\noff-screen, scrolled out of view{note} (act and get_text work on \
+                     them; act action=scroll_to before click):\n{text}"
+                );
+            }
+        }
+        if with_role {
+            // Visible elements the query names in other roles: the role
+            // asked for (and its synonyms) was the miss.
+            if let Ok(other) = render::find(cache, windows, query, "", MISS_SUGGESTIONS)
+                && !other.is_empty()
+            {
+                let roles = roles_of(cache, &other);
+                self.b.fill_actions(cache, &other).await;
+                let (text, _) = self.print(as_lines(other), cache, app).await;
+                return format!(
+                    "; it matches elements of role {roles} (pass that role, or none):\n{text}"
+                );
+            }
+            let hits = render::find_offscreen(&off, &docs, query, "", MISS_SUGGESTIONS);
+            if !hits.is_empty() {
+                let roles = roles_of(&off, &hits);
+                self.b.fill_actions(&mut off, &hits).await;
+                let (text, _) = self.print(as_lines(hits), &off, app).await;
+                return format!(
+                    "\noff-screen, scrolled out of view, of role {roles} (pass that role, or \
+                     none; act action=scroll_to before click):\n{text}"
                 );
             }
         }
@@ -2311,7 +2809,7 @@ impl<B: Backend> Server<B> {
         let window = a.get("window").and_then(Json::as_str).unwrap_or("");
         let app_key = app.to_lowercase();
         let mut kept = true;
-        let (id, cache, at, ties) = loop {
+        let (id, cache, at, ties, synonym) = loop {
             let located = self.locate(app, query, &role, true, kept, window);
             let located = trace::time("locate", located).await?;
             let (mut m, mut cache, cached) = match located {
@@ -2340,6 +2838,12 @@ impl<B: Backend> Server<B> {
                 self.untie(&mut m, &mut cache, app, query, &role).await?;
             }
             let ties = m.picked.len();
+            let roles: Vec<&str> = m
+                .picked
+                .iter()
+                .map(|(id, _)| cache[id].role.as_str())
+                .collect();
+            let synonym = render::synonym_note(&role, m.by_synonym, &roles);
             let id = m.first().clone();
             // The window it is in, from the nodes read: no walk up to it.
             let frame = if center { frame_in(&cache, &id) } else { None };
@@ -2365,7 +2869,7 @@ impl<B: Backend> Server<B> {
                 }
             );
             if there {
-                break (id, cache, at, ties);
+                break (id, cache, at, ties, synonym);
             }
             // Gone or hidden without an event: read afresh.
             self.forget_reads(&app_key);
@@ -2376,6 +2880,9 @@ impl<B: Backend> Server<B> {
         let mut found = render::describe(&cache[&id], rid);
         if ties > 1 {
             found.push_str(&format!(" (first of {ties} matches)"));
+        }
+        if !synonym.is_empty() {
+            found.push_str(&format!(" ({synonym})"));
         }
         let found = Some(found);
         let role = cache[&id].role.clone();
@@ -2615,7 +3122,11 @@ impl<B: Backend> Server<B> {
             let Some(root) = cache.get(&id) else {
                 continue;
             };
-            if !root.showing || (kind != render::Surface::Dialog && listed.entries.is_empty()) {
+            // A dialog with nothing to list says nothing either (Qt keeps a
+            // second, empty file dialog window next to the shown one).
+            let empty = listed.entries.is_empty()
+                && (kind != render::Surface::Dialog || listed.message.is_none());
+            if !root.showing || empty {
                 continue;
             }
             found.push(hash);
@@ -2718,8 +3229,7 @@ impl<B: Backend> Server<B> {
             .map(|w| w.title)
     }
 
-    /// The active window and focused element, compared before and after
-    /// an input for its effect line.
+    /// The active window and focused element (no app, no page).
     async fn fingerprint(&self) -> Fingerprint<B::Id> {
         let (apps, focus) = tokio::join!(self.b.list_apps(), self.b.focused());
         let window = apps.into_iter().find_map(|a| {
@@ -2732,30 +3242,174 @@ impl<B: Backend> Server<B> {
         Fingerprint {
             window,
             focus: focus.map(|f| (f.id, f.info.role, f.info.name, f.info.states)),
+            app: None,
+            page: None,
         }
+    }
+
+    /// What an input's effect line compares before and after it: the
+    /// `fingerprint`, and for `app` (the app the input names, else the
+    /// active window's), when allowed, its windows and the page shown.
+    async fn input_fingerprint(&self, app: Option<String>) -> Fingerprint<B::Id> {
+        let named = app.map(|a| a.to_lowercase());
+        let allowed = named.clone().filter(|a| self.is_allowed(a));
+        // An app named: its windows read alongside.
+        let (mut print, named_windows) = tokio::join!(self.fingerprint(), async {
+            match &allowed {
+                Some(app) => self.b.app_windows(app).await,
+                None => None,
+            }
+        });
+        let (app, windows) = match named {
+            Some(_) => (allowed, named_windows),
+            None => {
+                let app = print
+                    .window
+                    .as_ref()
+                    .map(|(a, _)| a.to_lowercase())
+                    .filter(|a| self.is_allowed(a));
+                let windows = match &app {
+                    Some(app) => self.b.app_windows(app).await,
+                    None => None,
+                };
+                (app, windows)
+            }
+        };
+        if let (Some(app), Some(windows)) = (app, windows) {
+            print.page = trace::time("page", self.page_of(&app, &windows)).await;
+            print.app = Some((app, windows));
+        }
+        print
+    }
+
+    /// The web page a browser `app` (Firefox, Chromium and Electron apps)
+    /// shows in the window an input goes to (`page_window`), for the effect
+    /// line. The document found for that window is read again while it
+    /// shows (one round trip), else searched for in that window only; a
+    /// window without one is remembered as such until another window is
+    /// the one. None for other apps, and when the window is not known.
+    async fn page_of(&self, app: &str, windows: &[B::Id]) -> Option<backend::Page> {
+        let toolkit = self.b.toolkit_of(windows.first()?).await;
+        if !WEB_TOOLKITS.contains(&toolkit.to_lowercase().as_str()) {
+            return None;
+        }
+        let mut cache = Cache::new();
+        let window = self.page_window(windows, &mut cache).await?;
+        let known = self.page_docs.lock().unwrap().get(app).cloned();
+        if let Some((w, doc, at)) = known
+            && w == window
+        {
+            match doc {
+                // No document in this window when last looked.
+                None if at.elapsed() < NO_PAGE_RECHECK => return None,
+                None => {}
+                Some(doc) => {
+                    if let Some(page) = self.b.page(&doc).await {
+                        return Some(page);
+                    }
+                }
+            }
+        }
+        let found = self
+            .active_document(app, vec![window.clone()], &mut cache)
+            .await
+            .ok();
+        let page = match &found {
+            Some(doc) => self.b.page(doc).await,
+            None => None,
+        };
+        // A document that shows no page is searched for again next time.
+        let doc = match (&found, &page) {
+            (Some(_), None) => {
+                self.page_docs.lock().unwrap().remove(app);
+                return None;
+            }
+            _ => found,
+        };
+        self.page_docs
+            .lock()
+            .unwrap()
+            .insert(app.to_string(), (window, doc, Instant::now()));
+        page
+    }
+
+    /// The window of `app` (`windows`) an input goes to, for `page_of`:
+    /// its active one, else its only showing one; None when several show
+    /// and none is active (which one the input reaches is not known).
+    async fn page_window(&self, windows: &[B::Id], cache: &mut Cache<B::Id>) -> Option<B::Id> {
+        // The windows themselves only (limit 1 stops after their level).
+        let level = search_fetch(0, 1);
+        self.b.prefetch_with(cache, windows.to_vec(), &level).await;
+        let showing: Vec<&B::Id> = windows
+            .iter()
+            .filter(|w| cache.get(*w).is_some_and(|i| i.showing))
+            .collect();
+        if let Some(w) = showing
+            .iter()
+            .find(|w| cache[**w].states.contains(&"active"))
+        {
+            return Some((*w).clone());
+        }
+        match showing.as_slice() {
+            [w] => Some((*w).clone()),
+            _ => None,
+        }
+    }
+
+    /// The app an input tool's arguments name: `app`, else the app of the
+    /// element `id` refers to; None for neither.
+    async fn input_app(&self, a: &Json) -> Option<String> {
+        if let Some(app) = a.get("app").and_then(Json::as_str)
+            && !app.trim().is_empty()
+        {
+            return Some(app.trim().to_lowercase());
+        }
+        let rid = a.get("id").and_then(Json::as_i64)?;
+        let refs = self.refs.lock().await;
+        refs.map.get(&(rid as u64)).map(|r| r.app.clone())
     }
 
     /// After an input tool ran: wait up to `settle_ms` for the app to react
     /// (ending early once it reported a change since `mark`), then the
-    /// effect line and what `observe` asks for.
+    /// effect line and what `observe` asks for. `sent`: the tool sent
+    /// input (a verified act may find the state there already).
+    /// `content`: the element whose page the content wait waited for
+    /// (`content_wait`): no settle on top, and its app's changes count.
     async fn after_input(
         &self,
         tool: &str,
         a: &Json,
         observe: Observe,
-        mark: u64,
-        before: Fingerprint<B::Id>,
+        (mark, before): (u64, Fingerprint<B::Id>),
+        sent: bool,
+        content: Option<B::Id>,
     ) -> Out {
-        let settle = arg_i(a, "settle_ms", SETTLE_MS).clamp(0, MAX_SETTLE_MS) as u64;
-        // The focused element's app is the one that reacts (its bus, on Linux).
-        let near: Vec<B::Id> = before.focus.iter().map(|f| f.0.clone()).collect();
+        let settle = match content {
+            Some(_) => 0,
+            None => arg_i(a, "settle_ms", SETTLE_MS).clamp(0, MAX_SETTLE_MS) as u64,
+        };
+        // The focused element's app reacts (its bus, on Linux), the app the
+        // input went to (`act` reaches a browser behind the terminal), and
+        // the element whose page the content wait watched.
+        let mut near: Vec<B::Id> = before.focus.iter().map(|f| f.0.clone()).collect();
+        if let Some((_, windows)) = &before.app {
+            near.extend(windows.iter().cloned());
+        }
+        near.extend(content);
         if settle > 0 {
             self.b
                 .wait_change(&near, mark, Duration::from_millis(settle))
                 .await;
         }
-        let events = self.b.changed_since(&near, mark);
-        let after = self.fingerprint().await;
+        let mut events = self.b.changed_since(&near, mark);
+        // A page answers late: wait a little longer for it to start (not
+        // when nothing was sent).
+        if settle > 0 && sent && before.page.is_some() && events != Some(true) {
+            trace::time("page settle", self.b.wait_change(&near, mark, PAGE_SETTLE)).await;
+            events = self.b.changed_since(&near, mark);
+        }
+        let app = before.app.as_ref().map(|(app, _)| app.clone());
+        let after = self.input_fingerprint(app).await;
         let allowed = self.allowed();
         let is_allowed = |app: &str| allowed.contains(&app.to_lowercase());
         let mut text = format!(
@@ -3366,14 +4020,20 @@ impl<B: Backend> Server<B> {
         let role = arg_s(a, "role", "");
         let max_results = arg_i(a, "max_results", 30).max(0) as usize;
         let windows = trace::time("app_windows", self.app_windows(&app)).await?;
-        let (hits, mut cache, _) = self
+        let ((hits, by_synonym), mut cache, _) = self
             .read_app(
                 Some(&app.to_lowercase()),
                 &windows,
                 Cache::new(),
                 search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
                 search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
-                |c| render::find(c, &windows, &query, &role, max_results),
+                |c| {
+                    render::with_role_synonyms(
+                        &role,
+                        |h: &Vec<B::Id>| !h.is_empty(),
+                        |r| render::find(c, &windows, &query, r, max_results),
+                    )
+                },
             )
             .await;
         if hits.is_empty() {
@@ -3385,9 +4045,16 @@ impl<B: Backend> Server<B> {
             } else {
                 "no matches"
             };
-            return Ok(format!("{head}{report}"));
+            let with_role = if role.trim().is_empty() {
+                String::new()
+            } else {
+                format!(" with role '{}'", role.trim())
+            };
+            return Ok(format!("{head}{with_role}{report}"));
         }
         self.b.fill_actions(&mut cache, &hits).await;
+        let roles: Vec<&str> = hits.iter().map(|id| cache[id].role.as_str()).collect();
+        let synonym = render::synonym_note(&role, by_synonym, &roles);
         let lines = hits
             .into_iter()
             .map(|id| Line::Node { depth: 0, id })
@@ -3396,7 +4063,11 @@ impl<B: Backend> Server<B> {
         if let Some(rid) = first {
             note_step_element(rid, true);
         }
-        Ok(text)
+        Ok(if synonym.is_empty() {
+            text
+        } else {
+            format!("{synonym}:\n{text}")
+        })
     }
 
     async fn act(&self, a: &Json) -> R<String> {
@@ -3456,7 +4127,11 @@ impl<B: Backend> Server<B> {
                     format!("action '{action}' not in [{}]", list.join(", "))
                 })?;
         }
+        let pre = self.pre_content(Some(id));
         let ok = self.b.do_action(id, idx).await?;
+        if ok && !names[idx].eq_ignore_ascii_case("showcontextmenu") {
+            self.note_content(pre, id, &t.role, false).await;
+        }
         // A window that opened or closed shows in the effect line.
         Ok(t.reply(&format!(
             "{} -> {}",
@@ -3652,7 +4327,9 @@ impl<B: Backend> Server<B> {
         for i in 0..times {
             // The user may take over between presses.
             if i > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after {i} of {times} presses of {combo}"))?;
             }
             self.b.press_combo(combo).await?;
         }
@@ -3761,13 +4438,19 @@ impl<B: Backend> Server<B> {
             )?;
         let steps = wanted as i64 - from as i64;
         let key = if steps > 0 { "down" } else { "up" };
-        for i in 0..steps.unsigned_abs() {
+        let n = steps.unsigned_abs();
+        let open_note = "; its list may still be open: key escape closes it";
+        for i in 0..n {
             if i > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after {i} of {n} presses of {key}{open_note}"))?;
             }
             self.b.press_combo(key).await?;
         }
-        self.gate(true).await?;
+        self.gate(true)
+            .await
+            .map_err(|e| format!("{e} after opening its list, before enter{open_note}"))?;
         self.b.press_combo("enter").await?;
         Ok(match steps {
             0 => format!("{} + key enter", actions[open]),
@@ -3870,8 +4553,21 @@ impl<B: Backend> Server<B> {
         if !opened && current.as_ref() == Some(&item) {
             return Ok(format!("already {quoted}; nothing sent"));
         }
+        // Opened, its menu may still show: the opening was sent.
+        let still_open = if opened {
+            " (it may still be open: key escape closes it)"
+        } else {
+            ""
+        };
+        let none = if opened {
+            "nothing selected"
+        } else {
+            "nothing sent"
+        };
         if cache[&item].states.contains(&"disabled") {
-            return Err(format!("{open_note}{quoted} is disabled; nothing sent"));
+            return Err(format!(
+                "{open_note}{quoted} is disabled; {none}{still_open}"
+            ));
         }
         let mut tried: Vec<String> = Vec::new();
         let mut shows = String::new();
@@ -3970,10 +4666,7 @@ impl<B: Backend> Server<B> {
                             if ok {
                                 return Ok(format!("{quoted} selected ({how}; verified)"));
                             }
-                            return Err(format!(
-                                "{}, but {s} afterwards (check with get_text before retrying)",
-                                sent(&tried)
-                            ));
+                            return Err(format!("{}, but {s} afterwards", sent(&tried)));
                         }
                         Err(e2) if tried.is_empty() => return Err(e2),
                         Err(e2) => {
@@ -3993,15 +4686,10 @@ impl<B: Backend> Server<B> {
                 }
             }
         }
-        let still_open = if opened {
-            " (it may still be open: key escape closes it)"
-        } else {
-            ""
-        };
         if tried.is_empty() {
             return Err(format!(
                 "{open_note}found {quoted}, but no way to select it without the pointer; \
-                 nothing sent: click the control, then click the entry{still_open}"
+                 {none}: click the control, then click the entry{still_open}"
             ));
         }
         Err(format!(
@@ -4163,7 +4851,9 @@ impl<B: Backend> Server<B> {
         for round in 0..WHEEL_ROUNDS {
             // The user may take over between turns.
             if round > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after wheel {total} {way} at {x},{y}"))?;
             }
             self.b
                 .pointer(x as i64, y as i64, "left", 0, dir * WHEEL_STEP)
@@ -4661,12 +5351,16 @@ impl<B: Backend> Server<B> {
             // With `state`, a match without it counts as no match.
             let has = |info: &Info<B::Id>| state.is_none_or(|s| s.holds(&info.states));
             match found {
-                Some((id, mut cache)) if gone != has(&cache[&id]) => {
+                Some((id, mut cache, by_synonym)) if gone != has(&cache[&id]) => {
                     self.b
                         .fill_actions(&mut cache, std::slice::from_ref(&id))
                         .await;
                     let rid = self.add_ref(&id, &cache[&id], &app.to_lowercase()).await;
-                    let line = render::describe(&cache[&id], rid);
+                    let mut line = render::describe(&cache[&id], rid);
+                    let synonym = render::synonym_note(&role, by_synonym, &[&cache[&id].role]);
+                    if !synonym.is_empty() {
+                        line.push_str(&format!(" ({synonym})"));
+                    }
                     if gone {
                         let s = state.map_or("", WaitState::name);
                         return Ok(format!("no longer {s} after {ms} ms{note}: {line}"));
@@ -4874,11 +5568,16 @@ impl<B: Backend> Server<B> {
         if clicks > 0 && OPENER_ROLES.contains(&t.role.as_str()) {
             let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
         }
+        let pre = self.pre_content(Some(&t.id));
         self.with_modifiers(
             &mods,
             self.b.pointer(x as i64, y as i64, &button, clicks, 0),
         )
         .await?;
+        // A plain left click: with modifiers it opens a new tab or selects.
+        if button == "left" && clicks > 0 && mods.is_empty() {
+            self.note_content(pre, &t.id, &t.role, false).await;
+        }
         let m = with_modifiers_note(&mods);
         Ok(t.reply(&format!("clicked {button} x{clicks} at {x},{y}{m}")))
     }
@@ -4987,7 +5686,12 @@ impl<B: Backend> Server<B> {
             let x = x0 + (x1 - x0) * i / DRAG_STEPS;
             let y = y0 + (y1 - y0) * i / DRAG_STEPS;
             // The user took over (or pressed the stop shortcut): let go.
-            moved = self.gate(true).await;
+            moved = self.gate(true).await.map_err(|e| {
+                format!(
+                    "{e} after {} of {DRAG_STEPS} moves from ({x0},{y0}); the button was released",
+                    i - 1
+                )
+            });
             if moved.is_err() {
                 break;
             }
@@ -5032,11 +5736,24 @@ impl<B: Backend> Server<B> {
         }
         let send = keys.join("+");
         let app = self.require_active_allowed().await?;
-        for i in 0..repeat.clamp(1, 100) {
+        // Enter submits, alt+left goes back: the page may change.
+        let content = match CONTENT_KEYS.contains(&send.as_str()) && self.b.changes_live() {
+            true => self.b.focused().await.map(|f| (f.id, f.info.role)),
+            false => None,
+        };
+        let pre = self.pre_content(content.as_ref().map(|(id, _)| id));
+        let times = repeat.clamp(1, 100);
+        for i in 0..times {
             if i > 0 {
-                self.gate(true).await?;
+                self.gate(true)
+                    .await
+                    .map_err(|e| format!("{e} after {i} of {times} presses of {send}"))?;
             }
             self.b.press_combo(&send).await?;
+        }
+        if let Some((id, role)) = &content {
+            // Enter in a search field submits it.
+            self.note_content(pre, id, role, true).await;
         }
         let focus = self.focus_note(false).await;
         Ok(format!("sent {combo} x{repeat} to {app}{focus}"))
@@ -5533,6 +6250,7 @@ impl<B: Backend> Server<B> {
                 flow::Body::Tool(call) => {
                     let settle = tested.contains(&n);
                     let r = self.batch_call(call, n, &run.done, input, settle).await;
+                    run.deliver(n, &r);
                     let hard = r.refused;
                     let ok = r.result.is_ok();
                     run.print(&n.to_string(), call, &r, step.optional);
@@ -5565,6 +6283,7 @@ impl<B: Backend> Server<B> {
                         _ => format!("{n}.on_fail.{}", k + 1),
                     };
                     let r = self.batch_call(call, n, &run.done, input, false).await;
+                    run.deliver(n, &r);
                     run.print(&label, call, &r, call.optional);
                     if r.result.is_err() && !call.optional {
                         handled = false;
@@ -5573,8 +6292,10 @@ impl<B: Backend> Server<B> {
                 }
             }
             if !handled && !step.optional {
-                if left > 0 {
-                    run.out.push(format!("stopped; {left} step(s) not run"));
+                // What reached the desktop, so a retry repeats none of it.
+                if input || left > 0 {
+                    let line = delivery::stopped(&run.sent, &run.maybe, n, steps.len(), input);
+                    run.out.push(line);
                 }
                 return Err(format!("{}{}", run.out.join("\n"), self.where_note().await));
             }
@@ -5618,18 +6339,20 @@ impl<B: Backend> Server<B> {
                 result: Err(e),
                 element: None,
                 refused: false,
+                wrote: false,
             };
         }
-        let ((result, refused), element) = STEP_ELEMENT
-            .scope(std::cell::Cell::new(None), async {
+        let (((result, refused), element), wrote) =
+            delivery::track(STEP_ELEMENT.scope(std::cell::Cell::new(None), async {
                 let r = with_refusals(self.call_inner(&call.tool, &args, held, settle)).await;
                 (r, STEP_ELEMENT.with(|e| e.get()))
-            })
+            }))
             .await;
         StepResult {
             result,
             element,
             refused,
+            wrote,
         }
     }
 
@@ -5655,6 +6378,7 @@ impl<B: Backend> Server<B> {
             for (k, call) in steps.iter().enumerate() {
                 // Its until (or a later step) tests what the input did.
                 let r = self.batch_call(call, n, &run.done, held, true).await;
+                run.deliver(n, &r);
                 let label = format!("{n}.{}", k + 1);
                 lines.print(&label, call, &r, call.optional);
                 let hard = r.refused;
@@ -5771,183 +6495,258 @@ impl<B: Backend> Server<B> {
             before: String::new(),
         };
         Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
-            let window = window_arg(name, a)?;
-            // Tools that reach no app through `permit` are confirmed here,
-            // by their `app` argument if any.
-            if NO_PERMIT_TOOLS.contains(&name) {
-                let app = a.get("app").and_then(Json::as_str);
-                if self.policy().needs_confirm(name, app) {
-                    self.confirm(name, app, a).await?;
-                }
+            let (result, wrote) = delivery::track(self.call_body(name, a, held, settle)).await;
+            if !DELIVERY_TOOLS.contains(&name) {
+                return result;
             }
-            let observe = observe_arg(name, a)?;
-            // Reads kept from before are not reused once this may have
-            // changed what an app shows, nor while it runs.
-            let _changes = (!READ_ONLY_TOOLS.contains(&name) || window.is_some())
-                .then(|| InputRun::start(&self.reads));
-            // A screenshot sends no input, but activating its window does. A
-            // batch that holds the input lock already runs its steps `held`.
-            let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
-                let guard = trace::time("input lock", self.input.lock()).await;
-                self.start_run();
-                Some(guard)
-            } else {
-                None
-            };
-            let gated = GATED_TOOLS.contains(&name) || window.is_some();
-            // Only an activate_window call of its own resumes after the stop
-            // shortcut, never a step of a batch that was running then.
-            let resumed = name == "activate_window"
-                && !held
-                && self.takeover.as_ref().is_some_and(|t| t.resume());
-            if gated {
-                trace::time("gate", self.gate(held)).await?;
-            }
-            let _ours = match &self.takeover {
-                Some(t) if gated => Some(t.ours()),
-                _ => None,
-            };
-            if let Some(label) = indicator_label(name, a) {
-                trace::time("indicate", self.b.indicate(&label)).await;
-            }
-            let activated = match &window {
-                Some(q) => trace::time("ensure_window", self.ensure_window(q)).await?,
-                None => None,
-            };
-            // Taken once the window is in front, before the input.
-            let before = match observe {
-                Some(_) => Some((
-                    self.b.change_mark(),
-                    trace::time("fingerprint before", self.fingerprint()).await,
-                )),
-                None => None,
-            };
-            // What the app the focus is in reports from now on ends the
-            // settle; `focus_note` waits for it, or else the end of the call.
-            let settle_near = match observe {
-                None if settle && WINDOW_NOTE_TOOLS.contains(&name) => {
-                    let mark = self.b.change_mark();
-                    let near: Vec<B::Id> =
-                        self.b.focused().await.map(|f| f.id).into_iter().collect();
-                    let _ = GATE.try_with(|g| g.borrow_mut().settle = Some(mark));
-                    Some(near)
-                }
-                _ => None,
-            };
-            // A window that came to the front since the last input (a dialog
-            // that opened after its reply): said before this input's result.
-            let pre_note = match observe {
-                None if WINDOW_NOTE_TOOLS.contains(&name) && window.is_none() => {
-                    self.window_change_note().await
-                }
-                _ => String::new(),
-            };
-            // Before the input: what shows after it was opened by it.
-            let shown_mark =
-                (observe.is_none() && SURFACE_TOOLS.contains(&name)).then(|| self.b.change_mark());
-            // What showed after the last input's reply, said with this
-            // one's "opened:" lines (`surfaces_note`).
-            if observe.is_some() || shown_mark.is_some() {
-                let before = trace::time("opened before", self.opened_before()).await;
-                let _ = GATE.try_with(|g| g.borrow_mut().before = before);
-            }
-            let result = match name {
-                "apps" => self.apps().await.map(Out::from),
-                "tree" => self.tree(a).await,
-                "find" => self.find(a).await.map(Out::from),
-                "act" => self.act(a).await.map(Out::from),
-                "set_text" => self.set_text(a).await.map(Out::from),
-                "get_text" => self.get_text(a).await.map(Out::from),
-                "wait_for" => self.wait_for(a).await.map(Out::from),
-                "wait_idle" => self.wait_idle(a).await.map(Out::from),
-                "pause" => self.pause(a).await.map(Out::from),
-                "focus" => self.focus(a).await.map(Out::from),
-                "click" => self.click(a).await.map(Out::from),
-                "drag" => self.drag(a).await.map(Out::from),
-                "windows" => self.windows(a).await.map(Out::from),
-                "move_window" => self.move_window(a).await.map(Out::from),
-                "close_window" => self.close_window(a).await.map(Out::from),
-                "menu" => self.menu(a).await.map(Out::from),
-                "launch" => self.launch(a).await.map(Out::from),
-                "doctor" => self.doctor().await.map(Out::from),
-                "scroll" => self.scroll(a).await.map(Out::from),
-                "key" => self.key(a).await.map(Out::from),
-                "type_text" => self.type_text(a).await.map(Out::from),
-                "clipboard_get" => self.clipboard_get(a).await.map(Out::from),
-                "clipboard_set" => self.clipboard_set(a).await.map(Out::from),
-                "mouse" => self.mouse(a).await.map(Out::from),
-                "hold" => self.hold(a).await.map(Out::from),
-                "cursor_position" => self.cursor_position().await.map(Out::from),
-                "activate_window" => self.activate_window(a).await.map(Out::from),
-                "file_dialog" => self.file_dialog(a).await.map(Out::from),
-                "screenshot" => self.screenshot(a).await,
-                "batch" => self.batch(a).await,
-                _ => Err(format!("Unknown tool: {name}")),
-            };
-            if let (Ok(_), Some(near)) = (&result, &settle_near) {
-                trace::time("settle", self.settle(near)).await;
-            }
-            let result = match (result, observe, before) {
-                (Ok(mut o), Some(observe), Some((mark, before))) => {
-                    let seen = trace::time(
-                        "after_input",
-                        self.after_input(name, a, observe, mark, before),
-                    )
-                    .await;
-                    o.text.push_str(&seen.text);
-                    o.images.extend(seen.images);
+            match result {
+                Ok(mut o) => {
+                    delivery::reply(&mut o.text, wrote);
                     Ok(o)
                 }
-                // Without `observe`, still say when another window came to
-                // the front (a dialog, a new browser window).
-                (Ok(mut o), None, _) if WINDOW_NOTE_TOOLS.contains(&name) => {
-                    let opened = match shown_mark {
-                        Some(mark) => {
-                            trace::time("surfaces", self.opened_note(name, a, mark)).await
-                        }
-                        None => String::new(),
-                    };
-                    if let Some(before) = pre_note.strip_prefix("; active window now ") {
-                        o.text
-                            .push_str(&format!("; before it, {before} had come to the front"));
-                    }
-                    o.text.push_str(&self.window_change_note().await);
-                    o.text.push_str(&opened);
-                    Ok(o)
-                }
-                (result, _, _) => result,
-            };
-            // What is still held, after every input step but a batch (its
-            // steps say it).
-            let note = if name == "batch" {
-                String::new()
-            } else {
-                self.held_note()
-            };
-            let result = result.map(|mut o| {
-                o.text.push_str(&note);
-                o
-            });
-            let result = match activated {
-                Some(title) => {
-                    let done = format!("activated {}; ", render::short_title(&title));
-                    result
-                        .map(|mut o| {
-                            o.text.insert_str(0, &done);
-                            o
-                        })
-                        .map_err(|e| format!("{done}{e}"))
-                }
-                None => result,
-            };
-            match resumed {
-                true => result.map(|mut o| {
-                    o.text.insert_str(0, "resumed after the user's stop; ");
-                    o
-                }),
-                false => result,
+                Err(e) => Err(delivery::error(e, wrote)),
             }
         }))
+    }
+
+    /// `call_inner`'s work, inside its GATE scope.
+    async fn call_body(&self, name: &str, a: &Json, held: bool, settle: bool) -> R<Out> {
+        let window = window_arg(name, a)?;
+        // Tools that reach no app through `permit` are confirmed here,
+        // by their `app` argument if any.
+        if NO_PERMIT_TOOLS.contains(&name) {
+            let app = a.get("app").and_then(Json::as_str);
+            if self.policy().needs_confirm(name, app) {
+                self.confirm(name, app, a).await?;
+            }
+        }
+        let observe = observe_arg(name, a)?;
+        // Reads kept from before are not reused once this may have
+        // changed what an app shows, nor while it runs.
+        let _changes = (!READ_ONLY_TOOLS.contains(&name) || window.is_some())
+            .then(|| InputRun::start(&self.reads));
+        // What the input sets for the content wait (input tools run one
+        // at a time: the input lock is held).
+        let input_tool = INPUT_TOOLS.contains(&name);
+        if input_tool {
+            self.content
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+        }
+        // A screenshot sends no input, but activating its window does. A
+        // batch that holds the input lock already runs its steps `held`.
+        let _input = if (INPUT_TOOLS.contains(&name) || window.is_some()) && !held {
+            let guard = trace::time("input lock", self.input.lock()).await;
+            self.start_run();
+            Some(guard)
+        } else {
+            None
+        };
+        let gated = GATED_TOOLS.contains(&name) || window.is_some();
+        // Only an activate_window call of its own resumes after the stop
+        // shortcut, never a step of a batch that was running then.
+        let resumed = name == "activate_window"
+            && !held
+            && self.takeover.as_ref().is_some_and(|t| t.resume());
+        let waited = match gated {
+            true => trace::time("gate", self.gate_wait(held)).await?,
+            false => None,
+        };
+        let _ours = match &self.takeover {
+            Some(t) if gated => Some(t.ours()),
+            _ => None,
+        };
+        if let Some(label) = indicator_label(name, a) {
+            trace::time("indicate", self.b.indicate(&label)).await;
+        }
+        let activated = match &window {
+            Some(q) => {
+                // Bringing it to the front again is harmless: not
+                // counted as sent.
+                let ensured = delivery::untracked(self.ensure_window(q));
+                trace::time("ensure_window", ensured).await?
+            }
+            None => None,
+        };
+        if input_tool {
+            // An activation's own events would count as the app's.
+            let base = activated.is_none().then(|| self.b.change_mark());
+            *self.content_base.lock().unwrap_or_else(|e| e.into_inner()) = base;
+        }
+        // Taken once the window is in front, before the input.
+        let before = match observe {
+            Some(_) => Some((
+                self.b.change_mark(),
+                trace::time(
+                    "fingerprint before",
+                    self.input_fingerprint(self.input_app(a).await),
+                )
+                .await,
+            )),
+            None => None,
+        };
+        // What the app the focus is in reports from now on ends the
+        // settle; `focus_note` waits for it, or else the end of the call.
+        let settle_near = match observe {
+            None if settle && WINDOW_NOTE_TOOLS.contains(&name) => {
+                let mark = self.b.change_mark();
+                let near: Vec<B::Id> = self.b.focused().await.map(|f| f.id).into_iter().collect();
+                let _ = GATE.try_with(|g| g.borrow_mut().settle = Some(mark));
+                Some(near)
+            }
+            _ => None,
+        };
+        // A window that came to the front since the last input (a dialog
+        // that opened after its reply): said before this input's result.
+        let pre_note = match observe {
+            None if WINDOW_NOTE_TOOLS.contains(&name) && window.is_none() => {
+                self.window_change_note().await
+            }
+            _ => String::new(),
+        };
+        // Before the input: what shows after it was opened by it.
+        let shown_mark =
+            (observe.is_none() && SURFACE_TOOLS.contains(&name)).then(|| self.b.change_mark());
+        // What showed after the last input's reply, said with this
+        // one's "opened:" lines (`surfaces_note`).
+        if observe.is_some() || shown_mark.is_some() {
+            let before = trace::time("opened before", self.opened_before()).await;
+            let _ = GATE.try_with(|g| g.borrow_mut().before = before);
+        }
+        let result = match name {
+            "apps" => self.apps().await.map(Out::from),
+            "tree" => self.tree(a).await,
+            "find" => self.find(a).await.map(Out::from),
+            "act" => self.act(a).await.map(Out::from),
+            "set_text" => self.set_text(a).await.map(Out::from),
+            "get_text" => self.get_text(a).await.map(Out::from),
+            "wait_for" => self.wait_for(a).await.map(Out::from),
+            "wait_idle" => self.wait_idle(a).await.map(Out::from),
+            "pause" => self.pause(a).await.map(Out::from),
+            "focus" => self.focus(a).await.map(Out::from),
+            "click" => self.click(a).await.map(Out::from),
+            "drag" => self.drag(a).await.map(Out::from),
+            "windows" => self.windows(a).await.map(Out::from),
+            "move_window" => self.move_window(a).await.map(Out::from),
+            "close_window" => self.close_window(a).await.map(Out::from),
+            "menu" => self.menu(a).await.map(Out::from),
+            "launch" => self.launch(a).await.map(Out::from),
+            "doctor" => self.doctor().await.map(Out::from),
+            "scroll" => self.scroll(a).await.map(Out::from),
+            "key" => self.key(a).await.map(Out::from),
+            "type_text" => self.type_text(a).await.map(Out::from),
+            "clipboard_get" => self.clipboard_get(a).await.map(Out::from),
+            "clipboard_set" => self.clipboard_set(a).await.map(Out::from),
+            "mouse" => self.mouse(a).await.map(Out::from),
+            "hold" => self.hold(a).await.map(Out::from),
+            "cursor_position" => self.cursor_position().await.map(Out::from),
+            "activate_window" => self.activate_window(a).await.map(Out::from),
+            "file_dialog" => self.file_dialog(a).await.map(Out::from),
+            "screenshot" => self.screenshot(a).await,
+            "batch" => self.batch(a).await,
+            _ => Err(format!("Unknown tool: {name}")),
+        };
+        // A web page the input changes in place: wait for its new
+        // content, so the next read does not see the old one.
+        let content = match (&result, input_tool) {
+            (Ok(_), true) => self
+                .content
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take(),
+            _ => None,
+        };
+        let limit = match a.get("settle_ms").is_some_and(|v| !v.is_null()) {
+            true => arg_i(a, "settle_ms", CONTENT_MS),
+            false => CONTENT_MS,
+        }
+        .clamp(0, MAX_SETTLE_MS) as u64;
+        let content = content.filter(|_| limit > 0);
+        let mut result = result;
+        if let (Ok(o), Some(c)) = (&mut result, &content) {
+            let limit = Duration::from_millis(limit);
+            let note = trace::time("content", self.content_wait(c, limit)).await;
+            o.text.push_str(&note);
+            // Waited already: no settle on top.
+            let _ = GATE.try_with(|g| g.borrow_mut().settle = None);
+        }
+        if let (Ok(_), Some(near)) = (&result, &settle_near) {
+            trace::time("settle", self.settle(near)).await;
+        }
+        let content_id = content.map(|c| c.id);
+        let result = match (result, observe, before) {
+            (Ok(mut o), Some(observe), Some((mark, before))) => {
+                // A verified act that found it so already sent nothing.
+                let sent = !o.text.contains("nothing sent");
+                let seen = trace::time(
+                    "after_input",
+                    self.after_input(name, a, observe, (mark, before), sent, content_id),
+                )
+                .await;
+                o.text.push_str(&seen.text);
+                o.images.extend(seen.images);
+                Ok(o)
+            }
+            // Without `observe`, still say when another window came to
+            // the front (a dialog, a new browser window).
+            (Ok(mut o), None, _) if WINDOW_NOTE_TOOLS.contains(&name) => {
+                let opened = match shown_mark {
+                    Some(mark) => trace::time("surfaces", self.opened_note(name, a, mark)).await,
+                    None => String::new(),
+                };
+                if let Some(before) = pre_note.strip_prefix("; active window now ") {
+                    o.text
+                        .push_str(&format!("; before it, {before} had come to the front"));
+                }
+                o.text.push_str(&self.window_change_note().await);
+                o.text.push_str(&opened);
+                Ok(o)
+            }
+            (result, _, _) => result,
+        };
+        // What is still held, after every input step but a batch (its
+        // steps say it).
+        let note = if name == "batch" {
+            String::new()
+        } else {
+            self.held_note()
+        };
+        let result = result.map(|mut o| {
+            o.text.push_str(&note);
+            o
+        });
+        let result = match activated {
+            Some(title) => {
+                let done = format!("activated {}; ", render::short_title(&title));
+                result
+                    .map(|mut o| {
+                        o.text.insert_str(0, &done);
+                        o
+                    })
+                    .map_err(|e| format!("{done}{e}"))
+            }
+            None => result,
+        };
+        let result = match waited {
+            Some(w) => {
+                let done = format!("waited {} ms for the user's input to stop; ", w.as_millis());
+                result
+                    .map(|mut o| {
+                        o.text.insert_str(0, &done);
+                        o
+                    })
+                    .map_err(|e| format!("{done}{e}"))
+            }
+            None => result,
+        };
+        match resumed {
+            true => result.map(|mut o| {
+                o.text.insert_str(0, "resumed after the user's stop; ");
+                o
+            }),
+            false => result,
+        }
     }
 }
 
@@ -5967,7 +6766,7 @@ fn written_mismatch(now: &str, text: &str, how: &str) -> String {
     let more = if now.chars().count() > 120 { "…" } else { "" };
     format!(
         "written, but the field now holds {shown:?}{more} ({} chars, {} asked{how}); \
-         it may limit or reformat input. Check with get_text before retrying.",
+         it may limit or reformat input",
         now.chars().count(),
         text.chars().count()
     )
@@ -6477,6 +7276,8 @@ mod tests {
         /// `select_item` adds to the selection, as AT-SPI's SelectChild
         /// does in a multi-selection list that is not cleared first.
         adds: std::cell::Cell<bool>,
+        /// The user types once this many more key presses went out.
+        user_after_presses: std::cell::Cell<Option<usize>>,
     }
 
     /// The fake's node `id` (the focus element too), changed by `f`.
@@ -6589,6 +7390,9 @@ mod tests {
         }
     }
 
+    /// A change an input makes: after this many ms, renaming an element.
+    type FakeChange = (u64, Option<(u32, String)>);
+
     /// The fake's change events, for kept reads: off unless a test turns
     /// them on.
     #[derive(Default)]
@@ -6605,6 +7409,22 @@ mod tests {
         prefetches: std::cell::Cell<u32>,
         /// `still_there` calls so far.
         checks: std::cell::Cell<u32>,
+        /// The page the app's window shows (`page`), when Some.
+        page: RefCell<Option<backend::Page>>,
+        /// The page the next action leaves shown (a link followed).
+        page_next: RefCell<Option<backend::Page>>,
+        /// `changed_since` says the app changed when asked about this
+        /// element of it (the app's windows), when Some.
+        events_on: std::cell::Cell<Option<u32>>,
+        /// `wait_change` hears of changes (`changes_live`): each bumps the
+        /// change mark (`FakeShown::seq`) and `changes`.
+        events: std::cell::Cell<bool>,
+        /// Changes the next input (action, click, key) makes, each this
+        /// many ms after it, renaming an element when Some.
+        next: RefCell<Vec<FakeChange>>,
+        /// The app changes on each read of an element's actions, as a live
+        /// page does between an input call's start and its input.
+        noise: std::cell::Cell<bool>,
     }
 
     /// Windows on the fake desktop: (app, title).
@@ -6613,6 +7433,24 @@ mod tests {
         ("fake", "notes.txt — Fake"),
         ("fake", "todo.txt — Fake"),
     ];
+
+    impl FakeBackend {
+        /// The changes an input makes (`FakeReads::next`), each later.
+        fn content_input(&self) {
+            for (ms, name) in self.reads.next.take() {
+                let (reads, shown) = (self.reads.clone(), self.shown.clone());
+                let (focus, nodes) = (self.focus.clone(), self.nodes.clone());
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    if let Some((id, n)) = name {
+                        fake_edit(&focus, &nodes, id, |i| i.name = n);
+                    }
+                    shown.seq.set(shown.seq.get() + 1);
+                    reads.changes.set(reads.changes.get() + 1);
+                });
+            }
+        }
+    }
 
     impl Backend for FakeBackend {
         type Id = u32;
@@ -6722,8 +7560,52 @@ mod tests {
         fn read_mark(&self) -> Option<u64> {
             self.reads.live.get().then(|| self.reads.changes.get())
         }
+        fn changes_live(&self) -> bool {
+            self.reads.events.get()
+        }
+        fn changed_since(&self, near: &[u32], mark: u64) -> Option<bool> {
+            // Events on one element of the app (its windows), when set;
+            // else any change since `mark` while events are on.
+            if let Some(w) = self.reads.events_on.get() {
+                return Some(near.contains(&w));
+            }
+            self.reads.events.get().then(|| self.shown.seq.get() > mark)
+        }
+        /// As on Linux: returns once a change came and its burst settled.
+        async fn wait_change(&self, _: &[u32], mark: u64, timeout: Duration) -> bool {
+            if !self.reads.events.get() {
+                tokio::time::sleep(timeout.min(Duration::from_millis(50))).await;
+                return true;
+            }
+            let start = Instant::now();
+            loop {
+                if self.shown.seq.get() > mark {
+                    loop {
+                        let seq = self.shown.seq.get();
+                        tokio::time::sleep(Duration::from_millis(15)).await;
+                        if self.shown.seq.get() == seq {
+                            return true;
+                        }
+                    }
+                }
+                let left = timeout.saturating_sub(start.elapsed());
+                if left.is_zero() {
+                    return false;
+                }
+                tokio::time::sleep(left.min(Duration::from_millis(5))).await;
+            }
+        }
+        async fn loading(&self, _: &[u32]) -> bool {
+            self.reads.loading.get()
+        }
         fn unchanged_since(&self, _: &[u32], mark: u64) -> bool {
             self.reads.live.get() && self.reads.changes.get() == mark
+        }
+        async fn page(&self, doc: &u32) -> Option<backend::Page> {
+            let info = self.info(doc, 0).await;
+            (info.showing && render::DOCUMENT_ROLES.contains(&info.role.as_str()))
+                .then(|| self.reads.page.borrow().clone())
+                .flatten()
         }
         async fn may_keep(&self, _: &[u32]) -> bool {
             self.reads.live.get() && !self.reads.loading.get()
@@ -6756,8 +7638,20 @@ mod tests {
         /// As on Linux, a read without `actions` leaves them out:
         /// `fill_actions` reads them.
         async fn prefetch_with(&self, cache: &mut Cache<u32>, roots: Vec<u32>, f: &Fetch) {
-            let read = roots.clone();
-            self.prefetch(cache, roots, f.only_showing, f.text_limit, f.limit)
+            // Off-screen reads (a page's rows below the fold) take the
+            // whole subtree, as Linux's does up to its limit.
+            let mut read = roots.clone();
+            if f.offscreen {
+                let mut stack = roots;
+                while let Some(id) = stack.pop()
+                    && read.len() < 10_000
+                {
+                    let kids = self.info(&id, 0).await.children;
+                    read.extend(kids.iter().copied());
+                    stack.extend(kids);
+                }
+            }
+            self.prefetch(cache, read.clone(), f.only_showing, f.text_limit, f.limit)
                 .await;
             if !f.actions {
                 for id in &read {
@@ -6776,6 +7670,9 @@ mod tests {
             }
         }
         async fn actions(&self, id: &u32) -> Vec<String> {
+            if self.reads.noise.get() {
+                self.shown.seq.set(self.shown.seq.get() + 1);
+            }
             self.info(id, 0).await.actions
         }
         async fn toggles(&self, id: &u32) -> backend::Toggles {
@@ -6789,11 +7686,9 @@ mod tests {
             }
         }
         async fn select_item(&self, item: &u32) -> R<bool> {
-            let commit = self
-                .sem
-                .selection
-                .get()
-                .ok_or("its list offers no accessibility selection")?;
+            let commit = self.sem.selection.get().ok_or_else(|| {
+                delivery::nothing_sent("its list offers no accessibility selection")
+            })?;
             self.keys.borrow_mut().push(format!("select {item}"));
             if self.sem.adds.get() {
                 fake_edit(&self.focus, &self.nodes, *item, |i| {
@@ -6806,6 +7701,11 @@ mod tests {
         }
         async fn toolkit_of(&self, _: &u32) -> String {
             self.sem.toolkit.borrow().clone()
+        }
+        /// "multi line" stands for the state tree and find do not show.
+        async fn edit_states(&self, id: &u32) -> Option<(bool, bool)> {
+            let st = self.info(id, 0).await.states;
+            Some((st.contains(&"editable"), st.contains(&"multi line")))
         }
         async fn scroll_into_view(&self, id: &u32) -> R<bool> {
             let works = self.sem.scroll_to.get().ok_or(backend::NO_SCROLL_TO)?;
@@ -6833,7 +7733,15 @@ mod tests {
                 .borrow_mut()
                 .push(format!("action {index} on {id}"));
             self.shown.input();
+            if let Some(next) = self.reads.page_next.take() {
+                *self.reads.page.borrow_mut() = Some(next);
+            }
+            self.content_input();
             let info = self.info(id, 0).await;
+            // As AT-SPI's DoAction when the app does not reply in time.
+            if info.name.contains("timeout") {
+                return Err("DoAction got no reply in 2 s".into());
+            }
             let action = info.actions.get(index).map(|a| semantic::norm(a));
             if !info.name.to_lowercase().contains("stuck") {
                 if semantic::is_check_role(&info.role) || info.states.contains(&"checkable") {
@@ -6901,6 +7809,16 @@ mod tests {
         async fn press_combo(&self, combo: &str) -> R<()> {
             self.keys.borrow_mut().push(format!("down {combo}"));
             self.shown.input();
+            self.content_input();
+            if let Some(n) = self.sem.user_after_presses.get() {
+                if n <= 1 {
+                    self.sem.user_after_presses.set(None);
+                    self.takeover
+                        .user_input(Instant::now(), takeover::Device::Keyboard);
+                } else {
+                    self.sem.user_after_presses.set(Some(n - 1));
+                }
+            }
             // A list whose focused "Item N" moves down.
             let down = |focus: &RefCell<Info<u32>>| {
                 let mut focus = focus.borrow_mut();
@@ -6988,6 +7906,7 @@ mod tests {
                     .borrow_mut()
                     .push(format!("click {button} x{clicks}"));
                 self.shown.input();
+                self.content_input();
             }
             if scroll != 0 {
                 self.keys.borrow_mut().push(format!("scroll {scroll}"));
@@ -7042,7 +7961,9 @@ mod tests {
                     allowed.iter().any(|a| a == app)
                         && (title.to_lowercase().contains(&q) || app.contains(&q))
                 })
-                .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
+                .ok_or_else(|| {
+                    delivery::nothing_sent(format!("no window of an allowed app matches '{query}'"))
+                })?;
             self.keys.borrow_mut().push(format!("activate {title}"));
             *self.active.borrow_mut() = (app.into(), title.into());
             Ok(Some(backend::Activated {
@@ -7967,7 +8888,7 @@ mod tests {
                 "{r}"
             );
             assert!(lines[1].starts_with("[2] wait_for failed: "), "{r}");
-            assert_eq!(lines[2], "stopped; 1 step(s) not run");
+            assert_eq!(lines[2], "stopped; sent: [1]; not sent: [2..3]");
             assert_eq!(*s.keys.borrow(), ["down a", "up a"]);
         });
     }
@@ -8120,6 +9041,8 @@ mod tests {
         let fp = |window: Option<(&str, &str)>, focus: Option<&str>| Fingerprint {
             window: window.map(|(a, t)| (a.to_string(), t.to_string())),
             focus: focus.map(|n| (1u32, "push button".to_string(), n.to_string(), vec![])),
+            app: None,
+            page: None,
         };
         let allowed = |app: &str| app != "secret";
         let kate = Some(("kate", "a.txt — Kate"));
@@ -8490,7 +9413,7 @@ mod tests {
             let r = call_tool(&mut s, 9, "hold", json!({"down": false})).await;
             assert_eq!(reply_text(&r), "released left; nothing held");
             let r = call_tool(&mut s, 10, "hold", json!({"down": false})).await;
-            assert_eq!(reply_text(&r), "nothing was held");
+            assert_eq!(reply_text(&r), "nothing was held; nothing sent");
             assert_eq!(
                 log(&s),
                 [
@@ -8556,7 +9479,8 @@ mod tests {
             .await;
             assert_eq!(
                 reply_text(&r).lines().next().unwrap(),
-                "Error executing tool mouse: pointer failed; released ctrl"
+                "Error executing tool mouse: pointer failed; maybe sent: look before retrying; \
+                 released ctrl"
             );
             assert_eq!(
                 log(&s),
@@ -10175,7 +11099,7 @@ mod tests {
                 reply_text(&r).lines().next().unwrap(),
                 format!(
                     "Error executing tool act: stale id {id} (was push button \"OK\", \
-                     now push button \"Cancel\"); call tree/find again"
+                     now push button \"Cancel\"); call tree/find again; nothing sent"
                 )
             );
             assert!(reply_text(&r).contains("\nnow: "), "{r}");
@@ -10409,7 +11333,7 @@ mod tests {
                 lines[5],
                 "[6] act failed: `id` \"$2\": step 2 (wait_for) failed"
             );
-            assert_eq!(lines[6], "stopped; 1 step(s) not run");
+            assert_eq!(lines[6], "stopped; sent: [5]; not sent: [6..7]");
             assert_eq!(actions_run(&s), 0);
             assert!(s.keys.borrow().is_empty());
             // A reference that can never work fails the whole batch before
@@ -10524,7 +11448,10 @@ mod tests {
             );
             assert!(lines[2].starts_with("[2] key: sent a"), "{lines:?}");
             assert!(lines[3].starts_with("[3] key: sent b"), "{lines:?}");
-            assert_eq!(lines[4], "[4] mouse failed: pointer failed");
+            assert_eq!(
+                lines[4],
+                "[4] mouse failed: pointer failed; maybe sent: look before retrying"
+            );
             assert!(
                 lines[5].starts_with("[4.on_fail.1] act failed (optional): "),
                 "{lines:?}"
@@ -10566,7 +11493,7 @@ mod tests {
                 lines[1].starts_with("[1.on_fail] act failed: "),
                 "{lines:?}"
             );
-            assert_eq!(lines[2], "stopped; 1 step(s) not run");
+            assert_eq!(lines[2], "stopped; nothing sent");
             assert!(lines[3].starts_with("now: "), "{lines:?}");
             assert!(lines[3].ends_with("; released shift"), "{lines:?}");
             assert_eq!(*s.keys.borrow(), ["keydown shift", "keyup shift"]);
@@ -10658,7 +11585,7 @@ mod tests {
             );
             assert!(lines[1].starts_with("[1.1] scroll: "), "{lines:?}");
             assert_eq!(lines[2], "[1.2] find: no matches");
-            assert_eq!(lines[3], "stopped; 1 step(s) not run");
+            assert_eq!(lines[3], "stopped; maybe sent: [1]; not sent: [2]");
             assert!(lines[4].starts_with("now: "), "{lines:?}");
             assert_eq!(*s.keys.borrow(), ["scroll 3", "scroll 3"]);
             // Optional: the batch goes on, but "$1" names a failed step.
@@ -10728,7 +11655,10 @@ mod tests {
                 lines[0],
                 "Error executing tool batch: [1] repeat failed: step 1.2 failed in run 1"
             );
-            assert_eq!(lines[2], "[1.2] mouse failed: pointer failed");
+            assert_eq!(
+                lines[2],
+                "[1.2] mouse failed: pointer failed; maybe sent: look before retrying"
+            );
             // An optional one does not.
             let (err, lines) = run_batch(
                 &mut s,
@@ -10743,7 +11673,10 @@ mod tests {
             .await;
             assert!(!err, "{lines:?}");
             assert_eq!(lines[0], "[1] repeat: until met in run 2");
-            assert_eq!(lines[1], "[1.1] mouse failed (optional): pointer failed");
+            assert_eq!(
+                lines[1],
+                "[1.1] mouse failed (optional): pointer failed; maybe sent: look before retrying"
+            );
         });
     }
 
@@ -11128,36 +12061,372 @@ mod tests {
             assert_eq!(*s.keys.borrow(), ["down a", "up a", "down c", "up c"]);
         });
     }
+    /// The user types every 100 ms for `ms`.
+    fn keep_typing(t: &std::sync::Arc<takeover::Takeover>, ms: u64) {
+        let t = t.clone();
+        tokio::task::spawn_local(async move {
+            let start = Instant::now();
+            while start.elapsed() < Duration::from_millis(ms) {
+                t.user_input(Instant::now(), takeover::Device::Keyboard);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        });
+    }
+
+    /// The one delivery marker of `text`: "nothing sent", "maybe sent" or
+    /// none (sent), failing when it has several.
+    fn marker(text: &str) -> &'static str {
+        let none = text.matches(delivery::NOTHING_SENT).count();
+        let maybe = text.matches(delivery::MAYBE_SENT).count();
+        assert!(none + maybe <= 1, "{text}");
+        match (none, maybe) {
+            (1, _) => "no",
+            (_, 1) => "maybe",
+            _ => "yes",
+        }
+    }
+
     #[test]
-    fn input_pauses_while_the_user_is_active_and_reads_go_on() {
+    fn every_input_reply_says_whether_input_was_sent() {
+        local(async {
+            let mut s = session("delivery");
+            // Sent: no marker.
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "OK"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert_eq!(marker(reply_text(&r)), "yes", "{r}");
+            // Refused before sending: lookup miss, validation, a window
+            // that does not match, the allowlist.
+            for (n, tool, args) in [
+                (3, "act", json!({"app": "fake", "query": "Nowhere"})),
+                (4, "key", json!({})),
+                (5, "hold", json!({"key": "a", "button": "left"})),
+                (6, "activate_window", json!({"query": "zzz"})),
+                (7, "click", json!({"app": "konsole", "query": "x"})),
+                (8, "click", json!({"id": 999})),
+            ] {
+                let r = call_tool(&mut s, n, tool, args).await;
+                assert_eq!(r["result"]["isError"], true, "{r}");
+                assert_eq!(marker(reply_text(&r)), "no", "{tool}: {r}");
+            }
+            // A DoAction that got no reply may have acted: never "nothing".
+            s.focus.borrow_mut().name = "Send timeout".into();
+            let r = call_tool(&mut s, 9, "act", json!({"app": "fake", "query": "Send"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert_eq!(marker(reply_text(&r)), "maybe", "{r}");
+            assert!(
+                reply_text(&r)
+                    .contains("DoAction got no reply in 2 s; maybe sent: look before retrying"),
+                "{r}"
+            );
+            // The user keeps typing: refused, nothing sent, said once.
+            keep_typing(&s.takeover, 4000);
+            let r = call_tool(&mut s, 10, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert_eq!(marker(reply_text(&r)), "no", "{r}");
+        });
+    }
+
+    #[test]
+    fn a_stopped_batch_says_which_steps_sent_input() {
+        local(async {
+            let mut s = session("delivery-batch");
+            s.focus.borrow_mut().name = "Send timeout".into();
+            let (err, lines) = run_batch(
+                &mut s,
+                2,
+                json!([
+                    {"tool": "key", "args": {"combo": "a"}},
+                    {"tool": "find", "args": {"app": "fake", "query": "Send"}},
+                    {"tool": "act", "args": {"app": "fake", "query": "Send"}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                    {"tool": "key", "args": {"combo": "c"}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(
+                lines[2]
+                    .ends_with("DoAction got no reply in 2 s; maybe sent: look before retrying"),
+                "{lines:?}"
+            );
+            assert_eq!(
+                lines[3],
+                "stopped; sent: [1]; maybe sent: [3]; not sent: [4..5]"
+            );
+            // A step that sent nothing before any input: the batch says so.
+            let (err, lines) = run_batch(
+                &mut s,
+                3,
+                json!([
+                    {"tool": "act", "args": {"app": "fake", "query": "Nowhere"}},
+                    {"tool": "key", "args": {"combo": "b"}},
+                ]),
+            )
+            .await;
+            assert!(err, "{lines:?}");
+            assert!(lines[0].contains("; nothing sent"), "{lines:?}");
+            assert_eq!(lines[1], "stopped; nothing sent");
+        });
+    }
+
+    #[test]
+    fn a_call_that_wrote_never_says_nothing_sent() {
+        local(async {
+            // A menu button opened through its action (sent), then its
+            // entry is disabled: nothing selected, but the menu is open.
+            let mut s = session("delivery-opened");
+            fake_window(&s, &[10, 20]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(
+                    10,
+                    with_actions(
+                        fake_node("push button", "Sort", &[]),
+                        &["Press", "Show Menu"],
+                    ),
+                );
+                n.insert(20, fake_node("popup menu", "", &[21, 22]));
+                n.insert(
+                    21,
+                    with_actions(fake_node("radio menu item", "By name", &[]), &["click"]),
+                );
+                let mut date =
+                    with_actions(fake_node("radio menu item", "By date", &[]), &["click"]);
+                date.states = vec!["disabled"];
+                n.insert(22, date);
+            }
+            let q = json!({"app": "fake", "query": "Sort", "option": "date"});
+            let r = call_tool(&mut s, 2, "act", q).await;
+            assert!(is_error(&r), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "opened it (Show Menu); \"By date\" is disabled; nothing selected (it may \
+                     still be open: key escape closes it); maybe sent: look before retrying"
+                ),
+                "{text}"
+            );
+            assert_eq!(marker(text), "maybe", "{text}");
+            // Selection sent but not shown, then the key fallback refused
+            // by the tier: the Selection may have acted.
+            let mut s = session("delivery-fallback");
+            fake_combo(&s, false, "UTF-8", &["Toggle"]);
+            s.sem.selection.set(Some(false));
+            let allow = std::env::temp_dir().join(format!(
+                "desktop-mcp-test-{}-delivery-fallback.txt",
+                std::process::id()
+            ));
+            std::fs::write(&allow, "fake:click\n").unwrap();
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "UTF-8", "role": "combo box", "option": "UTF-16"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "sent Selection, but it shows \"UTF-8\" afterwards; the key fallback:"
+                ) && text.contains(
+                    "needs the full tier ('fake' has click); nothing more sent; \
+                         maybe sent: look before retrying"
+                ),
+                "{text}"
+            );
+            assert_eq!(marker(text), "maybe", "{text}");
+            // No Selection interface: nothing went out, and the refusal
+            // says so.
+            s.sem.selection.set(None);
+            let r = call_tool(
+                &mut s,
+                3,
+                "act",
+                json!({"app": "fake", "query": "UTF-8", "role": "combo box", "option": "UTF-16"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            assert_eq!(marker(reply_text(&r)), "no", "{r}");
+        });
+    }
+
+    #[test]
+    fn input_interrupted_part_way_says_how_far_it_got() {
+        local(async {
+            let mut s = session("delivery-interrupted");
+            s.sem.user_after_presses.set(Some(2));
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "down", "repeat": 5})).await;
+            assert!(is_error(&r), "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "key: interrupted: the user started using the keyboard; input stopped there \
+                     after 2 of 5 presses of down; maybe sent: look before retrying"
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("Retry when they stop"), "{text}");
+            assert_eq!(marker(text), "maybe", "{text}");
+            let downs = s.keys.borrow().iter().filter(|k| *k == "down down").count();
+            assert_eq!(downs, 2);
+        });
+    }
+
+    #[test]
+    fn input_waits_out_a_pause_that_ends_soon() {
+        local(async {
+            let mut s = session("takeover-wait");
+            // The user pressed Enter in their terminal 1.2 s ago.
+            s.takeover.user_input(
+                Instant::now() - Duration::from_millis(1200),
+                takeover::Device::Keyboard,
+            );
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with("waited ")
+                    && text.contains(" ms for the user's input to stop; sent a x1"),
+                "{text}"
+            );
+            let took = start.elapsed();
+            assert!(took >= Duration::from_millis(250), "{took:?}");
+            assert!(took < Duration::from_millis(1000), "{took:?}");
+            assert_eq!(
+                *s.keys.borrow(),
+                [
+                    "indicate paused while you use the keyboard",
+                    "down a",
+                    "up a"
+                ]
+            );
+            // Nothing recent: no wait, no note.
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "b"})).await;
+            assert!(reply_text(&r).starts_with("sent b x1"), "{r}");
+        });
+    }
+
+    #[test]
+    fn input_pauses_while_the_user_keeps_typing_and_reads_go_on() {
         local(async {
             let mut s = session("takeover-pause");
-            s.takeover
-                .user_input(Instant::now(), takeover::Device::Keyboard);
+            keep_typing(&s.takeover, 4000);
+            let start = Instant::now();
             let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
             assert_eq!(r["result"]["isError"], true, "{r}");
             let text = reply_text(&r);
             assert!(
-                text.contains("paused: the user is using the keyboard"),
+                text.contains("paused: the user is using the keyboard")
+                    && text.contains("ms for them to stop); nothing sent"),
                 "{text}"
             );
-            assert_eq!(
-                *s.keys.borrow(),
-                ["indicate paused while you use the keyboard"]
+            // Given up once the pause could not end within the limit.
+            let took = start.elapsed();
+            assert!(took >= Duration::from_millis(900), "{took:?}");
+            assert!(took <= takeover::WAIT_LIMIT, "{took:?}");
+            assert!(
+                s.keys
+                    .borrow()
+                    .iter()
+                    .all(|k| k.starts_with("indicate paused")),
+                "{:?}",
+                s.keys.borrow()
             );
             // Reading and the clipboard are not held up.
+            let start = Instant::now();
             let r = call_tool(&mut s, 3, "find", json!({"app": "fake", "query": "OK"})).await;
             assert_eq!(r["result"]["isError"], false, "{r}");
             let r = call_tool(&mut s, 4, "clipboard_set", json!({"text": "x"})).await;
             assert_eq!(r["result"]["isError"], false, "{r}");
-            // Once the window passed, input goes through.
-            let mut s = session("takeover-pause-2");
-            s.takeover.user_input(
-                Instant::now() - Duration::from_millis(1600),
-                takeover::Device::Keyboard,
+            assert!(start.elapsed() < Duration::from_millis(300));
+        });
+    }
+
+    #[test]
+    fn the_stop_shortcut_ends_a_wait_for_the_user() {
+        local(async {
+            let mut s = session("takeover-wait-stop");
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Pointer);
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                t.stop();
+            });
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "click", json!({"x": 1, "y": 2})).await;
+            assert!(reply_text(&r).contains("stopped by the user"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(600));
+            assert!(
+                !s.keys.borrow().iter().any(|k| k.starts_with("click")),
+                "{:?}",
+                s.keys.borrow()
             );
-            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+        });
+    }
+
+    #[test]
+    fn a_cancelled_wait_for_the_user_sends_nothing() {
+        local(async {
+            let mut s = session("takeover-wait-cancel");
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Keyboard);
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "key", "arguments": {"combo": "a"}}}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            send(
+                &mut s,
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                "params": {"requestId": 2}}),
+            )
+            .await;
+            tokio::time::sleep(Duration::from_millis(1600)).await;
+            assert!(
+                !s.keys.borrow().iter().any(|k| k == "down a"),
+                "{:?}",
+                s.keys.borrow()
+            );
+        });
+    }
+
+    #[test]
+    fn user_input_before_a_batch_sends_anything_only_pauses_it() {
+        local(async {
+            let mut s = session("takeover-batch-wait");
+            let t = s.takeover.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                t.user_input(Instant::now(), takeover::Device::Keyboard);
+            });
+            // The user typed while the batch read: its first input waits,
+            // and the run starts then, so later steps go on.
+            let steps = json!({"steps": [
+                {"tool": "find", "args": {"app": "fake", "query": "OK"}},
+                {"tool": "pause", "args": {"ms": 100}},
+                {"tool": "key", "args": {"combo": "a"}},
+                {"tool": "key", "args": {"combo": "b"}},
+            ]});
+            let r = call_tool(&mut s, 2, "batch", steps).await;
             assert_eq!(r["result"]["isError"], false, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("[3] key: waited ") && text.contains("[4] key: sent b"),
+                "{text}"
+            );
+            let keys: Vec<String> = s
+                .keys
+                .borrow()
+                .iter()
+                .filter(|k| !k.starts_with("indicate"))
+                .cloned()
+                .collect();
+            assert_eq!(keys, ["down a", "up a", "down b", "up b"]);
         });
     }
 
@@ -11180,7 +12449,7 @@ mod tests {
             let text = reply_text(&r);
             assert!(
                 text.contains("[1] activate_window failed: stopped by the user")
-                    && text.contains("1 step(s) not run"),
+                    && text.contains("\nstopped; nothing sent\n"),
                 "{text}"
             );
             // Neither does `window` on an input tool.
@@ -11229,8 +12498,11 @@ mod tests {
             assert_eq!(r["result"]["isError"], true, "{r}");
             let text = reply_text(&r);
             assert!(
-                text.contains("[3] key failed: interrupted: the user started using the mouse")
-                    && text.contains("stopped; 1 step(s) not run"),
+                text.contains(
+                    "[3] key failed: interrupted: the user started using the mouse; input \
+                     stopped there; nothing sent\n\
+                     stopped; sent: [1]; not sent: [3..4]"
+                ),
                 "{text}"
             );
             assert_eq!(
@@ -11667,6 +12939,291 @@ mod tests {
         });
     }
 
+    /// `fake_reads`, as a web page (Firefox's toolkit) whose app sends
+    /// change events.
+    fn fake_page(s: &Session) {
+        fake_reads(s);
+        s.reads.events.set(true);
+        *s.sem.toolkit.borrow_mut() = "gecko".into();
+    }
+
+    #[test]
+    fn a_press_on_a_web_page_waits_for_its_new_content() {
+        local(async {
+            let mut s = session("content-act");
+            fake_page(&s);
+            let save = json!({"app": "fake", "query": "Save"});
+            call_tool(&mut s, 2, "find", save.clone()).await;
+            // "Next page": the page changes after a network round trip.
+            s.reads
+                .next
+                .replace(vec![(250, Some((30, "Saved".into()))), (300, None)]);
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Open"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("Press -> ok; page changed (settled after ")
+                    && text.ends_with("; effect: changed"),
+                "{text}"
+            );
+            let took = start.elapsed();
+            assert!(took >= Duration::from_millis(450), "{took:?}");
+            assert!(took < Duration::from_millis(1200), "{took:?}");
+            // The next read sees the new content, not the kept old read.
+            let r = call_tool(&mut s, 4, "find", json!({"app": "fake", "query": "Saved"})).await;
+            assert!(reply_text(&r).contains("push button \"Saved\""), "{r}");
+        });
+    }
+
+    #[test]
+    fn without_a_web_page_input_does_not_wait_for_content() {
+        local(async {
+            let mut s = session("content-native");
+            fake_page(&s);
+            *s.sem.toolkit.borrow_mut() = "qt".into();
+            call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "Save"})).await;
+            s.reads
+                .next
+                .replace(vec![(250, Some((30, "Saved".into())))]);
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Open"})).await;
+            let text = reply_text(&r);
+            assert!(!text.contains("page"), "{text}");
+            // Read before the app changed: what it showed then...
+            let saved = json!({"app": "fake", "query": "Saved"});
+            let r = call_tool(&mut s, 4, "find", saved.clone()).await;
+            assert!(reply_text(&r).starts_with("no matches"), "{r}");
+            // ...and the change event drops that read once it comes.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            let r = call_tool(&mut s, 5, "find", saved).await;
+            assert!(reply_text(&r).contains("push button \"Saved\""), "{r}");
+        });
+    }
+
+    #[test]
+    fn content_waits_are_short_or_absent_when_nothing_changes() {
+        local(async {
+            let mut s = session("content-cost");
+            fake_page(&s);
+            // A plain key: no wait at all (the fake key takes 50 ms).
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(150));
+            // Enter submits: waits for the page.
+            s.reads.next.replace(vec![(100, None)]);
+            let r = call_tool(&mut s, 3, "key", json!({"combo": "Return"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+            // Nothing changes: bounded by settle_ms.
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"app": "fake", "query": "Open", "settle_ms": 200}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("; no page change seen in 2"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(500));
+            // settle_ms 0: no content wait.
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                json!({"app": "fake", "query": "Open", "settle_ms": 0}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            // A click into a text field is for typing: no wait.
+            s.nodes
+                .borrow_mut()
+                .insert(30, fake_node("entry", "Search", &[]));
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                6,
+                "click",
+                json!({"app": "fake", "query": "Search"}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(150));
+            // A click on a button waits.
+            s.reads.next.replace(vec![(100, None)]);
+            let r = call_tool(&mut s, 7, "click", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_content_wait_goes_on_while_the_page_loads() {
+        local(async {
+            let mut s = session("content-loading");
+            fake_page(&s);
+            s.reads.next.replace(vec![(50, None)]);
+            s.reads.loading.set(true);
+            let reads = s.reads.clone();
+            tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(600)).await;
+                reads.loading.set(false);
+            });
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(600));
+            // Still loading at the limit: said so.
+            s.reads.next.replace(vec![(50, None)]);
+            s.reads.loading.set(true);
+            let r = call_tool(
+                &mut s,
+                3,
+                "act",
+                json!({"app": "fake", "query": "Open", "settle_ms": 400}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("; page changed, still loading after 4"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn toggles_and_typing_get_no_content_wait() {
+        local(async {
+            let mut s = session("content-toggles");
+            fake_page(&s);
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.insert(30, fake_node("check box", "Remember me", &[]));
+                let mut body = fake_node("section", "Message body", &[]);
+                body.states = vec!["editable", "multi line"];
+                nodes.insert(31, body);
+            }
+            // A check box only toggles: its state change is no change event.
+            for (i, tool) in [(2, "act"), (3, "click")] {
+                let start = Instant::now();
+                let r = call_tool(
+                    &mut s,
+                    i,
+                    tool,
+                    json!({"app": "fake", "query": "Remember me"}),
+                )
+                .await;
+                assert!(!reply_text(&r).contains("page"), "{r}");
+                assert!(start.elapsed() < Duration::from_millis(300), "{tool}");
+            }
+            // A click into an editable section (a rich text editor) is for
+            // typing.
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                4,
+                "click",
+                json!({"app": "fake", "query": "Message body"}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(300));
+            // Enter in a terminal or a multi-line field types a line...
+            for (i, role, states) in [
+                (5, "terminal", vec!["focused", "editable"]),
+                (6, "entry", vec!["focused", "editable", "multi line"]),
+            ] {
+                {
+                    let mut f = s.focus.borrow_mut();
+                    f.role = role.into();
+                    f.states = states;
+                }
+                s.reads.next.replace(vec![(100, None)]);
+                let start = Instant::now();
+                let r = call_tool(&mut s, i, "key", json!({"combo": "Return"})).await;
+                assert!(!reply_text(&r).contains("page"), "{role}: {r}");
+                assert!(start.elapsed() < Duration::from_millis(250), "{role}");
+                tokio::time::sleep(Duration::from_millis(150)).await;
+            }
+            // ...in a single-line one (a search field) it submits.
+            s.focus.borrow_mut().states = vec!["focused", "editable"];
+            s.reads.next.replace(vec![(150, None)]);
+            let r = call_tool(&mut s, 7, "key", json!({"combo": "Return"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_content_wait_outlasts_a_placeholder_before_the_new_content() {
+        local(async {
+            let mut s = session("content-early");
+            fake_page(&s);
+            call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "Save"})).await;
+            // A spinner at once, the content after a network round trip.
+            s.reads
+                .next
+                .replace(vec![(10, None), (300, Some((30, "Saved".into())))]);
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; page changed (settled after"),
+                "{r}"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(600));
+            let r = call_tool(&mut s, 4, "find", json!({"app": "fake", "query": "Saved"})).await;
+            assert!(reply_text(&r).contains("push button \"Saved\""), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_content_wait_is_short_while_the_app_never_goes_quiet() {
+        local(async {
+            let mut s = session("content-noise");
+            fake_page(&s);
+            // Another tab's clock or video: a change every 20 ms.
+            let shown = s.shown.clone();
+            let ticking = Rc::new(std::cell::Cell::new(true));
+            let ticks = ticking.clone();
+            tokio::task::spawn_local(async move {
+                while ticks.get() {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    shown.seq.set(shown.seq.get() + 1);
+                }
+            });
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "Open"})).await;
+            let took = start.elapsed();
+            assert!(reply_text(&r).contains("still changing after "), "{r}");
+            assert!(took < Duration::from_millis(900), "{took:?}");
+            // The app changed between the call's start and the input: that
+            // is not the page's change.
+            s.reads.noise.set(true);
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; app was already changing; still changing after "),
+                "{r}"
+            );
+            assert!(start.elapsed() < Duration::from_millis(900));
+            ticking.set(false);
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            // Once it is quiet, the wait ends at the first quiet.
+            let r = call_tool(&mut s, 4, "act", json!({"app": "fake", "query": "Open"})).await;
+            assert!(
+                reply_text(&r).contains("; app was already changing; quiet after "),
+                "{r}"
+            );
+        });
+    }
+
     #[test]
     fn kept_reads_expire() {
         local(async {
@@ -11949,5 +13506,475 @@ mod tests {
         cache.insert(7, node("panel", &[8]));
         cache.insert(8, node("panel", &[7]));
         assert_eq!(frame_in(&cache, &8), None);
+    }
+
+    /// A web mail page in the fake: a table of rows and cells.
+    fn fake_mail(s: &Session) {
+        *s.focus.borrow_mut() = Info {
+            role: "frame".into(),
+            name: "Inbox — Mail".into(),
+            showing: true,
+            children: vec![39],
+            ..Info::default()
+        };
+        *s.sem.toolkit.borrow_mut() = "Gecko".into();
+        let mut nodes = s.nodes.borrow_mut();
+        nodes.insert(39, fake_node("document web", "Inbox", &[40]));
+        nodes.insert(40, fake_node("table", "", &[41, 43]));
+        nodes.insert(41, fake_node("table row", "Invoice March", &[42]));
+        nodes.insert(42, fake_node("table cell", "Invoice March", &[]));
+        nodes.insert(43, fake_node("table row", "Lunch", &[]));
+        nodes.insert(44, fake_node("link", "Archive", &[]));
+        nodes.get_mut(&40).unwrap().children.push(44);
+    }
+
+    #[test]
+    fn a_role_that_names_nothing_matches_through_its_synonyms() {
+        local(async {
+            let mut s = session("role-synonyms");
+            fake_mail(&s);
+            let r = call_tool(
+                &mut s,
+                2,
+                "find",
+                json!({"app": "fake", "query": "invoice", "role": "row"}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "role 'row' matched as 'table row':\n[1] table row \"Invoice March\" actions=Press",
+                "{r}"
+            );
+            // The role as given wins: no note.
+            let r = call_tool(
+                &mut s,
+                3,
+                "find",
+                json!({"app": "fake", "query": "invoice", "role": "Table Cell"}),
+            )
+            .await;
+            assert_eq!(
+                reply_text(&r),
+                "[2] table cell \"Invoice March\" actions=Press",
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "act",
+                json!({"app": "fake", "query": "invoice", "role": "gridcell"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with(
+                    "[2] table cell \"Invoice March\" actions=Press (role 'gridcell' matched as 'table cell'): Press -> ok"
+                ),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                5,
+                "wait_for",
+                json!({"app": "fake", "query": "lunch", "role": "listitem", "timeout_ms": 200}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).ends_with(
+                    "[3] table row \"Lunch\" actions=Press (role 'listitem' matched as 'table row')"
+                ),
+                "{r}"
+            );
+            // A role nothing of the query has: the roles it has instead.
+            let r = call_tool(
+                &mut s,
+                6,
+                "find",
+                json!({"app": "fake", "query": "archive", "role": "button"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with(
+                    "no matches with role 'button'; it matches elements of role 'link' \
+                     (pass that role, or none):\n[4] link \"Archive\" actions=Press\n"
+                ),
+                "{r}"
+            );
+            let r = call_tool(
+                &mut s,
+                7,
+                "act",
+                json!({"app": "fake", "query": "archive", "role": "checkbox"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(
+                    "no visible element in 'fake' matches 'archive' with role 'checkbox'; \
+                     it matches elements of role 'link'"
+                ),
+                "{r}"
+            );
+        });
+    }
+
+    fn page(title: &str, url: &str, busy: bool) -> backend::Page {
+        backend::Page {
+            title: title.into(),
+            url: url.into(),
+            busy,
+        }
+    }
+
+    #[test]
+    fn the_effect_line_names_a_page_that_changed_or_loads() {
+        local(async {
+            let mut s = session("page-effect");
+            fake_mail(&s);
+            *s.reads.page.borrow_mut() = Some(page("Inbox (3)", "https://mail/#inbox", false));
+            let act = json!({"app": "fake", "query": "Invoice March", "role": "table row", "settle_ms": 0});
+            let effect = |r: &Json| {
+                let t = reply_text(r);
+                t[t.find("effect: ").expect(t) + 8..].to_string()
+            };
+            // Nothing changed: still "no visible change".
+            let r = call_tool(&mut s, 2, "act", act.clone()).await;
+            assert_eq!(effect(&r), "no visible change", "{r}");
+            // The row opened its mail: the page's title changed, though
+            // the window's did not (yet).
+            *s.reads.page_next.borrow_mut() =
+                Some(page("Invoice March - Mail", "https://mail/#inbox/1", false));
+            let r = call_tool(&mut s, 3, "act", act.clone()).await;
+            assert_eq!(effect(&r), "page changed to 'Invoice March - Mail'", "{r}");
+            // The next page of results: same title, another address, loading.
+            *s.reads.page_next.borrow_mut() =
+                Some(page("Invoice March - Mail", "https://mail/#inbox/2", true));
+            let r = call_tool(&mut s, 4, "act", act.clone()).await;
+            assert_eq!(
+                effect(&r),
+                "page changed to 'Invoice March - Mail' (https://mail/#inbox/2) \
+                 (still loading: wait_idle before reading it)",
+                "{r}"
+            );
+            // Still loading, same page, as it was before the input: the
+            // input made no change of its own.
+            let r = call_tool(&mut s, 5, "act", act.clone()).await;
+            assert_eq!(
+                effect(&r),
+                "no visible change (the page was already loading: wait_idle before reading it)",
+                "{r}"
+            );
+            // Done loading; then the input starts a load of the same page.
+            *s.reads.page.borrow_mut() =
+                Some(page("Invoice March - Mail", "https://mail/#inbox/2", false));
+            *s.reads.page_next.borrow_mut() =
+                Some(page("Invoice March - Mail", "https://mail/#inbox/2", true));
+            let r = call_tool(&mut s, 6, "act", act.clone()).await;
+            assert_eq!(
+                effect(&r),
+                "changed: the page started loading (wait_idle before reading it)",
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_page_loading_before_the_input_is_no_change_of_its() {
+        let fp = |page: Option<backend::Page>, focus: &str| Fingerprint {
+            window: Some(("firefox".to_string(), "Mail — Mozilla Firefox".to_string())),
+            focus: Some((1u32, "link".to_string(), focus.to_string(), vec![])),
+            app: None,
+            page,
+        };
+        let allowed = |_: &str| true;
+        let busy = Some(page("Mail", "u1", true));
+        let idle = Some(page("Mail", "u1", false));
+        // Busy before and after, nothing else: no change, events or not.
+        assert_eq!(
+            effect_text(
+                &fp(busy.clone(), "a"),
+                &fp(busy.clone(), "a"),
+                Some(false),
+                allowed
+            ),
+            "no visible change (the page was already loading: wait_idle before reading it)"
+        );
+        assert_eq!(
+            effect_text(
+                &fp(busy.clone(), "a"),
+                &fp(busy.clone(), "a"),
+                Some(true),
+                allowed
+            ),
+            "not known: the page was already loading (wait_idle before reading it)"
+        );
+        // The focus moved meanwhile: a change.
+        assert_eq!(
+            effect_text(
+                &fp(busy.clone(), "a"),
+                &fp(busy.clone(), "b"),
+                None,
+                allowed
+            ),
+            "changed (the page is still loading: wait_idle before reading it)"
+        );
+        // It started loading after the input.
+        assert_eq!(
+            effect_text(
+                &fp(idle.clone(), "a"),
+                &fp(busy.clone(), "a"),
+                None,
+                allowed
+            ),
+            "changed: the page started loading (wait_idle before reading it)"
+        );
+        // It finished loading: its events are the ones the app sent.
+        assert_eq!(
+            effect_text(&fp(busy, "a"), &fp(idle.clone(), "a"), Some(false), allowed),
+            "no visible change"
+        );
+        assert_eq!(
+            effect_text(&fp(idle.clone(), "a"), &fp(idle, "a"), Some(true), allowed),
+            "changed"
+        );
+    }
+
+    /// `fake_mail` plus elements scrolled out of view in its page, and a
+    /// visible link that shares a name with one of them.
+    fn fake_mail_below(s: &Session) {
+        fake_mail(s);
+        let hidden = |role: &str, name: &str| Info {
+            showing: false,
+            ..fake_node(role, name, &[])
+        };
+        let mut n = s.nodes.borrow_mut();
+        n.insert(45, hidden("heading", "Issues"));
+        n.insert(46, fake_node("link", "Issues", &[]));
+        n.insert(47, hidden("push button", "Next page"));
+        n.insert(48, hidden("link", "New issue"));
+        n.insert(49, hidden("push button", "Delete"));
+        n.insert(50, fake_node("toggle button", "Delete mode", &[]));
+        n.get_mut(&40)
+            .unwrap()
+            .children
+            .extend([45, 46, 47, 48, 49, 50]);
+    }
+
+    #[test]
+    fn a_miss_offers_the_role_scrolled_out_of_view_first() {
+        local(async {
+            let mut s = session("miss-offscreen-role");
+            fake_mail_below(&s);
+            // The heading asked for is below the fold; a visible link of
+            // the same name is not offered instead.
+            let r = call_tool(
+                &mut s,
+                2,
+                "find",
+                json!({"app": "fake", "query": "issues", "role": "heading"}),
+            )
+            .await;
+            let t = reply_text(&r);
+            assert!(
+                t.starts_with(
+                    "no visible matches with role 'heading'\noff-screen, scrolled out of view \
+                     (act and get_text work on them; act action=scroll_to before click):\n"
+                ),
+                "{r}"
+            );
+            assert!(t.contains("heading \"Issues\""), "{r}");
+            assert!(!t.contains("link"), "{r}");
+            // Its synonyms off-screen too, said as such.
+            let r = call_tool(
+                &mut s,
+                3,
+                "find",
+                json!({"app": "fake", "query": "next page", "role": "button"}),
+            )
+            .await;
+            let t = reply_text(&r);
+            assert!(
+                t.contains(
+                    "off-screen, scrolled out of view (role 'button' matched as 'push button')"
+                ),
+                "{r}"
+            );
+            assert!(t.contains("push button \"Next page\""), "{r}");
+            // Neither visible nor off-screen in that role: off-screen ones
+            // of another role, with it.
+            let r = call_tool(
+                &mut s,
+                4,
+                "find",
+                json!({"app": "fake", "query": "new issue", "role": "button"}),
+            )
+            .await;
+            let t = reply_text(&r);
+            assert!(
+                t.starts_with(
+                    "no visible matches with role 'button'\noff-screen, scrolled out of view, \
+                     of role 'link' (pass that role, or none; act action=scroll_to before click):\n"
+                ),
+                "{r}"
+            );
+            assert!(t.contains("link \"New issue\""), "{r}");
+            // An input tool's miss offers the same.
+            let r = call_tool(
+                &mut s,
+                5,
+                "act",
+                json!({"app": "fake", "query": "issues", "role": "heading"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            let t = reply_text(&r);
+            assert!(t.contains("off-screen, scrolled out of view"), "{r}");
+            assert!(t.contains("heading \"Issues\""), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_synonym_never_stands_in_for_the_role_scrolled_out_of_view() {
+        local(async {
+            let mut s = session("synonym-offscreen");
+            fake_mail_below(&s);
+            let before = s.keys.borrow().len();
+            // The push button is below the fold; the visible toggle button
+            // only matches through the synonyms: not pressed.
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "Delete", "role": "push button"}),
+            )
+            .await;
+            assert!(is_error(&r), "{r}");
+            let t = reply_text(&r);
+            assert!(
+                t.contains(
+                    "no visible element in 'fake' matches 'Delete' with role 'push button'\n\
+                     off-screen, scrolled out of view"
+                ),
+                "{r}"
+            );
+            assert!(t.contains("push button \"Delete\""), "{r}");
+            assert_eq!(s.keys.borrow().len(), before, "nothing sent");
+            // Without the push button anywhere, the synonym serves.
+            s.nodes.borrow_mut().remove(&49);
+            let r = call_tool(
+                &mut s,
+                3,
+                "act",
+                json!({"app": "fake", "query": "Delete", "role": "push button"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("(role 'push button' matched as 'toggle button')"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_page_is_the_one_of_the_window_the_input_goes_to() {
+        local(async {
+            let mut s = session("page-window");
+            fake_mail(&s);
+            *s.reads.page.borrow_mut() = Some(page("Inbox (3)", "https://mail/#inbox", false));
+            let act = json!({"app": "fake", "query": "Invoice March", "role": "table row", "settle_ms": 0});
+            let effect = |r: &Json| {
+                let t = reply_text(r);
+                t[t.find("effect: ").expect(t) + 8..].to_string()
+            };
+            *s.reads.page_next.borrow_mut() =
+                Some(page("Invoice March - Mail", "https://mail/#inbox/1", false));
+            let r = call_tool(&mut s, 2, "act", act.clone()).await;
+            assert_eq!(effect(&r), "page changed to 'Invoice March - Mail'", "{r}");
+            // A second browser window shows, and none is active: which
+            // window the input reaches is not known, so no page is
+            // compared (rather than the other window's).
+            s.more_windows.borrow_mut().push(60);
+            s.nodes
+                .borrow_mut()
+                .insert(60, fake_node("frame", "Other — Mail", &[]));
+            *s.reads.page_next.borrow_mut() =
+                Some(page("Lunch - Mail", "https://mail/#inbox/3", false));
+            let r = call_tool(&mut s, 3, "act", act.clone()).await;
+            assert_eq!(effect(&r), "no visible change", "{r}");
+            // The other window is active: its page, and no document there.
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.get_mut(&60).unwrap().states.push("active");
+            }
+            let r = call_tool(&mut s, 4, "act", act.clone()).await;
+            assert_eq!(effect(&r), "no visible change", "{r}");
+            // The mail window active again: its page found again.
+            s.nodes.borrow_mut().get_mut(&60).unwrap().states.clear();
+            s.focus.borrow_mut().states.push("active");
+            *s.reads.page_next.borrow_mut() =
+                Some(page("Archive - Mail", "https://mail/#archive", false));
+            let r = call_tool(&mut s, 5, "act", act).await;
+            assert_eq!(effect(&r), "page changed to 'Archive - Mail'", "{r}");
+        });
+    }
+
+    #[test]
+    fn the_effect_line_hears_the_app_the_input_went_to() {
+        local(async {
+            let mut s = session("effect-app");
+            fake_mail(&s);
+            // The app reports changes on a window of its own, not on the
+            // focused element (the terminal had focus).
+            s.more_windows.borrow_mut().push(60);
+            s.nodes
+                .borrow_mut()
+                .insert(60, fake_node("frame", "Other — Mail", &[]));
+            s.reads.events_on.set(Some(60));
+            let r = call_tool(
+                &mut s,
+                2,
+                "act",
+                json!({"app": "fake", "query": "Lunch", "settle_ms": 0}),
+            )
+            .await;
+            assert!(reply_text(&r).ends_with("; effect: changed"), "{r}");
+            // Without an app named: the active window's app.
+            let r = call_tool(
+                &mut s,
+                3,
+                "key",
+                json!({"combo": "a", "observe": "effect", "settle_ms": 0}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("; effect: changed"), "{r}");
+        });
+    }
+
+    #[test]
+    fn effect_prefers_the_page_to_the_window_title() {
+        let fp = |title: &str, page: Option<backend::Page>| Fingerprint {
+            window: Some(("firefox".to_string(), format!("{title} — Mozilla Firefox"))),
+            focus: None::<(u32, String, String, Vec<&'static str>)>,
+            app: None,
+            page,
+        };
+        let allowed = |_: &str| true;
+        let before = fp("Inbox", Some(page("Inbox", "u1", false)));
+        let after = fp("Mail 1", Some(page("Mail 1", "u2", false)));
+        assert_eq!(
+            effect_text(&before, &after, Some(true), allowed),
+            "page changed to 'Mail 1'"
+        );
+        // A new page without a title yet: its address.
+        let after = fp("Inbox", Some(page("", "https://x/2", true)));
+        assert_eq!(
+            effect_text(&before, &after, None, allowed),
+            "page changed to https://x/2 (still loading: wait_idle before reading it)"
+        );
+        // Another app's window in front: the window line.
+        let mut other = fp("x", None);
+        other.window = Some(("kate".into(), "a.txt — Kate".into()));
+        assert_eq!(
+            effect_text(&before, &other, None, allowed),
+            "window changed to 'a.txt — Kate'"
+        );
     }
 }

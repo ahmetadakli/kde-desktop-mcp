@@ -26,8 +26,7 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    Layout, NO_AREA, NO_FILE_DIALOG, R, Screen, Shot, Toggles, WindowChange, WindowEntry,
-    WindowGeo,
+    Layout, NO_AREA, R, Screen, Shot, Toggles, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -1178,10 +1177,8 @@ impl Backend for LinuxBackend {
 
     async fn fills_file_dialog(&self, window: &Obj) -> bool {
         // As `active_file_dialog` finds it: a KDE dialog with KFileWidget's
-        // file name field.
-        matches!(self.comp, Compositor::Kde(_))
-            && self.a11y.role(window).await == "dialog"
-            && self.file_dialog_parts(window).await.0.is_some()
+        // file name field (KWin and Hyprland alike).
+        self.a11y.role(window).await == "dialog" && self.file_dialog_parts(window).await.0.is_some()
     }
 
     async fn app_name(&self, id: &Obj) -> Option<String> {
@@ -1270,6 +1267,24 @@ impl Backend for LinuxBackend {
         self.a11y.relation(window, atspi::RELATION_EMBEDS).await
     }
 
+    async fn page(&self, doc: &Obj) -> Option<crate::backend::Page> {
+        let (role, states, title, url) = tokio::join!(
+            self.a11y.role(doc),
+            self.a11y.states(doc),
+            self.a11y.name(doc),
+            self.a11y.document_url(doc)
+        );
+        let states = states?;
+        let shown = atspi::has(states, atspi::SHOWING) && !atspi::has(states, atspi::DEFUNCT);
+        (shown && crate::render::DOCUMENT_ROLES.contains(&role.as_str())).then(|| {
+            crate::backend::Page {
+                title: title.trim().to_string(),
+                url,
+                busy: atspi::has(states, atspi::BUSY),
+            }
+        })
+    }
+
     async fn loading(&self, windows: &[Obj]) -> bool {
         let busy = futures_util::future::join_all(windows.iter().map(|w| async move {
             match self.embedded_document(w).await {
@@ -1336,20 +1351,20 @@ impl Backend for LinuxBackend {
     /// SelectChild adds to a multi-selection list's selection: cleared
     /// first there, so the entry ends up the only one selected.
     async fn select_item(&self, item: &Obj) -> R<bool> {
-        let parent = self
-            .a11y
-            .parent(item)
-            .await
-            .ok_or("the entry has no parent to select it in")?;
+        let parent = self.a11y.parent(item).await.ok_or_else(|| {
+            crate::delivery::nothing_sent("the entry has no parent to select it in")
+        })?;
         let (ifaces, index, st) = tokio::join!(
             self.a11y.interfaces(&parent),
             self.a11y.index_in_parent(item),
             self.a11y.states(&parent)
         );
         if !ifaces.iter().any(|i| i == "org.a11y.atspi.Selection") {
-            return Err("its list offers no accessibility selection".into());
+            return Err(crate::delivery::nothing_sent(
+                "its list offers no accessibility selection",
+            ));
         }
-        let index = index?;
+        let index = index.map_err(crate::delivery::nothing_sent)?;
         if st.is_some_and(|s| atspi::has(s, atspi::MULTISELECTABLE)) {
             self.a11y.clear_selection(&parent).await?;
         }
@@ -1424,6 +1439,12 @@ impl Backend for LinuxBackend {
 
     async fn toolkit_of(&self, id: &Obj) -> String {
         self.toolkit(&id.bus).await.to_lowercase()
+    }
+
+    async fn edit_states(&self, id: &Obj) -> Option<(bool, bool)> {
+        let st = self.a11y.states(id).await?;
+        let bit = |b: u32| st & (1u64 << b) != 0;
+        Some((bit(atspi::EDITABLE), bit(atspi::MULTI_LINE)))
     }
 
     async fn full_text(&self, id: &Obj, limit: usize) -> R<String> {
@@ -1692,7 +1713,7 @@ impl Backend for LinuxBackend {
     }
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {
-        input::button_code(button)?;
+        input::button_code(button).map_err(crate::delivery::nothing_sent)?;
         crate::trace::time("move_pointer", self.move_pointer(x, y)).await?;
         crate::trace::time("buttons", self.input.buttons(button, clicks, scroll)).await
     }
@@ -1765,7 +1786,9 @@ impl Backend for LinuxBackend {
                 let apps = self.apps_with_pids().await;
                 let allow = Self::allow_of(allowed, &apps);
                 let Some(raised) = kwin.activate(query, &allow).await? else {
-                    return Err(format!("no window of an allowed app matches '{query}'"));
+                    return Err(crate::delivery::nothing_sent(format!(
+                        "no window of an allowed app matches '{query}'"
+                    )));
                 };
                 // KWin switches at once; the toolkit reports ACTIVE a moment later.
                 if apps.iter().any(|(pid, ..)| *pid == Some(raised.pid)) {
@@ -1804,7 +1827,9 @@ impl Backend for LinuxBackend {
                     title.contains(&q) || app.contains(&q) || class.contains(&q)
                 });
                 let Some(c) = found else {
-                    return Err(format!("no window of an allowed app matches '{query}'"));
+                    return Err(crate::delivery::nothing_sent(format!(
+                        "no window of an allowed app matches '{query}'"
+                    )));
                 };
                 let addr = c["address"].as_str().unwrap_or("");
                 h.dispatch(&format!("focuswindow address:{addr}")).await?;
@@ -1911,7 +1936,11 @@ impl Backend for LinuxBackend {
             Compositor::Kde(kwin) => kwin
                 .set_window(query, &self.kwin_allow(allowed).await, change)
                 .await?
-                .ok_or_else(|| format!("no window of an allowed app matches '{query}'")),
+                .ok_or_else(|| {
+                    crate::delivery::nothing_sent(format!(
+                        "no window of an allowed app matches '{query}'"
+                    ))
+                }),
             Compositor::Hyprland(h) => {
                 let (snap, clients) = self.hypr_clients(h, query, allowed).await?;
                 // The active window when it matches, else the first.
@@ -1919,7 +1948,11 @@ impl Backend for LinuxBackend {
                     .iter()
                     .find(|c| c.geo.active)
                     .or(clients.first())
-                    .ok_or_else(|| format!("no window of an allowed app matches '{query}'"))?;
+                    .ok_or_else(|| {
+                        crate::delivery::nothing_sent(format!(
+                            "no window of an allowed app matches '{query}'"
+                        ))
+                    })?;
                 let back = hyprland::monitor_workspace(&snap.monitors, c.monitor);
                 let desk = match &change.desktop {
                     Some(d) => Some(hyprland::workspace_target(&snap, d)?),
@@ -1972,10 +2005,12 @@ impl Backend for LinuxBackend {
         let (name, argv) = (app.to_string(), args.to_vec());
         let r = tokio::task::spawn_blocking(move || launch::resolve(&name, &argv))
             .await
-            .map_err(|e| e.to_string())??;
+            .map_err(|e| e.to_string())?
+            // Not found or not allowed to start: nothing started.
+            .map_err(crate::delivery::nothing_sent)?;
         // Windows already open, to tell a new one of a running instance.
         let before = self.all_windows(allowed).await.unwrap_or_default();
-        let (pid, exit) = launch::spawn(&r)?;
+        let (pid, exit) = launch::spawn(&r).map_err(crate::delivery::nothing_sent)?;
         let mut out = Launched {
             command: launch::describe(&r),
             pid,
@@ -2064,24 +2099,47 @@ impl Backend for LinuxBackend {
     }
 
     async fn active_file_dialog(&self) -> R<FileDialog<Obj>> {
-        let Compositor::Kde(kwin) = &self.comp else {
-            return Err(NO_FILE_DIALOG.into());
-        };
         let a11y = &self.a11y;
-        let (active, apps) = tokio::join!(kwin.active_parent(), a11y.apps_with_windows());
-        let active = active?.ok_or("no active window")?;
-        // The accessible window KWin has in front: the ACTIVE one of the
-        // process KWin names, so the parent it reports is this window's.
+        // The window in front, as the compositor has it: KWin also names
+        // the window it belongs to (a portal dialog's app); Hyprland only
+        // its process and title.
+        let (active, apps) = match &self.comp {
+            Compositor::Kde(kwin) => {
+                let (active, apps) = tokio::join!(kwin.active_parent(), a11y.apps_with_windows());
+                (active?.ok_or("no active window")?, apps)
+            }
+            Compositor::Hyprland(h) => {
+                let (active, apps) = tokio::join!(h.active_window(), a11y.apps_with_windows());
+                let aw = active?.ok_or("no active window")?;
+                let caption = aw["title"].clone();
+                (
+                    serde_json::json!({"pid": aw["pid"], "caption": caption}),
+                    apps,
+                )
+            }
+        };
+        // The accessible window in front: of the process the compositor
+        // names, the ACTIVE one (KDE), else (Hyprland sets no ACTIVE state)
+        // the one titled as the compositor's.
         let pid = active["pid"].as_i64();
+        let caption = active["caption"].as_str().unwrap_or("").trim().to_string();
         let mut found = None;
         'apps: for (app, name, windows) in apps {
             if self.pid(&app.bus).await.map(i64::from) != pid {
                 continue;
             }
-            for w in windows {
-                if a11y.has_state(&w, atspi::ACTIVE).await {
-                    found = Some((name, w));
+            for w in &windows {
+                if a11y.has_state(w, atspi::ACTIVE).await {
+                    found = Some((name.clone(), w.clone()));
                     break 'apps;
+                }
+            }
+            if !caption.is_empty() {
+                for w in &windows {
+                    if a11y.name(w).await.trim() == caption {
+                        found = Some((name.clone(), w.clone()));
+                        break 'apps;
+                    }
                 }
             }
         }

@@ -318,7 +318,8 @@ impl Backend for WindowsBackend {
     }
 
     async fn press_combo(&self, combo: &str) -> R<()> {
-        let (downs, ups) = logic::combo_events(&logic::parse_combo(combo)?);
+        let (downs, ups) =
+            logic::combo_events(&logic::parse_combo(combo).map_err(crate::delivery::nothing_sent)?);
         input::send_keys(&downs)?;
         tokio::time::sleep(KEY_HOLD).await;
         input::send_keys(&ups)?;
@@ -336,7 +337,7 @@ impl Backend for WindowsBackend {
     }
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {
-        let (down, up) = input::button_flags(button)?;
+        let (down, up) = input::button_flags(button).map_err(crate::delivery::nothing_sent)?;
         input::set_cursor(x, y)?;
         tokio::time::sleep(POINTER_SETTLE).await;
         for _ in 0..clicks.clamp(0, 3) {
@@ -358,7 +359,7 @@ impl Backend for WindowsBackend {
     }
 
     async fn button(&self, button: &str, down: bool) -> R<()> {
-        let (d, u) = input::button_flags(button)?;
+        let (d, u) = input::button_flags(button).map_err(crate::delivery::nothing_sent)?;
         input::button(if down { d } else { u })?;
         tokio::time::sleep(BUTTON_HOLD).await;
         Ok(())
@@ -367,7 +368,10 @@ impl Backend for WindowsBackend {
     async fn key(&self, key: &str, down: bool) -> R<()> {
         // One SendInput queue for keyboard and mouse: no settle needed to
         // keep a modifier ordered before a click.
-        input::send_keys(&[logic::key_event(logic::vk(key)?, !down)])?;
+        input::send_keys(&[logic::key_event(
+            logic::vk(key).map_err(crate::delivery::nothing_sent)?,
+            !down,
+        )])?;
         if down {
             tokio::time::sleep(KEY_HOLD).await;
         }
