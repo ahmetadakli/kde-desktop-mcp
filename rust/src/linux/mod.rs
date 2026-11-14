@@ -26,8 +26,7 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    Layout, NO_AREA, NO_FILE_DIALOG, R, Screen, Shot, Toggles, WindowChange, WindowEntry,
-    WindowGeo,
+    Layout, NO_AREA, R, Screen, Shot, Toggles, WindowChange, WindowEntry, WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -1178,10 +1177,8 @@ impl Backend for LinuxBackend {
 
     async fn fills_file_dialog(&self, window: &Obj) -> bool {
         // As `active_file_dialog` finds it: a KDE dialog with KFileWidget's
-        // file name field.
-        matches!(self.comp, Compositor::Kde(_))
-            && self.a11y.role(window).await == "dialog"
-            && self.file_dialog_parts(window).await.0.is_some()
+        // file name field (KWin and Hyprland alike).
+        self.a11y.role(window).await == "dialog" && self.file_dialog_parts(window).await.0.is_some()
     }
 
     async fn app_name(&self, id: &Obj) -> Option<String> {
@@ -2102,24 +2099,47 @@ impl Backend for LinuxBackend {
     }
 
     async fn active_file_dialog(&self) -> R<FileDialog<Obj>> {
-        let Compositor::Kde(kwin) = &self.comp else {
-            return Err(NO_FILE_DIALOG.into());
-        };
         let a11y = &self.a11y;
-        let (active, apps) = tokio::join!(kwin.active_parent(), a11y.apps_with_windows());
-        let active = active?.ok_or("no active window")?;
-        // The accessible window KWin has in front: the ACTIVE one of the
-        // process KWin names, so the parent it reports is this window's.
+        // The window in front, as the compositor has it: KWin also names
+        // the window it belongs to (a portal dialog's app); Hyprland only
+        // its process and title.
+        let (active, apps) = match &self.comp {
+            Compositor::Kde(kwin) => {
+                let (active, apps) = tokio::join!(kwin.active_parent(), a11y.apps_with_windows());
+                (active?.ok_or("no active window")?, apps)
+            }
+            Compositor::Hyprland(h) => {
+                let (active, apps) = tokio::join!(h.active_window(), a11y.apps_with_windows());
+                let aw = active?.ok_or("no active window")?;
+                let caption = aw["title"].clone();
+                (
+                    serde_json::json!({"pid": aw["pid"], "caption": caption}),
+                    apps,
+                )
+            }
+        };
+        // The accessible window in front: of the process the compositor
+        // names, the ACTIVE one (KDE), else (Hyprland sets no ACTIVE state)
+        // the one titled as the compositor's.
         let pid = active["pid"].as_i64();
+        let caption = active["caption"].as_str().unwrap_or("").trim().to_string();
         let mut found = None;
         'apps: for (app, name, windows) in apps {
             if self.pid(&app.bus).await.map(i64::from) != pid {
                 continue;
             }
-            for w in windows {
-                if a11y.has_state(&w, atspi::ACTIVE).await {
-                    found = Some((name, w));
+            for w in &windows {
+                if a11y.has_state(w, atspi::ACTIVE).await {
+                    found = Some((name.clone(), w.clone()));
                     break 'apps;
+                }
+            }
+            if !caption.is_empty() {
+                for w in &windows {
+                    if a11y.name(w).await.trim() == caption {
+                        found = Some((name.clone(), w.clone()));
+                        break 'apps;
+                    }
                 }
             }
         }

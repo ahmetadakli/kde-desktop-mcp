@@ -3122,7 +3122,11 @@ impl<B: Backend> Server<B> {
             let Some(root) = cache.get(&id) else {
                 continue;
             };
-            if !root.showing || (kind != render::Surface::Dialog && listed.entries.is_empty()) {
+            // A dialog with nothing to list says nothing either (Qt keeps a
+            // second, empty file dialog window next to the shown one).
+            let empty = listed.entries.is_empty()
+                && (kind != render::Surface::Dialog || listed.message.is_none());
+            if !root.showing || empty {
                 continue;
             }
             found.push(hash);
