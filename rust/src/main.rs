@@ -4018,7 +4018,14 @@ impl<B: Backend> Server<B> {
 
     async fn find(&self, a: &Json) -> R<String> {
         self.b.enable().await;
-        let query = req_s(a, "query")?;
+        // `role` alone lists the elements of that role (query "" matches
+        // every name).
+        let has_role = !arg_s(a, "role", "").trim().is_empty();
+        let query = match a.get("query").and_then(Json::as_str) {
+            Some(q) => q.to_string(),
+            None if has_role => String::new(),
+            None => return Err("missing string argument 'query' (or pass `role`)".into()),
+        };
         let app = req_s(a, "app")?;
         let role = arg_s(a, "role", "");
         let max_results = arg_i(a, "max_results", 30).max(0) as usize;
@@ -4890,6 +4897,8 @@ impl<B: Backend> Server<B> {
         let hidden = !cache[&bar].showing;
         let mut node = bar;
         let mut trail: Vec<String> = Vec::new();
+        // The menu items walked, from the bar down (`open_parents`).
+        let mut chain: Vec<B::Id> = Vec::new();
         let mut opened: Vec<String> = Vec::new();
         let where_ = |trail: &[String]| {
             if trail.is_empty() {
@@ -4911,6 +4920,16 @@ impl<B: Backend> Server<B> {
         for seg in &path {
             let mut items = self.menu_entries(&mut cache, &node).await;
             if items.is_empty() && !trail.is_empty() {
+                self.open_parents(&chain, &windows, &app_key)
+                    .await
+                    .map_err(|e| format!("{}: {e}{}", where_(&trail), open_note(&opened)))?;
+                // Those stay open too: each takes an escape.
+                for parent in trail.iter().take(trail.len().saturating_sub(1)) {
+                    let name = render::json_str(parent);
+                    if !opened.contains(&name) {
+                        opened.push(name);
+                    }
+                }
                 items = self
                     .open_submenu(&mut cache, &node, &windows)
                     .await
@@ -4934,6 +4953,7 @@ impl<B: Backend> Server<B> {
                 }
             };
             trail.push(cache[&item].name.trim().to_string());
+            chain.push(item.clone());
             node = item;
         }
         self.b
@@ -4945,6 +4965,16 @@ impl<B: Backend> Server<B> {
             let _ = GATE.try_with(|g| g.borrow_mut().quiet = true);
             let mut items = self.menu_entries(&mut cache, &node).await;
             if items.is_empty() && !trail.is_empty() {
+                self.open_parents(&chain, &windows, &app_key)
+                    .await
+                    .map_err(|e| format!("{}: {e}{}", where_(&trail), open_note(&opened)))?;
+                // Those stay open too: each takes an escape.
+                for parent in trail.iter().take(trail.len().saturating_sub(1)) {
+                    let name = render::json_str(parent);
+                    if !opened.contains(&name) {
+                        opened.push(name);
+                    }
+                }
                 items = self
                     .open_submenu(&mut cache, &node, &windows)
                     .await
@@ -5067,6 +5097,42 @@ impl<B: Backend> Server<B> {
 
     /// Open a submenu whose entries are not in the tree until it is shown
     /// (Firefox), and wait for them.
+    /// Open the menus above `node` on the way to it (`chain`, from the menu
+    /// bar down, `node` last), so it opens on screen: KDE fills some menus
+    /// (Dolphin's "Create New", KNewFileMenu) only when they are shown,
+    /// and a submenu of a menu bar Dolphin hides is not shown by its own
+    /// action. Menus already listed need no wait for their entries.
+    async fn open_parents(&self, chain: &[B::Id], windows: &[B::Id], app: &str) -> R<()> {
+        let Some((_, parents)) = chain.split_last() else {
+            return Ok(());
+        };
+        // On Wayland an app shows a popup menu only after recent input from
+        // the user (an input serial): actions alone left Dolphin's "Create
+        // New" empty. A shift press and release, which types nothing, gives
+        // it one; only while that app's window is in front.
+        if self
+            .require_active_allowed()
+            .await
+            .is_ok_and(|front| front.eq_ignore_ascii_case(app))
+        {
+            self.b.press_combo("shift").await?;
+        }
+        for p in parents {
+            if !self.b.may_open_menu(p).await {
+                return Ok(());
+            }
+            let actions = self.b.actions(p).await;
+            if let Some(idx) = actions.iter().position(|a| a.to_lowercase() == "show menu") {
+                // Shown before its submenu's action runs, or that one is
+                // not shown either.
+                let mark = self.b.change_mark();
+                self.b.do_action(p, idx).await?;
+                self.b.wait_change(windows, mark, PARENT_MENU_WAIT).await;
+            }
+        }
+        Ok(())
+    }
+
     async fn open_submenu(
         &self,
         cache: &mut Cache<B::Id>,
@@ -6774,6 +6840,9 @@ fn written_mismatch(now: &str, text: &str, how: &str) -> String {
         text.chars().count()
     )
 }
+
+/// Longest wait for a parent menu `open_parents` opened to show.
+const PARENT_MENU_WAIT: Duration = Duration::from_millis(500);
 
 /// Tools whose failure reply ends with what is on screen (`where_note`).
 const CONTEXT_TOOLS: [&str; 14] = [
@@ -8583,9 +8652,15 @@ mod tests {
                 "\"Tools > Opened\" -> ok; effect: no visible change",
                 "{r}"
             );
+            // A shift tap first: on Wayland a popup shows only after input.
             assert_eq!(
                 s.keys.borrow()[before..].to_vec(),
-                vec!["action 0 on 30".to_string(), "action 0 on 99".to_string()]
+                vec![
+                    "down shift".to_string(),
+                    "up shift".to_string(),
+                    "action 0 on 30".to_string(),
+                    "action 0 on 99".to_string()
+                ]
             );
             let r = call_tool(&mut s, 8, "menu", json!({"app": "evil"})).await;
             assert!(reply_text(&r).contains("is not in"), "{r}");
@@ -10663,6 +10738,24 @@ mod tests {
             let r = call_tool(&mut s, 5, "act", json!({"id": id})).await;
             assert!(reply_text(&r).starts_with("doDefault -> ok"), "{r}");
             assert!(s.keys.borrow().last().unwrap().starts_with("action 1 on "));
+        });
+    }
+
+    #[test]
+    fn find_takes_a_role_without_a_query() {
+        local(async {
+            let mut s = session("find-role");
+            let r = call_tool(
+                &mut s,
+                2,
+                "find",
+                json!({"app": "fake", "role": "push button"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("push button \"OK\""), "{r}");
+            let r = call_tool(&mut s, 3, "find", json!({"app": "fake"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("(or pass `role`)"), "{r}");
         });
     }
 

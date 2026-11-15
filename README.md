@@ -579,7 +579,10 @@ tool; `off` turns it off). Not available on Windows yet.
   nothing is opened. KDE apps that replace the menu bar with a hamburger
   button ("Menüyü Aç", which has no accessibility action and no children)
   keep the hidden menu bar in the tree, and its entries work: `menu` finds it
-  too (Kate, Dolphin). Firefox fills a menu only while it is open; `menu`
+  too (Kate, Dolphin). A submenu filled only when shown on screen (Dolphin's
+  "Create New") is opened with its parent menus, after a shift press and
+  release (Wayland shows a popup only after recent input; it types nothing)
+  while the app's window is in front. Firefox fills a menu only while it is open; `menu`
   does not open Firefox menus itself (doing so through accessibility hung or
   crashed a fresh Firefox in tests), so open the menu with `key` first.
 - `launch`: starts an allowed app (`app`, e.g. `kate`) with an optional `args`
