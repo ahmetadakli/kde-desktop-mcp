@@ -1,0 +1,96 @@
+# Builds the binaries for a version tag (v0.16.0) and attaches them to its
+# GitHub release, so users can install without Rust (see README,
+# "Installation"). The release notes are written by hand; a tag pushed
+# without a release gets one with generated notes.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    name: Linux x86_64
+    # An older glibc than most distributions have: the binary runs on them.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        run: |
+          want="${GITHUB_REF_NAME#v}"
+          have=$(sed -n 's/^version = "\(.*\)"/\1/p' rust/Cargo.toml | head -1)
+          [ "$want" = "$have" ] || { echo "tag $GITHUB_REF_NAME, Cargo.toml $have"; exit 1; }
+      # wl-clipboard-rs links libwayland-client.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwayland-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      - run: cargo test --release
+        working-directory: rust
+      - run: cargo build --release --locked
+        working-directory: rust
+      - name: Package
+        run: |
+          name="desktop-mcp-${GITHUB_REF_NAME}-x86_64-linux"
+          mkdir "$name"
+          cp rust/target/release/desktop-mcp LICENSE README.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: desktop-mcp-*-x86_64-linux.tar.gz
+
+  windows:
+    name: Windows x86_64
+    # Cross-built with mingw: not run on Windows here (see README).
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends mingw-w64 zip
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+          key: windows-gnu
+      - run: cargo build --release --locked --target x86_64-pc-windows-gnu
+        working-directory: rust
+      - name: Package
+        run: |
+          name="desktop-mcp-${GITHUB_REF_NAME}-x86_64-windows"
+          mkdir "$name"
+          cp rust/target/x86_64-pc-windows-gnu/release/desktop-mcp.exe LICENSE README.md "$name/"
+          zip -r "$name.zip" "$name"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: desktop-mcp-*-x86_64-windows.zip
+
+  publish:
+    name: Attach to the release
+    needs: [linux, windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Checksums
+        run: sha256sum desktop-mcp-* > SHA256SUMS && cat SHA256SUMS
+      - name: Upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1 \
+            || gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          gh release upload "$GITHUB_REF_NAME" desktop-mcp-* SHA256SUMS --clobber

@@ -18,6 +18,7 @@ mod shot;
 mod takeover;
 mod tools;
 mod trace;
+mod update;
 #[cfg(windows)]
 mod windows;
 // The Windows backend's pure helpers, so their tests also run on Linux.
@@ -3734,12 +3735,14 @@ impl<B: Backend> Server<B> {
             std::env::consts::OS,
             std::env::consts::ARCH
         )];
+        let update = update::line(env!("CARGO_PKG_VERSION")).await;
         let mut row = |ok: bool, name: &str, detail: &str| {
             lines.push(format!(
                 "[{}] {name}: {detail}",
                 if ok { "ok" } else { "FAIL" }
             ));
         };
+        row(true, "update", &update);
         row(
             !allow.is_empty(),
             "allowlist",
@@ -7161,6 +7164,10 @@ compile_error!("desktop-mcp supports Linux (KDE Plasma, Hyprland) and Windows on
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    if matches!(std::env::args().nth(1).as_deref(), Some("--version" | "-V")) {
+        println!("desktop-mcp {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     #[cfg(target_os = "linux")]
     if std::env::args().nth(1).as_deref() == Some("--indicator") {
         if let Err(e) = linux::indicator::run() {
