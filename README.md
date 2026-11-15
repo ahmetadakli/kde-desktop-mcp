@@ -755,9 +755,32 @@ confirm list and the password setting.
 
 ## Installation
 
-Every platform needs [Rust](https://rustup.rs/). After installing, open a new
-Claude Code session and check with `/mcp` that the `desktop` server is
-connected.
+Each [GitHub release](https://github.com/ahmetadakli/kde-desktop-mcp/releases)
+comes with prebuilt binaries, so no Rust is needed; building from source needs
+[Rust](https://rustup.rs/). Either way, the system packages listed per desktop
+below are needed. After installing, open a new Claude Code session and check
+with `/mcp` that the `desktop` server is connected.
+
+### Quick install (prebuilt)
+
+Linux (x86_64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ahmetadakli/kde-desktop-mcp/main/tools/install.sh | bash
+```
+
+It downloads the latest release, checks it against the release's `SHA256SUMS`,
+installs `~/.local/bin/desktop-mcp` and adds the `desktop` server to Claude Code
+when there is none (`VERSION=…`, `INSTALL_DIR=…` and `NO_CLAUDE_ADD=1` change
+that; see the script). Arch Linux: AUR recipes for `kde-desktop-mcp` (source)
+and `kde-desktop-mcp-bin` are in [`packaging/aur`](packaging/aur) (not on the
+AUR yet).
+
+Windows: download `desktop-mcp-v…-x86_64-windows.zip` from the release, unpack
+it and run `claude mcp add --scope user desktop -- "C:\path\to\desktop-mcp.exe"`.
+The Windows build is cross-compiled and has not been run on real Windows yet.
+
+The sections below build from source.
 
 ### KDE Plasma (Wayland)
 
@@ -809,8 +832,12 @@ Building for Windows on Linux also works (`mingw-w64-gcc` and
 
 ### Updating
 
-Claude Code runs the binary you built; reconnecting (`/mcp`) restarts that same
-file, so a new version needs a pull and a build. In the clone (no need to clone
+Claude Code runs the binary you installed; reconnecting (`/mcp`) restarts that
+same file, so a new version has to be installed first. `doctor` says when a
+newer release is out.
+
+Installed with `install.sh`: run the same command again. With an AUR package:
+your usual system update. Built from source: in the clone (no need to clone
 again or to run `claude mcp add` again; the path stays the same):
 
 ```bash
