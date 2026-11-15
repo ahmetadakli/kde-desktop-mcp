@@ -1,5 +1,5 @@
-pkgbase = kde-desktop-mcp-bin
-	pkgdesc = MCP server that lets AI agents control desktop apps through the accessibility tree (KDE Plasma, Hyprland; prebuilt)
+pkgbase = desktop-mcp-bin
+	pkgdesc = MCP server for AI agents to operate desktop apps through the accessibility tree, screenshot-free (KDE Plasma, Hyprland; prebuilt)
 	pkgver = 0.16.0
 	pkgrel = 1
 	url = https://github.com/ahmetadakli/kde-desktop-mcp
@@ -10,9 +10,9 @@ pkgbase = kde-desktop-mcp-bin
 	depends = at-spi2-core
 	optdepends = spectacle: screenshots when KWin ScreenShot2 is unavailable
 	optdepends = grim: screenshots on Hyprland
-	provides = kde-desktop-mcp
-	conflicts = kde-desktop-mcp
+	provides = desktop-mcp
+	conflicts = desktop-mcp
 	source = https://github.com/ahmetadakli/kde-desktop-mcp/releases/download/v0.16.0/desktop-mcp-v0.16.0-x86_64-linux.tar.gz
 	sha256sums = 9549dc39360c74f46c66e442280a88dda5947dbacdfabb59e7333d23c9c7b47b
 
-pkgname = kde-desktop-mcp-bin
+pkgname = desktop-mcp-bin

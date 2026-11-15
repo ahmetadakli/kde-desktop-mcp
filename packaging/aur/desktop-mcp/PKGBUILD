@@ -1,12 +1,13 @@
 # Maintainer: Ahmet Adaklı <ahmetadakli280@gmail.com>
-# Builds desktop-mcp from the release's source. kde-desktop-mcp-bin installs
+# Builds desktop-mcp from the release's source. desktop-mcp-bin installs
 # the prebuilt binary of the GitHub release instead.
-pkgname=kde-desktop-mcp
+pkgname=desktop-mcp
+_repo=kde-desktop-mcp
 pkgver=0.16.0
 pkgrel=1
-pkgdesc="MCP server that lets AI agents control desktop apps through the accessibility tree (KDE Plasma, Hyprland)"
+pkgdesc="MCP server for AI agents to operate desktop apps through the accessibility tree, screenshot-free (KDE Plasma, Hyprland)"
 arch=('x86_64')
-url="https://github.com/ahmetadakli/kde-desktop-mcp"
+url="https://github.com/ahmetadakli/$_repo"
 license=('MIT')
 depends=('gcc-libs' 'glibc' 'at-spi2-core')
 makedepends=('cargo')
@@ -17,26 +18,26 @@ source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('a1b461db7e3a2a647bf9f67a73061053a3aba6618fb3d08a8eab37459319d9d7')
 
 prepare() {
-  cd "$pkgname-$pkgver/rust"
+  cd "$_repo-$pkgver/rust"
   export RUSTUP_TOOLCHAIN=stable
   cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
 }
 
 build() {
-  cd "$pkgname-$pkgver/rust"
+  cd "$_repo-$pkgver/rust"
   export RUSTUP_TOOLCHAIN=stable
   export CARGO_TARGET_DIR=target
   cargo build --frozen --release
 }
 
 check() {
-  cd "$pkgname-$pkgver/rust"
+  cd "$_repo-$pkgver/rust"
   export RUSTUP_TOOLCHAIN=stable
   cargo test --frozen --release
 }
 
 package() {
-  cd "$pkgname-$pkgver"
+  cd "$_repo-$pkgver"
   install -Dm755 rust/target/release/desktop-mcp "$pkgdir/usr/bin/desktop-mcp"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"

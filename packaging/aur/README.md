@@ -4,8 +4,8 @@ Two package recipes for the [AUR](https://aur.archlinux.org/), tested with
 `makepkg` but not published yet (publishing needs an AUR account with an SSH
 key):
 
-- `kde-desktop-mcp`: builds the release's source with cargo.
-- `kde-desktop-mcp-bin`: installs the prebuilt Linux binary that the release
+- `desktop-mcp`: builds the release's source with cargo.
+- `desktop-mcp-bin`: installs the prebuilt Linux binary that the release
   workflow attaches to each GitHub release.
 
 Both install `/usr/bin/desktop-mcp`; add it to Claude Code with
@@ -14,12 +14,13 @@ Both install `/usr/bin/desktop-mcp`; add it to Claude Code with
 ## Publishing (first time)
 
 ```bash
-git clone ssh://aur@aur.archlinux.org/kde-desktop-mcp.git aur-kde-desktop-mcp
-cp packaging/aur/kde-desktop-mcp/{PKGBUILD,.SRCINFO} aur-kde-desktop-mcp/
-cd aur-kde-desktop-mcp && git add PKGBUILD .SRCINFO && git commit -m "Initial import" && git push
+git clone ssh://aur@aur.archlinux.org/desktop-mcp.git aur-desktop-mcp
+cp packaging/aur/desktop-mcp/{PKGBUILD,.SRCINFO} aur-desktop-mcp/
+cd aur-desktop-mcp && git add PKGBUILD .SRCINFO && git commit -m "Initial import" && git push
 ```
 
-The same for `kde-desktop-mcp-bin`.
+The same for `desktop-mcp-bin`. The AUR names follow the binary's name
+(`desktop-mcp`), not the repository's.
 
 ## For each release
 

@@ -1,19 +1,19 @@
 # Maintainer: Ahmet Adaklı <ahmetadakli280@gmail.com>
 # The prebuilt binary of the GitHub release (built by the release workflow on
-# Ubuntu 22.04). kde-desktop-mcp builds it from source instead.
-pkgname=kde-desktop-mcp-bin
+# Ubuntu 22.04). desktop-mcp builds it from source instead.
+pkgname=desktop-mcp-bin
 _name=desktop-mcp
 pkgver=0.16.0
 pkgrel=1
-pkgdesc="MCP server that lets AI agents control desktop apps through the accessibility tree (KDE Plasma, Hyprland; prebuilt)"
+pkgdesc="MCP server for AI agents to operate desktop apps through the accessibility tree, screenshot-free (KDE Plasma, Hyprland; prebuilt)"
 arch=('x86_64')
 url="https://github.com/ahmetadakli/kde-desktop-mcp"
 license=('MIT')
 depends=('gcc-libs' 'glibc' 'at-spi2-core')
 optdepends=('spectacle: screenshots when KWin ScreenShot2 is unavailable'
             'grim: screenshots on Hyprland')
-provides=('kde-desktop-mcp')
-conflicts=('kde-desktop-mcp')
+provides=('desktop-mcp')
+conflicts=('desktop-mcp')
 source=("$url/releases/download/v$pkgver/$_name-v$pkgver-x86_64-linux.tar.gz")
 sha256sums=('9549dc39360c74f46c66e442280a88dda5947dbacdfabb59e7333d23c9c7b47b')
 
