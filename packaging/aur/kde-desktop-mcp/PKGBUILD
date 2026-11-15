@@ -2,7 +2,7 @@
 # Builds desktop-mcp from the release's source. kde-desktop-mcp-bin installs
 # the prebuilt binary of the GitHub release instead.
 pkgname=kde-desktop-mcp
-pkgver=0.15.0
+pkgver=0.16.0
 pkgrel=1
 pkgdesc="MCP server that lets AI agents control desktop apps through the accessibility tree (KDE Plasma, Hyprland)"
 arch=('x86_64')
@@ -14,7 +14,7 @@ optdepends=('spectacle: screenshots when KWin ScreenShot2 is unavailable'
             'grim: screenshots on Hyprland')
 options=('!lto')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('79495d0924a6c91d7d6402fa314745fa80891d3811d78cf44bcea38cef6cc8ec')
+sha256sums=('a1b461db7e3a2a647bf9f67a73061053a3aba6618fb3d08a8eab37459319d9d7')
 
 prepare() {
   cd "$pkgname-$pkgver/rust"
