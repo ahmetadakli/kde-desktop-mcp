@@ -268,9 +268,9 @@ pub fn tools() -> Json {
         ),
         t(
             "find",
-            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive). Optionally filter by role as tree shows it (case, spaces aside;\none that names nothing is tried as its synonyms: row, cell, button, textbox,\ndropdown, tab…, and the reply says which matched); with `role`, the role name\nis searched too. Window, tab and page titles (frame,\nwindow, page tab, document web) are listed after all other matches. Without\nany, elements holding every word of `query` (any order, accents aside) are.\nWith no visible match, lists matches scrolled out of the page's view (act\nand get_text work on them), else the elements with the closest names.\nLines read as in tree (actions the role implies omitted). Usually cheaper\nthan tree.",
+            "Search an allowed app for elements whose name or text contains `query`\n(case-insensitive); `role` alone (no query) lists the elements of that role. Optionally filter by role as tree shows it (case, spaces aside;\none that names nothing is tried as its synonyms: row, cell, button, textbox,\ndropdown, tab…, and the reply says which matched); with `role`, the role name\nis searched too. Window, tab and page titles (frame,\nwindow, page tab, document web) are listed after all other matches. Without\nany, elements holding every word of `query` (any order, accents aside) are.\nWith no visible match, lists matches scrolled out of the page's view (act\nand get_text work on them), else the elements with the closest names.\nLines read as in tree (actions the role implies omitted). Usually cheaper\nthan tree.",
             schema(&[
-                ("query", "string", None),
+                ("query", "string", Some(Json::Null)),
                 ("app", "string", None),
                 ("role", "string", Some(json!(""))),
                 ("max_results", "integer", Some(json!(30)))
