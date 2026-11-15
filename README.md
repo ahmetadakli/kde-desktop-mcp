@@ -772,8 +772,8 @@ curl -fsSL https://raw.githubusercontent.com/ahmetadakli/kde-desktop-mcp/main/to
 It downloads the latest release, checks it against the release's `SHA256SUMS`,
 installs `~/.local/bin/desktop-mcp` and adds the `desktop` server to Claude Code
 when there is none (`VERSION=…`, `INSTALL_DIR=…` and `NO_CLAUDE_ADD=1` change
-that; see the script). Arch Linux: AUR recipes for `kde-desktop-mcp` (source)
-and `kde-desktop-mcp-bin` are in [`packaging/aur`](packaging/aur) (not on the
+that; see the script). Arch Linux: AUR recipes for `desktop-mcp` (source)
+and `desktop-mcp-bin` are in [`packaging/aur`](packaging/aur) (not on the
 AUR yet).
 
 Windows: download `desktop-mcp-v…-x86_64-windows.zip` from the release, unpack
