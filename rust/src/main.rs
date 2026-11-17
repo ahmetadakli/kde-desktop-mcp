@@ -5841,11 +5841,30 @@ impl<B: Backend> Server<B> {
         {
             return Err(self.password_refusal("type_text", &f.app.to_lowercase()));
         }
-        let note = self.b.type_text(&text).await?;
+        // A trailing newline is pressed as Enter: inserted or pasted, it
+        // does not submit a single-line field (a browser's address bar, a
+        // search box). Newlines inside the text stay text.
+        let body = text.trim_end_matches('\n');
+        let enters = text.len() - body.len();
+        let note = match body.is_empty() {
+            true => String::new(),
+            false => self.b.type_text(body).await?,
+        };
+        for i in 0..enters {
+            if i > 0 || !body.is_empty() {
+                self.gate(true).await?;
+            }
+            self.b.press_combo("enter").await?;
+        }
+        let pressed = match enters {
+            0 => String::new(),
+            1 => ", then pressed Enter".into(),
+            n => format!(", then pressed Enter x{n}"),
+        };
         let focus = self.focus_note(true).await;
         Ok(format!(
-            "typed {} chars into {app}{focus}{note}",
-            text.chars().count()
+            "typed {} chars into {app}{pressed}{focus}{note}",
+            body.chars().count()
         ))
     }
 
@@ -10759,6 +10778,28 @@ mod tests {
             let r = call_tool(&mut s, 5, "act", json!({"id": id})).await;
             assert!(reply_text(&r).starts_with("doDefault -> ok"), "{r}");
             assert!(s.keys.borrow().last().unwrap().starts_with("action 1 on "));
+        });
+    }
+
+    #[test]
+    fn a_trailing_newline_is_pressed_as_enter() {
+        local(async {
+            let mut s = session("type-enter");
+            let r = call_tool(&mut s, 2, "type_text", json!({"text": "abc\n"})).await;
+            assert!(
+                reply_text(&r).contains("typed 3 chars into fake, then pressed Enter"),
+                "{r}"
+            );
+            assert!(
+                s.keys
+                    .borrow()
+                    .ends_with(&["down enter".to_string(), "up enter".to_string()])
+            );
+            let r = call_tool(&mut s, 3, "type_text", json!({"text": "a\nb"})).await;
+            assert!(
+                reply_text(&r).starts_with("typed 3 chars into fake;"),
+                "{r}"
+            );
         });
     }
 
