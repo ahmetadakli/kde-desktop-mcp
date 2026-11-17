@@ -6777,6 +6777,15 @@ impl<B: Backend> Server<B> {
             let limit = Duration::from_millis(limit);
             let note = trace::time("content", self.content_wait(c, limit)).await;
             o.text.push_str(&note);
+            // An accessibility action is no user gesture to a browser: a
+            // file input's picker (and some popups) open only for a real
+            // click. Nothing changed: say so instead of leaving a guess.
+            if name == "act" && note.starts_with("; no page change seen") {
+                o.text.push_str(
+                    " (a browser opens file pickers and some popups only for a real click: \
+                     click it)",
+                );
+            }
             // Waited already: no settle on top.
             let _ = GATE.try_with(|g| g.borrow_mut().settle = None);
         }
@@ -13188,6 +13197,8 @@ mod tests {
             )
             .await;
             assert!(reply_text(&r).contains("; no page change seen in 2"), "{r}");
+            // ...and says a real click may be what it needs.
+            assert!(reply_text(&r).contains("only for a real click"), "{r}");
             assert!(start.elapsed() < Duration::from_millis(500));
             // settle_ms 0: no content wait.
             let r = call_tool(
