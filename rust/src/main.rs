@@ -6048,15 +6048,28 @@ impl<B: Backend> Server<B> {
         if !self.is_allowed(&app) {
             return false;
         }
-        if app.to_lowercase().contains(&q) {
-            return true;
-        }
         match self.b.windows(query, &self.allowed()).await {
-            Ok(list) => list.iter().any(|w| w.active),
-            Err(_) => self
-                .active_title()
-                .await
-                .is_some_and(|t| t.to_lowercase().contains(&q)),
+            // In front only if it is (one of) the best match: "Claude" with
+            // a terminal titled "~ : claude" in front still activates
+            // Claude Desktop (backend::window_rank).
+            Ok(list) if !list.is_empty() => {
+                let ranked: Vec<(u8, bool)> = list
+                    .iter()
+                    .filter_map(|w| {
+                        backend::window_rank(query, &w.title, &[&w.app]).map(|r| (r, w.active))
+                    })
+                    .collect();
+                let best = ranked.iter().map(|(r, _)| *r).min();
+                ranked.iter().any(|(r, active)| *active && Some(*r) == best)
+            }
+            Ok(_) => false,
+            Err(_) => {
+                app.to_lowercase().contains(&q)
+                    || self
+                        .active_title()
+                        .await
+                        .is_some_and(|t| t.to_lowercase().contains(&q))
+            }
         }
     }
 

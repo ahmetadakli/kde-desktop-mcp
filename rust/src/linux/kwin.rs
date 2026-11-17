@@ -168,19 +168,30 @@ function okApp(w) {
 }
 "#;
 
-/// Raises the first window of an allowed app whose caption or class contains
-/// the query; evaluates to its caption and pid as JSON, "" when none
-/// matched.
+/// Raises the window of an allowed app that best matches the query (ranked
+/// as backend::window_rank: title equal, class equal or ending it after a
+/// dot, class containing it, title containing it; the first of a rank
+/// wins); evaluates to its caption and pid as JSON, "" when none matched.
 const ACTIVATE: &str = r#"(() => { %OK_APP%
-const q = %QUERY%.toLowerCase();
-for (const w of workspace.windowList()) {
+const q = %QUERY%.toLowerCase().trim();
+function rank(w) {
+  const t = w.caption.toLowerCase().trim();
   const cls = (w.resourceClass || "").toLowerCase();
-  if (okApp(w) && (w.caption.toLowerCase().includes(q) || cls.includes(q))) {
-    workspace.activeWindow = w;
-    return JSON.stringify({caption: w.caption, pid: w.pid});
-  }
+  if (t === q) return 0;
+  if (cls === q || cls.endsWith("." + q)) return 1;
+  if (cls.includes(q)) return 2;
+  if (t.includes(q)) return 3;
+  return -1;
 }
-return "";
+let best = null, bestRank = 9;
+for (const w of workspace.windowList()) {
+  if (!okApp(w)) continue;
+  const r = rank(w);
+  if (r >= 0 && r < bestRank) { best = w; bestRank = r; }
+}
+if (!best) return "";
+workspace.activeWindow = best;
+return JSON.stringify({caption: best.caption, pid: best.pid});
 })()"#;
 
 /// Shared by WINDOWS and SET_WINDOW: windows of allowed apps whose caption
