@@ -9,6 +9,7 @@
 mod backend;
 mod delivery;
 mod flow;
+mod launch_pick;
 #[cfg(target_os = "linux")]
 mod linux;
 mod policy;

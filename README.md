@@ -592,8 +592,8 @@ tool; `off` turns it off). Not available on Windows yet.
   list (no shell; its `.desktop` file first, else the program on `PATH`) and
   waits until its window opens (`wait_ms`, default 15 s, at most 60 s; 0 does
   not wait). Prints the window as `windows` does; also finds launches handed
-  to an already running instance (firefox, kate). Window tracking works on
-  KDE and Hyprland.
+  to an already running instance (firefox, kate). Works on KDE, Hyprland and
+  Windows (see the Windows limitations).
 - Terminal windows: `windows` also lists each terminal tab's pts device,
   foreground command and directory; `activate_window` with
   `terminal: "pytest"` brings forward the terminal running that command (or in
@@ -1103,6 +1103,16 @@ Windows:
   window reports where it goes back to; while minimized since before the
   server saw it, that rectangle still includes the borders. The desktop
   and taskbar (explorer's `Progman`, `Shell_TrayWnd`) are never listed.
+- `launch` looks for the program in App Paths (`msedge`), on `PATH`
+  (including the Store's execution aliases such as `mspaint`), in System32
+  and the Windows folder, then among the user's Store apps by executable or
+  package name (`calculatorapp` starts `Microsoft.WindowsCalculator`); only
+  `.exe` programs are started, never a script. Starters that pass the request
+  on and end (System32's `calc.exe`, `explorer <folder>`, which exits with
+  code 1, `msedge <url>` while Edge runs) count as a hand-off; other exit
+  codes are failures. A Store app's window shows as `applicationframehost`,
+  as `windows` lists it. Notepad's own starter process stays running without
+  a window after handing a file to the open Notepad.
 - Key names follow the US keyboard layout positions; use `type_text` for text.
 - `type_text` pastes through the clipboard (a single character is typed as a
   key). It saves the clipboard text first and puts it back once the app in

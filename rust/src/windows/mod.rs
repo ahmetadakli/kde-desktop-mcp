@@ -8,6 +8,7 @@
 
 mod clipboard;
 mod input;
+mod launch;
 mod logic;
 mod uia;
 mod wm;
@@ -23,10 +24,11 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use crate::backend::{
-    Activated, AppEntry, Backend, Cache, Check, Clip, Info, NO_AREA, R, Screen, Shot, WindowChange,
-    WindowEntry, WindowGeo,
+    Activated, AppEntry, Backend, Cache, Check, Clip, Info, Launched, NO_AREA, R, Screen, Shot,
+    WindowChange, WindowEntry, WindowGeo,
 };
 use crate::delivery::nothing_sent;
+use crate::launch_pick::{self as pick, Found};
 use logic::Props;
 use uia::{Elem, Uia};
 
@@ -94,6 +96,23 @@ fn dead() -> Info<Elem> {
         children: Vec::new(),
         operable: false,
     }
+}
+
+/// Allowed apps' windows as `launch` compares them, with a Store app's
+/// frame standing for the app it hosts (its name and process), next to the
+/// windows as `windows` reports them.
+fn launch_windows(allowed: &[String]) -> (Vec<WindowGeo>, Vec<WindowGeo>) {
+    wm::list("", allowed)
+        .into_iter()
+        .map(|w| {
+            let mut seen = w.geo.clone();
+            if !w.hosted.is_empty() {
+                seen.app = w.hosted;
+                seen.pid = w.hosted_pid;
+            }
+            (seen, w.geo)
+        })
+        .unzip()
 }
 
 impl WindowsBackend {
@@ -613,6 +632,119 @@ impl Backend for WindowsBackend {
         };
         wm::close(w.hwnd).map_err(nothing_sent)?;
         Ok(w.geo.clone())
+    }
+
+    async fn launch(
+        &self,
+        app: &str,
+        args: &[String],
+        allowed: &[String],
+        wait: Duration,
+    ) -> R<Launched> {
+        let (name, argv) = (app.to_string(), args.to_vec());
+        let r = tokio::task::spawn_blocking(move || launch::resolve(&name, &argv))
+            .await
+            .map_err(|e| e.to_string())?
+            // Not found: nothing started.
+            .map_err(nothing_sent)?;
+        // Windows already open, to tell a new one of a running instance.
+        let (before, _) = launch_windows(allowed);
+        let (pid, exit) = match &r.target {
+            launch::Target::Program(p) => {
+                let (pid, exit) = launch::spawn(p, args).map_err(nothing_sent)?;
+                (pid, Some(exit))
+            }
+            launch::Target::Store(aumid) => {
+                let (aumid, argv) = (aumid.clone(), args.to_vec());
+                let pid = tokio::task::spawn_blocking(move || launch::activate(&aumid, &argv))
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .map_err(nothing_sent)?;
+                (pid, None)
+            }
+        };
+        let mut out = Launched {
+            command: launch::describe(&r),
+            pid,
+            ..Launched::default()
+        };
+        if wait.is_zero() {
+            out.note = "not waiting for its window (wait_ms=0)".into();
+            return Ok(out);
+        }
+        let start = std::time::Instant::now();
+        let hints = pick::arg_hints(args);
+        // A Store app that was running already took the request: its
+        // windows are not new, and it counts as a clean hand-off.
+        let running = exit.is_none() && before.iter().any(|w| w.pid == pid);
+        let mut tree = std::collections::HashSet::new();
+        if !running {
+            tree.insert(pid);
+        }
+        let mut ended = running.then_some(start);
+        // Rounds since the tree last grew.
+        let mut stable = 0;
+        loop {
+            let scanned = pick::tree_scan_due(stable);
+            let grow = |tree: &std::collections::HashSet<u32>| match tree.is_empty() {
+                true => tree.clone(),
+                false => pick::descendants(tree, launch::parents()),
+            };
+            if scanned {
+                let grown = grow(&tree);
+                stable = if grown.len() > tree.len() {
+                    0
+                } else {
+                    stable + 1
+                };
+                tree = grown;
+            } else {
+                stable += 1;
+            }
+            let (now, shown) = launch_windows(allowed);
+            let status = exit.as_ref().and_then(|e| *e.lock().unwrap());
+            if status.is_some() && ended.is_none() {
+                ended = Some(std::time::Instant::now());
+            }
+            // Starters hand the request on and end, explorer with code 1.
+            let exited = match status {
+                Some(code) => ended.map(|t| (logic::handoff_exit(Some(code as i32)), t.elapsed())),
+                None => ended.map(|t| (true, t.elapsed())),
+            };
+            let stage = pick::stage(start.elapsed(), exited);
+            let mut picked = pick::pick_window(app, &before, &now, &tree, stage, &hints);
+            if picked.as_ref().is_some_and(|(_, how)| *how != Found::Own) && !scanned {
+                // A skipped scan must not call the started app's own window
+                // the running instance's.
+                tree = grow(&tree);
+                stable = 0;
+                picked = pick::pick_window(app, &before, &now, &tree, stage, &hints);
+            }
+            if let Some((w, how)) = picked {
+                let i = now.iter().position(|n| std::ptr::eq(n, w)).unwrap_or(0);
+                out.window = shown.into_iter().nth(i);
+                out.note = match how {
+                    Found::Own => "",
+                    Found::New => "opened by the running instance",
+                    Found::Existing => "handed to the running instance",
+                }
+                .into();
+                return Ok(out);
+            }
+            if let (Some(code), Some((false, since))) = (status, exited)
+                && since >= pick::HANDOFF_GRACE
+            {
+                return Err(format!(
+                    "{} (pid {pid}) exited with code {} without opening a window",
+                    out.command,
+                    logic::exit_code(code)
+                ));
+            }
+            if start.elapsed() >= wait {
+                return Ok(out);
+            }
+            tokio::time::sleep(pick::poll_interval(start.elapsed())).await;
+        }
     }
 
     async fn screens(&self) -> Vec<Screen> {

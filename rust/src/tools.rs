@@ -464,7 +464,7 @@ pub fn tools() -> Json {
         ),
         t(
             "launch",
-            "Start an allowed app (`app` as named by apps, e.g. \"kate\") with optional\n`args` (a list, no shell), resolved through its .desktop file or PATH, and\nwait up to `wait_ms` (at most 60000) until its window appears. Replies with\nthe window as windows prints it; finds windows a running instance opens\n(single-instance apps such as firefox or kate) too. 0 = do not wait.\nWindow tracking works on KDE Plasma and Hyprland; Linux only.",
+            "Start an allowed app (`app` as named by apps, e.g. \"kate\") with optional\n`args` (a list, no shell), resolved through its .desktop file or PATH\n(Windows: App Paths, PATH, System32 or a Store app), and wait up to\n`wait_ms` (at most 60000) until its window appears. Replies with the window\nas windows prints it; finds windows a running instance opens\n(single-instance apps such as firefox or kate) too. 0 = do not wait.\nWorks on KDE Plasma, Hyprland and Windows.",
             schema(&[
                 ("app", "string", None),
                 ("args", "array", Some(Json::Null)),

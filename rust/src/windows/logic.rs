@@ -695,6 +695,237 @@ pub fn dpi_scale(dpi: u32) -> f64 {
     (dpi as f64 / 96.0 * 100.0).round() / 100.0
 }
 
+/// The file `launch` looks for: `app` with ".exe" added unless it has it.
+pub fn exe_file(app: &str) -> String {
+    if app.to_lowercase().ends_with(".exe") {
+        app.to_string()
+    } else {
+        format!("{app}.exe")
+    }
+}
+
+/// `%NAME%` references replaced by `env(NAME)`; unknown ones are kept.
+pub fn expand_env(s: &str, env: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.find('%') {
+            Some(j) if j > 0 => match env(&after[..j]) {
+                Some(v) => {
+                    out.push_str(&v);
+                    rest = &after[j + 1..];
+                }
+                None => {
+                    out.push('%');
+                    rest = after;
+                }
+            },
+            _ => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The program an App Paths entry names: its default value without the
+/// quotes some installers add, environment references expanded.
+pub fn app_path_value(raw: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let v = raw.trim().trim_matches('"').trim();
+    (!v.is_empty()).then(|| expand_env(v, env))
+}
+
+/// Where `launch` looks for a program after App Paths: PATH (including the
+/// Store's execution aliases in WindowsApps), then System32 and the Windows
+/// folder, each folder once.
+pub fn program_dirs(
+    path: &[std::path::PathBuf],
+    system_root: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = path.to_vec();
+    if let Some(root) = system_root.filter(|r| !r.is_empty()) {
+        let root = root.trim_end_matches(['\\', '/']);
+        dirs.push(format!("{root}\\System32").into());
+        dirs.push(root.into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| {
+        let key = d
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase();
+        !key.is_empty() && seen.insert(key)
+    });
+    dirs
+}
+
+/// The program to start for `file` ("notepad.exe"): the App Paths entry
+/// when it exists, else the first folder of `dirs` holding it. `exists`
+/// must accept the Store's 0-byte execution aliases.
+pub fn find_program(
+    file: &str,
+    app_path: Option<String>,
+    dirs: &[std::path::PathBuf],
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    if let Some(p) = app_path.map(std::path::PathBuf::from)
+        && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        && exists(&p)
+    {
+        return Some(p);
+    }
+    dirs.iter().map(|d| d.join(file)).find(|p| exists(p))
+}
+
+/// The value of attribute `name` in an XML start tag, quoted either way.
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(i) = tag[from..].find(name) {
+        let at = from + i;
+        from = at + name.len();
+        let before = tag[..at].chars().next_back();
+        if !before.is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let rest = tag[at + name.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let q = rest.chars().next()?;
+        if q != '"' && q != '\'' {
+            continue;
+        }
+        let end = rest[1..].find(q)?;
+        return Some(rest[1..1 + end].to_string());
+    }
+    None
+}
+
+/// The start tags named `name` in `xml` (`<Application ...>`), not the
+/// ones whose name only begins with it (`<Applications>`).
+fn xml_tags<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
+    let open = format!("<{name}");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = xml[from..].find(&open) {
+        let at = from + i;
+        let rest = &xml[at + open.len()..];
+        from = at + open.len();
+        if !rest.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/') {
+            continue;
+        }
+        let end = rest.find('>').unwrap_or(rest.len());
+        out.push(&rest[..end]);
+    }
+    out
+}
+
+/// A package's identity name and its applications (Id, Executable) from
+/// its AppxManifest.xml.
+pub fn manifest_apps(xml: &str) -> (String, Vec<(String, String)>) {
+    let name = xml_tags(xml, "Identity")
+        .first()
+        .and_then(|t| xml_attr(t, "Name"))
+        .unwrap_or_default();
+    let apps = xml_tags(xml, "Application")
+        .into_iter()
+        .filter_map(|t| {
+            Some((
+                xml_attr(t, "Id")?,
+                xml_attr(t, "Executable").unwrap_or_default(),
+            ))
+        })
+        .collect();
+    (name, apps)
+}
+
+/// The family name of a package full name
+/// (Name_Version_Arch_ResourceId_PublisherId): Name_PublisherId.
+pub fn package_family(full: &str) -> Option<String> {
+    let parts: Vec<&str> = full.split('_').collect();
+    match parts.as_slice() {
+        [name, .., publisher] if parts.len() >= 3 && !name.is_empty() && !publisher.is_empty() => {
+            Some(format!("{name}_{publisher}"))
+        }
+        _ => None,
+    }
+}
+
+/// How well a Store app matches `app`, lower is better: its executable
+/// ("CalculatorApp.exe" for "calculatorapp"), then the last part of the
+/// package name ("Microsoft.Paint" for "paint"), then a package name
+/// holding it ("Microsoft.WindowsCalculator" for "calculator").
+pub fn store_rank(app: &str, package: &str, executable: &str) -> Option<u8> {
+    let app = app.to_lowercase();
+    let package = package.to_lowercase();
+    if !executable.is_empty() && exe_stem(executable) == app {
+        Some(0)
+    } else if package.rsplit('.').next() == Some(app.as_str()) {
+        Some(1)
+    } else if app.chars().count() >= 4 && package.contains(&app) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// Arguments as one command line, quoted the way programs split it
+/// (CommandLineToArgvW): words with spaces or quotes are quoted, quotes
+/// and the backslashes before them escaped.
+pub fn command_args(args: &[String]) -> String {
+    let quote = |a: &String| {
+        if !a.is_empty() && !a.contains([' ', '\t', '"']) {
+            return a.clone();
+        }
+        let mut out = String::from('"');
+        let mut slashes = 0;
+        for c in a.chars() {
+            match c {
+                '\\' => slashes += 1,
+                '"' => {
+                    out.push_str(&"\\".repeat(slashes * 2 + 1));
+                    slashes = 0;
+                }
+                _ => {
+                    out.push_str(&"\\".repeat(slashes));
+                    slashes = 0;
+                }
+            }
+            if c != '\\' {
+                out.push(c);
+            }
+        }
+        out.push_str(&"\\".repeat(slashes * 2));
+        out.push('"');
+        out
+    };
+    args.iter().map(quote).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether a started program's exit is a hand-off rather than a failure.
+/// Starters such as System32's notepad.exe, the Store's execution aliases,
+/// `explorer <folder>` (exit code 1) and `msedge <url>` pass the request to
+/// another process and end; any other code is a failure.
+pub fn handoff_exit(code: Option<i32>) -> bool {
+    matches!(code, Some(0 | 1))
+}
+
+/// An exit code as Windows tools show it: decimal, or hex for an NTSTATUS
+/// (a crash such as 0xC0000005).
+pub fn exit_code(code: u32) -> String {
+    if code >= 0x8000_0000 {
+        format!("{code:#010X}").replace("0X", "0x")
+    } else {
+        code.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1123,5 +1354,121 @@ mod tests {
         assert_eq!(dpi_scale(144), 1.5);
         assert_eq!(dpi_scale(120), 1.25);
         assert_eq!(dpi_scale(0), 1.0);
+    }
+    #[test]
+    fn launch_finds_app_paths_then_path_then_the_windows_folders() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(exe_file("notepad"), "notepad.exe");
+        assert_eq!(exe_file("Foo.EXE"), "Foo.EXE");
+        let env = |k: &str| match k {
+            "ProgramFiles" => Some(r"C:\Program Files".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            app_path_value(r#" "%ProgramFiles%\Edge\msedge.exe" "#, env).as_deref(),
+            Some(r"C:\Program Files\Edge\msedge.exe")
+        );
+        assert_eq!(app_path_value("\"\"", env), None);
+        assert_eq!(expand_env("%NOPE%\\a%%b%", env), "%NOPE%\\a%%b%");
+        assert_eq!(expand_env("x%ProgramFiles%y", env), r"xC:\Program Filesy");
+        let path = [
+            PathBuf::from(r"C:\WINDOWS\system32"),
+            PathBuf::from(r"C:\Users\a\AppData\Local\Microsoft\WindowsApps"),
+            PathBuf::from(""),
+        ];
+        let dirs = program_dirs(&path, Some(r"C:\WINDOWS"));
+        // System32 is on PATH already (other case): listed once.
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from(r"C:\WINDOWS\system32"),
+                PathBuf::from(r"C:\Users\a\AppData\Local\Microsoft\WindowsApps"),
+                PathBuf::from(r"C:\WINDOWS"),
+            ]
+        );
+        let have = |p: &Path| {
+            let s = p.to_string_lossy();
+            s.ends_with("WindowsApps/mspaint.exe")
+                || s.ends_with("WindowsApps\\mspaint.exe")
+                || s.contains("Edge")
+        };
+        let edge = Some(r"C:\Program Files\Edge\msedge.exe".to_string());
+        assert_eq!(
+            find_program("msedge.exe", edge, &dirs, have),
+            Some(PathBuf::from(r"C:\Program Files\Edge\msedge.exe"))
+        );
+        // An App Paths entry naming a missing file or a script is skipped.
+        let script = Some(r"C:\Program Files\Edge\run.cmd".to_string());
+        assert_eq!(find_program("x.exe", script, &dirs, have), None);
+        let paint = find_program("mspaint.exe", None, &dirs, have).unwrap();
+        assert!(paint.starts_with(&dirs[1]), "{paint:?}");
+        assert_eq!(find_program("nosuch.exe", None, &dirs, have), None);
+    }
+
+    #[test]
+    fn store_apps_come_from_their_manifest() {
+        let xml = r#"<?xml version="1.0"?><Package><Identity Name="Microsoft.WindowsCalculator"
+            Publisher="CN=Microsoft" Version="11.2607.0.0" ProcessorArchitecture="x64"/>
+            <Applications>
+              <Application Id="App" Executable="CalculatorApp.exe" EntryPoint="Calculator.App"
+                desktop4:SupportsMultipleInstances="true">
+              </Application>
+              <Application Id='Second' Executable='Tools\Other.exe'/>
+            </Applications></Package>"#;
+        let (name, apps) = manifest_apps(xml);
+        assert_eq!(name, "Microsoft.WindowsCalculator");
+        assert_eq!(
+            apps,
+            [
+                ("App".to_string(), "CalculatorApp.exe".to_string()),
+                ("Second".to_string(), r"Tools\Other.exe".to_string())
+            ]
+        );
+        assert_eq!(manifest_apps("<Package/>"), (String::new(), vec![]));
+        assert_eq!(
+            package_family("Microsoft.WindowsCalculator_11.2607.0.0_x64__8wekyb3d8bbwe").as_deref(),
+            Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe")
+        );
+        assert_eq!(package_family("NoUnderscore"), None);
+        let calc = "Microsoft.WindowsCalculator";
+        assert_eq!(
+            store_rank("calculatorapp", calc, "CalculatorApp.exe"),
+            Some(0)
+        );
+        assert_eq!(
+            store_rank("mspaint", "Microsoft.Paint", r"PaintApp\mspaint.exe"),
+            Some(0)
+        );
+        assert_eq!(store_rank("paint", "Microsoft.Paint", "x.exe"), Some(1));
+        assert_eq!(store_rank("calculator", calc, ""), Some(2));
+        assert_eq!(store_rank("calc", calc, "CalculatorApp.exe"), Some(2));
+        assert_eq!(store_rank("app", calc, "CalculatorApp.exe"), None);
+        assert_eq!(store_rank("paint", calc, "CalculatorApp.exe"), None);
+    }
+
+    #[test]
+    fn launch_args_are_quoted_for_the_command_line() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            command_args(&s(&[r"C:\mcp\a.txt", "-x"])),
+            r"C:\mcp\a.txt -x"
+        );
+        assert_eq!(
+            command_args(&s(&[r"C:\My Files\", "", r#"say "hi""#, r"a\\"])),
+            r#""C:\My Files\\" "" "say \"hi\"" a\\"#
+        );
+        assert_eq!(command_args(&s(&[r#"a\"b"#])), r#""a\\\"b""#);
+    }
+
+    #[test]
+    fn quick_exits_with_0_or_1_are_hand_offs() {
+        assert!(handoff_exit(Some(0)));
+        // explorer.exe <folder> exits with 1 after the shell opened it.
+        assert!(handoff_exit(Some(1)));
+        assert!(!handoff_exit(Some(2)));
+        assert!(!handoff_exit(Some(-1073741819)));
+        assert!(!handoff_exit(None));
+        assert_eq!(exit_code(2), "2");
+        assert_eq!(exit_code(0xC000_0005), "0xC0000005");
     }
 }

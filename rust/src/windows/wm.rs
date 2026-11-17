@@ -30,11 +30,12 @@ use crate::backend::{R, Screen, WindowGeo};
 
 /// A listed top-level window: its handle, what `windows` reports, and for
 /// a Store app's frame the app it hosts ("" otherwise, or while the app is
-/// minimized and its CoreWindow detached).
+/// minimized and its CoreWindow detached) and that app's process id.
 pub struct Win {
     pub hwnd: HWND,
     pub geo: WindowGeo,
     pub hosted: String,
+    pub hosted_pid: u32,
 }
 
 fn rect(r: RECT) -> Rect {
@@ -120,18 +121,22 @@ fn frame(h: HWND) -> Option<Rect> {
     }
 }
 
-/// The app a Store app's frame window hosts: its CoreWindow child's.
-fn hosted_app(h: HWND, class: &str) -> String {
+/// The app a Store app's frame window hosts and its process id: its
+/// CoreWindow child's.
+fn hosted_app(h: HWND, class: &str) -> (String, u32) {
     if class != logic::STORE_FRAME_CLASS {
-        return String::new();
+        return (String::new(), 0);
     }
     let core: Vec<u16> = logic::STORE_CORE_CLASS
         .encode_utf16()
         .chain(Some(0))
         .collect();
     match unsafe { FindWindowExW(Some(h), None, PCWSTR(core.as_ptr()), PCWSTR::null()) } {
-        Ok(c) if !c.is_invalid() => input::proc_name(pid(c)),
-        _ => String::new(),
+        Ok(c) if !c.is_invalid() => {
+            let p = pid(c);
+            (input::proc_name(p), p)
+        }
+        _ => (String::new(), 0),
     }
 }
 
@@ -245,7 +250,7 @@ pub fn list(query: &str, allowed: &[String]) -> Vec<Win> {
         if app.is_empty() {
             continue;
         }
-        let hosted = hosted_app(h, &class);
+        let (hosted, hosted_pid) = hosted_app(h, &class);
         if !logic::window_allowed(allowed, &app, &hosted)
             || !logic::window_matches(&q, &t, &app, &hosted)
         {
@@ -255,6 +260,7 @@ pub fn list(query: &str, allowed: &[String]) -> Vec<Win> {
             hwnd: h,
             geo: describe(h, t, app, fg_root),
             hosted,
+            hosted_pid,
         });
     }
     out
