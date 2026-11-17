@@ -933,6 +933,12 @@ pub fn role_matches(actual: &str, role: &str) -> bool {
     role.is_empty() || role.split('|').any(|r| role_key(r).eq(role_key(actual)))
 }
 
+/// Whether `actual` is one of `roles`, compared as `role_key` does: UIA's
+/// "menuitem" is AT-SPI's "menu item".
+pub fn role_in(actual: &str, roles: &[&str]) -> bool {
+    roles.iter().any(|r| role_key(r).eq(role_key(actual)))
+}
+
 /// Role names models pass (ARIA, HTML, UIA, everyday words) and the
 /// AT-SPI and UIA roles they mean, in `role_key` form. A `role` that names
 /// nothing is tried again as its set (see `role_synonyms`).
@@ -1341,7 +1347,9 @@ pub fn locate<Id: Clone + Eq + Hash>(
 /// and then, wherever they are:
 /// 4. an element one operates (`interactive`: a button, an entry, a list
 ///    item) beats one that only shows the name (a label, a list or
-///    heading named the same).
+///    heading named the same);
+/// 5. a menu entry beats what it holds: WinUI's menu bar entry holds a
+///    button named the same.
 ///
 /// Ok(None) when nothing matches.
 pub fn locate_all<Id: Clone + Eq + Hash>(
@@ -1413,6 +1421,14 @@ pub fn locate_all<Id: Clone + Eq + Hash>(
         hits.retain(|h| h.1 == last);
     }
     narrow(&mut hits, |h| interactive(&cache[h.0]));
+    if hits.len() > 1 {
+        let entries: Vec<&Id> = hits
+            .iter()
+            .filter(|h| role_in(&cache[h.0].role, &MENU_ITEM_ROLES))
+            .map(|h| h.0)
+            .collect();
+        hits.retain(|h| !entries.iter().any(|e| *e != h.0 && holds(cache, e, h.0)));
+    }
     let picked = hits
         .into_iter()
         .map(|(id, w)| (id.clone(), roots[w].clone()))
@@ -1891,10 +1907,10 @@ pub fn menu_bars<Id: Clone + Eq + Hash>(
             break;
         }
         let info = &cache[id];
-        if info.role == "menu bar" {
+        if role_in(&info.role, &["menu bar"]) {
             found.push(id.clone());
         }
-        if MENU_BAR_STOP.contains(&info.role.as_str()) {
+        if role_in(&info.role, &MENU_BAR_STOP) {
             continue;
         }
         stack.extend(
@@ -1925,9 +1941,9 @@ pub fn menu_items<Id: Clone + Eq + Hash>(cache: &Cache<Id>, node: &Id) -> Result
     while let Some(id) = stack.pop() {
         let info = &cache[id];
         let role = info.role.as_str();
-        if MENU_ITEM_ROLES.contains(&role) && !info.name.trim().is_empty() {
+        if role_in(role, &MENU_ITEM_ROLES) && !info.name.trim().is_empty() {
             items.push(id.clone());
-        } else if MENU_HOLDER_ROLES.contains(&role) {
+        } else if role_in(role, &MENU_HOLDER_ROLES) {
             stack.extend(
                 get(cache, &info.children, &mut missing)
                     .into_iter()
@@ -1940,19 +1956,39 @@ pub fn menu_items<Id: Clone + Eq + Hash>(cache: &Cache<Id>, node: &Id) -> Result
 }
 
 /// Whether a menu entry opens a submenu rather than doing something: a
-/// named "menu" (GTK, Firefox), an entry with a popup below it or Qt's
-/// "Show Menu" action.
+/// named "menu" (GTK, Firefox), an entry with a popup below it, Qt's
+/// "Show Menu" action or UIA's "expand" (a leaf entry has none).
 pub fn is_submenu<Id: Clone + Eq + Hash>(cache: &Cache<Id>, info: &Info<Id>) -> bool {
     info.role == "menu"
         || info
             .actions
             .iter()
-            .any(|a| a.eq_ignore_ascii_case("show menu"))
+            .any(|a| a.eq_ignore_ascii_case("show menu") || a.eq_ignore_ascii_case("expand"))
         || info
             .children
             .iter()
             .filter_map(|c| cache.get(c))
-            .any(|c| c.role == "popup menu" || c.role == "menu")
+            .any(|c| role_in(&c.role, &["popup menu", "menu"]))
+}
+
+/// Whether `node` is `root` or below it in `cache`: a menu holding the
+/// entry that opened a submenu is not that submenu.
+pub fn holds<Id: Clone + Eq + Hash>(cache: &Cache<Id>, root: &Id, node: &Id) -> bool {
+    let mut stack = vec![root];
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        if id == node {
+            return true;
+        }
+        seen += 1;
+        if seen > FIND_MAX_SEEN {
+            break;
+        }
+        if let Some(info) = cache.get(id) {
+            stack.extend(info.children.iter());
+        }
+    }
+    false
 }
 
 /// A menu label as compared: without accelerator markers (`&`, `_`; doubled
@@ -2110,7 +2146,7 @@ pub const SURFACE_LIST_ROLES: [&str; 2] = ["list", "list box"];
 /// counts under a combo box: the caller checks its parent.
 pub fn surface_kind(role: &str) -> Option<Surface> {
     match role {
-        "menu" | "popup menu" => Some(Surface::Menu),
+        r if role_in(r, &["menu", "popup menu"]) => Some(Surface::Menu),
         r if SURFACE_LIST_ROLES.contains(&r) => Some(Surface::List),
         r if DIALOG_ROLES.contains(&r) => Some(Surface::Dialog),
         _ => None,
@@ -2226,8 +2262,8 @@ pub fn surface_entries<Id: Clone + Eq + Hash>(
         let role = info.role.as_str();
         let named = !info.name.trim().is_empty();
         let entry = match kind {
-            Surface::Menu => MENU_ITEM_ROLES.contains(&role) && named,
-            Surface::List => LIST_ENTRY_ROLES.contains(&role) && named,
+            Surface::Menu => role_in(role, &MENU_ITEM_ROLES) && named,
+            Surface::List => role_in(role, &LIST_ENTRY_ROLES) && named,
             Surface::Dialog => {
                 if DIALOG_BUTTON_ROLES.contains(&role) && named {
                     buttons.push((id.clone(), parent));
@@ -2337,7 +2373,7 @@ pub fn surface_line<Id>(
     let mut role = default_entry_role(kind);
     for (i, (rid, info)) in entries.iter().enumerate() {
         let mut item = format!(" [{rid}]");
-        if info.role != role {
+        if !role_in(&info.role, &[role]) {
             role = info.role.as_str();
             item.push(' ');
             item.push_str(role);
@@ -2483,6 +2519,93 @@ mod tests {
         let mut gap = c.clone();
         gap.remove("/pop");
         assert_eq!(menu_items(&gap, &"/file"), Err(vec!["/pop"]));
+    }
+
+    /// Win11 Notepad as UIA shows it: the menu bar's entries expand, and
+    /// the open flyout is a "menu" in a popup window of its own, not below
+    /// the entry.
+    fn uia_menu_cache() -> Cache<&'static str> {
+        let mut c = Cache::new();
+        c.insert(
+            "/w",
+            node(
+                "window",
+                "a.txt",
+                true,
+                &["active"],
+                &["/host", "/doc", "/site"],
+            ),
+        );
+        c.insert("/host", node("pane", "PopupHost", true, &[], &["/popup"]));
+        c.insert("/popup", node("window", "Açılan", true, &[], &["/flyout"]));
+        c.insert(
+            "/flyout",
+            node(
+                "menu",
+                "",
+                true,
+                &[],
+                &["/new", "/sep", "/recent", "/saveas"],
+            ),
+        );
+        c.insert("/new", node("menuitem", "Yeni sekme", true, &[], &[]));
+        c.insert("/sep", node("separator", "", true, &[], &[]));
+        let mut recent = node("menuitem", "En Son", true, &[], &[]);
+        recent.actions = vec!["expand".into(), "collapse".into()];
+        c.insert("/recent", recent);
+        let mut saveas = node("menuitem", "Farklı kaydet", true, &[], &[]);
+        saveas.actions = vec!["invoke".into()];
+        c.insert("/saveas", saveas);
+        c.insert(
+            "/doc",
+            node("document", "Metin düzenleyici", true, &[], &[]),
+        );
+        c.insert("/site", node("pane", "", true, &[], &["/mb"]));
+        c.insert("/mb", node("menubar", "", true, &[], &["/file", "/edit"]));
+        let mut file = node("menuitem", "Dosya", true, &["expanded"], &["/filebtn"]);
+        file.actions = vec!["expand".into(), "collapse".into(), "invoke".into()];
+        c.insert("/file", file);
+        c.insert("/filebtn", node("button", "Dosya", true, &[], &[]));
+        let mut edit = node("menuitem", "Düzenle", true, &[], &[]);
+        edit.actions = vec!["expand".into(), "collapse".into(), "invoke".into()];
+        c.insert("/edit", edit);
+        c
+    }
+
+    #[test]
+    fn uia_menu_roles_count_as_their_at_spi_spellings() {
+        let c = uia_menu_cache();
+        assert_eq!(menu_bars(&c, &["/w"]).unwrap(), vec!["/mb"]);
+        assert_eq!(menu_items(&c, &"/mb").unwrap(), vec!["/file", "/edit"]);
+        // The entry holds only its own button: the flyout is elsewhere.
+        assert!(menu_items(&c, &"/file").unwrap().is_empty());
+        assert_eq!(
+            menu_items(&c, &"/flyout").unwrap(),
+            vec!["/new", "/recent", "/saveas"]
+        );
+        assert!(is_submenu(&c, &c["/file"]) && is_submenu(&c, &c["/recent"]));
+        assert!(!is_submenu(&c, &c["/saveas"]) && !is_submenu(&c, &c["/new"]));
+        assert_eq!(surface_kind("menu"), Some(Surface::Menu));
+        assert!(role_in("menuitem", &MENU_ITEM_ROLES));
+        assert!(role_in("menubar", &MENU_BAR_STOP));
+        assert!(!role_in("menuitem", &["menu"]));
+        // The flyout holds "En Son", whose submenu is another flyout.
+        assert!(holds(&c, &"/flyout", &"/recent") && holds(&c, &"/w", &"/saveas"));
+        assert!(!holds(&c, &"/flyout", &"/file"));
+        let entries: Vec<(u64, &Info<&str>)> = ["/new", "/recent"]
+            .iter()
+            .enumerate()
+            .map(|(i, id)| (i as u64 + 1, &c[id]))
+            .collect();
+        let line = surface_line(&c["/flyout"], Surface::Menu, None, &entries);
+        assert_eq!(line, "menu (2 entries): [1] \"Yeni sekme\" [2] \"En Son\"");
+        // The entry, not the button inside it that shows its label.
+        let mut c = c;
+        c.get_mut("/filebtn").unwrap().actions = vec!["invoke".into()];
+        let m = locate_all(&c, &["/w"], "Dosya", "", true, "")
+            .unwrap()
+            .unwrap();
+        assert_eq!(m.picked, vec![("/file", "/w")]);
     }
 
     #[test]

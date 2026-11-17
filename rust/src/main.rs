@@ -1282,6 +1282,11 @@ fn indicator_label(tool: &str, a: &Json) -> Option<String> {
 const MENU_FETCH_ROUNDS: usize = 50;
 /// How long `menu` waits for a submenu it opened to list its entries.
 const MENU_OPEN_WAIT: Duration = Duration::from_millis(2000);
+/// Between looks for a menu that is no window of its own (`open_menus`).
+const MENU_POLL: Duration = Duration::from_millis(30);
+/// After this long, a menu that showed before a submenu was opened may be
+/// that submenu (opened again) rather than one about to close.
+const MENU_OLD_AFTER: Duration = Duration::from_millis(400);
 
 /// The action that runs a menu entry: press, click and the like, else its
 /// only (or first) action; None without any.
@@ -2953,12 +2958,13 @@ impl<B: Backend> Server<B> {
     /// OPENER_ROLES element) it first waits up to SETTLE_MS for a menu,
     /// list or dialog to show; otherwise only what showed already counts.
     async fn opened_note(&self, tool: &str, a: &Json, mark: u64) -> String {
-        if !self.b.names_surfaces() {
+        if !self.b.names_menus() {
             return String::new();
         }
         let opener =
             opens_surface(tool, a) || GATE.try_with(|g| g.borrow().opener).unwrap_or(false);
         if opener {
+            let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
             let wait = Duration::from_millis(SETTLE_MS as u64);
             trace::time("wait_shown", self.b.wait_shown(&[], mark, wait)).await;
         }
@@ -2973,7 +2979,7 @@ impl<B: Backend> Server<B> {
     /// windows are looked at, and what the last scan listed is not again.
     /// What shows after this is left to the next input's reply.
     async fn surfaces_note(&self, mark: u64, scan: bool) -> String {
-        if !self.b.names_surfaces() {
+        if !self.b.names_menus() {
             return String::new();
         }
         let next = self.b.change_mark();
@@ -3008,10 +3014,33 @@ impl<B: Backend> Server<B> {
                     return Vec::new();
                 }
                 let app = app.to_lowercase();
-                match self.b.app_windows(&app).await {
-                    Some(windows) => self.surfaces(windows, true, Some(&app), &[]).await,
-                    None => Vec::new(),
+                let Some(mut windows) = self.b.app_windows(&app).await else {
+                    return Vec::new();
+                };
+                // Menus inside the windows (`open_menus`), looked for after
+                // an input likely to open one (a search of the whole app),
+                // which may show a little later: up to SETTLE_MS.
+                if GATE.try_with(|g| g.borrow().opener).unwrap_or(false) {
+                    let start = Instant::now();
+                    while let Some(menus) = self.b.open_menus(&windows).await {
+                        if !menus.is_empty() {
+                            // Opened by this input, though the last look
+                            // listed it (the same flyout, opened again).
+                            let hashes: Vec<u64> = menus.iter().map(id_hash).collect();
+                            self.seen_surfaces
+                                .lock()
+                                .await
+                                .retain(|h| !hashes.contains(h));
+                            windows.extend(menus);
+                            break;
+                        }
+                        if start.elapsed() >= Duration::from_millis(SETTLE_MS as u64) {
+                            break;
+                        }
+                        tokio::time::sleep(MENU_POLL).await;
+                    }
                 }
+                self.surfaces(windows, true, Some(&app), &[]).await
             }
             None => Vec::new(),
         }
@@ -3023,7 +3052,7 @@ impl<B: Backend> Server<B> {
     /// before this call's input; said with its own "opened:" lines. No
     /// round trip when nothing was shown.
     async fn opened_before(&self) -> String {
-        if !self.b.names_surfaces() {
+        if !self.b.names_menus() {
             return String::new();
         }
         let Some((mark, listed)) = self.shown_pending.lock().await.clone() else {
@@ -4156,6 +4185,20 @@ impl<B: Backend> Server<B> {
         };
         let t = self.target(a).await?;
         let id = &t.id;
+        // Expanding a menu entry opens its submenu: the reply waits for it
+        // (`opened_note`).
+        let opens = |name: &str| ["expand", "show menu"].contains(&name.to_lowercase().as_str());
+        let menu_like =
+            render::role_in(&t.role, &OPENER_ROLES) || render::role_in(&t.role, &DROP_DOWN_ROLES);
+        if menu_like && (verb == Some(Verb::Expand) || opens(&action)) {
+            let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
+        }
+        // A drop-down button (UIA: a button that expands) opens a menu
+        // whatever its action.
+        let drop_down = |names: &[String]| {
+            render::role_in(&t.role, &DROP_DOWN_ROLES)
+                && names.iter().any(|n| n.eq_ignore_ascii_case("expand"))
+        };
         if let Some(verb) = verb {
             let done = self.verified(&t, verb, &action, option.as_deref()).await;
             // None: not of the kind, but it has an action of that name.
@@ -4191,6 +4234,9 @@ impl<B: Backend> Server<B> {
                     let list: Vec<String> = names.iter().map(|n| render::py_repr(n)).collect();
                     format!("action '{action}' not in [{}]", list.join(", "))
                 })?;
+        }
+        if (render::role_in(&t.role, &OPENER_ROLES) && opens(&names[idx])) || drop_down(&names) {
+            let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
         }
         let pre = self.pre_content(Some(id));
         let ok = self.b.do_action(id, idx).await?;
@@ -4835,7 +4881,9 @@ impl<B: Backend> Server<B> {
             }
             let menus: Vec<B::Id> = popups
                 .iter()
-                .filter(|(_, i)| i.showing && matches!(i.role.as_str(), "menu" | "popup menu"))
+                .filter(|(_, i)| {
+                    i.showing && render::surface_kind(&i.role) == Some(render::Surface::Menu)
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             let found: Vec<B::Id> = menus
@@ -5188,6 +5236,47 @@ impl<B: Backend> Server<B> {
         Ok(())
     }
 
+    /// The entries of the submenu `node` opened when they are not below it
+    /// (`open_menus`): of the first menu showing that does not hold `node`,
+    /// one that showed before it was opened (`before`) only with `old`.
+    async fn detached_entries(
+        &self,
+        cache: &mut Cache<B::Id>,
+        node: &B::Id,
+        windows: &[B::Id],
+        before: &[B::Id],
+        old: bool,
+    ) -> Vec<B::Id> {
+        let Some(menus) = self.b.open_menus(windows).await else {
+            return Vec::new();
+        };
+        let (new, seen): (Vec<B::Id>, Vec<B::Id>) =
+            menus.into_iter().partition(|m| !before.contains(m));
+        let menus = match old {
+            true => new.into_iter().chain(seen).collect(),
+            false => new,
+        };
+        for menu in menus {
+            let mut one = Cache::new();
+            self.b
+                .prefetch_with(
+                    &mut one,
+                    vec![menu.clone()],
+                    &search_fetch(0, render::FIND_MAX_SEEN),
+                )
+                .await;
+            if render::holds(&one, &menu, node) {
+                continue;
+            }
+            let items = self.menu_entries(&mut one, &menu).await;
+            cache.extend(one);
+            if !items.is_empty() {
+                return items;
+            }
+        }
+        Vec::new()
+    }
+
     async fn open_submenu(
         &self,
         cache: &mut Cache<B::Id>,
@@ -5206,13 +5295,35 @@ impl<B: Backend> Server<B> {
         let idx = actions
             .iter()
             .position(|a| {
-                ["show menu", "open", "click", "press", "activate"]
+                ["show menu", "expand", "open", "click", "press", "activate"]
                     .contains(&a.to_lowercase().as_str())
             })
             .or((!actions.is_empty()).then_some(0))
             .ok_or(
                 "its entries are not in the accessibility tree and it has no action to open it",
             )?;
+        // Menus open already (the one holding `node`, or one left open) are
+        // not the submenu, unless nothing else shows.
+        let mut before = self.b.open_menus(windows).await.unwrap_or_default();
+        // Open already (a listing left it so): closed first, with what it
+        // opened in turn, so the menu that shows is its own.
+        if !before.is_empty()
+            && let Some(c) = actions
+                .iter()
+                .position(|a| a.eq_ignore_ascii_case("collapse"))
+            && self.b.info(node, 0).await.states.contains(&"expanded")
+        {
+            self.b.do_action(node, c).await?;
+            let start = Instant::now();
+            while start.elapsed() < MENU_OLD_AFTER {
+                tokio::time::sleep(MENU_POLL).await;
+                let now = self.b.open_menus(windows).await.unwrap_or_default();
+                if now.len() < before.len() {
+                    before = now;
+                    break;
+                }
+            }
+        }
         let mut mark = self.b.change_mark();
         self.b.do_action(node, idx).await?;
         let start = Instant::now();
@@ -5220,7 +5331,13 @@ impl<B: Backend> Server<B> {
             // Read the entry afresh: what the cache holds predates the popup.
             let mut fresh = Cache::new();
             fresh.insert(node.clone(), self.b.info(node, 0).await);
-            let items = self.menu_entries(&mut fresh, node).await;
+            let mut items = self.menu_entries(&mut fresh, node).await;
+            if items.is_empty() {
+                let old = start.elapsed() >= MENU_OLD_AFTER;
+                items = self
+                    .detached_entries(&mut fresh, node, windows, &before, old)
+                    .await;
+            }
             cache.extend(fresh);
             if !items.is_empty() {
                 return Ok(items);
@@ -5693,7 +5810,7 @@ impl<B: Backend> Server<B> {
             self.check_button_free(&button)?;
         }
         let (t, (x, y)) = self.target_center(a).await?;
-        if clicks > 0 && OPENER_ROLES.contains(&t.role.as_str()) {
+        if clicks > 0 && render::role_in(&t.role, &OPENER_ROLES) {
             let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
         }
         let pre = self.pre_content(Some(&t.id));
@@ -6989,6 +7106,10 @@ const SURFACE_TOOLS: [&str; 4] = ["click", "mouse", "key", "type_text"];
 /// Roles of elements a click on likely opens a menu, list or dialog with.
 const OPENER_ROLES: [&str; 4] = ["combo box", "push button menu", "menu", "menu item"];
 
+/// Roles of a button that opens a menu when it also has an "expand"
+/// action (UIA's drop-down and split buttons).
+const DROP_DOWN_ROLES: [&str; 3] = ["button", "push button", "split button"];
+
 /// Whether an input is likely to open a menu, list or dialog, so its reply
 /// waits (up to SETTLE_MS) for one to show: a right click, the menu key,
 /// F10 or alt + a letter (menus), alt+down (a combo box's list), and the
@@ -7560,7 +7681,14 @@ mod tests {
         uia_roles: std::cell::Cell<bool>,
         /// Dialogs `fills_file_dialog` takes for file dialogs.
         file_dialogs: RefCell<Vec<u32>>,
+        /// Submenus open apart from their entry, as UIA's XAML flyouts:
+        /// expanding entry k shows menu `flyouts[k]` in the pane
+        /// FAKE_POPUP_HOST; `open_menus` finds them.
+        flyouts: RefCell<HashMap<u32, u32>>,
     }
+
+    /// Where the fake shows a flyout (`FakeShown::flyouts`).
+    const FAKE_POPUP_HOST: u32 = 40;
 
     impl FakeShown {
         /// The elements an input shows appear, with an event each.
@@ -7724,6 +7852,30 @@ mod tests {
         }
         fn names_surfaces(&self) -> bool {
             !self.shown.uia_roles.get()
+        }
+        fn names_menus(&self) -> bool {
+            self.names_surfaces() || !self.shown.flyouts.borrow().is_empty()
+        }
+        async fn open_menus(&self, windows: &[u32]) -> Option<Vec<u32>> {
+            if self.shown.flyouts.borrow().is_empty() {
+                return None;
+            }
+            let mut out = Vec::new();
+            let mut stack: Vec<u32> = Vec::new();
+            for w in windows {
+                stack.extend(self.info(w, 0).await.children);
+            }
+            while let Some(id) = stack.pop() {
+                let info = self.info(&id, 0).await;
+                if !info.showing {
+                    continue;
+                }
+                if info.role == "menu" {
+                    out.push(id);
+                }
+                stack.extend(info.children);
+            }
+            Some(out)
         }
         async fn fills_file_dialog(&self, window: &u32) -> bool {
             self.shown.file_dialogs.borrow().contains(window)
@@ -7955,6 +8107,18 @@ mod tests {
                 }
             }
             let mut nodes = self.nodes.borrow_mut();
+            let flyouts = self.shown.flyouts.borrow();
+            if let Some(menu) = flyouts.get(id)
+                && let Some(host) = nodes.get_mut(&FAKE_POPUP_HOST)
+            {
+                match action.as_deref() {
+                    Some("expand") if !host.children.contains(menu) => host.children.push(*menu),
+                    // Closes the submenus opened from it too (higher ids).
+                    Some("collapse") => host.children.retain(|m| m < menu),
+                    _ => {}
+                }
+            }
+            drop(flyouts);
             if let Some(n) = nodes.get_mut(id)
                 && n.role == "menu"
                 && n.children.is_empty()
@@ -8784,6 +8948,104 @@ mod tests {
             );
             let r = call_tool(&mut s, 8, "menu", json!({"app": "evil"})).await;
             assert!(reply_text(&r).contains("is not in"), "{r}");
+        });
+    }
+
+    /// The fake window as Win11 Notepad through UIA: menu bar entries
+    /// that expand, whose submenus open as flyouts in a popup host.
+    fn fake_flyout_menus(s: &Session) {
+        *s.focus.borrow_mut() = Info {
+            role: "window".into(),
+            name: "notes.txt - Fake".into(),
+            showing: true,
+            states: vec!["active"],
+            children: vec![FAKE_POPUP_HOST, 41],
+            ..Info::default()
+        };
+        let entry = |name: &str, kids: &[u32]| Info {
+            actions: vec!["expand".into(), "collapse".into(), "invoke".into()],
+            operable: true,
+            ..fake_node("menuitem", name, kids)
+        };
+        let leaf = |name: &str| Info {
+            actions: vec!["invoke".into()],
+            ..fake_node("menuitem", name, &[])
+        };
+        let mut n = s.nodes.borrow_mut();
+        n.insert(FAKE_POPUP_HOST, fake_node("pane", "PopupHost", &[]));
+        n.insert(41, fake_node("menubar", "", &[42]));
+        n.insert(42, entry("Dosya", &[43]));
+        // The entry's label is a button of the same name.
+        n.insert(43, fake_node("button", "Dosya", &[]));
+        n.insert(44, fake_node("menu", "", &[45, 46]));
+        n.insert(45, leaf("Farklı kaydet"));
+        n.insert(46, entry("En Son", &[]));
+        n.insert(47, fake_node("menu", "", &[48]));
+        n.insert(48, leaf("a.txt"));
+        s.shown.uia_roles.set(true);
+        *s.shown.flyouts.borrow_mut() = HashMap::from([(42, 44), (46, 47)]);
+    }
+
+    #[test]
+    fn menus_open_as_flyouts_apart_from_their_entries() {
+        local(async {
+            let mut s = session("menu-flyout");
+            fake_flyout_menus(&s);
+            let r = call_tool(&mut s, 2, "menu", json!({"app": "fake", "path": "Dosya"})).await;
+            let text = reply_text(&r).to_string();
+            assert!(text.starts_with("\"Dosya\":\n"), "{text}");
+            assert!(text.contains("menuitem \"Farklı kaydet\""), "{text}");
+            assert!(
+                text.contains("\"En Son\" actions=click (submenu)"),
+                "{text}"
+            );
+            assert!(text.contains("(opened \"Dosya\" to read it"), "{text}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 42");
+            // The submenu of En Son, not the flyout holding it.
+            let r = call_tool(
+                &mut s,
+                3,
+                "menu",
+                json!({"app": "fake", "path": "Dosya > En Son"}),
+            )
+            .await;
+            let text = reply_text(&r).to_string();
+            assert!(text.contains("menuitem \"a.txt\""), "{text}");
+            assert!(!text.contains("Farklı kaydet"), "{text}");
+            let r = call_tool(
+                &mut s,
+                4,
+                "menu",
+                json!({"app": "fake", "path": "Dosya > Farklı kaydet"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with("\"Dosya > Farklı kaydet\" -> ok"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 45");
+            // act takes the entry, not its label's button, expands it by
+            // default and lists the flyout it opened.
+            s.nodes
+                .borrow_mut()
+                .get_mut(&FAKE_POPUP_HOST)
+                .unwrap()
+                .children
+                .clear();
+            let r = call_tool(&mut s, 5, "act", json!({"app": "fake", "query": "Dosya"})).await;
+            let text = reply_text(&r);
+            assert!(text.contains("menuitem \"Dosya\""), "{text}");
+            assert!(text.contains("expand -> ok"), "{text}");
+            assert!(
+                text.contains("\nopened: menu (2 entries): [") && text.contains("\"En Son\""),
+                "{text}"
+            );
+            // Opened again (the same flyout): listed again.
+            let r = call_tool(&mut s, 6, "act", json!({"app": "fake", "query": "Dosya"})).await;
+            assert!(
+                reply_text(&r).contains("\nopened: menu (2 entries): ["),
+                "{r}"
+            );
         });
     }
 

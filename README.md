@@ -474,7 +474,7 @@ tool; `off` turns it off). Not available on Windows yet.
   apps: there it costs nothing beyond one cached toolkit lookup (and on a
   web page one state read). When the page does not change, the call takes the whole
   `settle_ms`. `mouse` clicks at coordinates do not wait.
-- What an input opened (Linux): after `act`, `menu`, `close_window` and the
+- What an input opened (Linux; Windows: menus): after `act`, `menu`, `close_window` and the
   input tools given `observe`, and after `click`, `key`, `mouse` and
   `type_text` without it, the reply lists the menus, popup menus, combo box
   lists, dialogs and alerts of allowed apps that opened, one line each, with
@@ -507,9 +507,13 @@ tool; `off` turns it off). Not available on Windows yet.
   inputs only list what showed already. When registering those events
   failed, those likely openers and `act`, `menu` and `close_window` look at
   the active app's top-level windows instead, and a surface one such look
-  listed is not read or listed again while it stays open. Not on Windows:
-  UI Automation's roles do not name menus and dialogs this way (a dialog is
-  a `window`), so nothing is looked at or waited for there.
+  listed is not read or listed again while it stays open. On Windows only
+  menus are listed: UI Automation's roles do not name dialogs this way (a
+  dialog is a `window`; `close_window` still lists the one it opened). With
+  no show events there, after those likely openers, and after `act` or
+  `click` on a menu entry or a drop-down button (one that expands), the
+  app's windows are searched for a menu showing in them (a XAML flyout sits
+  in a popup inside the window), up to 150 ms; other inputs do not look.
   Only menus already open are read: nothing here opens a menu through
   accessibility (Firefox can crash when one does).
 - Failures say what is on screen: when `find` finds nothing, or `act`,
@@ -588,6 +592,10 @@ tool; `off` turns it off). Not available on Windows yet.
   while the app's window is in front. Firefox fills a menu only while it is open; `menu`
   does not open Firefox menus itself (doing so through accessibility hung or
   crashed a fresh Firefox in tests), so open the menu with `key` first.
+  On Windows a menu bar entry and a submenu entry are expanded to read their
+  entries (UI Automation's ExpandCollapse; Win11 Notepad and Paint), which
+  open as a flyout elsewhere in the window: `menu` takes the menu that
+  showed, not the one holding the entry.
 - `launch`: starts an allowed app (`app`, e.g. `kate`) with an optional `args`
   list (no shell; its `.desktop` file first, else the program on `PATH`) and
   waits until its window opens (`wait_ms`, default 15 s, at most 60 s; 0 does
@@ -1126,6 +1134,10 @@ Windows:
   image, files or text over 4 MiB is not put back, nor is anything when the
   app does not read the paste within 1 s; the reply says so. While another app
   holds the clipboard open, the text is typed key by key instead.
+- A menu bar entry or submenu entry acts by expanding (its first action is
+  `expand`); `act` lists the menu it opened as `opened: menu (…)`. A button
+  whose only action is `invoke` but opens a menu (Explorer's "Diğer
+  seçenekler") is not looked after: `find` the entries.
 - In very large windows (browsers, Word) `tree` and `find` can be slow because
   they fetch the whole subtree at once.
 

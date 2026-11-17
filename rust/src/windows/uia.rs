@@ -333,6 +333,38 @@ impl Uia {
         out
     }
 
+    /// The menus showing below `roots` (not the roots themselves): a XAML
+    /// flyout (Win11 Notepad's "Dosya" menu) sits in a popup window inside
+    /// the app's window, not below the entry that opened it.
+    pub fn showing_menus(&self, roots: &[IUIAutomationElement]) -> Vec<Elem> {
+        let Some(req) = &self.req else {
+            return Vec::new();
+        };
+        let cond = unsafe {
+            let menu = VARIANT::from(UIA_MenuControlTypeId.0);
+            let no = VARIANT::from(false);
+            self.auto
+                .CreatePropertyCondition(UIA_ControlTypePropertyId, &menu)
+                .and_then(|m| {
+                    let shown = self
+                        .auto
+                        .CreatePropertyCondition(UIA_IsOffscreenPropertyId, &no)?;
+                    self.auto.CreateAndCondition(&m, &shown)
+                })
+        };
+        let Ok(cond) = cond else {
+            return Vec::new();
+        };
+        roots
+            .iter()
+            .flat_map(|root| {
+                let found =
+                    unsafe { root.FindAllBuildCache(TreeScope_Descendants, &cond, &req.windows) };
+                Self::elems(found.ok(), false)
+            })
+            .collect()
+    }
+
     /// Fetch `el` and everything below it in one cross-process call.
     pub fn fetch_subtree(&self, el: &IUIAutomationElement) -> Option<IUIAutomationElement> {
         unsafe { el.BuildUpdatedCache(&self.req.as_ref()?.subtree).ok() }
@@ -448,6 +480,13 @@ impl Uia {
             }
         }
     }
+}
+
+/// Whether `el`, fetched with its properties cached, is on screen.
+pub fn cached_onscreen(el: &IUIAutomationElement) -> bool {
+    cached(el, UIA_IsOffscreenPropertyId)
+        .and_then(|v| v.bool())
+        .is_some_and(|off| !off)
 }
 
 /// Cached control type, or the live one for elements fetched without it.

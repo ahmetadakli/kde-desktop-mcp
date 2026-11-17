@@ -427,6 +427,18 @@ pub trait Backend {
     fn names_surfaces(&self) -> bool {
         false
     }
+    /// Whether what an input opened can be listed at least for menus:
+    /// `names_surfaces`, or menus are found by `open_menus`.
+    fn names_menus(&self) -> bool {
+        self.names_surfaces()
+    }
+    /// The menus showing inside `windows` that are no windows of their own
+    /// and not below the entry that opened them (UIA's XAML flyouts, in a
+    /// popup inside the app's window), for a backend without show events
+    /// (`shown_since` None); None when it does not look for them.
+    async fn open_menus(&self, _windows: &[Self::Id]) -> Option<Vec<Self::Id>> {
+        None
+    }
     /// The dialogs the window `w` shows (a save prompt), for a backend whose
     /// roles do not name them (`names_surfaces` false): each is listed as
     /// a dialog, whatever its role.

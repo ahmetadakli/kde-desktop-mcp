@@ -152,11 +152,14 @@ impl WindowsBackend {
                 .map(|t| logic::preview(&t, text_limit)),
             None => None,
         };
+        // XAML's popup window says it is off screen while the flyout in it
+        // shows: a child on screen shows it.
+        let showing = !p.offscreen || children.iter().any(|k| uia::cached_onscreen(&k.el));
         Info {
             role: p.role().to_string(),
             name: p.name.clone(),
             states: p.states(fg),
-            showing: !p.offscreen,
+            showing,
             actions: p.actions().into_iter().map(String::from).collect(),
             text: text.filter(|t| !t.is_empty()),
             children,
@@ -326,6 +329,14 @@ impl Backend for WindowsBackend {
         let p = uia::props(&el);
         let kids = Uia::cached_children(&el);
         self.info_of(&el, &p, Self::foreground_i32(), text_limit, kids)
+    }
+
+    async fn identity(&self, id: &Elem) -> (String, String) {
+        // One element, not its subtree as `info` fetches.
+        match self.uia.fetch(&id.el) {
+            Some(p) => (p.role().to_string(), p.name),
+            None => (String::new(), String::new()),
+        }
     }
 
     async fn prefetch(
@@ -558,6 +569,27 @@ impl Backend for WindowsBackend {
             }
         }
         w.app.clone()
+    }
+
+    fn names_menus(&self) -> bool {
+        true
+    }
+
+    async fn open_menus(&self, windows: &[Elem]) -> Option<Vec<Elem>> {
+        let roots: Vec<IUIAutomationElement> = windows.iter().map(|w| w.el.clone()).collect();
+        let mut menus = self.uia.showing_menus(&roots);
+        // A Win32 popup menu (#32768) is a top-level window of its own,
+        // possibly newer than `windows`.
+        let pids: Vec<u32> = windows
+            .iter()
+            .filter_map(|w| self.uia.fetch(&w.el).map(|p| p.pid))
+            .collect();
+        for (e, p) in self.uia.top_level() {
+            if p.role() == "menu" && pids.contains(&p.pid) && !menus.contains(&e) {
+                menus.push(e);
+            }
+        }
+        Some(menus)
     }
 
     async fn dialogs_of(&self, w: &WindowGeo) -> Vec<Elem> {

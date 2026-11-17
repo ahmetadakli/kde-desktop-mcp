@@ -386,6 +386,10 @@ pub fn unix_newlines(text: &str) -> String {
 pub const TOGGLE_ON: i32 = 1;
 pub const EXPANDED: i32 = 1;
 pub const PARTIALLY_EXPANDED: i32 = 2;
+/// ExpandCollapseState_LeafNode: the pattern is there, but nothing opens.
+pub const LEAF_NODE: i32 = 3;
+/// UIA_MenuItemControlTypeId.
+const MENU_ITEM: i32 = 50011;
 
 /// Everything the Python backend reads about one element, as fetched in one
 /// UIA cache request.
@@ -505,16 +509,25 @@ impl Props {
         out
     }
 
-    /// Python `_action_table` names, in order.
+    /// Python `_action_table` names, in order; but a menu entry that opens
+    /// a submenu lists expand first, its default (as Qt's "Show Menu"):
+    /// Invoke on a Win11 menu bar entry opens nothing. A leaf node has
+    /// nothing to expand.
     pub fn actions(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
+        let expand = self.expand && self.expand_state != LEAF_NODE;
+        let submenu = expand && self.control_type == MENU_ITEM;
+        if submenu {
+            out.push("expand");
+            out.push("collapse");
+        }
         if self.invoke {
             out.push("invoke");
         }
         if self.toggle {
             out.push("toggle");
         }
-        if self.expand {
+        if expand && !submenu {
             out.push("expand");
             out.push("collapse");
         }
@@ -1238,6 +1251,25 @@ mod tests {
             ..Default::default()
         };
         assert!(p.actions().is_empty());
+        // A menu entry opening a submenu expands by default; a leaf node
+        // has nothing to expand.
+        let entry = Props {
+            control_type: 50011,
+            invoke: true,
+            expand: true,
+            ..Default::default()
+        };
+        assert_eq!(entry.actions(), vec!["expand", "collapse", "invoke"]);
+        let leaf = Props {
+            expand_state: LEAF_NODE,
+            ..entry.clone()
+        };
+        assert_eq!(leaf.actions(), vec!["invoke"]);
+        let button = Props {
+            control_type: 50000,
+            ..entry
+        };
+        assert_eq!(button.actions(), vec!["invoke", "expand", "collapse"]);
     }
 
     #[test]
