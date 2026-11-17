@@ -407,6 +407,7 @@ pub fn clients_of(snap: &Snapshot) -> Vec<Client> {
                         .as_i64()
                         .and_then(|p| u32::try_from(p).ok())
                         .unwrap_or(0),
+                    id: 0,
                     terminals: Vec::new(),
                     desktops: workspace_label(&c["workspace"]).into_iter().collect(),
                 },
@@ -698,6 +699,7 @@ mod tests {
                 maximized: true,
                 output: "HEADLESS-1".into(),
                 pid: 526509,
+                id: 0,
                 terminals: Vec::new(),
                 desktops: vec!["2".into()],
             }

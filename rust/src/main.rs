@@ -1356,6 +1356,13 @@ fn window_reached(w: &WindowGeo, c: &WindowChange) -> bool {
     state && near(c.x, w.x) && near(c.y, w.y) && near(c.width, w.width) && near(c.height, w.height)
 }
 
+/// Whether two reads of windows can be the same window by their handles
+/// (`id`, 0 where the backend has none): two windows of a process can
+/// share a title.
+fn same_id(a: &WindowGeo, b: &WindowGeo) -> bool {
+    a.id == 0 || b.id == 0 || a.id == b.id
+}
+
 /// `"title" [app] at (x,y) WxH {active,maximized} on OUTPUT, desktop 2`.
 fn describe_window(w: &WindowGeo) -> String {
     let states: Vec<&str> = [
@@ -3039,6 +3046,20 @@ impl<B: Backend> Server<B> {
         app: Option<&str>,
         skip: &[u64],
     ) -> Vec<String> {
+        self.surfaces_as(candidates, scanned, app, skip, false)
+            .await
+    }
+
+    /// `surfaces`; with `dialogs`, every candidate is taken for a dialog
+    /// (`dialogs_of`'s, whose roles do not say so).
+    async fn surfaces_as(
+        &self,
+        candidates: Vec<B::Id>,
+        scanned: bool,
+        app: Option<&str>,
+        skip: &[u64],
+        dialogs: bool,
+    ) -> Vec<String> {
         if candidates.is_empty() {
             return Vec::new();
         }
@@ -3059,7 +3080,13 @@ impl<B: Backend> Server<B> {
         let mut picked: Vec<(B::Id, String, render::Surface)> = candidates
             .into_iter()
             .zip(roles)
-            .filter_map(|((c, app), (role, _))| Some((c, app, render::surface_kind(&role)?)))
+            .filter_map(|((c, app), (role, _))| {
+                let kind = match dialogs {
+                    true => render::Surface::Dialog,
+                    false => render::surface_kind(&role)?,
+                };
+                Some((c, app, kind))
+            })
             .collect();
         // A list counts only under a combo box.
         let keep = futures_util::future::join_all(picked.iter().map(|(c, _, kind)| async move {
@@ -3604,7 +3631,7 @@ impl<B: Backend> Server<B> {
         while !window_reached(&w, &change) && start.elapsed() < WINDOW_SETTLE {
             tokio::time::sleep(Duration::from_millis(25)).await;
             let now = self.b.windows(&w.title, &allowed).await?;
-            match now.into_iter().find(|n| n.app == w.app) {
+            match now.into_iter().find(|n| n.app == w.app && same_id(n, &w)) {
                 Some(n) => w = n,
                 None => break,
             }
@@ -3645,7 +3672,12 @@ impl<B: Backend> Server<B> {
                 .await
                 .unwrap_or_default()
                 .iter()
-                .any(|n| n.app == closed.app && n.pid == closed.pid && n.title == closed.title);
+                .any(|n| {
+                    n.app == closed.app
+                        && n.pid == closed.pid
+                        && n.title == closed.title
+                        && same_id(n, &closed)
+                });
             if !open || start.elapsed() >= CLOSE_SETTLE {
                 break !open;
             }
@@ -3655,16 +3687,17 @@ impl<B: Backend> Server<B> {
             return Ok(format!("closed {what}"));
         }
         // The app's dialogs (a save prompt), with their buttons' ids.
-        let windows = match self.b.names_surfaces() {
+        let named = self.b.names_surfaces();
+        let windows = match named {
             true => self
                 .b
                 .app_windows(&app.to_lowercase())
                 .await
                 .unwrap_or_default(),
-            false => Vec::new(),
+            false => self.b.dialogs_of(&closed).await,
         };
         let shown = self
-            .surfaces(windows, false, Some(&app.to_lowercase()), &[])
+            .surfaces_as(windows, false, Some(&app.to_lowercase()), &[], !named)
             .await;
         Ok(if shown.is_empty() {
             format!(
@@ -7494,6 +7527,8 @@ mod tests {
         next: RefCell<Vec<u32>>,
         /// Parent of an element, by id.
         parents: RefCell<HashMap<u32, u32>>,
+        /// `dialogs_of` names the dialog `close_window` opens.
+        names_dialogs: std::cell::Cell<bool>,
         /// `close_window` leaves the window open and opens this dialog
         /// window; without it, the fake has no window control.
         close_opens: std::cell::Cell<Option<u32>>,
@@ -7672,6 +7707,13 @@ mod tests {
         }
         async fn app_name(&self, id: &u32) -> Option<String> {
             (!self.shown.nameless.borrow().contains(id)).then(|| "fake".into())
+        }
+        async fn dialogs_of(&self, _w: &WindowGeo) -> Vec<u32> {
+            // The dialog `close_window` opened, when set to name it.
+            match self.shown.names_dialogs.get() {
+                true => self.shown.close_opens.get().into_iter().collect(),
+                false => Vec::new(),
+            }
         }
         async fn close_window(&self, query: &str, allowed: &[String]) -> R<WindowGeo> {
             let dialog = self
@@ -11103,6 +11145,39 @@ mod tests {
             );
             // Listed once, not again after the effect line.
             assert!(!text.contains("opened:"), "{text}");
+            let save = id_before(text, "Save");
+            let r = call_tool(&mut s, 3, "act", json!({"id": save})).await;
+            assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
+        });
+    }
+
+    #[test]
+    fn close_window_lists_a_dialog_the_backend_names_without_its_role() {
+        local(async {
+            let mut s = session("surface-close-uia");
+            fake_surfaces(&s);
+            s.shown.uia_roles.set(true);
+            s.shown.names_dialogs.set(true);
+            // UIA calls a save prompt a "window", with plain buttons.
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.get_mut(&60).unwrap().role = "window".into();
+                nodes.get_mut(&62).unwrap().role = "button".into();
+            }
+            s.shown.close_opens.set(Some(60));
+            let r = call_tool(
+                &mut s,
+                2,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("still open, showing dialog 'Save?'")
+                    && text.contains("] button \"Save\" ["),
+                "{text}"
+            );
             let save = id_before(text, "Save");
             let r = call_tool(&mut s, 3, "act", json!({"id": save})).await;
             assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");

@@ -550,18 +550,21 @@ tool; `off` turns it off). Not available on Windows yet.
   maximized, minimized), output and virtual desktop in screen coordinates,
   after the screen layout (name, area, scale) and the virtual desktops
   (KDE: number, name, the current one; Hyprland: the regular workspaces and
-  the monitor each is on) (KDE and Hyprland).
+  the monitor each is on) (KDE, Hyprland and Windows, which has no virtual
+  desktops to list).
 - `move_window`: moves, resizes, maximizes, minimizes or restores a window,
   and with `desktop` (a number or name as `windows` lists them) moves it to
   that virtual desktop (KDE: the window is then on that one only) or
   workspace (Hyprland: silently, the view stays; a new number makes the
   workspace); waits (at most 1 s) until the window has its new geometry and
-  reports the real result (KDE and Hyprland; see the Hyprland limitations).
+  reports the real result (KDE, Hyprland and Windows; see the Hyprland and
+  Windows limitations).
 - `close_window`: closes the one window whose title or app name contains
   `query` (several matches: an error listing them) as its close button does
-  (KWin `closeWindow()`, Hyprland `closewindow`), so an app with unsaved
-  changes still asks; the reply then says the window is still open and
-  lists the app's dialog (the save prompt) with its buttons' ids
+  (KWin `closeWindow()`, Hyprland `closewindow`, Windows `WM_CLOSE`), so an
+  app with unsaved changes still asks; the reply then says the window is
+  still open and lists the app's dialog (the save prompt; Windows: a window
+  it owns or a modal one inside it) with its buttons' ids
   (`showing dialog '…': [60] push button "Save" [61] "Discard" …`). Always
   needs the user's consent, as tools on the `confirm:` list do (see
   [Tiers, confirmation and password fields](#tiers-confirmation-and-password-fields)).
@@ -1090,7 +1093,16 @@ Hyprland:
 Windows:
 - Input cannot be sent to windows running as administrator from a server that
   is not (Windows UIPI).
-- Microsoft Store apps may show up as `applicationframehost`.
+- Microsoft Store apps may show up as `applicationframehost`. The window tools
+  also let a Store app's window through when the allowlist names the app
+  it hosts (`calculatorapp`), and `query` matches that name too.
+- Window tools: positions and sizes are physical pixels (as for `mouse`) of
+  the visible frame, without the invisible resize borders; the screen
+  areas `screenshot` reports include them. Virtual desktops are not listed
+  and `move_window` cannot change them (`desktop` is refused). A minimized
+  window reports where it goes back to; while minimized since before the
+  server saw it, that rectangle still includes the borders. The desktop
+  and taskbar (explorer's `Progman`, `Shell_TrayWnd`) are never listed.
 - Key names follow the US keyboard layout positions; use `type_text` for text.
 - `type_text` pastes through the clipboard (a single character is typed as a
   key). It saves the clipboard text first and puts it back once the app in

@@ -10,6 +10,7 @@ mod clipboard;
 mod input;
 mod logic;
 mod uia;
+mod wm;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -22,8 +23,10 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use crate::backend::{
-    Activated, AppEntry, Backend, Cache, Clip, Info, NO_AREA, R, Shot, WindowEntry,
+    Activated, AppEntry, Backend, Cache, Check, Clip, Info, NO_AREA, R, Screen, Shot, WindowChange,
+    WindowEntry, WindowGeo,
 };
+use crate::delivery::nothing_sent;
 use logic::Props;
 use uia::{Elem, Uia};
 
@@ -57,6 +60,9 @@ const KEYSTROKE_MAX: usize = 1;
 /// Pause between the characters typed key by key: a SendInput burst of
 /// KEYEVENTF_UNICODE events makes Win11 Notepad drop and repeat them.
 const CHAR_GAP: Duration = Duration::from_millis(5);
+/// How long a minimized or maximized window may take to restore before it
+/// is moved or resized.
+const RESTORE_WAIT: Duration = Duration::from_millis(500);
 
 pub struct WindowsBackend {
     uia: Uia,
@@ -501,6 +507,134 @@ impl Backend for WindowsBackend {
             }
         }
         Ok(None)
+    }
+
+    async fn window_app(&self, w: &WindowGeo) -> String {
+        // A Store app's frame: the app it hosts, as the allowlist may name it.
+        if w.app == logic::STORE_FRAME_APP {
+            let all = [w.app.clone()];
+            if let Some(n) = wm::find(w, &all).filter(|n| !n.hosted.is_empty()) {
+                return n.hosted;
+            }
+        }
+        w.app.clone()
+    }
+
+    async fn dialogs_of(&self, w: &WindowGeo) -> Vec<Elem> {
+        let all = [w.app.clone()];
+        match wm::find(w, &all) {
+            Some(n) => self.uia.dialogs(n.hwnd, &wm::owned(n.hwnd)),
+            None => Vec::new(),
+        }
+    }
+
+    async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
+        Ok(wm::list(query, allowed)
+            .into_iter()
+            .map(|w| w.geo)
+            .collect())
+    }
+
+    async fn set_window(
+        &self,
+        query: &str,
+        allowed: &[String],
+        change: &WindowChange,
+    ) -> R<WindowGeo> {
+        use windows::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE};
+        if change.desktop.is_some() {
+            return Err(nothing_sent(
+                "virtual desktops cannot be changed on Windows",
+            ));
+        }
+        let mut list = wm::list(query, allowed);
+        let active: Vec<bool> = list.iter().map(|w| w.geo.active).collect();
+        let Some(i) = logic::pick_window(&active) else {
+            return Err(crate::backend::not_one_window(query, &[]));
+        };
+        let w = list.swap_remove(i);
+        let h = w.hwnd;
+        let geometry = [change.x, change.y, change.width, change.height]
+            .iter()
+            .any(Option::is_some);
+        let state = change.state.as_deref();
+        // Restore until neither minimized nor maximized (a maximized window
+        // that was minimized comes back maximized first); true when asked.
+        let restore = || async move {
+            let mut asked = false;
+            for _ in 0..2 {
+                if !wm::is_minimized(h) && !wm::is_maximized(h) {
+                    break;
+                }
+                asked = true;
+                let minimized = wm::is_minimized(h);
+                wm::show(h, SW_RESTORE);
+                poll(RESTORE_WAIT, || match minimized {
+                    true => !wm::is_minimized(h),
+                    false => !wm::is_maximized(h),
+                })
+                .await;
+            }
+            asked
+        };
+        let mut sent = false;
+        match state {
+            // With a new geometry the window ends up restored (as on KWin).
+            Some("maximize") if !geometry => {
+                wm::show(h, SW_MAXIMIZE);
+                sent = true;
+            }
+            Some("restore") => sent = restore().await,
+            _ => {}
+        }
+        if geometry {
+            // A maximized or minimized window is restored to be moved, as
+            // KWin does.
+            sent |= restore().await;
+            if let Err(e) = wm::place(h, change.x, change.y, change.width, change.height) {
+                return Err(match sent {
+                    false => nothing_sent(e),
+                    true => e,
+                });
+            }
+        }
+        // Last, so a move given with it does not restore the window again.
+        if state == Some("minimize") {
+            wm::show(h, SW_MINIMIZE);
+        }
+        Ok(wm::reread(h, &w.geo.app))
+    }
+
+    async fn close_window(&self, query: &str, allowed: &[String]) -> R<WindowGeo> {
+        let list = wm::list(query, allowed);
+        let [w] = list.as_slice() else {
+            let geos: Vec<WindowGeo> = list.into_iter().map(|w| w.geo).collect();
+            return Err(crate::backend::not_one_window(query, &geos));
+        };
+        wm::close(w.hwnd).map_err(nothing_sent)?;
+        Ok(w.geo.clone())
+    }
+
+    async fn screens(&self) -> Vec<Screen> {
+        wm::screens()
+    }
+
+    async fn doctor(&self) -> Vec<Check> {
+        let screens = wm::screens();
+        vec![Check {
+            name: "screens",
+            ok: !screens.is_empty(),
+            detail: screens
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{} at ({},{}) {}x{} scale {}",
+                        s.name, s.x, s.y, s.width, s.height, s.scale
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; "),
+        }]
     }
 
     async fn screenshot(&self) -> Option<Shot> {

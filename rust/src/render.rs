@@ -2306,7 +2306,11 @@ pub fn surface_line<Id>(
     message: Option<&str>,
     entries: &[(u64, &Info<Id>)],
 ) -> String {
-    let mut out = root.role.clone();
+    // A dialog whose role does not say so (UIA's "window") is called one.
+    let mut out = match kind == Surface::Dialog && !DIALOG_ROLES.contains(&root.role.as_str()) {
+        true => "dialog".to_string(),
+        false => root.role.clone(),
+    };
     let name = first_chars(&root.name.replace('\n', " "), 80);
     if !name.trim().is_empty() {
         out.push(' ');

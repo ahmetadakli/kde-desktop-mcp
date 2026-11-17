@@ -433,12 +433,12 @@ pub fn tools() -> Json {
         ),
         t(
             "windows",
-            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state, output and virtual desktop\n(Hyprland: workspace), after the screens (name, geometry, scale) and the\ndesktops (number, name, the current one). Terminal windows also list each\ntab's pseudo-terminal with its foreground command and directory. `query`\nfilters by title or app name. KDE Plasma and Hyprland.",
+            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state, output and virtual desktop\n(Hyprland: workspace), after the screens (name, geometry, scale) and the\ndesktops (number, name, the current one). Terminal windows also list each\ntab's pseudo-terminal with its foreground command and directory. `query`\nfilters by title or app name. KDE Plasma, Hyprland and Windows (no virtual\ndesktops there).",
             schema(&[("query", "string", Some(json!("")))])
         ),
         t(
             "move_window",
-            "Move and/or resize the first window of an allowed app whose title or\napp name contains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), set `state` to maximize, minimize or restore, and/or\nmove it to virtual desktop `desktop` (number or name as windows lists them;\nHyprland: a workspace, created when the number is new; the view stays).\nReplies with the new geometry. KDE Plasma and Hyprland (there a tiled\nwindow is floated to move or resize it; minimize parks it on the special\nworkspace special:minimized).",
+            "Move and/or resize the first window of an allowed app whose title or\napp name contains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), set `state` to maximize, minimize or restore, and/or\nmove it to virtual desktop `desktop` (number or name as windows lists them;\nHyprland: a workspace, created when the number is new; the view stays).\nReplies with the new geometry. KDE Plasma, Hyprland (there a tiled window\nis floated to move or resize it; minimize parks it on the special workspace\nspecial:minimized) and Windows (without `desktop`).",
             schema(&[
                 ("query", "string", None),
                 ("x", "integer", Some(Json::Null)),
@@ -451,7 +451,7 @@ pub fn tools() -> Json {
         ),
         t(
             "close_window",
-            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes: the reply then lists that dialog\nwith its buttons' ids. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma and\nHyprland.",
+            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes: the reply then lists that dialog\nwith its buttons' ids. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma,\nHyprland and Windows.",
             schema(&[
                 ("query", "string", None),
                 ("confirm", "boolean", Some(json!(false))),

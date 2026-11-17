@@ -543,6 +543,158 @@ pub fn center(left: i32, top: i32, right: i32, bottom: i32) -> Option<(i32, i32)
     (w > 0 && h > 0).then(|| (left + w.div_euclid(2), top + h.div_euclid(2)))
 }
 
+/// Window classes of the shell itself (desktop, taskbars): explorer's, but
+/// not windows to list, move or close.
+const SHELL_CLASSES: [&str; 4] = [
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+];
+
+/// The frame of a Store app's window; the app runs in its CoreWindow child.
+pub const STORE_FRAME_CLASS: &str = "ApplicationFrameWindow";
+pub const STORE_CORE_CLASS: &str = "Windows.UI.Core.CoreWindow";
+/// The process behind every Store app's frame window.
+pub const STORE_FRAME_APP: &str = "applicationframehost";
+
+/// Whether a top-level window is one `windows` lists: shown, not cloaked
+/// (a suspended Store app's frame, another virtual desktop), no tool
+/// window, titled, and not part of the shell.
+pub fn listed_window(
+    visible: bool,
+    cloaked: bool,
+    tool_window: bool,
+    class: &str,
+    title: &str,
+) -> bool {
+    visible
+        && !cloaked
+        && !tool_window
+        && !title.trim().is_empty()
+        && !SHELL_CLASSES.contains(&class)
+}
+
+/// Whether a window of `app` (and, for a Store app's frame, the app it
+/// hosts) matches the lower-case query `q`: by title or app; "" matches all.
+pub fn window_matches(q: &str, title: &str, app: &str, hosted: &str) -> bool {
+    q.is_empty()
+        || title.to_lowercase().contains(q)
+        || app.contains(q)
+        || (!hosted.is_empty() && hosted.contains(q))
+}
+
+/// Whether the allowlist lets a window through: its app, or the Store app
+/// its frame hosts.
+pub fn window_allowed(allowed: &[String], app: &str, hosted: &str) -> bool {
+    allowed
+        .iter()
+        .any(|a| a == app || (!hosted.is_empty() && a == hosted))
+}
+
+/// The window `move_window` changes among matches in z-order: the active
+/// one, else the topmost.
+pub fn pick_window(active: &[bool]) -> Option<usize> {
+    active
+        .iter()
+        .position(|a| *a)
+        .or((!active.is_empty()).then_some(0))
+}
+
+/// A rectangle as Win32 has it: left, top, right, bottom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl Rect {
+    pub fn width(&self) -> i32 {
+        self.right - self.left
+    }
+    pub fn height(&self) -> i32 {
+        self.bottom - self.top
+    }
+}
+
+/// The invisible resize borders around a window's visible frame: how far
+/// its window rectangle reaches past the frame on each side.
+pub fn borders(window: Rect, frame: Rect) -> Rect {
+    Rect {
+        left: frame.left - window.left,
+        top: frame.top - window.top,
+        right: window.right - frame.right,
+        bottom: window.bottom - frame.bottom,
+    }
+}
+
+/// The visible frame a change asks for (x, y, width, height), the values
+/// not given kept from `frame`.
+pub fn wanted_frame(
+    frame: Rect,
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> (i32, i32, i32, i32) {
+    let px = |v: Option<f64>, keep: i32| v.map_or(keep, |v| v.round() as i32);
+    (
+        px(x, frame.left),
+        px(y, frame.top),
+        px(width, frame.width()).max(1),
+        px(height, frame.height()).max(1),
+    )
+}
+
+/// `window` without its invisible `borders`: its visible frame.
+pub fn inset(window: Rect, borders: Rect) -> Rect {
+    Rect {
+        left: window.left + borders.left,
+        top: window.top + borders.top,
+        right: window.right - borders.right,
+        bottom: window.bottom - borders.bottom,
+    }
+}
+
+/// SetWindowPos arguments (x, y, cx, cy) that give the window the visible
+/// frame `(x, y, w, h)`, its invisible borders added around it.
+pub fn window_pos(frame: (i32, i32, i32, i32), borders: Rect) -> (i32, i32, i32, i32) {
+    let (x, y, w, h) = frame;
+    (
+        x - borders.left,
+        y - borders.top,
+        w + borders.left + borders.right,
+        h + borders.top + borders.bottom,
+    )
+}
+
+/// A restored-position rectangle (WINDOWPLACEMENT, workspace coordinates:
+/// relative to the work area) in screen coordinates.
+pub fn workspace_to_screen(r: Rect, work: Rect, monitor: Rect) -> Rect {
+    let (dx, dy) = (work.left - monitor.left, work.top - monitor.top);
+    Rect {
+        left: r.left + dx,
+        top: r.top + dy,
+        right: r.right + dx,
+        bottom: r.bottom + dy,
+    }
+}
+
+/// A monitor's name without the device prefix: "DISPLAY1" for `\\.\DISPLAY1`.
+pub fn display_name(device: &str) -> String {
+    device.trim_start_matches("\\\\.\\").to_string()
+}
+
+/// Scale factor of a monitor's effective DPI (96 is 100 %).
+pub fn dpi_scale(dpi: u32) -> f64 {
+    if dpi == 0 {
+        return 1.0;
+    }
+    (dpi as f64 / 96.0 * 100.0).round() / 100.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -870,5 +1022,106 @@ mod tests {
             bgra_to_rgb(&[1, 2, 3, 255, 4, 5, 6, 0]),
             vec![3, 2, 1, 6, 5, 4]
         );
+    }
+
+    #[test]
+    fn shell_and_hidden_windows_are_not_listed() {
+        assert!(listed_window(true, false, false, "Notepad", "a - Notepad"));
+        assert!(!listed_window(
+            true,
+            false,
+            false,
+            "Progman",
+            "Program Manager"
+        ));
+        assert!(!listed_window(true, false, false, "Shell_TrayWnd", "x"));
+        assert!(!listed_window(
+            true,
+            true,
+            false,
+            "ApplicationFrameWindow",
+            "Calc"
+        ));
+        assert!(!listed_window(false, false, false, "Notepad", "a"));
+        assert!(!listed_window(true, false, true, "Notepad", "a"));
+        assert!(!listed_window(true, false, false, "Notepad", "  "));
+    }
+
+    #[test]
+    fn windows_match_title_app_or_hosted_app() {
+        assert!(window_matches("", "x", "notepad", ""));
+        assert!(window_matches(
+            "hesap",
+            "Hesap Makinesi",
+            "applicationframehost",
+            ""
+        ));
+        assert!(window_matches(
+            "calc",
+            "Hesap",
+            "applicationframehost",
+            "calculatorapp"
+        ));
+        assert!(!window_matches("calc", "Hesap", "applicationframehost", ""));
+        let allowed = vec!["calculatorapp".to_string()];
+        assert!(window_allowed(
+            &allowed,
+            "applicationframehost",
+            "calculatorapp"
+        ));
+        assert!(!window_allowed(&allowed, "applicationframehost", ""));
+        assert!(!window_allowed(&[String::new()], "notepad", ""));
+    }
+
+    #[test]
+    fn the_active_match_is_picked_else_the_topmost() {
+        assert_eq!(pick_window(&[false, true]), Some(1));
+        assert_eq!(pick_window(&[false, false]), Some(0));
+        assert_eq!(pick_window(&[]), None);
+    }
+
+    #[test]
+    fn invisible_borders_are_added_to_the_frame_asked_for() {
+        let r = |left, top, right, bottom| Rect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let window = r(93, 80, 907, 587);
+        let frame = r(100, 80, 900, 580);
+        let b = borders(window, frame);
+        assert_eq!(b, r(7, 0, 7, 7));
+        let want = wanted_frame(frame, Some(200.0), None, None, Some(300.0));
+        assert_eq!(want, (200, 80, 800, 300));
+        assert_eq!(window_pos(want, b), (193, 80, 814, 307));
+        assert_eq!(inset(window, b), frame);
+        assert_eq!(wanted_frame(frame, None, None, Some(0.0), None).2, 1);
+    }
+
+    #[test]
+    fn workspace_rects_move_by_the_work_area_offset() {
+        let r = |left, top, right, bottom| Rect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let mon = r(0, 0, 1920, 1080);
+        let work = r(0, 40, 1920, 1080); // taskbar on top
+        assert_eq!(
+            workspace_to_screen(r(10, 10, 110, 60), work, mon),
+            r(10, 50, 110, 100)
+        );
+    }
+
+    #[test]
+    fn monitors_are_named_and_scaled() {
+        assert_eq!(display_name("\\\\.\\DISPLAY1"), "DISPLAY1");
+        assert_eq!(display_name("DISPLAY2"), "DISPLAY2");
+        assert_eq!(dpi_scale(96), 1.0);
+        assert_eq!(dpi_scale(144), 1.5);
+        assert_eq!(dpi_scale(120), 1.25);
+        assert_eq!(dpi_scale(0), 1.0);
     }
 }

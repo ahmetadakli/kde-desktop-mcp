@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, SAFEARRAY,
 };
@@ -296,6 +297,40 @@ impl Uia {
                 (e, p)
             })
             .collect()
+    }
+
+    /// The dialogs of the top-level window `h`: the windows it owns
+    /// (`owned`, a Win32 save prompt) and the modal windows inside it (a
+    /// XAML one, as Win11 Notepad's).
+    pub fn dialogs(&self, h: HWND, owned: &[HWND]) -> Vec<Elem> {
+        let Some(req) = &self.req else {
+            return Vec::new();
+        };
+        let mut out: Vec<Elem> = owned
+            .iter()
+            .filter_map(|o| unsafe { self.auto.ElementFromHandleBuildCache(*o, &req.windows) }.ok())
+            .map(|el| Self::wrap(el, false))
+            .collect();
+        let modal = unsafe {
+            let window = VARIANT::from(UIA_WindowControlTypeId.0);
+            let yes = VARIANT::from(true);
+            self.auto
+                .CreatePropertyCondition(UIA_ControlTypePropertyId, &window)
+                .and_then(|w| {
+                    let m = self
+                        .auto
+                        .CreatePropertyCondition(UIA_WindowIsModalPropertyId, &yes)?;
+                    self.auto.CreateAndCondition(&w, &m)
+                })
+        };
+        if let Ok(cond) = modal
+            && let Ok(root) = unsafe { self.auto.ElementFromHandle(h) }
+        {
+            let found =
+                unsafe { root.FindAllBuildCache(TreeScope_Descendants, &cond, &req.windows) };
+            out.extend(Self::elems(found.ok(), false));
+        }
+        out
     }
 
     /// Fetch `el` and everything below it in one cross-process call.

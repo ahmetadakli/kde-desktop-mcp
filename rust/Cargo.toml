@@ -24,6 +24,7 @@ jpeg-encoder = "=0.7.1"
 png = "=0.18.0"
 windows = { version = "=0.62.2", features = [
     "Win32_Foundation",
+    "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_System_Com",

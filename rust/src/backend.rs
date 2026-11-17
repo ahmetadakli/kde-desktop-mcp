@@ -72,7 +72,8 @@ pub struct Fetch {
 pub const NO_AREA: &str = "element has no on-screen area";
 
 /// Window management the desktop does not offer (KDE and Hyprland do).
-pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma and Hyprland";
+pub const NO_WINDOW_CONTROL: &str =
+    "window geometry is only available on KDE Plasma, Hyprland and Windows";
 
 /// Clipboard access the desktop does not offer.
 pub const NO_CLIPBOARD: &str =
@@ -96,7 +97,8 @@ pub enum Clip {
     Other(Vec<String>),
 }
 
-/// A top-level window and where it is, in logical screen px.
+/// A top-level window and where it is, in logical screen px (Windows:
+/// physical px, its visible frame).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WindowGeo {
     pub title: String,
@@ -110,6 +112,9 @@ pub struct WindowGeo {
     pub maximized: bool,
     pub output: String,
     pub pid: u32,
+    /// The backend's handle of the window (Windows: its HWND), to tell
+    /// windows of one process with the same title apart; 0 when unknown.
+    pub id: u64,
     /// Pseudo-terminals the window's processes hold (terminal emulators).
     pub terminals: Vec<Terminal>,
     /// The virtual desktops (KDE: their numbers; Hyprland: the workspace
@@ -415,6 +420,12 @@ pub trait Backend {
     fn names_surfaces(&self) -> bool {
         false
     }
+    /// The dialogs the window `w` shows (a save prompt), for a backend whose
+    /// roles do not name them (`names_surfaces` false): each is listed as
+    /// a dialog, whatever its role.
+    async fn dialogs_of(&self, _w: &WindowGeo) -> Vec<Self::Id> {
+        Vec::new()
+    }
     /// Whether `window`, a dialog, is a file dialog `file_dialog` fills.
     async fn fills_file_dialog(&self, _window: &Self::Id) -> bool {
         false
@@ -717,8 +728,6 @@ pub trait Backend {
 }
 
 /// Why `close_window` closed nothing: no window or several match `query`.
-// The Windows backend has no window control yet.
-#[cfg_attr(windows, allow(dead_code))]
 pub fn not_one_window(query: &str, matches: &[WindowGeo]) -> String {
     // Nothing was closed: the caller's write sent nothing.
     if matches.is_empty() {
