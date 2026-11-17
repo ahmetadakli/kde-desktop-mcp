@@ -77,6 +77,9 @@ pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Pl
 /// Clipboard access the desktop does not offer (only Linux so far).
 pub const NO_CLIPBOARD: &str = "the clipboard tools are only available on Linux (Wayland)";
 
+/// Starting apps the platform does not offer yet.
+pub const NO_LAUNCH: &str = "launch is not supported on this platform yet";
+
 /// What `clipboard_get` found on the clipboard.
 // Only the Linux backend builds one so far.
 #[cfg_attr(windows, allow(dead_code))]
@@ -342,6 +345,11 @@ pub trait Backend {
     fn allow_file(&self) -> PathBuf;
     fn default_allow(&self) -> &'static str;
     fn apps_note(&self) -> &'static str;
+    /// An allowlist confirm rule naming an app of this platform, for
+    /// doctor's hint.
+    fn confirm_example(&self) -> &'static str {
+        "key:konsole"
+    }
     /// Roles skipped (children lifted) when unnamed and actionless.
     fn boring_roles(&self) -> &'static [&'static str];
 
@@ -636,7 +644,7 @@ pub trait Backend {
     /// Windows of allowed apps whose title or app contains `query` (all when
     /// empty).
     async fn windows(&self, _query: &str, _allowed: &[String]) -> R<Vec<WindowGeo>> {
-        Err(NO_WINDOW_CONTROL.into())
+        Err(crate::delivery::nothing_sent(NO_WINDOW_CONTROL))
     }
     /// `windows` without what costs extra (terminals), for polling.
     async fn windows_quick(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
@@ -659,21 +667,21 @@ pub trait Backend {
         _allowed: &[String],
         _change: &WindowChange,
     ) -> R<WindowGeo> {
-        Err(NO_WINDOW_CONTROL.into())
+        Err(crate::delivery::nothing_sent(NO_WINDOW_CONTROL))
     }
     /// Ask the only window of an allowed app whose title or app contains
     /// `query` to close, as its close button does: the app may still ask to
     /// save changes. Returns that window as it was; Err when no window or
     /// more than one matches.
     async fn close_window(&self, _query: &str, _allowed: &[String]) -> R<WindowGeo> {
-        Err(NO_WINDOW_CONTROL.into())
+        Err(crate::delivery::nothing_sent(NO_WINDOW_CONTROL))
     }
     /// Read the clipboard as text, at most `limit` characters.
     async fn clipboard_get(&self, _limit: usize) -> R<Clip> {
-        Err(NO_CLIPBOARD.into())
+        Err(crate::delivery::nothing_sent(NO_CLIPBOARD))
     }
     async fn clipboard_set(&self, _text: &str) -> R<()> {
-        Err(NO_CLIPBOARD.into())
+        Err(crate::delivery::nothing_sent(NO_CLIPBOARD))
     }
     /// Start `app` (an allowed name) with `args`, without a shell, and wait
     /// up to `wait` for its window; `allowed` limits which windows are seen.
@@ -684,7 +692,7 @@ pub trait Backend {
         _allowed: &[String],
         _wait: std::time::Duration,
     ) -> R<Launched> {
-        Err("launch is not supported on this platform yet".into())
+        Err(crate::delivery::nothing_sent(NO_LAUNCH))
     }
     async fn screens(&self) -> Vec<Screen> {
         Vec::new()
@@ -699,7 +707,7 @@ pub trait Backend {
     async fn indicate(&self, _label: &str) {}
     /// The active window as a file dialog; Err when it is none.
     async fn active_file_dialog(&self) -> R<FileDialog<Self::Id>> {
-        Err(NO_FILE_DIALOG.into())
+        Err(crate::delivery::nothing_sent(NO_FILE_DIALOG))
     }
     /// Platform checks for `doctor`.
     async fn doctor(&self) -> Vec<Check> {

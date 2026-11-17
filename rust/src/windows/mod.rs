@@ -141,6 +141,10 @@ impl Backend for WindowsBackend {
         APPS_NOTE
     }
 
+    fn confirm_example(&self) -> &'static str {
+        "key:notepad"
+    }
+
     fn boring_roles(&self) -> &'static [&'static str] {
         BORING
     }

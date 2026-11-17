@@ -3765,7 +3765,10 @@ impl<B: Backend> Server<B> {
             true,
             "confirm",
             &if policy.confirm.is_empty() {
-                "none (add e.g. 'confirm: key:konsole' to the allowlist)".to_string()
+                format!(
+                    "none (add e.g. 'confirm: {}' to the allowlist)",
+                    self.b.confirm_example()
+                )
             } else {
                 let list: Vec<String> = policy.confirm.iter().map(|r| r.to_string()).collect();
                 format!("{}; {asks}", list.join(", "))
@@ -7588,6 +7591,9 @@ mod tests {
         fn apps_note(&self) -> &'static str {
             ""
         }
+        fn confirm_example(&self) -> &'static str {
+            "key:fake"
+        }
         fn boring_roles(&self) -> &'static [&'static str] {
             &[]
         }
@@ -7672,7 +7678,7 @@ mod tests {
                 .shown
                 .close_opens
                 .get()
-                .ok_or(backend::NO_WINDOW_CONTROL)?;
+                .ok_or_else(|| delivery::nothing_sent(backend::NO_WINDOW_CONTROL))?;
             let list = self.windows(query, allowed).await?;
             let [w] = list.as_slice() else {
                 return Err(backend::not_one_window(query, &list));
@@ -8744,8 +8750,42 @@ mod tests {
                 json!({"query": "notes", "confirm": true}),
             )
             .await;
-            assert!(reply_text(&r).contains(backend::NO_WINDOW_CONTROL), "{r}");
+            let text = reply_text(&r);
+            assert!(text.contains(backend::NO_WINDOW_CONTROL), "{r}");
+            assert!(
+                text.ends_with("; nothing sent") && !text.contains(delivery::MAYBE_SENT),
+                "{text}"
+            );
             assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn move_window_without_window_control_says_nothing_sent() {
+        local(async {
+            let mut s = session("move-unsupported");
+            let r = call_tool(&mut s, 2, "move_window", json!({"query": "notes", "x": 1})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(text.contains(backend::NO_WINDOW_CONTROL), "{text}");
+            assert!(
+                text.ends_with("; nothing sent") && !text.contains(delivery::MAYBE_SENT),
+                "{text}"
+            );
+        });
+    }
+
+    #[test]
+    fn doctor_confirm_hint_names_an_app_of_the_platform() {
+        local(async {
+            let mut s = session("doctor-hint");
+            let r = call_tool(&mut s, 2, "doctor", json!({})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("none (add e.g. 'confirm: key:fake' to the allowlist)"),
+                "{text}"
+            );
+            assert!(!text.contains("konsole"), "{text}");
         });
     }
 
@@ -8814,7 +8854,12 @@ mod tests {
             assert!(text(&r).contains("args must be a list of strings"), "{r}");
             // Allowed: it reaches the backend, which cannot launch here.
             let r = call_tool(&mut s, 4, "launch", json!({"app": " Fake ", "args": ["x"]})).await;
-            assert!(text(&r).contains("not supported"), "{r}");
+            let t = text(&r);
+            assert!(t.contains(backend::NO_LAUNCH), "{t}");
+            assert!(
+                t.ends_with("; nothing sent") && !t.contains(delivery::MAYBE_SENT),
+                "{t}"
+            );
         });
         assert_eq!(
             indicator_label("launch", &json!({"app": "kate"})).as_deref(),
@@ -9788,6 +9833,7 @@ mod tests {
             assert_eq!(r["result"]["isError"], true, "{r}");
             let text = r["result"]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains(backend::NO_FILE_DIALOG), "{text}");
+            assert!(text.ends_with("; nothing sent"), "{text}");
         });
     }
 
