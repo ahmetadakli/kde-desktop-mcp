@@ -2032,6 +2032,14 @@ impl<B: Backend> Server<B> {
     /// The allowlist file, parsed (see `policy`); created with the
     /// backend's default list when missing.
     fn policy(&self) -> Policy {
+        let mut p = self.policy_file();
+        p.add_aliases(&self.b.app_aliases());
+        p
+    }
+
+    /// The allowlist file as written, without the apps allowed through an
+    /// alias.
+    fn policy_file(&self) -> Policy {
         if !self.allow_file.exists() {
             if let Some(dir) = self.allow_file.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -3777,14 +3785,24 @@ impl<B: Backend> Server<B> {
             ));
         };
         row(true, "update", &update);
+        let listed = self.policy_file();
+        let aliased: Vec<String> = allow
+            .iter()
+            .filter(|a| listed.tier(a).is_none())
+            .cloned()
+            .collect();
+        let aliased = match aliased.is_empty() {
+            true => String::new(),
+            false => format!("; allowed through an alias: {}", aliased.join(", ")),
+        };
         row(
             !allow.is_empty(),
             "allowlist",
             &format!(
-                "{} ({} apps: {})",
+                "{} ({} apps: {}){aliased}",
                 self.allow_file.display(),
-                allow.len(),
-                policy.apps_line()
+                listed.apps.len(),
+                listed.apps_line()
             ),
         );
         for w in &policy.warnings {
@@ -7630,6 +7648,10 @@ mod tests {
         fn confirm_example(&self) -> &'static str {
             "key:fake"
         }
+        /// As a Store app hosted by the allowed "fake".
+        fn app_aliases(&self) -> Vec<(String, &'static str)> {
+            vec![("hosted".into(), "fake")]
+        }
         fn boring_roles(&self) -> &'static [&'static str] {
             &[]
         }
@@ -8829,6 +8851,19 @@ mod tests {
                 "{text}"
             );
             assert!(!text.contains("konsole"), "{text}");
+        });
+    }
+
+    #[test]
+    fn doctor_lists_the_file_and_names_apps_allowed_through_an_alias() {
+        local(async {
+            let mut s = session("doctor-alias");
+            let r = call_tool(&mut s, 2, "doctor", json!({})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("(1 apps: fake); allowed through an alias: hosted"),
+                "{text}"
+            );
         });
     }
 

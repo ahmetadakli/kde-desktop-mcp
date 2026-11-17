@@ -354,6 +354,13 @@ pub trait Backend {
     fn confirm_example(&self) -> &'static str {
         "key:konsole"
     }
+    /// (app, alias) pairs: `app` is allowed with the alias's tier when the
+    /// allowlist names the alias but not the app. Windows: the Store apps
+    /// ApplicationFrameHost now hosts, so an allowlist written for their
+    /// frames keeps working.
+    fn app_aliases(&self) -> Vec<(String, &'static str)> {
+        Vec::new()
+    }
     /// Roles skipped (children lifted) when unnamed and actionless.
     fn boring_roles(&self) -> &'static [&'static str];
 

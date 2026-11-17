@@ -16,21 +16,21 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, FindWindowExW, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow, GetWindowLongW,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow, GetWindowLongW,
     GetWindowPlacement, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
     IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SHOW_WINDOW_CMD, SWP_ASYNCWINDOWPOS,
     SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT, WM_CLOSE,
     WS_EX_TOOLWINDOW,
 };
-use windows::core::{BOOL, PCWSTR};
+use windows::core::BOOL;
 
 use super::input;
 use super::logic::{self, Rect};
 use crate::backend::{R, Screen, WindowGeo};
 
 /// A listed top-level window: its handle, what `windows` reports, and for
-/// a Store app's frame the app it hosts ("" otherwise, or while the app is
-/// minimized and its CoreWindow detached) and that app's process id.
+/// a Store app's frame the app it hosts ("" otherwise) and that app's
+/// process id.
 pub struct Win {
     pub hwnd: HWND,
     pub geo: WindowGeo,
@@ -121,23 +121,13 @@ fn frame(h: HWND) -> Option<Rect> {
     }
 }
 
-/// The app a Store app's frame window hosts and its process id: its
-/// CoreWindow child's.
-fn hosted_app(h: HWND, class: &str) -> (String, u32) {
+/// The app a Store app's frame window hosts and its process id ("" and 0
+/// for other windows, or a frame that hosts none).
+fn hosted_app(h: HWND, class: &str, frame_pid: u32) -> (String, u32) {
     if class != logic::STORE_FRAME_CLASS {
         return (String::new(), 0);
     }
-    let core: Vec<u16> = logic::STORE_CORE_CLASS
-        .encode_utf16()
-        .chain(Some(0))
-        .collect();
-    match unsafe { FindWindowExW(Some(h), None, PCWSTR(core.as_ptr()), PCWSTR::null()) } {
-        Ok(c) if !c.is_invalid() => {
-            let p = pid(c);
-            (input::proc_name(p), p)
-        }
-        _ => (String::new(), 0),
-    }
+    input::hosted(h, frame_pid).unwrap_or_default()
 }
 
 /// A monitor's device name and its full and work-area rectangles.
@@ -246,11 +236,12 @@ pub fn list(query: &str, allowed: &[String]) -> Vec<Win> {
         ) {
             continue;
         }
-        let app = input::proc_name(pid(h));
+        let p = pid(h);
+        let app = input::proc_name(p);
         if app.is_empty() {
             continue;
         }
-        let (hosted, hosted_pid) = hosted_app(h, &class);
+        let (hosted, hosted_pid) = hosted_app(h, &class, p);
         if !logic::window_allowed(allowed, &app, &hosted)
             || !logic::window_matches(&q, &t, &app, &hosted)
         {
@@ -258,7 +249,18 @@ pub fn list(query: &str, allowed: &[String]) -> Vec<Win> {
         }
         out.push(Win {
             hwnd: h,
-            geo: describe(h, t, app, fg_root),
+            // A Store app's frame shows as the app it hosts, as `apps`
+            // lists it.
+            geo: describe(
+                h,
+                t,
+                if hosted.is_empty() {
+                    app
+                } else {
+                    hosted.clone()
+                },
+                fg_root,
+            ),
             hosted,
             hosted_pid,
         });

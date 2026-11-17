@@ -43,9 +43,10 @@ msedge
 winword
 excel
 ";
-const APPS_NOTE: &str = "App names are executable names without .exe. Store apps may run \
-inside 'applicationframehost'. Windows of elevated (admin) apps cannot receive input from a \
-non-elevated server.";
+const APPS_NOTE: &str = "App names are executable names without .exe. Store apps hosted by \
+ApplicationFrameHost are listed under their own executable (e.g. 'calculatorapp'); \
+'applicationframehost' in the allowlist still allows all of them. Windows of elevated (admin) \
+apps cannot receive input from a non-elevated server.";
 const BORING: &[&str] = &["pane", "group", "custom"];
 const KEY_HOLD: Duration = Duration::from_millis(8);
 const KEY_GAP: Duration = Duration::from_millis(8);
@@ -96,6 +97,12 @@ fn dead() -> Info<Elem> {
         children: Vec::new(),
         operable: false,
     }
+}
+
+/// The app of a top-level window, a Store app's frame named after the app
+/// it hosts.
+fn app_of(p: &Props) -> String {
+    input::window_app(input::hwnd_from_i32(p.hwnd), p.pid)
 }
 
 /// Allowed apps' windows as `launch` compares them, with a Store app's
@@ -255,6 +262,14 @@ impl Backend for WindowsBackend {
         "key:notepad"
     }
 
+    fn app_aliases(&self) -> Vec<(String, &'static str)> {
+        input::hosted_apps()
+            .into_iter()
+            .filter(|a| a != logic::STORE_FRAME_APP)
+            .map(|a| (a, logic::STORE_FRAME_APP))
+            .collect()
+    }
+
     fn boring_roles(&self) -> &'static [&'static str] {
         BORING
     }
@@ -267,7 +282,7 @@ impl Backend for WindowsBackend {
         let fg = Self::foreground_i32();
         let mut apps: BTreeMap<String, Vec<WindowEntry>> = BTreeMap::new();
         for (_, p) in self.uia.top_level() {
-            let name = input::proc_name(p.pid);
+            let name = app_of(&p);
             if name.is_empty() {
                 continue;
             }
@@ -288,7 +303,13 @@ impl Backend for WindowsBackend {
             .uia
             .top_level()
             .into_iter()
-            .filter(|(_, p)| input::proc_name(p.pid) == app)
+            // A Store app's frame is the root: its tree has the title bar
+            // as well as the app. 'applicationframehost' still reaches
+            // every frame.
+            .filter(|(_, p)| {
+                app_of(p) == app
+                    || (app == logic::STORE_FRAME_APP && input::proc_name(p.pid) == app)
+            })
             .map(|(e, _)| e)
             .collect();
         (!windows.is_empty()).then_some(windows)
@@ -506,7 +527,7 @@ impl Backend for WindowsBackend {
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {
         let q = query.to_lowercase();
         for (_, p) in self.uia.top_level() {
-            let app = input::proc_name(p.pid);
+            let app = app_of(&p);
             if !allowed.contains(&app) {
                 continue;
             }

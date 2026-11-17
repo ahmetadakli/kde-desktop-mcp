@@ -209,6 +209,20 @@ impl Policy {
         p
     }
 
+    /// Allow each `app` with the tier of its `alias` when the list names
+    /// the alias but not the app (an entry of its own wins). Confirm rules
+    /// and `passwords:` naming the alias do not carry over.
+    pub fn add_aliases(&mut self, aliases: &[(String, &str)]) {
+        for (app, alias) in aliases {
+            let app = app.trim().to_lowercase();
+            if let Some(t) = self.apps.get(*alias).copied()
+                && !app.is_empty()
+            {
+                self.apps.entry(app).or_insert(t);
+            }
+        }
+    }
+
     /// Allowed app names, sorted.
     pub fn names(&self) -> Vec<String> {
         self.apps.keys().cloned().collect()
@@ -361,5 +375,41 @@ mod tests {
             needed_tier("launch", &json!({"args": ["-e", "sh"]})),
             Tier::Full
         );
+    }
+
+    #[test]
+    fn aliases_take_the_alias_tier_unless_listed() {
+        let frame = "applicationframehost";
+        let aliases = [
+            ("CalculatorApp".to_string(), frame),
+            ("systemsettings".to_string(), frame),
+        ];
+        let mut p = Policy::parse("applicationframehost:click\nsystemsettings:view\n");
+        p.add_aliases(&aliases);
+        assert_eq!(
+            p.tier("calculatorapp"),
+            Some(Tier::Click),
+            "alias tier copied"
+        );
+        assert_eq!(p.tier("systemsettings"), Some(Tier::View), "own entry wins");
+        assert_eq!(p.tier(frame), Some(Tier::Click));
+
+        let mut p = Policy::parse("calculatorapp:view\napplicationframehost\n");
+        p.add_aliases(&aliases);
+        assert_eq!(
+            p.tier("calculatorapp"),
+            Some(Tier::View),
+            "own lower tier wins"
+        );
+        assert_eq!(p.tier("systemsettings"), Some(Tier::Full));
+
+        let mut p = Policy::parse("calculatorapp\n");
+        p.add_aliases(&aliases);
+        assert_eq!(
+            p.names(),
+            vec!["calculatorapp"],
+            "no alias listed: nothing added"
+        );
+        assert_eq!(p.tier(frame), None);
     }
 }

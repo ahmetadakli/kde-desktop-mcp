@@ -19,10 +19,11 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
     VIRTUAL_KEY,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect,
-    GetWindowThreadProcessId, IsIconic, SW_RESTORE, SetCursorPos, SetForegroundWindow, ShowWindow,
+    FindWindowExW, GA_ROOT, GetAncestor, GetCursorPos, GetForegroundWindow, GetWindowRect,
+    GetWindowTextW, GetWindowThreadProcessId, IsIconic, SW_RESTORE, SetCursorPos,
+    SetForegroundWindow, ShowWindow,
 };
-use windows::core::PWSTR;
+use windows::core::{PCWSTR, PWSTR};
 
 use super::logic::{self, KeyEv};
 use crate::backend::R;
@@ -175,13 +176,91 @@ pub fn proc_name(pid: u32) -> String {
     image_stem(pid)
 }
 
+/// The app a window belongs to, as the allowlist names it: see
+/// `window_app`.
 pub fn hwnd_proc_name(h: HWND) -> String {
     if h.is_invalid() {
         return String::new();
     }
+    window_app(h, hwnd_pid(h))
+}
+
+pub fn hwnd_pid(h: HWND) -> u32 {
     let mut pid = 0u32;
     unsafe { GetWindowThreadProcessId(h, Some(&mut pid)) };
-    proc_name(pid)
+    pid
+}
+
+fn wide_z(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(Some(0)).collect()
+}
+
+/// The app of the top-level window `h` of process `pid`: the process's
+/// executable stem, or for a Store app's frame (ApplicationFrameHost's) the
+/// app it hosts, when it hosts one.
+pub fn window_app(h: HWND, pid: u32) -> String {
+    let name = proc_name(pid);
+    // A null parent would make FindWindowExW search the top-level windows.
+    if name != logic::STORE_FRAME_APP || h.is_invalid() {
+        return name;
+    }
+    match hosted(h, pid) {
+        Some((app, _)) => app,
+        None => name,
+    }
+}
+
+/// The Store app the frame `h` (of ApplicationFrameHost, process
+/// `frame_pid`) hosts, and its process id: its CoreWindow child's. While
+/// the app is minimized Windows takes its CoreWindow out of the frame and
+/// parks it as a top-level window of the same title; that one counts too.
+pub fn hosted(h: HWND, frame_pid: u32) -> Option<(String, u32)> {
+    let class = wide_z(logic::STORE_CORE_CLASS);
+    let of = |c: HWND| {
+        let p = hwnd_pid(c);
+        let name = proc_name(p);
+        (p != frame_pid && !name.is_empty()).then_some((name, p))
+    };
+    if let Ok(c) = unsafe { FindWindowExW(Some(h), None, PCWSTR(class.as_ptr()), PCWSTR::null()) }
+        && !c.is_invalid()
+    {
+        return of(c);
+    }
+    let mut buf = [0u16; 512];
+    let n = unsafe { GetWindowTextW(h, &mut buf) };
+    if n <= 0 {
+        return None;
+    }
+    let title: Vec<u16> = buf[..n as usize].iter().copied().chain(Some(0)).collect();
+    match unsafe { FindWindowExW(None, None, PCWSTR(class.as_ptr()), PCWSTR(title.as_ptr())) } {
+        Ok(c) if !c.is_invalid() => of(c),
+        _ => None,
+    }
+}
+
+/// The apps the Store frames now open host (ApplicationFrameHost's own
+/// name for a frame that hosts none), for the allowlist alias. Win32 only:
+/// cheap enough for every allowlist read.
+pub fn hosted_apps() -> Vec<String> {
+    let class = wide_z(logic::STORE_FRAME_CLASS);
+    let mut out: Vec<String> = Vec::new();
+    let mut prev: Option<HWND> = None;
+    // A bound in case frames come and go while walking them.
+    for _ in 0..256 {
+        let Ok(h) = (unsafe { FindWindowExW(None, prev, PCWSTR(class.as_ptr()), PCWSTR::null()) })
+        else {
+            break;
+        };
+        if h.is_invalid() {
+            break;
+        }
+        let app = window_app(h, hwnd_pid(h));
+        if !app.is_empty() && !out.contains(&app) {
+            out.push(app);
+        }
+        prev = Some(h);
+    }
+    out
 }
 
 fn image_stem(pid: u32) -> String {

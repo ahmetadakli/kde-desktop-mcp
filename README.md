@@ -1093,9 +1093,13 @@ Hyprland:
 Windows:
 - Input cannot be sent to windows running as administrator from a server that
   is not (Windows UIPI).
-- Microsoft Store apps may show up as `applicationframehost`. The window tools
-  also let a Store app's window through when the allowlist names the app
-  it hosts (`calculatorapp`), and `query` matches that name too.
+- Microsoft Store apps run inside a frame window of ApplicationFrameHost;
+  `apps`, `windows`, `find`/`act` and the input checks name such a window
+  after the app it hosts (`calculatorapp`, `systemsettings`), also while it
+  is minimized. `applicationframehost` in the allowlist still allows every
+  Store app with its tier (an app's own line wins), and `app:
+  "applicationframehost"` still reaches every frame; `confirm:` and
+  `passwords:` items naming it do not carry over to the apps.
 - Window tools: positions and sizes are physical pixels (as for `mouse`) of
   the visible frame, without the invisible resize borders; the screen
   areas `screenshot` reports include them. Virtual desktops are not listed
@@ -1110,7 +1114,7 @@ Windows:
   `.exe` programs are started, never a script. Starters that pass the request
   on and end (System32's `calc.exe`, `explorer <folder>`, which exits with
   code 1, `msedge <url>` while Edge runs) count as a hand-off; other exit
-  codes are failures. A Store app's window shows as `applicationframehost`,
+  codes are failures. A Store app's window shows under the app's own name,
   as `windows` lists it. Notepad's own starter process stays running without
   a window after handing a file to the open Notepad.
 - Key names follow the US keyboard layout positions; use `type_text` for text.
