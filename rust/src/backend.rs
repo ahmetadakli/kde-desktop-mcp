@@ -74,15 +74,14 @@ pub const NO_AREA: &str = "element has no on-screen area";
 /// Window management the desktop does not offer (KDE and Hyprland do).
 pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma and Hyprland";
 
-/// Clipboard access the desktop does not offer (only Linux so far).
-pub const NO_CLIPBOARD: &str = "the clipboard tools are only available on Linux (Wayland)";
+/// Clipboard access the desktop does not offer.
+pub const NO_CLIPBOARD: &str =
+    "the clipboard tools are only available on Linux (Wayland) and Windows";
 
 /// Starting apps the platform does not offer yet.
 pub const NO_LAUNCH: &str = "launch is not supported on this platform yet";
 
 /// What `clipboard_get` found on the clipboard.
-// Only the Linux backend builds one so far.
-#[cfg_attr(windows, allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Clip {
     Empty,

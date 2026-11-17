@@ -382,17 +382,17 @@ pub fn tools() -> Json {
         ),
         t(
             "type_text",
-            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. A trailing newline is pressed as Enter (it submits\nan address bar or search box); newlines inside the text stay text.\nOn Linux this may paste through the clipboard;\nthe text it held is put back afterwards (images and files are not; the reply\nsays so). The reply names the focused element and warns when it is not an\neditable field. Refused while a password field has focus, unless the user\nallowed it in the allowlist.",
+            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. A trailing newline is pressed as Enter (it submits\nan address bar or search box); newlines inside the text stay text.\nThis may paste through the clipboard; the\ntext it held is put back afterwards (images and files are not; the reply\nsays so). The reply names the focused element and warns when it is not an\neditable field. Refused while a password field has focus, unless the user\nallowed it in the allowlist.",
             schema(&[("text", "string", None)])
         ),
         t(
             "clipboard_get",
-            "Read the clipboard as text, at most `limit` characters (the reply says\nwhen it was cut). Only works while an allowed app's window is active, since\nthe clipboard may hold anything the user copied. Says so instead when it\nholds no text (an image, files) or a password marked by a password manager.\nLinux only.",
+            "Read the clipboard as text, at most `limit` characters (the reply says\nwhen it was cut). Only works while an allowed app's window is active, since\nthe clipboard may hold anything the user copied. Says so instead when it\nholds no text (an image, files) or a password marked by a password manager.\nLinux and Windows.",
             schema(&[("limit", "integer", Some(json!(20000)))])
         ),
         t(
             "clipboard_set",
-            "Put `text` on the clipboard, e.g. to paste it later with key ctrl+v or to\nhand it to the user. Only while an allowed app's window is active. Linux\nonly.",
+            "Put `text` on the clipboard, e.g. to paste it later with key ctrl+v or to\nhand it to the user. Only while an allowed app's window is active. Linux\nand Windows.",
             schema(&[("text", "string", None)])
         ),
         t(

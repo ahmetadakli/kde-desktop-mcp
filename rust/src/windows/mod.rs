@@ -6,6 +6,7 @@
 //! process is per-monitor DPI aware, as `uiautomation` made the Python
 //! server, so UIA bounds and SetCursorPos use the same physical pixels.
 
+mod clipboard;
 mod input;
 mod logic;
 mod uia;
@@ -14,12 +15,15 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE, SetProcessDpiAwarenessContext,
 };
 
-use crate::backend::{Activated, AppEntry, Backend, Cache, Info, NO_AREA, R, Shot, WindowEntry};
+use crate::backend::{
+    Activated, AppEntry, Backend, Cache, Clip, Info, NO_AREA, R, Shot, WindowEntry,
+};
 use logic::Props;
 use uia::{Elem, Uia};
 
@@ -45,9 +49,18 @@ const BUTTON_HOLD: Duration = Duration::from_millis(15);
 const BUTTON_GAP: Duration = Duration::from_millis(30);
 const FOCUS_WAIT: Duration = Duration::from_millis(50);
 const ACTIVATE_WAIT: Duration = Duration::from_millis(500);
+/// How long an app may take to read a paste before the clipboard is left
+/// holding the typed text.
+const PASTE_READ_WAIT: Duration = Duration::from_secs(1);
+/// Text this short is typed key by key: no clipboard round trip.
+const KEYSTROKE_MAX: usize = 1;
+/// Pause between the characters typed key by key: a SendInput burst of
+/// KEYEVENTF_UNICODE events makes Win11 Notepad drop and repeat them.
+const CHAR_GAP: Duration = Duration::from_millis(5);
 
 pub struct WindowsBackend {
     uia: Uia,
+    clip: clipboard::Clipboard,
 }
 
 async fn poll(limit: Duration, mut check: impl FnMut() -> bool) -> bool {
@@ -83,7 +96,10 @@ impl WindowsBackend {
             // Fails when already set (e.g. by a manifest); either way is fine.
             let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE);
         }
-        Ok(WindowsBackend { uia: Uia::new()? })
+        Ok(WindowsBackend {
+            uia: Uia::new()?,
+            clip: clipboard::Clipboard::default(),
+        })
     }
 
     /// Info of an element whose properties (and, from a subtree request,
@@ -118,6 +134,75 @@ impl WindowsBackend {
 
     fn foreground_i32() -> i32 {
         input::hwnd_i32(input::foreground())
+    }
+
+    /// Type `text` key by key, one character per SendInput with a pause in
+    /// between (KEYEVENTF_UNICODE: any layout, the clipboard untouched).
+    async fn keystrokes(&self, text: &str) -> R<()> {
+        // The pauses are shorter than the default 15.6 ms timer tick.
+        unsafe { timeBeginPeriod(1) };
+        let mut r = Ok(());
+        for (i, batch) in logic::unicode_per_char(text).iter().enumerate() {
+            if i > 0 {
+                tokio::time::sleep(CHAR_GAP).await;
+            }
+            if let Err(e) = input::send_keys(batch) {
+                r = Err(if i == 0 {
+                    crate::delivery::nothing_sent(e)
+                } else {
+                    e
+                });
+                break;
+            }
+        }
+        unsafe { timeEndPeriod(1) };
+        r
+    }
+
+    /// Paste `text` with ctrl+v through the clipboard, then put back the
+    /// text the clipboard held once the app in front has read the paste
+    /// (restoring earlier would let it paste the old text). Images, files
+    /// and other non-text contents are not put back; the note says so.
+    /// When the clipboard cannot be taken, the text is typed key by key.
+    async fn paste(&self, text: &str) -> R<String> {
+        use crate::trace::time;
+        let saved = time("save", self.clip.save()).await;
+        if let clipboard::Saved::Busy = saved {
+            self.keystrokes(text).await?;
+            return Ok(String::new());
+        }
+        let mut offered = time("offer", self.clip.offer(text)).await;
+        // A clipboard monitor read the text right away: offer it again, so
+        // the paste's own read shows.
+        if offered.is_ok() && self.clip.read_early().await {
+            offered = self.clip.offer(text).await;
+        }
+        if offered.is_err() {
+            // The clipboard may have been emptied before the offer failed.
+            self.clip.restore(saved).await;
+            self.keystrokes(text).await?;
+            return Ok(String::new());
+        }
+        let since = std::time::Instant::now();
+        if let Err(e) = time("ctrl+v", self.press_combo("ctrl+v")).await {
+            // Nothing was pasted: safe to put the clipboard back now.
+            self.clip.restore(saved).await;
+            return Err(e);
+        }
+        let read = time("wait_read", self.clip.wait_read(since, PASTE_READ_WAIT)).await;
+        Ok(match saved {
+            clipboard::Saved::Busy => String::new(),
+            clipboard::Saved::Nothing(why) => {
+                format!("; the clipboard now holds the typed text (not put back: {why})")
+            }
+            // An empty clipboard is emptied again once the paste was read;
+            // unread, the typed text stays and nothing was lost.
+            clipboard::Saved::Empty if !read => String::new(),
+            _ if !read => "; the paste was not read within 1 s, so the clipboard was not put \
+                 back"
+                .into(),
+            saved => time("restore", self.clip.restore(saved)).await,
+        })
     }
 }
 
@@ -332,12 +417,19 @@ impl Backend for WindowsBackend {
     }
 
     async fn type_text(&self, text: &str) -> R<String> {
-        // KEYEVENTF_UNICODE sends characters independent of the keyboard
-        // layout and leaves the clipboard alone.
-        for batch in logic::unicode_batches(text) {
-            input::send_keys(&batch)?;
+        if text.chars().count() <= KEYSTROKE_MAX {
+            self.keystrokes(text).await?;
+            return Ok(String::new());
         }
-        Ok(String::new())
+        self.paste(text).await
+    }
+
+    async fn clipboard_get(&self, limit: usize) -> R<Clip> {
+        self.clip.get(limit).await
+    }
+
+    async fn clipboard_set(&self, text: &str) -> R<()> {
+        self.clip.set(text).await
     }
 
     async fn pointer(&self, x: i64, y: i64, button: &str, clicks: i64, scroll: i64) -> R<()> {

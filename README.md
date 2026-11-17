@@ -624,12 +624,13 @@ tool; `off` turns it off). Not available on Windows yet.
   the input, so no other call takes the focus in between; when it already is,
   nothing extra happens. Without `window` nothing is activated.
 - `clipboard_get`, `clipboard_set`: read or write the clipboard as text (Linux
-  only). Because the clipboard can hold anything the user copied anywhere
+  and Windows). Because the clipboard can hold anything the user copied anywhere
   (passwords included), both work only while a window of an allowed app is
   active. `clipboard_get` returns at most `limit` characters (default 20,000;
   the reply says when it was cut); if the clipboard holds an image or files
   rather than text, it only names the types, and it does not read content a
-  password manager marked as a password (`x-kde-passwordManagerHint`).
+  password manager marked as a password (`x-kde-passwordManagerHint`; on
+  Windows `ExcludeClipboardContentFromMonitorProcessing`).
 - `mouse`, `screenshot`: fallback only. `screenshot` returns the image inside
   the reply, shrinks it so its longer side is 1024 px by default (`max_size`)
   and reports which screen area it shows. The inline image is a JPEG
@@ -1091,6 +1092,14 @@ Windows:
   is not (Windows UIPI).
 - Microsoft Store apps may show up as `applicationframehost`.
 - Key names follow the US keyboard layout positions; use `type_text` for text.
+- `type_text` pastes through the clipboard (a single character is typed as a
+  key). It saves the clipboard text first and puts it back once the app in
+  front has read the paste: the text is offered with delayed rendering, so the
+  read shows as the app's request for it. The typed text is kept out of the
+  clipboard history (Win+V) and marked for clipboard monitors. As on KDE, an
+  image, files or text over 4 MiB is not put back, nor is anything when the
+  app does not read the paste within 1 s; the reply says so. While another app
+  holds the clipboard open, the text is typed key by key instead.
 - In very large windows (browsers, Word) `tree` and `find` can be slow because
   they fetch the whole subtree at once.
 

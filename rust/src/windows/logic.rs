@@ -10,8 +10,6 @@ pub const KEYEVENTF_UNICODE: u32 = 0x4;
 pub const VK_TAB: u16 = 0x09;
 pub const VK_RETURN: u16 = 0x0D;
 pub const VK_MENU: u16 = 0x12;
-/// Python sends whenever this many inputs have piled up while typing.
-const TYPE_BATCH: usize = 200;
 
 /// One KEYBDINPUT: virtual key, scan code (UTF-16 unit for KEYEVENTF_UNICODE)
 /// and flags.
@@ -134,14 +132,16 @@ pub fn combo_events(vks: &[u16]) -> (Vec<KeyEv>, Vec<KeyEv>) {
     (downs, ups)
 }
 
-/// Python `type_text`: every UTF-16 unit as a KEYEVENTF_UNICODE down/up pair
-/// (independent of the keyboard layout), newline and tab as real keys,
-/// split into SendInput batches the way Python splits them.
-pub fn unicode_batches(text: &str) -> Vec<Vec<KeyEv>> {
+/// The keystroke fallback of `type_text`: one SendInput batch per
+/// character, each UTF-16 unit a KEYEVENTF_UNICODE down/up pair (independent
+/// of the keyboard layout; a surrogate pair stays in one batch), newline and
+/// tab as real keys. Sent one at a time with a pause in between: Win11
+/// Notepad drops and repeats characters of a burst.
+pub fn unicode_per_char(text: &str) -> Vec<Vec<KeyEv>> {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut out = Vec::new();
-    let mut batch = Vec::new();
     for ch in text.chars() {
+        let mut batch = Vec::new();
         if ch == '\n' || ch == '\t' {
             let vk = if ch == '\n' { VK_RETURN } else { VK_TAB };
             batch.push(KeyEv {
@@ -154,29 +154,151 @@ pub fn unicode_batches(text: &str) -> Vec<Vec<KeyEv>> {
                 scan: 0,
                 flags: KEYEVENTF_KEYUP,
             });
-            continue;
+        } else {
+            let mut units = [0u16; 2];
+            let units = ch.encode_utf16(&mut units);
+            for &unit in units.iter() {
+                batch.push(KeyEv {
+                    vk: 0,
+                    scan: unit,
+                    flags: KEYEVENTF_UNICODE,
+                });
+            }
+            for &unit in units.iter() {
+                batch.push(KeyEv {
+                    vk: 0,
+                    scan: unit,
+                    flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                });
+            }
         }
-        let mut units = [0u16; 2];
-        for &unit in ch.encode_utf16(&mut units).iter() {
-            batch.push(KeyEv {
-                vk: 0,
-                scan: unit,
-                flags: KEYEVENTF_UNICODE,
-            });
-            batch.push(KeyEv {
-                vk: 0,
-                scan: unit,
-                flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-            });
-        }
-        if batch.len() >= TYPE_BATCH {
-            out.push(std::mem::take(&mut batch));
-        }
-    }
-    if !batch.is_empty() {
         out.push(batch);
     }
     out
+}
+
+// ------------------------------------------------------------ clipboard
+
+pub const CF_TEXT: u32 = 1;
+pub const CF_OEMTEXT: u32 = 7;
+pub const CF_UNICODETEXT: u32 = 13;
+pub const CF_HDROP: u32 = 15;
+/// Registered formats that only mark the contents: the password hint of
+/// password managers (KeePass, Bitwarden) and the opt-outs of the clipboard
+/// history (Win+V) and the cloud clipboard.
+pub const HINT_EXCLUDE: &str = "ExcludeClipboardContentFromMonitorProcessing";
+pub const HINT_VIEWER_IGNORE: &str = "Clipboard Viewer Ignore";
+pub const HINT_HISTORY: &str = "CanIncludeInClipboardHistory";
+pub const HINT_CLOUD: &str = "CanUploadToCloudClipboard";
+/// Formats that hold no content of their own: those hints, and what OLE
+/// adds to everything it puts on the clipboard (alone after
+/// `Set-Clipboard -Value $null`).
+const NOT_CONTENT: [&str; 6] = [
+    HINT_EXCLUDE,
+    HINT_VIEWER_IGNORE,
+    HINT_HISTORY,
+    HINT_CLOUD,
+    "DataObject",
+    "Ole Private Data",
+];
+
+/// Names of the predefined clipboard formats (registered ones have their
+/// own name).
+const STANDARD_FORMATS: &[(u32, &str)] = &[
+    (1, "CF_TEXT"),
+    (2, "CF_BITMAP"),
+    (3, "CF_METAFILEPICT"),
+    (4, "CF_SYLK"),
+    (5, "CF_DIF"),
+    (6, "CF_TIFF"),
+    (7, "CF_OEMTEXT"),
+    (8, "CF_DIB"),
+    (9, "CF_PALETTE"),
+    (10, "CF_PENDATA"),
+    (11, "CF_RIFF"),
+    (12, "CF_WAVE"),
+    (13, "CF_UNICODETEXT"),
+    (14, "CF_ENHMETAFILE"),
+    (15, "CF_HDROP"),
+    (16, "CF_LOCALE"),
+    (17, "CF_DIBV5"),
+    (0x80, "CF_OWNERDISPLAY"),
+    (0x81, "CF_DSPTEXT"),
+    (0x82, "CF_DSPBITMAP"),
+    (0x83, "CF_DSPMETAFILEPICT"),
+    (0x8E, "CF_DSPENHMETAFILE"),
+];
+
+/// The name of a predefined format; None for a registered one.
+pub fn standard_format(id: u32) -> Option<&'static str> {
+    STANDARD_FORMATS
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, n)| *n)
+}
+
+/// What the clipboard holds, from its formats (ids with their names).
+#[derive(Debug, PartialEq)]
+pub enum ClipKind {
+    Empty,
+    /// Text; `secret` when marked as a password.
+    Text {
+        secret: bool,
+    },
+    /// Copied files (Explorer's copy).
+    Files,
+    /// Something else (an image...): the formats offered, hints left out.
+    Other(Vec<String>),
+}
+
+/// The names of the formats that hold content.
+pub fn content_names(formats: &[(u32, String)]) -> Vec<String> {
+    formats
+        .iter()
+        .filter(|(_, n)| !NOT_CONTENT.contains(&n.as_str()))
+        .map(|(_, n)| n.clone())
+        .collect()
+}
+
+pub fn classify(formats: &[(u32, String)]) -> ClipKind {
+    let has = |id: u32| formats.iter().any(|(i, _)| *i == id);
+    let named = |n: &str| formats.iter().any(|(_, x)| x == n);
+    let real = content_names(formats);
+    if real.is_empty() {
+        ClipKind::Empty
+    } else if has(CF_HDROP) {
+        ClipKind::Files
+    } else if has(CF_UNICODETEXT) || has(CF_TEXT) || has(CF_OEMTEXT) {
+        ClipKind::Text {
+            secret: named(HINT_EXCLUDE) || named(HINT_VIEWER_IGNORE),
+        }
+    } else {
+        ClipKind::Other(real)
+    }
+}
+
+/// `text` as CF_UNICODETEXT: CRLF line ends, NUL-terminated UTF-16.
+pub fn clipboard_units(text: &str) -> Vec<u16> {
+    let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+    units
+}
+
+/// The UTF-16 units of CF_UNICODETEXT data, up to its NUL.
+pub fn until_nul(units: &[u16]) -> &[u16] {
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    &units[..end]
+}
+
+/// At most `limit` characters of clipboard text with "\n" line ends, and
+/// whether any were cut.
+pub fn clipboard_text(units: &[u16], limit: usize) -> (String, bool) {
+    let text = unix_newlines(&String::from_utf16_lossy(until_nul(units)));
+    match text.char_indices().nth(limit) {
+        Some((i, _)) => (text[..i].to_string(), true),
+        None => (text, false),
+    }
 }
 
 /// uiautomation's ControlTypeName without "Control", lower-cased, indexed
@@ -478,54 +600,120 @@ mod tests {
     }
 
     #[test]
-    fn unicode_typing_uses_utf16_units_and_real_enter() {
-        let b = unicode_batches("ğ😀\r\n\t");
-        assert_eq!(b.len(), 1);
-        let evs = &b[0];
-        assert_eq!(evs.len(), 2 + 4 + 2 + 2);
+    fn unicode_typing_sends_one_char_at_a_time() {
+        let b = unicode_per_char("ğ😀\r\n\t");
+        assert_eq!(b.len(), 4);
         assert_eq!(
-            evs[0],
-            KeyEv {
-                vk: 0,
-                scan: 0x011F,
-                flags: KEYEVENTF_UNICODE
-            }
+            b[0],
+            vec![
+                KeyEv {
+                    vk: 0,
+                    scan: 0x011F,
+                    flags: KEYEVENTF_UNICODE
+                },
+                KeyEv {
+                    vk: 0,
+                    scan: 0x011F,
+                    flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                }
+            ]
         );
-        assert_eq!(evs[1].flags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
-        assert_eq!((evs[2].scan, evs[4].scan), (0xD83D, 0xDE00));
+        // A surrogate pair goes down together, then up.
+        let scans: Vec<(u16, u32)> = b[1].iter().map(|e| (e.scan, e.flags)).collect();
         assert_eq!(
-            evs[6],
-            KeyEv {
-                vk: VK_RETURN,
-                scan: 0,
-                flags: 0
-            }
+            scans,
+            vec![
+                (0xD83D, KEYEVENTF_UNICODE),
+                (0xDE00, KEYEVENTF_UNICODE),
+                (0xD83D, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+                (0xDE00, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+            ]
         );
         assert_eq!(
-            evs[7],
-            KeyEv {
-                vk: VK_RETURN,
-                scan: 0,
-                flags: KEYEVENTF_KEYUP
-            }
+            b[2],
+            vec![
+                KeyEv {
+                    vk: VK_RETURN,
+                    scan: 0,
+                    flags: 0
+                },
+                KeyEv {
+                    vk: VK_RETURN,
+                    scan: 0,
+                    flags: KEYEVENTF_KEYUP
+                }
+            ]
         );
-        assert_eq!(evs[8].vk, VK_TAB);
-        assert!(unicode_batches("").is_empty());
+        assert_eq!(b[3][0].vk, VK_TAB);
+        assert!(unicode_per_char("").is_empty());
     }
 
     #[test]
-    fn unicode_typing_batches_like_python() {
-        let sizes: Vec<usize> = unicode_batches(&"a".repeat(250))
-            .iter()
-            .map(Vec::len)
-            .collect();
-        assert_eq!(sizes, vec![200, 200, 100]);
-        // Newlines never trigger a flush on their own.
-        let sizes: Vec<usize> = unicode_batches(&"\n".repeat(150))
-            .iter()
-            .map(Vec::len)
-            .collect();
-        assert_eq!(sizes, vec![300]);
+    fn clipboard_formats_classify_like_linux_types() {
+        let f = |v: &[(u32, &str)]| -> Vec<(u32, String)> {
+            v.iter().map(|(i, n)| (*i, n.to_string())).collect()
+        };
+        assert_eq!(classify(&[]), ClipKind::Empty);
+        // Only the history opt-outs left: nothing to read.
+        assert_eq!(
+            classify(&f(&[(0xC100, HINT_HISTORY), (0xC101, HINT_CLOUD)])),
+            ClipKind::Empty
+        );
+        assert_eq!(
+            classify(&f(&[
+                (13, "CF_UNICODETEXT"),
+                (16, "CF_LOCALE"),
+                (1, "CF_TEXT")
+            ])),
+            ClipKind::Text { secret: false }
+        );
+        assert_eq!(
+            classify(&f(&[(0xC0AA, HINT_EXCLUDE), (13, "CF_UNICODETEXT")])),
+            ClipKind::Text { secret: true }
+        );
+        assert_eq!(
+            classify(&f(&[(0xC0AA, HINT_VIEWER_IGNORE), (1, "CF_TEXT")])),
+            ClipKind::Text { secret: true }
+        );
+        // Explorer's copy also offers names as text: files win.
+        assert_eq!(
+            classify(&f(&[
+                (15, "CF_HDROP"),
+                (0xC00F, "FileNameW"),
+                (13, "CF_UNICODETEXT")
+            ])),
+            ClipKind::Files
+        );
+        assert_eq!(
+            classify(&f(&[(8, "CF_DIB"), (0xC101, HINT_CLOUD), (17, "CF_DIBV5")])),
+            ClipKind::Other(vec!["CF_DIB".into(), "CF_DIBV5".into()])
+        );
+        // OLE's own formats alone: emptied through OLE.
+        assert_eq!(
+            classify(&f(&[(0xC009, "DataObject"), (0xC013, "Ole Private Data")])),
+            ClipKind::Empty
+        );
+        assert_eq!(
+            content_names(&f(&[(0xC009, "DataObject"), (15, "CF_HDROP")])),
+            vec!["CF_HDROP".to_string()]
+        );
+        assert_eq!(standard_format(17), Some("CF_DIBV5"));
+        assert_eq!(standard_format(0xC000), None);
+    }
+
+    #[test]
+    fn clipboard_text_round_trips_with_crlf() {
+        let units = clipboard_units("a\nb\r\nç😀");
+        assert_eq!(units.last(), Some(&0));
+        assert_eq!(String::from_utf16_lossy(until_nul(&units)), "a\r\nb\r\nç😀");
+        assert_eq!(clipboard_text(&units, 100), ("a\nb\nç😀".into(), false));
+        assert_eq!(clipboard_text(&units, 3), ("a\nb".into(), true));
+        // Data past the NUL (GlobalSize rounds up) is not text.
+        assert_eq!(
+            clipboard_text(&[104, 105, 0, 120, 120], 10),
+            ("hi".into(), false)
+        );
+        assert_eq!(clipboard_text(&[], 10), (String::new(), false));
     }
 
     #[test]
