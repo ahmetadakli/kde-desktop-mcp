@@ -437,7 +437,12 @@ tool; `off` turns it off). Not available on Windows yet.
   walk of the apps (alongside, when `app`/`id` names it) and, for a
   browser, a read of its windows' states and the remembered page (one round
   trip each); a search of the window (up to 20000 nodes) when that window
-  changed, at most every 5 s for a window found without a page. A canvas that draws without
+  changed, at most every 5 s for a window found without a page. Where the
+  backend hears no change events (Windows), the visible part of the app's
+  windows is also hashed before the input and read again about every 50 ms
+  until it differs or the wait is over, so a display that changed while focus
+  and title stayed (Calculator) reads `changed`; this costs one subtree read
+  before the input and one or more after. A canvas that draws without
   accessibility events may report `no visible change`. `observe` adds a view
   in the same reply: `focus` (the focused element), `tree` (compact tree of
   the active window, or of `app`'s, at most 6000 characters) or `screenshot`

@@ -395,6 +395,13 @@ pub trait Backend {
     fn changes_live(&self) -> bool {
         false
     }
+    /// Whether the effect line reads the app's content before and after
+    /// an input to see a change (a display whose name changed while focus
+    /// and title stayed): for backends that hear of no changes. It costs a
+    /// subtree read before the input and one or more after.
+    fn compares_content(&self) -> bool {
+        !self.changes_live()
+    }
     /// Whether the app whose windows (or elements) are `near` reported a
     /// change after `mark`, or windows or apps came or went; None when the
     /// backend gets no change events. Cheap: no round trip.

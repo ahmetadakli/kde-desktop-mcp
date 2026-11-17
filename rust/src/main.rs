@@ -813,6 +813,10 @@ const WAIT_MIN_GAP: Duration = Duration::from_millis(50);
 /// How often `wait_idle` reads the tree where no change events come.
 const IDLE_POLL: Duration = Duration::from_millis(100);
 
+/// How often the effect line reads an app's content again while it waits
+/// for a change, where the backend gets no change events.
+const CONTENT_POLL: Duration = Duration::from_millis(50);
+
 /// What `wait_for` `state` asks of the element.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WaitState {
@@ -1089,6 +1093,10 @@ struct Fingerprint<Id> {
     app: Option<(String, Vec<Id>)>,
     /// The page the app's window shows (`Backend::page`).
     page: Option<backend::Page>,
+    /// A hash of what the app's windows show (`content_hash`), read only
+    /// when the backend gets no change events: an input that changes a
+    /// display but neither focus nor title still shows.
+    content: Option<u64>,
 }
 
 /// After an input to a window showing a web page, how much longer than
@@ -1175,6 +1183,14 @@ fn effect_text<Id: PartialEq>(
             "no visible change (the page was already loading: wait_idle before reading it)".into()
         }
         _ if events == Some(true) => "changed".into(),
+        // No events to go by: what the app shows differs.
+        _ if events.is_none()
+            && before.content.is_some()
+            && after.content.is_some()
+            && before.content != after.content =>
+        {
+            "changed".into()
+        }
         _ => "no visible change".into(),
     }
 }
@@ -3331,13 +3347,20 @@ impl<B: Backend> Server<B> {
             focus: focus.map(|f| (f.id, f.info.role, f.info.name, f.info.states)),
             app: None,
             page: None,
+            content: None,
         }
     }
 
     /// What an input's effect line compares before and after it: the
     /// `fingerprint`, and for `app` (the app the input names, else the
     /// active window's), when allowed, its windows and the page shown.
-    async fn input_fingerprint(&self, app: Option<String>) -> Fingerprint<B::Id> {
+    /// `content`: the app's content hash when just read (else read here,
+    /// for a backend without change events).
+    async fn input_fingerprint(
+        &self,
+        app: Option<String>,
+        content: Option<u64>,
+    ) -> Fingerprint<B::Id> {
         let named = app.map(|a| a.to_lowercase());
         let allowed = named.clone().filter(|a| self.is_allowed(a));
         // An app named: its windows read alongside.
@@ -3364,6 +3387,12 @@ impl<B: Backend> Server<B> {
         };
         if let (Some(app), Some(windows)) = (app, windows) {
             print.page = trace::time("page", self.page_of(&app, &windows)).await;
+            if self.b.compares_content() {
+                print.content = match content {
+                    Some(c) => Some(c),
+                    None => Some(trace::time("content", self.content_hash(&windows)).await),
+                };
+            }
             print.app = Some((app, windows));
         }
         print
@@ -3483,20 +3512,39 @@ impl<B: Backend> Server<B> {
             near.extend(windows.iter().cloned());
         }
         near.extend(content);
-        if settle > 0 {
-            self.b
-                .wait_change(&near, mark, Duration::from_millis(settle))
-                .await;
-        }
-        let mut events = self.b.changed_since(&near, mark);
-        // A page answers late: wait a little longer for it to start (not
-        // when nothing was sent).
-        if settle > 0 && sent && before.page.is_some() && events != Some(true) {
-            trace::time("page settle", self.b.wait_change(&near, mark, PAGE_SETTLE)).await;
-            events = self.b.changed_since(&near, mark);
-        }
+        // Without change events, the app's content is read again until it
+        // differs: a display that changed shows although focus and title
+        // stayed. A page answers late: a little longer.
+        let mut content_now = None;
+        let events = if let (Some(was), Some((_, windows)), None) = (
+            before.content,
+            &before.app,
+            self.b.changed_since(&near, mark),
+        ) {
+            let mut limit = Duration::from_millis(settle);
+            if settle > 0 && sent && before.page.is_some() {
+                limit += PAGE_SETTLE;
+            }
+            let now = trace::time("content settle", self.content_settle(windows, was, limit)).await;
+            content_now = Some(now);
+            None
+        } else {
+            if settle > 0 {
+                self.b
+                    .wait_change(&near, mark, Duration::from_millis(settle))
+                    .await;
+            }
+            let mut events = self.b.changed_since(&near, mark);
+            // A page answers late: wait a little longer for it to start
+            // (not when nothing was sent).
+            if settle > 0 && sent && before.page.is_some() && events != Some(true) {
+                trace::time("page settle", self.b.wait_change(&near, mark, PAGE_SETTLE)).await;
+                events = self.b.changed_since(&near, mark);
+            }
+            events
+        };
         let app = before.app.as_ref().map(|(app, _)| app.clone());
-        let after = self.input_fingerprint(app).await;
+        let after = self.input_fingerprint(app, content_now).await;
         let allowed = self.allowed();
         let is_allowed = |app: &str| allowed.contains(&app.to_lowercase());
         let mut text = format!(
@@ -5788,6 +5836,20 @@ impl<B: Backend> Server<B> {
         }
     }
 
+    /// `content_hash` of `windows` read until it differs from `was` or
+    /// `limit` passed (read at least once): the last hash read.
+    async fn content_settle(&self, windows: &[B::Id], was: u64, limit: Duration) -> u64 {
+        let start = Instant::now();
+        loop {
+            let now = self.content_hash(windows).await;
+            let left = limit.saturating_sub(start.elapsed());
+            if now != was || left.is_zero() {
+                return now;
+            }
+            tokio::time::sleep(left.min(CONTENT_POLL)).await;
+        }
+    }
+
     /// A hash of what the visible part of `windows` shows.
     async fn content_hash(&self, windows: &[B::Id]) -> u64 {
         let mut cache = Cache::new();
@@ -6892,7 +6954,7 @@ impl<B: Backend> Server<B> {
                 self.b.change_mark(),
                 trace::time(
                     "fingerprint before",
-                    self.input_fingerprint(self.input_app(a).await),
+                    self.input_fingerprint(self.input_app(a).await, None),
                 )
                 .await,
             )),
@@ -7757,6 +7819,8 @@ mod tests {
         /// `changed_since` says the app changed when asked about this
         /// element of it (the app's windows), when Some.
         events_on: std::cell::Cell<Option<u32>>,
+        /// The effect line compares the app's content (`compares_content`).
+        content: std::cell::Cell<bool>,
         /// `wait_change` hears of changes (`changes_live`): each bumps the
         /// change mark (`FakeShown::seq`) and `changes`.
         events: std::cell::Cell<bool>,
@@ -7941,6 +8005,9 @@ mod tests {
         }
         fn changes_live(&self) -> bool {
             self.reads.events.get()
+        }
+        fn compares_content(&self) -> bool {
+            self.reads.content.get()
         }
         fn changed_since(&self, near: &[u32], mark: u64) -> Option<bool> {
             // Events on one element of the app (its windows), when set;
@@ -9590,6 +9657,7 @@ mod tests {
             focus: focus.map(|n| (1u32, "push button".to_string(), n.to_string(), vec![])),
             app: None,
             page: None,
+            content: None,
         };
         let allowed = |app: &str| app != "secret";
         let kate = Some(("kate", "a.txt — Kate"));
@@ -9619,6 +9687,37 @@ mod tests {
         assert_eq!(
             effect(&fp(None, None), None),
             "window changed (none active now)"
+        );
+    }
+
+    #[test]
+    fn effect_without_events_compares_the_content() {
+        let fp = |content: Option<u64>| Fingerprint {
+            window: Some(("calculatorapp".to_string(), "Hesap Makinesi".to_string())),
+            focus: Some((1u32, "button".to_string(), "Yedi".to_string(), vec![])),
+            app: None,
+            page: None,
+            content,
+        };
+        let allowed = |_: &str| true;
+        // Only the display changed: focus and title stayed.
+        assert_eq!(
+            effect_text(&fp(Some(1)), &fp(Some(2)), None, allowed),
+            "changed"
+        );
+        assert_eq!(
+            effect_text(&fp(Some(1)), &fp(Some(1)), None, allowed),
+            "no visible change"
+        );
+        // Not read on one side: nothing to compare.
+        assert_eq!(
+            effect_text(&fp(None), &fp(Some(2)), None, allowed),
+            "no visible change"
+        );
+        // Events, where the backend gets them, decide.
+        assert_eq!(
+            effect_text(&fp(Some(1)), &fp(Some(2)), Some(false), allowed),
+            "no visible change"
         );
     }
 
@@ -13631,6 +13730,37 @@ mod tests {
     }
 
     #[test]
+    fn without_events_the_effect_line_sees_a_display_change() {
+        local(async {
+            let mut s = session("content-effect");
+            s.reads.content.set(true);
+            fake_window(&s, &[41]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(41, fake_node("push button", "Plus", &[]));
+            }
+            // The window's text changes after the press; focus and title
+            // stay. (The fake's prefetch reads only the roots it is given.)
+            let focus = s.focus.clone();
+            let later = tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                focus.borrow_mut().text = Some("12".into());
+            });
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "Plus"})).await;
+            later.await.unwrap();
+            assert!(reply_text(&r).ends_with("; effect: changed"), "{r}");
+            // Nothing changes: said so after the settle.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Plus"})).await;
+            assert!(
+                reply_text(&r).ends_with("; effect: no visible change"),
+                "{r}"
+            );
+            assert!(start.elapsed() < Duration::from_millis(500));
+        });
+    }
+
+    #[test]
     fn content_waits_are_short_or_absent_when_nothing_changes() {
         local(async {
             let mut s = session("content-cost");
@@ -14316,6 +14446,7 @@ mod tests {
             focus: Some((1u32, "link".to_string(), focus.to_string(), vec![])),
             app: None,
             page,
+            content: None,
         };
         let allowed = |_: &str| true;
         let busy = Some(page("Mail", "u1", true));
@@ -14588,6 +14719,7 @@ mod tests {
             focus: None::<(u32, String, String, Vec<&'static str>)>,
             app: None,
             page,
+            content: None,
         };
         let allowed = |_: &str| true;
         let before = fp("Inbox", Some(page("Inbox", "u1", false)));
