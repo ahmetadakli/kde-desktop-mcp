@@ -16,15 +16,18 @@ use windows::Win32::Graphics::Gdi::{
 };
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GW_OWNER, GWL_EXSTYLE, GetClassNameW, GetWindow, GetWindowLongW,
+    EnumWindows, GW_OWNER, GWL_EXSTYLE, GWL_STYLE, GetClassNameW, GetWindow, GetWindowLongW,
     GetWindowPlacement, GetWindowRect, GetWindowTextW, GetWindowThreadProcessId, IsIconic,
-    IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SHOW_WINDOW_CMD, SWP_ASYNCWINDOWPOS,
-    SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT, WM_CLOSE,
-    WS_EX_TOOLWINDOW,
+    IsWindow, IsWindowVisible, IsZoomed, PostMessageW, SHOW_WINDOW_CMD, SMTO_ABORTIFHUNG,
+    SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageTimeoutW, SetWindowPos,
+    ShowWindowAsync, WINDOWPLACEMENT, WM_CLOSE, WS_EX_TOOLWINDOW,
 };
 use windows::core::BOOL;
 
 use super::input;
+
+/// How long an Edit control may take to answer a message.
+const EDIT_REPLY_WAIT_MS: u32 = 1000;
 use super::logic::{self, Rect};
 use crate::backend::{R, Screen, WindowGeo};
 
@@ -66,7 +69,7 @@ fn top_level() -> Vec<HWND> {
     list
 }
 
-fn class_name(h: HWND) -> String {
+pub fn class_name(h: HWND) -> String {
     let mut buf = [0u16; 256];
     let n = unsafe { GetClassNameW(h, &mut buf) };
     wide(&buf, n)
@@ -283,6 +286,50 @@ pub fn reread(h: HWND, app: &str) -> WindowGeo {
         app.to_string(),
         input::root(input::foreground()),
     )
+}
+
+/// Whether the window `h` still exists and is shown (a closed common
+/// dialog may linger hidden, and UIA still reads it).
+pub fn is_shown(h: HWND) -> bool {
+    unsafe { IsWindow(Some(h)).as_bool() && IsWindowVisible(h).as_bool() }
+}
+
+/// Title of `front` when it is a window `owner` owns and shows in front
+/// of itself (a prompt), not `owner` itself.
+pub fn prompt_over(owner: HWND, front: HWND) -> Option<String> {
+    if front.is_invalid() || front == owner {
+        return None;
+    }
+    let by = unsafe { GetWindow(front, GW_OWNER) }.ok()?;
+    (by == owner && unsafe { IsWindowVisible(front) }.as_bool()).then(|| title(front))
+}
+
+/// Whether `h` is a single-line Win32 Edit control.
+pub fn single_line_edit(h: HWND) -> bool {
+    let style = unsafe { GetWindowLongW(h, GWL_STYLE) } as u32;
+    logic::single_line_edit(&class_name(h), style)
+}
+
+/// Replace all text of the Edit control `h` with `text`, as typing over a
+/// selection does (EM_REPLACESEL; the system marshals the string to the
+/// control's process). False when the control did not answer within
+/// EDIT_REPLY_WAIT.
+pub fn replace_edit_text(h: HWND, text: &str) -> bool {
+    let wide: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+    let send = |msg: u32, w: usize, l: isize| unsafe {
+        SendMessageTimeoutW(
+            h,
+            msg,
+            WPARAM(w),
+            LPARAM(l),
+            SMTO_ABORTIFHUNG,
+            EDIT_REPLY_WAIT_MS,
+            None,
+        )
+        .0 != 0
+    };
+    // Select all, then replace the selection (undoable, as a user edit).
+    send(logic::EM_SETSEL, 0, -1) && send(logic::EM_REPLACESEL, 1, wide.as_ptr() as isize)
 }
 
 pub fn is_minimized(h: HWND) -> bool {

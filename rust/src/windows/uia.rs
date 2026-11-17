@@ -17,7 +17,7 @@ use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4
 use windows::Win32::UI::Accessibility::*;
 use windows::core::{BSTR, Interface};
 
-use super::logic::Props;
+use super::logic::{self, Props};
 use crate::backend::R;
 
 /// Properties fetched with every element, in `Props` order.
@@ -53,6 +53,13 @@ const WINDOW_PROPS: &[UIA_PROPERTY_ID] = &[
     UIA_ControlTypePropertyId,
     UIA_NativeWindowHandlePropertyId,
     UIA_ProcessIdPropertyId,
+    UIA_RuntimeIdPropertyId,
+];
+
+/// Properties `logic::dialog_part` goes by.
+const PART_PROPS: &[UIA_PROPERTY_ID] = &[
+    UIA_AutomationIdPropertyId,
+    UIA_ClassNamePropertyId,
     UIA_RuntimeIdPropertyId,
 ];
 
@@ -198,6 +205,8 @@ struct Requests {
     element: IUIAutomationCacheRequest,
     /// Top-level windows: just what `apps` and matching need.
     windows: IUIAutomationCacheRequest,
+    /// What tells a file dialog's parts apart (`logic::dialog_part`).
+    parts: IUIAutomationCacheRequest,
     all: IUIAutomationCondition,
 }
 
@@ -222,10 +231,19 @@ impl Requests {
                 subtree: request(PROPS, TreeScope_Subtree)?,
                 element: request(PROPS, TreeScope_Element)?,
                 windows: request(WINDOW_PROPS, TreeScope_Element)?,
+                parts: request(PART_PROPS, TreeScope_Element)?,
                 all,
             })
         }
     }
+}
+
+/// What `Uia::file_dialog` found.
+pub struct FileDialogParts {
+    pub window: Elem,
+    pub name: String,
+    pub field: Option<Elem>,
+    pub accept: Option<Elem>,
 }
 
 pub struct Uia {
@@ -365,6 +383,57 @@ impl Uia {
             .collect()
     }
 
+    /// The common file dialog in the window `h` (a #32770): the window
+    /// with its name, and its file name field and default button when
+    /// found (`logic::dialog_part`).
+    pub fn file_dialog(&self, h: HWND) -> Option<FileDialogParts> {
+        let req = self.req.as_ref()?;
+        let window = unsafe { self.auto.ElementFromHandleBuildCache(h, &req.windows) }.ok()?;
+        let name = props(&window).name.trim().to_string();
+        let cond = unsafe {
+            let edit = VARIANT::from(BSTR::from("Edit"));
+            let button = VARIANT::from(BSTR::from("Button"));
+            self.auto
+                .CreatePropertyCondition(UIA_ClassNamePropertyId, &edit)
+                .and_then(|e| {
+                    let b = self
+                        .auto
+                        .CreatePropertyCondition(UIA_ClassNamePropertyId, &button)?;
+                    self.auto.CreateOrCondition(&e, &b)
+                })
+        }
+        .ok()?;
+        let found =
+            unsafe { window.FindAllBuildCache(TreeScope_Descendants, &cond, &req.parts) }.ok();
+        let mut out = FileDialogParts {
+            window: Self::wrap(window, false),
+            name,
+            field: None,
+            accept: None,
+        };
+        let n = found
+            .as_ref()
+            .map_or(0, |a| unsafe { a.Length() }.unwrap_or(0));
+        for i in 0..n {
+            let Some(el) = found.as_ref().and_then(|a| unsafe { a.GetElement(i) }.ok()) else {
+                continue;
+            };
+            let s = |id| cached(&el, id).and_then(|v| v.string()).unwrap_or_default();
+            let slot = match logic::dialog_part(
+                &s(UIA_AutomationIdPropertyId),
+                &s(UIA_ClassNamePropertyId),
+            ) {
+                Some(logic::DialogPart::FileName) => &mut out.field,
+                Some(logic::DialogPart::Accept) => &mut out.accept,
+                None => continue,
+            };
+            if slot.is_none() {
+                *slot = Some(Self::wrap(el, false));
+            }
+        }
+        Some(out)
+    }
+
     /// Fetch `el` and everything below it in one cross-process call.
     pub fn fetch_subtree(&self, el: &IUIAutomationElement) -> Option<IUIAutomationElement> {
         unsafe { el.BuildUpdatedCache(&self.req.as_ref()?.subtree).ok() }
@@ -392,6 +461,15 @@ impl Uia {
 
     pub fn set_focus(&self, el: &IUIAutomationElement) -> bool {
         unsafe { el.SetFocus() }.is_ok()
+    }
+
+    /// The element's own native handle, None when it has none (a
+    /// windowless element).
+    pub fn own_handle(&self, el: &IUIAutomationElement) -> Option<i32> {
+        unsafe { el.CurrentNativeWindowHandle() }
+            .ok()
+            .map(|h| h.0 as usize as u32 as i32)
+            .filter(|h| *h != 0)
     }
 
     /// Native handle of the element or its nearest ancestor that has one.

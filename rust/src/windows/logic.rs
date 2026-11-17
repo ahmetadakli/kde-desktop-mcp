@@ -939,9 +939,71 @@ pub fn exit_code(code: u32) -> String {
     }
 }
 
+/// Window class of a Win32 dialog box: the common item dialog (Open, Save
+/// As) is one, in the process of the app that opened it.
+pub const DIALOG_CLASS: &str = "#32770";
+pub const NOT_A_FILE_DIALOG: &str = "the active window is not a file Open/Save dialog";
+
+/// A part of the common file dialog that file_dialog uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DialogPart {
+    /// The file name field.
+    FileName,
+    /// The default button (Open, Save).
+    Accept,
+}
+
+/// Which part of a common file dialog an element is, by its AutomationId
+/// (the Win32 control id) and window class, both the same in every
+/// language: the Save dialog's file name Edit is 1001, the Open dialog's
+/// 1148 (in a ComboBox of that id); the default button is IDOK (1). The
+/// address bar's toolbar is also 1001 and the folder view's items reuse
+/// small ids, hence the class.
+pub fn dialog_part(automation_id: &str, class: &str) -> Option<DialogPart> {
+    match (automation_id, class) {
+        ("1001" | "1148", "Edit") => Some(DialogPart::FileName),
+        ("1", "Button") => Some(DialogPart::Accept),
+        _ => None,
+    }
+}
+
+pub const EM_SETSEL: u32 = 0x00B1;
+pub const EM_REPLACESEL: u32 = 0x00C2;
+const ES_MULTILINE: u32 = 0x0004;
+
+/// Whether a window of class `class` and style `style` is a single-line
+/// Win32 Edit control. set_text writes those with EM_REPLACESEL, as a user
+/// edit: the common file dialog ignores a name set with WM_SETTEXT (what
+/// ValuePattern.SetValue sends) and saves under the name it had.
+pub fn single_line_edit(class: &str, style: u32) -> bool {
+    class.eq_ignore_ascii_case("Edit") && style & ES_MULTILINE == 0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_single_line_edits_get_their_text_replaced() {
+        assert!(single_line_edit("Edit", 0x5001_0080));
+        assert!(single_line_edit("EDIT", 0));
+        assert!(!single_line_edit("Edit", 0x5001_0084));
+        assert!(!single_line_edit("RichEditD2DPT", 0));
+        assert!(!single_line_edit("ComboBox", 0));
+    }
+
+    #[test]
+    fn file_dialog_parts_go_by_id_and_class() {
+        assert_eq!(dialog_part("1001", "Edit"), Some(DialogPart::FileName));
+        assert_eq!(dialog_part("1148", "Edit"), Some(DialogPart::FileName));
+        assert_eq!(dialog_part("1", "Button"), Some(DialogPart::Accept));
+        // The address bar, the Open dialog's ComboBox, Cancel and the
+        // folder view's items are not.
+        assert_eq!(dialog_part("1001", "ToolbarWindow32"), None);
+        assert_eq!(dialog_part("1148", "ComboBox"), None);
+        assert_eq!(dialog_part("2", "Button"), None);
+        assert_eq!(dialog_part("1", "UIItem"), None);
+    }
 
     #[test]
     fn parses_keys_like_python() {

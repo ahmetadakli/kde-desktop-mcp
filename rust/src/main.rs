@@ -1456,17 +1456,38 @@ fn file_dialog_owner<Id>(d: &FileDialog<Id>, allowed: &[String]) -> R<String> {
     ))
 }
 
+/// What separates `~` from the rest of a path: also `\\` on Windows.
+const HOME_SEPS: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+
+/// The home folder `~` stands for: HOME, else (Windows, where it is
+/// usually unset) USERPROFILE.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| {
+            cfg!(windows)
+                .then(|| std::env::var_os("USERPROFILE"))
+                .flatten()
+        })
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
 /// `raw` with a leading `~` expanded to `home`; Err unless the result is an
 /// absolute path on one line.
 fn expand_path(raw: &str, home: Option<&std::path::Path>) -> R<PathBuf> {
+    expand_path_with(raw, home, HOME_SEPS)
+}
+
+/// `expand_path` with `seps` as the separators after `~`.
+fn expand_path_with(raw: &str, home: Option<&std::path::Path>, seps: &[char]) -> R<PathBuf> {
     let raw = raw.trim();
     if raw.is_empty() || raw.contains(['\n', '\r']) {
         return Err("path must be one non-empty line".into());
     }
     let path = match raw.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => home
-            .ok_or("cannot expand ~: HOME is not set")?
-            .join(rest.trim_start_matches('/')),
+        Some(rest) if rest.is_empty() || rest.starts_with(seps) => home
+            .ok_or("cannot expand ~: the home folder is not set")?
+            .join(rest.trim_start_matches(seps)),
         Some(_) => return Err("only ~ and ~/… are expanded, not ~user".into()),
         None => PathBuf::from(raw),
     };
@@ -6298,8 +6319,7 @@ impl<B: Backend> Server<B> {
     /// it to close. Nothing else in the dialog (or the portal) is exposed.
     async fn file_dialog(&self, a: &Json) -> R<String> {
         let action = arg_s(a, "action", "open").to_lowercase();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let path = expand_path(&req_s(a, "path")?, home.as_deref())?;
+        let path = expand_path(&req_s(a, "path")?, home_dir().as_deref())?;
         check_dialog_path(&path, &action)?;
         let (limit_ms, note) = wait_ms(a, "timeout_ms", 5000);
         self.b.enable().await;
@@ -6308,7 +6328,11 @@ impl<B: Backend> Server<B> {
         let owner = file_dialog_owner(&d, &allowed)
             .map_err(|e| refusal(format!("{e} (allowlist: {})", self.allow_file.display())))?;
         self.permit(&owner).await?;
-        let text = path.display().to_string();
+        let mut text = path.display().to_string();
+        if cfg!(windows) {
+            // `~/x` joined to the profile folder; the dialog's own form.
+            text = text.replace('/', "\\");
+        }
         // file_dialog found the dialog in front and checked whose it is.
         if matches!(
             self.write_text(&d.field, &text, true).await?,
@@ -6366,9 +6390,16 @@ impl<B: Backend> Server<B> {
         .await;
         let ms = start.elapsed().as_millis();
         if !closed {
+            let shows = match self.b.file_dialog_prompt(&d.window).await {
+                Some(t) => format!(
+                    "it shows {} in front (an overwrite confirmation or an error), \
+                     left unanswered",
+                    render::py_repr(&t)
+                ),
+                None => "it may ask to confirm overwriting a file, or show an error".into(),
+            };
             return Err(format!(
-                "wrote {text} and {how}, but the dialog is still open after {ms} ms{note}: \
-                 it may ask to confirm overwriting a file, or show an error"
+                "wrote {text} and {how}, but the dialog is still open after {ms} ms{note}: {shows}"
             ));
         }
         *self.last_active.lock().await = self.active_title().await;
@@ -10146,6 +10177,16 @@ mod tests {
         assert!(exp("/tmp/a\nb").is_err());
         assert!(exp("").is_err());
         assert!(expand_path("~/x", None).is_err());
+        // On Windows `~\` expands too; elsewhere a backslash is part of
+        // a file name.
+        let home = std::path::Path::new("/home/u");
+        let win = |p: &str| expand_path_with(p, Some(home), &['/', '\\']);
+        assert_eq!(
+            win("~\\Belgeler\\a.txt").unwrap(),
+            home.join("Belgeler\\a.txt")
+        );
+        assert_eq!(win("~/a.txt").unwrap(), home.join("a.txt"));
+        assert!(expand_path_with("~\\a", Some(home), &['/']).is_err());
     }
 
     #[test]

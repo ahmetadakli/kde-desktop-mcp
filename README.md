@@ -616,7 +616,10 @@ tool; `off` turns it off). Not available on Windows yet.
   the parent window KWin reports for it belongs to an allowed app, and a
   dialog without a reported parent is refused. The portal is not added to the
   allowlist; no other element of the dialog is reachable. For
-  `action: "open"` the file must exist, for `"save"` its folder (KDE only).
+  `action: "open"` the file must exist, for `"save"` its folder. On Windows
+  it fills an allowed app's common Open/Save As dialog (see the Windows
+  limitations). It never answers an overwrite confirmation: the call then
+  fails saying the dialog is still open.
 - `doctor`: checks the setup in one report: version, allowlist, which running
   apps are allowed, the session, AT-SPI, the virtual keyboard and mouse, KWin
   scripting, screens and the screenshot path.
@@ -1138,6 +1141,17 @@ Windows:
   `expand`); `act` lists the menu it opened as `opened: menu (…)`. A button
   whose only action is `invoke` but opens a menu (Explorer's "Diğer
   seçenekler") is not looked after: `find` the entries.
+- `file_dialog` works on the common Open/Save As dialog (a `#32770` window
+  in front, of the app that opened it), found by control ids rather than by
+  its language: the file name field (1001 in Save As, 1148 in Open) and the
+  default button. `~` stands for `%USERPROFILE%` unless `HOME` is set
+  (`~\` works too). When the dialog asks to confirm overwriting a file,
+  the error names that prompt and leaves it unanswered. An app's own file
+  picker of another kind is not a file dialog to it.
+- `set_text` on a single-line Win32 edit control writes as typing over a
+  selection would (EM_REPLACESEL), not with UI Automation's SetValue: the
+  common file dialog ignores a name set that way and saves under the old
+  one.
 - In very large windows (browsers, Word) `tree` and `find` can be slow because
   they fetch the whole subtree at once.
 

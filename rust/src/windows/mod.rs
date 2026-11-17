@@ -24,8 +24,8 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use crate::backend::{
-    Activated, AppEntry, Backend, Cache, Check, Clip, Info, Launched, NO_AREA, R, Screen, Shot,
-    WindowChange, WindowEntry, WindowGeo,
+    Activated, AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_AREA, R,
+    Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use crate::delivery::nothing_sent;
 use crate::launch_pick::{self as pick, Found};
@@ -328,7 +328,13 @@ impl Backend for WindowsBackend {
         };
         let p = uia::props(&el);
         let kids = Uia::cached_children(&el);
-        self.info_of(&el, &p, Self::foreground_i32(), text_limit, kids)
+        let mut info = self.info_of(&el, &p, Self::foreground_i32(), text_limit, kids);
+        // UIA keeps reading a window that was hidden or destroyed (the
+        // closed Open/Save dialog file_dialog waits for).
+        if p.hwnd != 0 && !wm::is_shown(input::hwnd_from_i32(p.hwnd)) {
+            info.showing = false;
+        }
+        info
     }
 
     async fn identity(&self, id: &Elem) -> (String, String) {
@@ -431,6 +437,11 @@ impl Backend for WindowsBackend {
             .uia
             .writable_value(&id.el)
             .ok_or("element has no writable value; use focus + type_text")?;
+        if let Some(h) = self.uia.own_handle(&id.el).map(input::hwnd_from_i32)
+            && wm::single_line_edit(h)
+        {
+            return Ok(wm::replace_edit_text(h, text));
+        }
         Ok(Uia::set_value(&vp, text))
     }
 
@@ -590,6 +601,32 @@ impl Backend for WindowsBackend {
             }
         }
         Some(menus)
+    }
+
+    async fn active_file_dialog(&self) -> R<FileDialog<Elem>> {
+        // The common item dialog is a #32770 window of the app's own
+        // process, owned by the app's window; UIA lists it below its owner,
+        // so it is taken from the foreground handle, not the root's children.
+        let h = input::foreground();
+        let not_one = || nothing_sent(logic::NOT_A_FILE_DIALOG);
+        if h.is_invalid() || wm::class_name(h) != logic::DIALOG_CLASS {
+            return Err(not_one());
+        }
+        let parts = self.uia.file_dialog(h).ok_or_else(not_one)?;
+        let field = parts.field.ok_or_else(not_one)?;
+        Ok(FileDialog {
+            window: parts.window,
+            app: input::proc_name(input::hwnd_pid(h)).to_lowercase(),
+            titles: vec![parts.name],
+            parent: None,
+            field,
+            accept: parts.accept,
+        })
+    }
+
+    async fn file_dialog_prompt(&self, window: &Elem) -> Option<String> {
+        let dialog = input::hwnd_from_i32(self.uia.own_handle(&window.el)?);
+        wm::prompt_over(dialog, input::foreground())
     }
 
     async fn dialogs_of(&self, w: &WindowGeo) -> Vec<Elem> {

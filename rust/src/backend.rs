@@ -242,7 +242,7 @@ pub fn window_rank(query: &str, title: &str, apps: &[&str]) -> Option<u8> {
     }
 }
 
-pub const NO_FILE_DIALOG: &str = "file dialogs are only supported on KDE Plasma";
+pub const NO_FILE_DIALOG: &str = "file dialogs are only supported on KDE Plasma and Windows";
 
 /// The active window when it is a file Open/Save dialog.
 #[derive(Clone, Debug)]
@@ -737,6 +737,12 @@ pub trait Backend {
     /// The active window as a file dialog; Err when it is none.
     async fn active_file_dialog(&self) -> R<FileDialog<Self::Id>> {
         Err(crate::delivery::nothing_sent(NO_FILE_DIALOG))
+    }
+    /// Title of the window a file dialog `window` shows in front of itself
+    /// (Windows' overwrite confirmation, an error box); None when it shows
+    /// none or the platform does not say.
+    async fn file_dialog_prompt(&self, _window: &Self::Id) -> Option<String> {
+        None
     }
     /// Platform checks for `doctor`.
     async fn doctor(&self) -> Vec<Check> {
