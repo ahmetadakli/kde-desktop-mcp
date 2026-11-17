@@ -5190,7 +5190,7 @@ impl<B: Backend> Server<B> {
         if t.protected() && !self.passwords_allowed(&t.app) {
             return Err(t.reply(&self.password_refusal("set_text", &t.app)));
         }
-        let typed = match self.write_text(&t.id, &text).await? {
+        let typed = match self.write_text(&t.id, &text, false).await? {
             Written::Refused => return Ok(t.reply("failed")),
             Written::Set => false,
             Written::Typed => true,
@@ -5224,7 +5224,7 @@ impl<B: Backend> Server<B> {
         };
         let mut how = "";
         let mut seen = self.read_back(&t.id, &text, patience).await;
-        if matches!(&seen, Ok(Some(_))) && retypable && self.retype(&t.id, &text).await {
+        if matches!(&seen, Ok(Some(_))) && retypable && self.retype(&t.id, &text, false).await {
             how = "; typed, the accessibility write had no effect";
             seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
             if let (Ok(None), Some(k)) = (&seen, key) {
@@ -5246,7 +5246,11 @@ impl<B: Backend> Server<B> {
     /// file dialog's name field), by focusing it, selecting all and typing.
     /// Text with a newline is never typed: Enter would submit. Err when it
     /// is neither, or typing could not start (nothing typed then).
-    async fn write_text(&self, id: &B::Id, text: &str) -> R<Written> {
+    /// `front_checked`: the caller made sure the window in front is the
+    /// one to type into (file_dialog: a portal dialog an allowed app
+    /// opened, itself not on the allowlist), so typing skips the check that
+    /// the active window's app is allowed.
+    async fn write_text(&self, id: &B::Id, text: &str, front_checked: bool) -> R<Written> {
         match self.b.set_text(id, text).await {
             Ok(true) => Ok(Written::Set),
             Ok(false) => Ok(Written::Refused),
@@ -5255,7 +5259,7 @@ impl<B: Backend> Server<B> {
                 if text.contains('\n') || !editable {
                     return Err(e);
                 }
-                if self.retype(id, text).await {
+                if self.retype(id, text, front_checked).await {
                     Ok(Written::Typed)
                 } else {
                     Err(format!(
@@ -5288,8 +5292,8 @@ impl<B: Backend> Server<B> {
     /// Focus the element, select all and type `text`; false when the element
     /// would not take focus in an allowed active window (nothing typed).
     /// Runs under the input lock `set_text` (an INPUT_TOOLS entry) holds.
-    async fn retype(&self, id: &B::Id, text: &str) -> bool {
-        if self.require_active_allowed().await.is_err() {
+    async fn retype(&self, id: &B::Id, text: &str, front_checked: bool) -> bool {
+        if !front_checked && self.require_active_allowed().await.is_err() {
             return false;
         }
         if !matches!(self.b.try_focus(id).await, Ok(Some(_))) && !self.b.is_focused(id).await {
@@ -6101,7 +6105,11 @@ impl<B: Backend> Server<B> {
             .map_err(|e| refusal(format!("{e} (allowlist: {})", self.allow_file.display())))?;
         self.permit(&owner).await?;
         let text = path.display().to_string();
-        if matches!(self.write_text(&d.field, &text).await?, Written::Refused) {
+        // file_dialog found the dialog in front and checked whose it is.
+        if matches!(
+            self.write_text(&d.field, &text, true).await?,
+            Written::Refused
+        ) {
             return Err("the file name field refused the path".into());
         }
         if let Some(now) = self.read_back(&d.field, &text, SET_TEXT_VERIFY).await? {
