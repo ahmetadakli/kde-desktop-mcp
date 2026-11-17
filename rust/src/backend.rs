@@ -207,6 +207,34 @@ pub struct Shot {
 }
 
 /// File dialogs the server can fill in (only KDE's so far).
+/// How well a window matches a `window`/`query` argument, lower is better,
+/// None when it does not: 0 its title is the query, 1 its app is (or ends
+/// a reverse-DNS app id: `com.anthropic.Claude` for "claude"), 2 its app
+/// contains it, 3 its title does. "Claude" then picks Claude Desktop, not
+/// a terminal titled "~ : claude".
+pub fn window_rank(query: &str, title: &str, apps: &[&str]) -> Option<u8> {
+    let q = query.trim().to_lowercase();
+    if q.is_empty() {
+        return Some(3);
+    }
+    let title = title.trim().to_lowercase();
+    let apps: Vec<String> = apps.iter().map(|a| a.to_lowercase()).collect();
+    if title == q {
+        Some(0)
+    } else if apps
+        .iter()
+        .any(|a| *a == q || a.ends_with(&format!(".{q}")))
+    {
+        Some(1)
+    } else if apps.iter().any(|a| a.contains(&q)) {
+        Some(2)
+    } else if title.contains(&q) {
+        Some(3)
+    } else {
+        None
+    }
+}
+
 pub const NO_FILE_DIALOG: &str = "file dialogs are only supported on KDE Plasma";
 
 /// The active window when it is a file Open/Save dialog.
@@ -700,4 +728,22 @@ pub fn not_one_window(query: &str, matches: &[WindowGeo]) -> String {
         matches.len(),
         list.join(", ")
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn windows_rank_title_then_app_then_parts() {
+        let rank = |q, t, a| super::window_rank(q, t, &[a]);
+        // The terminal titled "~ : claude" loses to Claude Desktop.
+        assert_eq!(rank("Claude", "Claude", "com.anthropic.Claude"), Some(0));
+        assert_eq!(rank("claude", "Chat — x", "com.anthropic.Claude"), Some(1));
+        assert_eq!(
+            rank("claude", "~ : claude — Konsole", "org.kde.konsole"),
+            Some(3)
+        );
+        assert_eq!(rank("kate", "notes — Kate", "org.kde.kate"), Some(1));
+        assert_eq!(rank("dolp", "x", "org.kde.dolphin"), Some(2));
+        assert_eq!(rank("zzz", "x", "y"), None);
+    }
 }

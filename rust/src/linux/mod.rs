@@ -1804,28 +1804,35 @@ impl Backend for LinuxBackend {
                 let names = Self::names_by_pid(&apps);
                 // Allowed as `windows` allows them: by pid, else by class.
                 let allow = Self::allow_of(allowed, &apps);
-                let found = clients.as_array().into_iter().flatten().find(|c| {
-                    if !c["mapped"].as_bool().unwrap_or(true)
-                        || c["hidden"].as_bool().unwrap_or(false)
-                    {
-                        return false;
-                    }
-                    let pid = c["pid"]
-                        .as_i64()
-                        .and_then(|p| u32::try_from(p).ok())
-                        .unwrap_or(0);
-                    let classes = [
-                        c["class"].as_str().unwrap_or(""),
-                        c["initialClass"].as_str().unwrap_or(""),
-                    ];
-                    if !allow.permits(pid, &classes) {
-                        return false;
-                    }
-                    let app = Self::client_app_name(&names, c);
-                    let title = c["title"].as_str().unwrap_or("").to_lowercase();
-                    let class = c["class"].as_str().unwrap_or("").to_lowercase();
-                    title.contains(&q) || app.contains(&q) || class.contains(&q)
-                });
+                let found = clients
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|c| {
+                        if !c["mapped"].as_bool().unwrap_or(true)
+                            || c["hidden"].as_bool().unwrap_or(false)
+                        {
+                            return None;
+                        }
+                        let pid = c["pid"]
+                            .as_i64()
+                            .and_then(|p| u32::try_from(p).ok())
+                            .unwrap_or(0);
+                        let classes = [
+                            c["class"].as_str().unwrap_or(""),
+                            c["initialClass"].as_str().unwrap_or(""),
+                        ];
+                        if !allow.permits(pid, &classes) {
+                            return None;
+                        }
+                        let app = Self::client_app_name(&names, c);
+                        let title = c["title"].as_str().unwrap_or("");
+                        let class = c["class"].as_str().unwrap_or("");
+                        crate::backend::window_rank(&q, title, &[&app, class]).map(|r| (r, c))
+                    })
+                    // The best match; the first of a rank.
+                    .min_by_key(|(r, _)| *r)
+                    .map(|(_, c)| c);
                 let Some(c) = found else {
                     return Err(crate::delivery::nothing_sent(format!(
                         "no window of an allowed app matches '{query}'"
