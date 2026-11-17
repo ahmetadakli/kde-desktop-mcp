@@ -526,6 +526,70 @@ impl Uia {
         unsafe { vp.SetValue(&BSTR::from(text)) }.is_ok()
     }
 
+    /// The live FrameworkId ("Win32", "XAML", "Chrome", ...).
+    pub fn framework(&self, el: &IUIAutomationElement) -> String {
+        unsafe { el.CurrentFrameworkId() }
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+
+    /// The first web document below `el` that is on screen (a browser
+    /// tab's page), in one cross-process call.
+    pub fn showing_document(&self, el: &IUIAutomationElement) -> Option<Elem> {
+        let cond = unsafe {
+            let doc = VARIANT::from(UIA_DocumentControlTypeId.0);
+            let no = VARIANT::from(false);
+            self.auto
+                .CreatePropertyCondition(UIA_ControlTypePropertyId, &doc)
+                .and_then(|d| {
+                    let shown = self
+                        .auto
+                        .CreatePropertyCondition(UIA_IsOffscreenPropertyId, &no)?;
+                    self.auto.CreateAndCondition(&d, &shown)
+                })
+        }
+        .ok()?;
+        let found = unsafe { el.FindFirst(TreeScope_Descendants, &cond) }.ok()?;
+        Some(Self::wrap(found, false))
+    }
+
+    /// The MSAA state bits (LegacyIAccessiblePattern), live.
+    pub fn legacy_state(&self, el: &IUIAutomationElement) -> Option<u32> {
+        let p: IUIAutomationLegacyIAccessiblePattern =
+            Self::pattern(el, UIA_LegacyIAccessiblePatternId)?;
+        unsafe { p.CurrentState() }.ok()
+    }
+
+    /// ScrollItemPattern.ScrollIntoView: Some(whether the app accepted
+    /// it), None when the element has no such pattern.
+    pub fn scroll_into_view(&self, el: &IUIAutomationElement) -> Option<bool> {
+        let p: IUIAutomationScrollItemPattern = Self::pattern(el, UIA_ScrollItemPatternId)?;
+        Some(unsafe { p.ScrollIntoView() }.is_ok())
+    }
+
+    /// The nearest ancestor of `el` that is on screen and scrolls (a
+    /// ScrollPattern that says it can): a list, a web page.
+    pub fn scroll_container(&self, el: &IUIAutomationElement) -> Option<Elem> {
+        let walker = unsafe { self.auto.ControlViewWalker() }.ok()?;
+        let mut cur = el.clone();
+        for _ in 0..64 {
+            cur = unsafe { walker.GetParentElement(&cur) }.ok()?;
+            let off = unsafe { cur.CurrentIsOffscreen() }.map_or(true, |b| b.as_bool());
+            if off {
+                continue;
+            }
+            if let Some(p) = Self::pattern::<IUIAutomationScrollPattern>(&cur, UIA_ScrollPatternId)
+            {
+                let v = unsafe { p.CurrentVerticallyScrollable() }.is_ok_and(|b| b.as_bool());
+                let h = unsafe { p.CurrentHorizontallyScrollable() }.is_ok_and(|b| b.as_bool());
+                if v || h {
+                    return Some(Self::wrap(cur, false));
+                }
+            }
+        }
+        None
+    }
+
     /// Run one entry of the Python action table.
     pub fn perform(&self, el: &IUIAutomationElement, action: &str) -> bool {
         unsafe {

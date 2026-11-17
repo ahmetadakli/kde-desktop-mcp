@@ -24,7 +24,7 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use crate::backend::{
-    Activated, AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_AREA, R,
+    Activated, AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_AREA, Page, R,
     Screen, Shot, WindowChange, WindowEntry, WindowGeo,
 };
 use crate::delivery::nothing_sent;
@@ -454,6 +454,58 @@ impl Backend for WindowsBackend {
             return Ok(Some("SetFocus".into()));
         }
         Ok(None)
+    }
+
+    async fn toolkit_of(&self, id: &Elem) -> String {
+        let class = self
+            .uia
+            .window_handle(&id.el)
+            .map(|h| wm::class_name(input::root(input::hwnd_from_i32(h))))
+            .unwrap_or_default();
+        logic::web_toolkit(&self.uia.framework(&id.el), &class).to_string()
+    }
+
+    async fn embedded_document(&self, window: &Elem) -> Option<Elem> {
+        // Chromium's page sits deep below its window: one FindFirst.
+        if self.toolkit_of(window).await.is_empty() {
+            return None;
+        }
+        self.uia.showing_document(&window.el)
+    }
+
+    async fn page(&self, doc: &Elem) -> Option<Page> {
+        let p = self.uia.fetch(&doc.el)?;
+        if p.role() != "document" || p.offscreen {
+            return None;
+        }
+        Some(Page {
+            title: p.name,
+            url: self.uia.value(&doc.el).unwrap_or_default(),
+            busy: self
+                .uia
+                .legacy_state(&doc.el)
+                .is_some_and(|s| s & logic::STATE_BUSY != 0),
+        })
+    }
+
+    async fn loading(&self, windows: &[Elem]) -> bool {
+        for w in windows {
+            if let Some(doc) = self.embedded_document(w).await
+                && self.page(&doc).await.is_some_and(|p| p.busy)
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn scroll_into_view(&self, id: &Elem) -> R<bool> {
+        // An element without ScrollItemPattern: the wheel fallback.
+        Ok(self.uia.scroll_into_view(&id.el).unwrap_or(false))
+    }
+
+    async fn scroll_container(&self, id: &Elem) -> Option<Elem> {
+        self.uia.scroll_container(&id.el)
     }
 
     async fn element_center(&self, id: &Elem) -> R<(i32, i32)> {

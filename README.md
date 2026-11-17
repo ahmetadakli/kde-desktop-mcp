@@ -336,8 +336,9 @@ tool; `off` turns it off). Not available on Windows yet.
   call's confirmation covers them. On Windows (roles compared without
   spaces: `checkbox`, `listitem`), check/uncheck/expand/collapse use the UI
   Automation Toggle and ExpandCollapse actions and `select` the entry's
-  SelectionItem;
-  Selection and ScrollTo are not supported there (untested on Windows).
+  SelectionItem; `scroll_to` uses ScrollItemPattern.ScrollIntoView, else the
+  wheel over the nearest scrolling ancestor (verified in Edge); Selection is
+  not supported there.
   Verified so far with unit tests only; not yet tried against Kate, Dolphin
   or Firefox.
 - Modifier clicks: `click`, `mouse` and `scroll` take `modifiers` (`ctrl`,
@@ -1159,6 +1160,13 @@ Windows:
   one.
 - In very large windows (browsers, Word) `tree` and `find` can be slow because
   they fetch the whole subtree at once.
+- UI Automation sends the server no change events: the effect line of an
+  input reads the app's windows before and after it (see `observe`), and
+  `wait_idle` polls them. In Chromium browsers (Edge, Chrome) and Electron
+  apps the page is the document on screen: its title and address (the
+  document's value) name a page change, and MSAA's busy state is taken as
+  loading. A link below the fold is off screen as Chromium says (no visible
+  match); `act action=scroll_to` on its id brings it into view.
 
 All:
 - Games and canvas-based interfaces mostly show up empty in the accessibility

@@ -979,6 +979,22 @@ pub fn single_line_edit(class: &str, style: u32) -> bool {
     class.eq_ignore_ascii_case("Edit") && style & ES_MULTILINE == 0
 }
 
+/// MSAA's STATE_SYSTEM_BUSY: a browser's document still loading.
+pub const STATE_BUSY: u32 = 0x800;
+
+/// The toolkit (`Backend::toolkit_of`) of an element from its UIA
+/// FrameworkId and its top-level window's class: "chromium" for Chromium
+/// browsers and Electron apps, "gecko" for Firefox, else "".
+pub fn web_toolkit(framework: &str, root_class: &str) -> &'static str {
+    if framework.eq_ignore_ascii_case("chrome") || root_class.starts_with("Chrome_WidgetWin") {
+        "chromium"
+    } else if framework.eq_ignore_ascii_case("gecko") || root_class == "MozillaWindowClass" {
+        "gecko"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1564,5 +1580,16 @@ mod tests {
         assert!(!handoff_exit(None));
         assert_eq!(exit_code(2), "2");
         assert_eq!(exit_code(0xC000_0005), "0xC0000005");
+    }
+
+    #[test]
+    fn web_toolkit_by_framework_or_window_class() {
+        assert_eq!(web_toolkit("Chrome", "Chrome_WidgetWin_1"), "chromium");
+        // The top-level window says Win32; its class says Chromium.
+        assert_eq!(web_toolkit("Win32", "Chrome_WidgetWin_1"), "chromium");
+        assert_eq!(web_toolkit("Gecko", ""), "gecko");
+        assert_eq!(web_toolkit("Win32", "MozillaWindowClass"), "gecko");
+        assert_eq!(web_toolkit("XAML", "ApplicationFrameWindow"), "");
+        assert_eq!(web_toolkit("Win32", "Notepad"), "");
     }
 }
