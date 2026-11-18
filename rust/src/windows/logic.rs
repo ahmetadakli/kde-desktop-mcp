@@ -858,6 +858,44 @@ pub fn manifest_apps(xml: &str) -> (String, Vec<(String, String)>) {
     (name, apps)
 }
 
+/// The executables (lower-case stems) of a package's apps that run inside
+/// an ApplicationFrameHost frame: UWP apps listed in the Start menu, not
+/// full-trust (Win32) ones that open windows of their own, nor the hidden
+/// system ones (AppListEntry="none": shell parts, brokers, pickers).
+pub fn manifest_hosted(xml: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<Application") {
+        let after = &rest[i + "<Application".len()..];
+        rest = after;
+        if !after.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let end = [after.find("</Application>"), after.find("<Application")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(after.len());
+        let body = &after[..end];
+        let tag = &body[..body.find('>').unwrap_or(body.len())];
+        let win32 = xml_attr(tag, "EntryPoint").as_deref() == Some("Windows.FullTrustApplication")
+            || ["packagedClassicApp", "win32App"]
+                .iter()
+                .any(|v| tag.contains(&format!("RuntimeBehavior=\"{v}\"")));
+        let hidden = xml_tags(body, "uap:VisualElements")
+            .iter()
+            .chain(&xml_tags(body, "VisualElements"))
+            .any(|t| xml_attr(t, "AppListEntry").as_deref() == Some("none"));
+        let exe = xml_attr(tag, "Executable").map(|e| exe_stem(&e));
+        if let Some(exe) = exe.filter(|e| !win32 && !hidden && !e.is_empty() && !e.contains('$'))
+            && !out.contains(&exe)
+        {
+            out.push(exe);
+        }
+    }
+    out
+}
+
 /// The family name of a package full name
 /// (Name_Version_Arch_ResourceId_PublisherId): Name_PublisherId.
 pub fn package_family(full: &str) -> Option<String> {
@@ -1543,6 +1581,26 @@ mod tests {
             ]
         );
         assert_eq!(manifest_apps("<Package/>"), (String::new(), vec![]));
+    }
+
+    #[test]
+    fn hosted_apps_are_the_uwp_ones() {
+        let xml = r#"<Applications>
+            <Application Id="App" Executable="CalculatorApp.exe" EntryPoint="Calculator.App">
+              <uap:VisualElements DisplayName="Calc" AppListEntry="default"/>
+            </Application>
+            <Application Id="N" Executable="Notepad\Notepad.exe"
+                EntryPoint="Windows.FullTrustApplication"></Application>
+            <Application Id="P" Executable="P.exe" uap10:RuntimeBehavior="packagedClassicApp">
+            </Application>
+            <Application Id="Again" Executable="calculatorapp.exe" EntryPoint="X"/>
+            <Application Id="NoExe" EntryPoint="Y"></Application>
+            <Application Id="Hidden" Executable="Broker.exe" EntryPoint="Z">
+              <uap:VisualElements AppListEntry="none" DisplayName="B"/>
+            </Application>
+            <Application Id="T" Executable="$targetnametoken$.exe" EntryPoint="Z"/>
+        </Applications>"#;
+        assert_eq!(manifest_hosted(xml), vec!["calculatorapp"]);
         assert_eq!(
             package_family("Microsoft.WindowsCalculator_11.2607.0.0_x64__8wekyb3d8bbwe").as_deref(),
             Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe")

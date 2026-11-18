@@ -67,6 +67,10 @@ const CHAR_GAP: Duration = Duration::from_millis(5);
 /// is moved or resized.
 const RESTORE_WAIT: Duration = Duration::from_millis(500);
 
+/// The executables of the installed Store apps ApplicationFrameHost hosts,
+/// read once in the background (`warm_up`).
+static INSTALLED_HOSTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
 pub struct WindowsBackend {
     uia: Uia,
     clip: clipboard::Clipboard,
@@ -266,11 +270,25 @@ impl Backend for WindowsBackend {
     }
 
     fn app_aliases(&self) -> Vec<(String, &'static str)> {
-        input::hosted_apps()
-            .into_iter()
+        // The installed ones too (once read), so whether a Store app is
+        // allowed does not depend on whether it is running.
+        let mut apps = input::hosted_apps();
+        for a in INSTALLED_HOSTED.get().into_iter().flatten() {
+            if !apps.contains(a) {
+                apps.push(a.clone());
+            }
+        }
+        apps.into_iter()
             .filter(|a| a != logic::STORE_FRAME_APP)
             .map(|a| (a, logic::STORE_FRAME_APP))
             .collect()
+    }
+
+    fn warm_up(&self) {
+        // Reading every package's manifest takes a moment: not on a call.
+        std::thread::spawn(|| {
+            let _ = INSTALLED_HOSTED.set(launch::installed_hosted_apps());
+        });
     }
 
     fn boring_roles(&self) -> &'static [&'static str] {
@@ -770,6 +788,13 @@ impl Backend for WindowsBackend {
         allowed: &[String],
         wait: Duration,
     ) -> R<Launched> {
+        if app.trim().eq_ignore_ascii_case(logic::STORE_FRAME_APP) {
+            // ApplicationFrameHost.exe itself, not a Store app.
+            return Err(nothing_sent(
+                "applicationframehost only hosts Store apps' frames; launch the Store app by its \
+                 own name (e.g. calculatorapp)",
+            ));
+        }
         let (name, argv) = (app.to_string(), args.to_vec());
         let r = tokio::task::spawn_blocking(move || launch::resolve(&name, &argv))
             .await

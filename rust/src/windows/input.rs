@@ -238,9 +238,8 @@ pub fn hosted(h: HWND, frame_pid: u32) -> Option<(String, u32)> {
     }
 }
 
-/// The apps the Store frames now open host (ApplicationFrameHost's own
-/// name for a frame that hosts none), for the allowlist alias. Win32 only:
-/// cheap enough for every allowlist read.
+/// The apps the Store frames now open host, for the allowlist alias.
+/// Win32 only: cheap enough for every allowlist read.
 pub fn hosted_apps() -> Vec<String> {
     let class = wide_z(logic::STORE_FRAME_CLASS);
     let mut out: Vec<String> = Vec::new();
@@ -254,8 +253,13 @@ pub fn hosted_apps() -> Vec<String> {
         if h.is_invalid() {
             break;
         }
-        let app = window_app(h, hwnd_pid(h));
-        if !app.is_empty() && !out.contains(&app) {
+        // Only ApplicationFrameHost's frames: explorer has a window of
+        // this class too, which made explorer an alias of the frame.
+        let pid = hwnd_pid(h);
+        if proc_name(pid) == logic::STORE_FRAME_APP
+            && let Some((app, _)) = hosted(h, pid)
+            && !out.contains(&app)
+        {
             out.push(app);
         }
         prev = Some(h);

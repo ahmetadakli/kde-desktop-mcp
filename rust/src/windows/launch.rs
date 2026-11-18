@@ -150,21 +150,38 @@ fn reg_subkeys(root: HKEY, key: &str) -> Vec<String> {
 
 const PACKAGES: &str = r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages";
 
+/// The user's installed packages: family name and AppxManifest.xml text.
+fn packages() -> impl Iterator<Item = (String, String)> {
+    reg_subkeys(HKEY_CURRENT_USER, PACKAGES)
+        .into_iter()
+        .filter_map(|full| {
+            let family = logic::package_family(&full)?;
+            let key = format!("{PACKAGES}\\{full}");
+            let root = reg_string(HKEY_CURRENT_USER, &key, Some("PackageRootFolder"))?;
+            let xml = std::fs::read_to_string(Path::new(&root).join("AppxManifest.xml")).ok()?;
+            Some((family, xml))
+        })
+}
+
+/// The executables of the installed Store apps that ApplicationFrameHost
+/// hosts (see `logic::manifest_hosted`). Reads every manifest: slow.
+pub fn installed_hosted_apps() -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for (_, xml) in packages() {
+        for app in logic::manifest_hosted(&xml) {
+            if !out.contains(&app) {
+                out.push(app);
+            }
+        }
+    }
+    out
+}
+
 /// The AppUserModelID of the user's Store app best matching `app` (see
 /// `logic::store_rank`), from the installed packages' manifests.
 fn store_app(app: &str) -> Option<String> {
     let mut best: Option<(u8, String)> = None;
-    for full in reg_subkeys(HKEY_CURRENT_USER, PACKAGES) {
-        let Some(family) = logic::package_family(&full) else {
-            continue;
-        };
-        let key = format!("{PACKAGES}\\{full}");
-        let Some(root) = reg_string(HKEY_CURRENT_USER, &key, Some("PackageRootFolder")) else {
-            continue;
-        };
-        let Ok(xml) = std::fs::read_to_string(Path::new(&root).join("AppxManifest.xml")) else {
-            continue;
-        };
+    for (family, xml) in packages() {
         let (name, apps) = logic::manifest_apps(&xml);
         for (id, exe) in apps {
             let Some(rank) = logic::store_rank(app, &name, &exe) else {

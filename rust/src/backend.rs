@@ -356,8 +356,8 @@ pub trait Backend {
     }
     /// (app, alias) pairs: `app` is allowed with the alias's tier when the
     /// allowlist names the alias but not the app. Windows: the Store apps
-    /// ApplicationFrameHost now hosts, so an allowlist written for their
-    /// frames keeps working.
+    /// ApplicationFrameHost hosts (open now or installed), so an allowlist
+    /// written for their frames keeps working.
     fn app_aliases(&self) -> Vec<(String, &'static str)> {
         Vec::new()
     }
