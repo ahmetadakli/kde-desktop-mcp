@@ -22,7 +22,7 @@ list like `[55] button "Save"` and acts on an element by its number.
 | Element actions | AT-SPI actions, EditableText | AT-SPI actions, EditableText | Invoke, Toggle, ExpandCollapse, SelectionItem, Value patterns |
 | Keyboard | `/dev/uinput` | `/dev/uinput` | Win32 `SendInput` |
 | Mouse | Absolute uinput pointer | Hyprland `movecursor` + uinput buttons | `SetCursorPos` + `SendInput` |
-| Typing text | Direct insertion via AT-SPI into Qt multi-line fields (clipboard untouched); elsewhere in-process clipboard + Ctrl+V, after which the previous clipboard text is put back | `wtype` (clipboard untouched); otherwise clipboard + Ctrl+V as on KDE | `KEYEVENTF_UNICODE` (clipboard untouched) |
+| Typing text | Direct insertion via AT-SPI into Qt multi-line fields (clipboard untouched); elsewhere in-process clipboard + Ctrl+V, after which the previous clipboard text is put back | `wtype` (clipboard untouched); otherwise clipboard + Ctrl+V as on KDE | Clipboard + Ctrl+V, after which the previous clipboard contents (all formats) are put back; a single character as a `KEYEVENTF_UNICODE` key |
 | Windows | KWin scripting (D-Bus) | Hyprland socket: `clients`, `monitors`, dispatchers, batched in one request | `SetForegroundWindow` |
 | Screenshot (fallback) | KWin `ScreenShot2` (D-Bus); else `spectacle` | `grim` | GDI |
 
@@ -1140,13 +1140,20 @@ Windows:
   a window after handing a file to the open Notepad.
 - Key names follow the US keyboard layout positions; use `type_text` for text.
 - `type_text` pastes through the clipboard (a single character is typed as a
-  key). It saves the clipboard text first and puts it back once the app in
-  front has read the paste: the text is offered with delayed rendering, so the
-  read shows as the app's request for it. The typed text is kept out of the
-  clipboard history (Win+V) and marked for clipboard monitors. As on KDE, an
-  image, files or text over 4 MiB is not put back, nor is anything when the
-  app does not read the paste within 1 s; the reply says so. While another app
-  holds the clipboard open, the text is typed key by key instead.
+  key). It saves the clipboard first, every format whose data is a memory
+  block (text with its HTML/RTF formatting, Office formats, images as DIB,
+  copied files), and puts it back once the app in front has read the paste:
+  the text is offered with delayed rendering, so the read shows as the app's
+  request for it. Formats that cannot be kept (metafiles, owner-drawn or
+  private ones) are named in the reply; contents over 16 MiB are not kept and
+  the clipboard is emptied instead. The typed text is kept out of the
+  clipboard history (Win+V) and marked for clipboard monitors, and it never
+  stays on the clipboard: when the app does not read the paste within 1 s the
+  clipboard is put back and the call fails (the text was probably not typed).
+  A paste cancelled half-way, or cut short by the server's exit, also puts
+  the clipboard back. While another app holds the clipboard open, the text is
+  typed key by key instead. Typing stops, with an error, when another window
+  comes to the front.
 - A menu bar entry or submenu entry acts by expanding (its first action is
   `expand`); `act` lists the menu it opened as `opened: menu (…)`. A button
   whose only action is `invoke` but opens a menu (Explorer's "Diğer

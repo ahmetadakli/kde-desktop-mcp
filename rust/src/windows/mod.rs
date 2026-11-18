@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
 use windows::Win32::UI::Accessibility::IUIAutomationElement;
 use windows::Win32::UI::HiDpi::{
@@ -176,40 +177,48 @@ impl WindowsBackend {
     }
 
     /// Type `text` key by key, one character per SendInput with a pause in
-    /// between (KEYEVENTF_UNICODE: any layout, the clipboard untouched).
-    async fn keystrokes(&self, text: &str) -> R<()> {
+    /// between (KEYEVENTF_UNICODE: any layout, the clipboard untouched),
+    /// stopping when the window `front` is no longer in front.
+    async fn keystrokes(&self, text: &str, front: HWND) -> R<()> {
         // The pauses are shorter than the default 15.6 ms timer tick.
-        unsafe { timeBeginPeriod(1) };
-        let mut r = Ok(());
-        for (i, batch) in logic::unicode_per_char(text).iter().enumerate() {
+        let _timer = FineTimer::new();
+        let chars = logic::unicode_per_char(text);
+        for (i, batch) in chars.iter().enumerate() {
             if i > 0 {
                 tokio::time::sleep(CHAR_GAP).await;
             }
-            if let Err(e) = input::send_keys(batch) {
-                r = Err(if i == 0 {
-                    crate::delivery::nothing_sent(e)
-                } else {
-                    e
-                });
-                break;
+            let r = match input::foreground() == front {
+                true => input::send_keys(batch),
+                false => Err(format!(
+                    "the active window changed after {i} of {} characters; the rest was not \
+                     typed",
+                    chars.len()
+                )),
+            };
+            if let Err(e) = r {
+                return Err(if i == 0 { nothing_sent(e) } else { e });
             }
         }
-        unsafe { timeEndPeriod(1) };
-        r
+        Ok(())
     }
 
-    /// Paste `text` with ctrl+v through the clipboard, then put back the
-    /// text the clipboard held once the app in front has read the paste
-    /// (restoring earlier would let it paste the old text). Images, files
-    /// and other non-text contents are not put back; the note says so.
+    /// Paste `text` with ctrl+v through the clipboard into the window
+    /// `front`, then put back what the clipboard held once the app has
+    /// read the paste (restoring earlier would let it paste the old
+    /// contents). Formats that cannot be put back are named in the note.
     /// When the clipboard cannot be taken, the text is typed key by key.
-    async fn paste(&self, text: &str) -> R<String> {
+    /// A paste the app does not read is an error, and the typed text never
+    /// stays on the clipboard (it may be a password).
+    async fn paste(&self, text: &str, front: HWND) -> R<String> {
         use crate::trace::time;
         let saved = time("save", self.clip.save()).await;
         if let clipboard::Saved::Busy = saved {
-            self.keystrokes(text).await?;
+            self.keystrokes(text, front).await?;
             return Ok(String::new());
         }
+        self.clip.hold(saved);
+        // Puts the clipboard back if the call is cancelled half-way.
+        let _put_back = PutBack(&self.clip);
         let mut offered = time("offer", self.clip.offer(text)).await;
         // A clipboard monitor read the text right away: offer it again, so
         // the paste's own read shows.
@@ -218,30 +227,61 @@ impl WindowsBackend {
         }
         if offered.is_err() {
             // The clipboard may have been emptied before the offer failed.
-            self.clip.restore(saved).await;
-            self.keystrokes(text).await?;
+            self.clip.restore().await;
+            self.keystrokes(text, front).await?;
             return Ok(String::new());
+        }
+        if input::foreground() != front {
+            let note = self.clip.restore().await;
+            return Err(nothing_sent(format!(
+                "the active window changed before the paste; nothing typed{note}"
+            )));
         }
         let since = std::time::Instant::now();
         if let Err(e) = time("ctrl+v", self.press_combo("ctrl+v")).await {
             // Nothing was pasted: safe to put the clipboard back now.
-            self.clip.restore(saved).await;
+            self.clip.restore().await;
             return Err(e);
         }
         let read = time("wait_read", self.clip.wait_read(since, PASTE_READ_WAIT)).await;
-        Ok(match saved {
-            clipboard::Saved::Busy => String::new(),
-            clipboard::Saved::Nothing(why) => {
-                format!("; the clipboard now holds the typed text (not put back: {why})")
-            }
-            // An empty clipboard is emptied again once the paste was read;
-            // unread, the typed text stays and nothing was lost.
-            clipboard::Saved::Empty if !read => String::new(),
-            _ if !read => "; the paste was not read within 1 s, so the clipboard was not put \
-                 back"
-                .into(),
-            saved => time("restore", self.clip.restore(saved)).await,
-        })
+        let note = time("restore", self.clip.restore()).await;
+        if !read {
+            let back = match note.is_empty() {
+                true => "; the clipboard was put back".to_string(),
+                false => note,
+            };
+            return Err(format!(
+                "the app in front did not read the paste within 1 s, so the text was probably \
+                 not typed (an app that does not paste with ctrl+v, or a busy one){back}"
+            ));
+        }
+        Ok(note)
+    }
+}
+
+/// timeBeginPeriod(1) while it lives, ended also when a call is cancelled
+/// half-way.
+struct FineTimer;
+
+impl FineTimer {
+    fn new() -> Self {
+        unsafe { timeBeginPeriod(1) };
+        FineTimer
+    }
+}
+
+impl Drop for FineTimer {
+    fn drop(&mut self) {
+        unsafe { timeEndPeriod(1) };
+    }
+}
+
+/// Puts back what a paste holds when the paste is dropped before it did.
+struct PutBack<'a>(&'a clipboard::Clipboard);
+
+impl Drop for PutBack<'_> {
+    fn drop(&mut self) {
+        self.0.restore_now();
     }
 }
 
@@ -282,6 +322,10 @@ impl Backend for WindowsBackend {
             .filter(|a| a != logic::STORE_FRAME_APP)
             .map(|a| (a, logic::STORE_FRAME_APP))
             .collect()
+    }
+
+    fn shutdown(&self) {
+        self.clip.shutdown();
     }
 
     fn warm_up(&self) {
@@ -553,11 +597,14 @@ impl Backend for WindowsBackend {
     }
 
     async fn type_text(&self, text: &str) -> R<String> {
+        // The window the caller found allowed in front: input stops if
+        // another one comes in front meanwhile.
+        let front = input::foreground();
         if text.chars().count() <= KEYSTROKE_MAX {
-            self.keystrokes(text).await?;
+            self.keystrokes(text, front).await?;
             return Ok(String::new());
         }
-        self.paste(text).await
+        self.paste(text, front).await
     }
 
     async fn clipboard_get(&self, limit: usize) -> R<Clip> {

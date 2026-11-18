@@ -1,7 +1,8 @@
 //! The Windows clipboard: CF_UNICODETEXT read and written for the clipboard
 //! tools, and the paste of `type_text`, whose text is offered with delayed
 //! rendering so the server sees the app in front read it before putting
-//! the old clipboard back.
+//! the old clipboard back (every format whose data is a memory block, so
+//! formatted text, images and files come back too).
 //!
 //! A message-only window on a thread of its own owns what the server puts
 //! on the clipboard: Windows asks the owner for delayed data with
@@ -32,7 +33,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 use windows::core::{HSTRING, PCWSTR, w};
 
-use super::logic::{self, CF_UNICODETEXT, ClipKind};
+use super::logic::{self, CF_UNICODETEXT, ClipKind, Keep};
 use crate::backend::{Clip, R};
 use crate::delivery::nothing_sent;
 
@@ -40,9 +41,9 @@ use crate::delivery::nothing_sent;
 /// or write it, usually for a few ms): tries, and the pause between them.
 const OPEN_TRIES: u32 = 25;
 const OPEN_RETRY: Duration = Duration::from_millis(10);
-/// Largest clipboard text `type_text` puts back, in UTF-16 units (4 MiB);
-/// anything bigger stays replaced.
-const RESTORE_MAX: usize = 2 << 20;
+/// Largest clipboard contents `type_text` puts back, all formats together
+/// (16 MiB); anything bigger is not kept.
+const RESTORE_MAX: usize = 16 << 20;
 /// After the app read the paste, how long to leave it before writing the
 /// clipboard again: it may still be reading other formats synthesized from
 /// the text (CF_TEXT, CF_LOCALE), which do not render again.
@@ -75,16 +76,17 @@ fn shared() -> std::sync::MutexGuard<'static, Shared> {
 
 /// The clipboard as it was before a paste: what to put back, or why not.
 pub enum Saved {
-    /// CF_UNICODETEXT as it was (NUL-terminated); `secret` when marked as
-    /// a password.
-    Text {
-        units: Vec<u16>,
-        secret: bool,
+    /// Each kept format's id, name and data (marks such as the password
+    /// hint included), and the names of the formats that cannot be kept.
+    Data {
+        formats: Vec<(u32, String, Vec<u8>)>,
+        lost: Vec<String>,
     },
     Empty,
     /// Another app held the clipboard open: it cannot be taken either.
     Busy,
-    Nothing(&'static str),
+    /// Nothing can be kept, and why.
+    Nothing(String),
 }
 
 /// The owner window, started on first use.
@@ -98,6 +100,9 @@ struct Owner {
 #[derive(Default)]
 pub struct Clipboard {
     owner: OnceLock<Option<Owner>>,
+    /// What a paste in progress puts back (`hold`), there for a paste that
+    /// is cancelled or a server that exits before it finished.
+    pending: Mutex<Option<Saved>>,
 }
 
 /// The clipboard, open; closed when dropped (on every path, so a failure
@@ -221,6 +226,83 @@ fn read_units(max: usize) -> R<(Vec<u16>, bool)> {
         let units = all[..all.len().min(max)].to_vec();
         let _ = GlobalUnlock(g);
         Ok((units, more))
+    }
+}
+
+/// The data of `format` on the open clipboard, a memory block of at most
+/// `max` bytes: None when it cannot be read, Err when it is bigger.
+fn read_block(format: u32, max: usize) -> Result<Option<Vec<u8>>, ()> {
+    unsafe {
+        let Ok(h) = GetClipboardData(format) else {
+            return Ok(None);
+        };
+        let g = HGLOBAL(h.0);
+        let size = GlobalSize(g);
+        if size > max {
+            return Err(());
+        }
+        let p = GlobalLock(g).cast::<u8>();
+        if p.is_null() {
+            return Ok(None);
+        }
+        let data = std::slice::from_raw_parts(p, size).to_vec();
+        let _ = GlobalUnlock(g);
+        Ok(Some(data))
+    }
+}
+
+/// Open the clipboard without awaiting (a cancelled paste's guard, the
+/// server's exit), retrying while another app has it open.
+fn open_now(owner: isize) -> Option<Open> {
+    for i in 0..OPEN_TRIES {
+        if i > 0 {
+            std::thread::sleep(OPEN_RETRY);
+        }
+        if unsafe { OpenClipboard(Some(hwnd(owner))) }.is_ok() {
+            return Some(Open);
+        }
+    }
+    None
+}
+
+/// Put `saved` back on the open clipboard unless another app took it since
+/// the paste (then its contents stay). The note for the reply.
+fn put_back(saved: Saved, owner: isize) -> String {
+    if let Saved::Busy = saved {
+        return String::new();
+    }
+    if unsafe { GetClipboardOwner() }.ok() != Some(hwnd(owner)) {
+        return String::new();
+    }
+    if unsafe { EmptyClipboard() }.is_err() {
+        return format!(
+            "; the clipboard could not be put back ([Errno {}] EmptyClipboard failed)",
+            last_error()
+        );
+    }
+    match saved {
+        Saved::Data { formats, mut lost } => {
+            for (f, name, data) in &formats {
+                if put(*f, data).is_err() {
+                    lost.push(name.clone());
+                }
+            }
+            // A text already in the clipboard history is not listed twice.
+            for name in OPT_OUTS {
+                if !formats.iter().any(|(_, n, _)| n == name) {
+                    let _ = put(register(name), &0u32.to_ne_bytes());
+                }
+            }
+            match lost.is_empty() {
+                true => String::new(),
+                false => format!("; the clipboard was put back without {}", lost.join(", ")),
+            }
+        }
+        // The typed text does not stay: it may be a password.
+        Saved::Nothing(why) => {
+            format!("; the clipboard was emptied ({why}, which is not put back)")
+        }
+        Saved::Empty | Saved::Busy => String::new(),
     }
 }
 
@@ -393,19 +475,48 @@ impl Clipboard {
         if unsafe { CountClipboardFormats() } == 0 {
             return Saved::Empty;
         }
-        match logic::classify(&formats()) {
-            ClipKind::Empty => Saved::Empty,
-            ClipKind::Files => Saved::Nothing("it held files"),
-            ClipKind::Other(_) => Saved::Nothing("it held no text"),
-            ClipKind::Text { secret } => match read_units(RESTORE_MAX) {
-                Ok((_, true)) => Saved::Nothing("it held more than 4 MiB"),
-                Ok((mut units, false)) => {
-                    units.push(0);
-                    Saved::Text { units, secret }
-                }
-                Err(_) => Saved::Nothing("it could not be read"),
-            },
+        let all = formats();
+        if logic::content_names(&all).is_empty() {
+            return Saved::Empty;
         }
+        let ids: Vec<u32> = all.iter().map(|(f, _)| *f).collect();
+        let (mut kept, mut lost) = (Vec::new(), Vec::new());
+        let mut total = 0;
+        for (f, name) in all {
+            match logic::keep_format(f, &name, &ids) {
+                Keep::Derived => {}
+                Keep::Lost => lost.push(name),
+                Keep::Copy => match read_block(f, RESTORE_MAX - total) {
+                    Ok(Some(data)) => {
+                        total += data.len();
+                        kept.push((f, name, data));
+                    }
+                    Ok(None) => lost.push(name),
+                    Err(()) => return Saved::Nothing("it held more than 16 MiB".into()),
+                },
+            }
+        }
+        let content: Vec<(u32, String)> = kept.iter().map(|(f, n, _)| (*f, n.clone())).collect();
+        if logic::content_names(&content).is_empty() {
+            return Saved::Nothing(format!("it held {}", lost.join(", ")));
+        }
+        Saved::Data {
+            formats: kept,
+            lost,
+        }
+    }
+
+    /// Keep `saved` to put back when the paste ends (`restore`), or is
+    /// cancelled or cut short by the exit (`restore_now`).
+    pub fn hold(&self, saved: Saved) {
+        *self.pending.lock().unwrap_or_else(|e| e.into_inner()) = Some(saved);
+    }
+
+    fn take_pending(&self) -> Option<Saved> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Own the clipboard with `text` rendered on demand, marked so the
@@ -476,40 +587,52 @@ impl Clipboard {
         read
     }
 
-    /// Put back what `save` found, unless another app took the clipboard
+    /// Put back what `hold` kept, unless another app took the clipboard
     /// since the paste (then its contents stay). The note for the reply.
-    pub async fn restore(&self, saved: Saved) -> String {
-        if let Saved::Nothing(_) | Saved::Busy = saved {
+    pub async fn restore(&self) -> String {
+        let Some(saved) = self.take_pending() else {
+            return String::new();
+        };
+        if let Saved::Busy = saved {
             return String::new();
         }
         let owner = match self.owner() {
-            Ok(o) => hwnd(o.hwnd),
+            Ok(o) => o.hwnd,
             Err(e) => return format!("; the clipboard could not be put back ({e})"),
         };
-        let open = match self.open().await {
-            Ok(o) => o,
-            Err(e) => return format!("; the clipboard could not be put back ({e})"),
-        };
-        if unsafe { GetClipboardOwner() }.ok() != Some(owner) {
-            return String::new();
+        match self.open().await {
+            Ok(_open) => put_back(saved, owner),
+            Err(e) => format!("; the clipboard could not be put back ({e})"),
         }
-        if unsafe { EmptyClipboard() }.is_err() {
-            return format!(
-                "; the clipboard could not be put back ([Errno {}] EmptyClipboard failed)",
-                last_error()
-            );
-        }
-        let note = match saved {
-            Saved::Text { units, secret } => match put(CF_UNICODETEXT, &unit_bytes(&units)) {
-                Ok(()) => {
-                    mark(secret);
-                    String::new()
-                }
-                Err(e) => format!("; the clipboard could not be put back ({e})"),
-            },
-            Saved::Empty | Saved::Busy | Saved::Nothing(_) => String::new(),
+    }
+
+    /// `restore` without awaiting: for a paste dropped half-way (its call
+    /// cancelled) and for the server's exit.
+    pub fn restore_now(&self) {
+        let Some(saved) = self.take_pending() else {
+            return;
         };
-        drop(open);
-        note
+        if let Some(Some(o)) = self.owner.get()
+            && let Some(_open) = open_now(o.hwnd)
+        {
+            put_back(saved, o.hwnd);
+        }
+    }
+
+    /// Before the server exits: put back what a paste still holds, and
+    /// take back typed text still only offered (its owner window goes, so
+    /// no one could read it, and it may be a password).
+    pub fn shutdown(&self) {
+        self.restore_now();
+        let Some(Some(o)) = self.owner.get() else {
+            return;
+        };
+        let offered = shared().text.is_some();
+        if offered
+            && let Some(_open) = open_now(o.hwnd)
+            && unsafe { GetClipboardOwner() }.ok() == Some(hwnd(o.hwnd))
+        {
+            let _ = unsafe { EmptyClipboard() };
+        }
     }
 }

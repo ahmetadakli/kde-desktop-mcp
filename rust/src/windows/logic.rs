@@ -277,6 +277,44 @@ pub fn classify(formats: &[(u32, String)]) -> ClipKind {
     }
 }
 
+/// What saving the clipboard before a paste does with one format.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Keep {
+    /// Its data is a memory block: copied, and put back after the paste.
+    Copy,
+    /// Windows makes it again from a format that is kept (CF_TEXT from
+    /// CF_UNICODETEXT, CF_BITMAP from CF_DIB), or it is OLE's own
+    /// bookkeeping, which points at the app's data object: left out.
+    Derived,
+    /// A handle that is not a memory block (a metafile, a palette, an
+    /// owner-drawn or private format): cannot be put back.
+    Lost,
+}
+
+/// How the format `id` named `name` is saved, with `present` the ids of
+/// every format on the clipboard.
+pub fn keep_format(id: u32, name: &str, present: &[u32]) -> Keep {
+    const CF_BITMAP: u32 = 2;
+    const CF_METAFILEPICT: u32 = 3;
+    const CF_DIB: u32 = 8;
+    const CF_PALETTE: u32 = 9;
+    const CF_PENDATA: u32 = 10;
+    const CF_ENHMETAFILE: u32 = 14;
+    const CF_DIBV5: u32 = 17;
+    let has = |f: u32| present.contains(&f);
+    match id {
+        CF_TEXT | CF_OEMTEXT if has(CF_UNICODETEXT) => Keep::Derived,
+        CF_BITMAP | CF_PALETTE if has(CF_DIB) || has(CF_DIBV5) => Keep::Derived,
+        CF_METAFILEPICT if has(CF_ENHMETAFILE) => Keep::Derived,
+        CF_BITMAP | CF_METAFILEPICT | CF_PALETTE | CF_PENDATA | CF_ENHMETAFILE => Keep::Lost,
+        // CF_OWNERDISPLAY and the display formats but CF_DSPTEXT, the
+        // private and the GDI object ranges.
+        0x80 | 0x82 | 0x83 | 0x8E | 0x200..=0x3FF => Keep::Lost,
+        _ if name == "DataObject" || name == "Ole Private Data" => Keep::Derived,
+        _ => Keep::Copy,
+    }
+}
+
 /// `text` as CF_UNICODETEXT: CRLF line ends, NUL-terminated UTF-16.
 pub fn clipboard_units(text: &str) -> Vec<u16> {
     let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
@@ -1245,6 +1283,31 @@ mod tests {
         );
         assert_eq!(standard_format(17), Some("CF_DIBV5"));
         assert_eq!(standard_format(0xC000), None);
+    }
+
+    #[test]
+    fn saving_keeps_memory_formats_and_names_the_rest() {
+        let word = [13, 1, 7, 16, 0xC0F0, 0xC0F1, 14, 3, 0xC0F2];
+        assert_eq!(keep_format(13, "CF_UNICODETEXT", &word), Keep::Copy);
+        assert_eq!(keep_format(1, "CF_TEXT", &word), Keep::Derived);
+        assert_eq!(keep_format(7, "CF_OEMTEXT", &word), Keep::Derived);
+        assert_eq!(keep_format(16, "CF_LOCALE", &word), Keep::Copy);
+        assert_eq!(keep_format(0xC0F0, "HTML Format", &word), Keep::Copy);
+        assert_eq!(keep_format(0xC0F1, "Rich Text Format", &word), Keep::Copy);
+        assert_eq!(keep_format(14, "CF_ENHMETAFILE", &word), Keep::Lost);
+        assert_eq!(keep_format(3, "CF_METAFILEPICT", &word), Keep::Derived);
+        assert_eq!(keep_format(0xC0F2, "DataObject", &word), Keep::Derived);
+        // CF_TEXT alone is the data itself.
+        assert_eq!(keep_format(1, "CF_TEXT", &[1]), Keep::Copy);
+        // An image: the DIB is kept, the bitmap made from it again.
+        let image = [8, 2, 17];
+        assert_eq!(keep_format(8, "CF_DIB", &image), Keep::Copy);
+        assert_eq!(keep_format(17, "CF_DIBV5", &image), Keep::Copy);
+        assert_eq!(keep_format(2, "CF_BITMAP", &image), Keep::Derived);
+        assert_eq!(keep_format(2, "CF_BITMAP", &[2]), Keep::Lost);
+        assert_eq!(keep_format(15, "CF_HDROP", &[15]), Keep::Copy);
+        assert_eq!(keep_format(0x80, "CF_OWNERDISPLAY", &[0x80]), Keep::Lost);
+        assert_eq!(keep_format(0x250, "format 592", &[0x250]), Keep::Lost);
     }
 
     #[test]

@@ -368,6 +368,9 @@ pub trait Backend {
     async fn enable(&self);
     /// Create slow resources (virtual input devices) ahead of first use.
     fn warm_up(&self) {}
+    /// The server exits: undo what calls still running would have undone
+    /// (Windows: put back the clipboard a paste holds).
+    fn shutdown(&self) {}
 
     async fn list_apps(&self) -> Vec<AppEntry>;
     /// Top-level windows of every process with this (lower-case) app name;

@@ -382,7 +382,7 @@ pub fn tools() -> Json {
         ),
         t(
             "type_text",
-            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. A trailing newline is pressed as Enter (it submits\nan address bar or search box); newlines inside the text stay text.\nThis may paste through the clipboard; the\ntext it held is put back afterwards (images and files are not; the reply\nsays so). The reply names the focused element and warns when it is not an\neditable field. Refused while a password field has focus, unless the user\nallowed it in the allowlist.",
+            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. A trailing newline is pressed as Enter (it submits\nan address bar or search box); newlines inside the text stay text.\nThis may paste through the clipboard; what it\nheld is put back afterwards (the reply names what could not be). The reply names the focused element and warns when it is not an\neditable field. Refused while a password field has focus, unless the user\nallowed it in the allowlist.",
             schema(&[("text", "string", None)])
         ),
         t(

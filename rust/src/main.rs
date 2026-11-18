@@ -7357,6 +7357,7 @@ async fn serve<B: Backend + 'static>(backend: B) -> R<()> {
     // On a signal the calls still running were dropped with run_loop:
     // release what they or `hold` left pressed before exiting.
     let _ = server.release_all().await;
+    server.b.shutdown();
     result
 }
 
