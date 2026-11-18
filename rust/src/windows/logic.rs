@@ -597,12 +597,12 @@ pub fn window_matches(q: &str, title: &str, app: &str, hosted: &str) -> bool {
         || (!hosted.is_empty() && hosted.contains(q))
 }
 
-/// Whether the allowlist lets a window through: its app, or the Store app
-/// its frame hosts.
+/// Whether the allowlist lets a window through: its app, or for a Store
+/// app's frame only the app it hosts (the frame's own name would get past
+/// that app's lower tier).
 pub fn window_allowed(allowed: &[String], app: &str, hosted: &str) -> bool {
-    allowed
-        .iter()
-        .any(|a| a == app || (!hosted.is_empty() && a == hosted))
+    let name = if hosted.is_empty() { app } else { hosted };
+    allowed.iter().any(|a| a == name)
 }
 
 /// The window `move_window` changes among matches in z-order: the active
@@ -1412,6 +1412,14 @@ mod tests {
         ));
         assert!(!window_allowed(&allowed, "applicationframehost", ""));
         assert!(!window_allowed(&[String::new()], "notepad", ""));
+        // The frame's name reaches only frames that host no app.
+        let frame = vec!["applicationframehost".to_string()];
+        assert!(!window_allowed(
+            &frame,
+            "applicationframehost",
+            "calculatorapp"
+        ));
+        assert!(window_allowed(&frame, "applicationframehost", ""));
     }
 
     #[test]

@@ -211,14 +211,31 @@ impl Policy {
 
     /// Allow each `app` with the tier of its `alias` when the list names
     /// the alias but not the app (an entry of its own wins). Confirm rules
-    /// and `passwords:` naming the alias do not carry over.
+    /// naming the alias apply to the app as well, so a rule written for
+    /// the alias keeps asking; `passwords:` naming the alias does not carry
+    /// over (leaving it out only refuses more).
     pub fn add_aliases(&mut self, aliases: &[(String, &str)]) {
         for (app, alias) in aliases {
             let app = app.trim().to_lowercase();
-            if let Some(t) = self.apps.get(*alias).copied()
-                && !app.is_empty()
-            {
-                self.apps.entry(app).or_insert(t);
+            if app.is_empty() {
+                continue;
+            }
+            if let Some(t) = self.apps.get(*alias).copied() {
+                self.apps.entry(app.clone()).or_insert(t);
+            }
+            let carried: Vec<ConfirmRule> = self
+                .confirm
+                .iter()
+                .filter(|r| r.app.as_deref() == Some(*alias))
+                .map(|r| ConfirmRule {
+                    tool: r.tool.clone(),
+                    app: Some(app.clone()),
+                })
+                .collect();
+            for rule in carried {
+                if !self.confirm.contains(&rule) {
+                    self.confirm.push(rule);
+                }
             }
         }
     }
@@ -411,5 +428,31 @@ mod tests {
             "no alias listed: nothing added"
         );
         assert_eq!(p.tier(frame), None);
+    }
+
+    #[test]
+    fn confirm_rules_naming_an_alias_cover_its_apps() {
+        let frame = "applicationframehost";
+        let aliases = [("calculatorapp".to_string(), frame)];
+        let mut p = Policy::parse(
+            "applicationframehost\ncalculatorapp:click\n\
+             confirm: key:applicationframehost, act:applicationframehost\n\
+             passwords: applicationframehost\n",
+        );
+        p.add_aliases(&aliases);
+        assert!(p.needs_confirm("key", Some("calculatorapp")));
+        assert!(p.needs_confirm("act", Some("CalculatorApp")));
+        assert!(
+            p.needs_confirm("key", Some(frame)),
+            "the alias keeps its rule"
+        );
+        assert!(!p.needs_confirm("type_text", Some("calculatorapp")));
+        assert!(
+            !p.passwords_allowed("calculatorapp", None),
+            "passwords: does not carry over"
+        );
+        // Added once, however often the aliases are applied.
+        p.add_aliases(&aliases);
+        assert_eq!(p.confirm.len(), 4);
     }
 }

@@ -1114,9 +1114,11 @@ Windows:
   `apps`, `windows`, `find`/`act` and the input checks name such a window
   after the app it hosts (`calculatorapp`, `systemsettings`), also while it
   is minimized. `applicationframehost` in the allowlist still allows every
-  Store app with its tier (an app's own line wins), and `app:
-  "applicationframehost"` still reaches every frame; `confirm:` and
-  `passwords:` items naming it do not carry over to the apps.
+  Store app with its tier (an app's own line wins), and its `confirm:` items
+  apply to those apps too (`passwords:` items naming it do not carry over).
+  A frame is reached only by its app's name: `app: "applicationframehost"`
+  finds just frames that host no app, so an app's own lower tier and confirm
+  rules cannot be passed by naming the frame.
 - Window tools: positions and sizes are physical pixels (as for `mouse`) of
   the visible frame, without the invisible resize borders; the screen
   areas `screenshot` reports include them. Virtual desktops are not listed

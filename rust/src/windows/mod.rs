@@ -44,8 +44,8 @@ winword
 excel
 ";
 const APPS_NOTE: &str = "App names are executable names without .exe. Store apps hosted by \
-ApplicationFrameHost are listed under their own executable (e.g. 'calculatorapp'); \
-'applicationframehost' in the allowlist still allows all of them. Windows of elevated (admin) \
+ApplicationFrameHost are listed and reached under their own executable (e.g. \
+'calculatorapp'); 'applicationframehost' in the allowlist allows those it does not name. Windows of elevated (admin) \
 apps cannot receive input from a non-elevated server.";
 const BORING: &[&str] = &["pane", "group", "custom"];
 const KEY_HOLD: Duration = Duration::from_millis(8);
@@ -307,12 +307,10 @@ impl Backend for WindowsBackend {
             .top_level()
             .into_iter()
             // A Store app's frame is the root: its tree has the title bar
-            // as well as the app. 'applicationframehost' still reaches
-            // every frame.
-            .filter(|(_, p)| {
-                app_of(p) == app
-                    || (app == logic::STORE_FRAME_APP && input::proc_name(p.pid) == app)
-            })
+            // as well as the app. Only the hosted app's name reaches it, so
+            // that app's own allowlist line and confirm rules apply;
+            // 'applicationframehost' is left with frames that host none.
+            .filter(|(_, p)| app_of(p) == app)
             .map(|(e, _)| e)
             .collect();
         (!windows.is_empty()).then_some(windows)
@@ -621,17 +619,6 @@ impl Backend for WindowsBackend {
             }
         }
         Ok(None)
-    }
-
-    async fn window_app(&self, w: &WindowGeo) -> String {
-        // A Store app's frame: the app it hosts, as the allowlist may name it.
-        if w.app == logic::STORE_FRAME_APP {
-            let all = [w.app.clone()];
-            if let Some(n) = wm::find(w, &all).filter(|n| !n.hosted.is_empty()) {
-                return n.hosted;
-            }
-        }
-        w.app.clone()
     }
 
     fn names_menus(&self) -> bool {
