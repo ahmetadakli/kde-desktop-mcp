@@ -761,6 +761,7 @@ fn window_geo(g: &Json) -> WindowGeo {
             .as_u64()
             .and_then(|p| u32::try_from(p).ok())
             .unwrap_or(0),
+        id: 0,
         terminals: Vec::new(),
         desktops: g["desktops"]
             .as_array()

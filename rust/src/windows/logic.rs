@@ -10,8 +10,6 @@ pub const KEYEVENTF_UNICODE: u32 = 0x4;
 pub const VK_TAB: u16 = 0x09;
 pub const VK_RETURN: u16 = 0x0D;
 pub const VK_MENU: u16 = 0x12;
-/// Python sends whenever this many inputs have piled up while typing.
-const TYPE_BATCH: usize = 200;
 
 /// One KEYBDINPUT: virtual key, scan code (UTF-16 unit for KEYEVENTF_UNICODE)
 /// and flags.
@@ -134,14 +132,16 @@ pub fn combo_events(vks: &[u16]) -> (Vec<KeyEv>, Vec<KeyEv>) {
     (downs, ups)
 }
 
-/// Python `type_text`: every UTF-16 unit as a KEYEVENTF_UNICODE down/up pair
-/// (independent of the keyboard layout), newline and tab as real keys,
-/// split into SendInput batches the way Python splits them.
-pub fn unicode_batches(text: &str) -> Vec<Vec<KeyEv>> {
+/// The keystroke fallback of `type_text`: one SendInput batch per
+/// character, each UTF-16 unit a KEYEVENTF_UNICODE down/up pair (independent
+/// of the keyboard layout; a surrogate pair stays in one batch), newline and
+/// tab as real keys. Sent one at a time with a pause in between: Win11
+/// Notepad drops and repeats characters of a burst.
+pub fn unicode_per_char(text: &str) -> Vec<Vec<KeyEv>> {
     let text = text.replace("\r\n", "\n").replace('\r', "\n");
     let mut out = Vec::new();
-    let mut batch = Vec::new();
     for ch in text.chars() {
+        let mut batch = Vec::new();
         if ch == '\n' || ch == '\t' {
             let vk = if ch == '\n' { VK_RETURN } else { VK_TAB };
             batch.push(KeyEv {
@@ -154,29 +154,189 @@ pub fn unicode_batches(text: &str) -> Vec<Vec<KeyEv>> {
                 scan: 0,
                 flags: KEYEVENTF_KEYUP,
             });
-            continue;
+        } else {
+            let mut units = [0u16; 2];
+            let units = ch.encode_utf16(&mut units);
+            for &unit in units.iter() {
+                batch.push(KeyEv {
+                    vk: 0,
+                    scan: unit,
+                    flags: KEYEVENTF_UNICODE,
+                });
+            }
+            for &unit in units.iter() {
+                batch.push(KeyEv {
+                    vk: 0,
+                    scan: unit,
+                    flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
+                });
+            }
         }
-        let mut units = [0u16; 2];
-        for &unit in ch.encode_utf16(&mut units).iter() {
-            batch.push(KeyEv {
-                vk: 0,
-                scan: unit,
-                flags: KEYEVENTF_UNICODE,
-            });
-            batch.push(KeyEv {
-                vk: 0,
-                scan: unit,
-                flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP,
-            });
-        }
-        if batch.len() >= TYPE_BATCH {
-            out.push(std::mem::take(&mut batch));
-        }
-    }
-    if !batch.is_empty() {
         out.push(batch);
     }
     out
+}
+
+// ------------------------------------------------------------ clipboard
+
+pub const CF_TEXT: u32 = 1;
+pub const CF_OEMTEXT: u32 = 7;
+pub const CF_UNICODETEXT: u32 = 13;
+pub const CF_HDROP: u32 = 15;
+/// Registered formats that only mark the contents: the password hint of
+/// password managers (KeePass, Bitwarden) and the opt-outs of the clipboard
+/// history (Win+V) and the cloud clipboard.
+pub const HINT_EXCLUDE: &str = "ExcludeClipboardContentFromMonitorProcessing";
+pub const HINT_VIEWER_IGNORE: &str = "Clipboard Viewer Ignore";
+pub const HINT_HISTORY: &str = "CanIncludeInClipboardHistory";
+pub const HINT_CLOUD: &str = "CanUploadToCloudClipboard";
+/// Formats that hold no content of their own: those hints, and what OLE
+/// adds to everything it puts on the clipboard (alone after
+/// `Set-Clipboard -Value $null`).
+const NOT_CONTENT: [&str; 6] = [
+    HINT_EXCLUDE,
+    HINT_VIEWER_IGNORE,
+    HINT_HISTORY,
+    HINT_CLOUD,
+    "DataObject",
+    "Ole Private Data",
+];
+
+/// Names of the predefined clipboard formats (registered ones have their
+/// own name).
+const STANDARD_FORMATS: &[(u32, &str)] = &[
+    (1, "CF_TEXT"),
+    (2, "CF_BITMAP"),
+    (3, "CF_METAFILEPICT"),
+    (4, "CF_SYLK"),
+    (5, "CF_DIF"),
+    (6, "CF_TIFF"),
+    (7, "CF_OEMTEXT"),
+    (8, "CF_DIB"),
+    (9, "CF_PALETTE"),
+    (10, "CF_PENDATA"),
+    (11, "CF_RIFF"),
+    (12, "CF_WAVE"),
+    (13, "CF_UNICODETEXT"),
+    (14, "CF_ENHMETAFILE"),
+    (15, "CF_HDROP"),
+    (16, "CF_LOCALE"),
+    (17, "CF_DIBV5"),
+    (0x80, "CF_OWNERDISPLAY"),
+    (0x81, "CF_DSPTEXT"),
+    (0x82, "CF_DSPBITMAP"),
+    (0x83, "CF_DSPMETAFILEPICT"),
+    (0x8E, "CF_DSPENHMETAFILE"),
+];
+
+/// The name of a predefined format; None for a registered one.
+pub fn standard_format(id: u32) -> Option<&'static str> {
+    STANDARD_FORMATS
+        .iter()
+        .find(|(i, _)| *i == id)
+        .map(|(_, n)| *n)
+}
+
+/// What the clipboard holds, from its formats (ids with their names).
+#[derive(Debug, PartialEq)]
+pub enum ClipKind {
+    Empty,
+    /// Text; `secret` when marked as a password.
+    Text {
+        secret: bool,
+    },
+    /// Copied files (Explorer's copy).
+    Files,
+    /// Something else (an image...): the formats offered, hints left out.
+    Other(Vec<String>),
+}
+
+/// The names of the formats that hold content.
+pub fn content_names(formats: &[(u32, String)]) -> Vec<String> {
+    formats
+        .iter()
+        .filter(|(_, n)| !NOT_CONTENT.contains(&n.as_str()))
+        .map(|(_, n)| n.clone())
+        .collect()
+}
+
+pub fn classify(formats: &[(u32, String)]) -> ClipKind {
+    let has = |id: u32| formats.iter().any(|(i, _)| *i == id);
+    let named = |n: &str| formats.iter().any(|(_, x)| x == n);
+    let real = content_names(formats);
+    if real.is_empty() {
+        ClipKind::Empty
+    } else if has(CF_HDROP) {
+        ClipKind::Files
+    } else if has(CF_UNICODETEXT) || has(CF_TEXT) || has(CF_OEMTEXT) {
+        ClipKind::Text {
+            secret: named(HINT_EXCLUDE) || named(HINT_VIEWER_IGNORE),
+        }
+    } else {
+        ClipKind::Other(real)
+    }
+}
+
+/// What saving the clipboard before a paste does with one format.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Keep {
+    /// Its data is a memory block: copied, and put back after the paste.
+    Copy,
+    /// Windows makes it again from a format that is kept (CF_TEXT from
+    /// CF_UNICODETEXT, CF_BITMAP from CF_DIB), or it is OLE's own
+    /// bookkeeping, which points at the app's data object: left out.
+    Derived,
+    /// A handle that is not a memory block (a metafile, a palette, an
+    /// owner-drawn or private format): cannot be put back.
+    Lost,
+}
+
+/// How the format `id` named `name` is saved, with `present` the ids of
+/// every format on the clipboard.
+pub fn keep_format(id: u32, name: &str, present: &[u32]) -> Keep {
+    const CF_BITMAP: u32 = 2;
+    const CF_METAFILEPICT: u32 = 3;
+    const CF_DIB: u32 = 8;
+    const CF_PALETTE: u32 = 9;
+    const CF_PENDATA: u32 = 10;
+    const CF_ENHMETAFILE: u32 = 14;
+    const CF_DIBV5: u32 = 17;
+    let has = |f: u32| present.contains(&f);
+    match id {
+        CF_TEXT | CF_OEMTEXT if has(CF_UNICODETEXT) => Keep::Derived,
+        CF_BITMAP | CF_PALETTE if has(CF_DIB) || has(CF_DIBV5) => Keep::Derived,
+        CF_METAFILEPICT if has(CF_ENHMETAFILE) => Keep::Derived,
+        CF_BITMAP | CF_METAFILEPICT | CF_PALETTE | CF_PENDATA | CF_ENHMETAFILE => Keep::Lost,
+        // CF_OWNERDISPLAY and the display formats but CF_DSPTEXT, the
+        // private and the GDI object ranges.
+        0x80 | 0x82 | 0x83 | 0x8E | 0x200..=0x3FF => Keep::Lost,
+        _ if name == "DataObject" || name == "Ole Private Data" => Keep::Derived,
+        _ => Keep::Copy,
+    }
+}
+
+/// `text` as CF_UNICODETEXT: CRLF line ends, NUL-terminated UTF-16.
+pub fn clipboard_units(text: &str) -> Vec<u16> {
+    let text = text.replace("\r\n", "\n").replace('\n', "\r\n");
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+    units
+}
+
+/// The UTF-16 units of CF_UNICODETEXT data, up to its NUL.
+pub fn until_nul(units: &[u16]) -> &[u16] {
+    let end = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    &units[..end]
+}
+
+/// At most `limit` characters of clipboard text with "\n" line ends, and
+/// whether any were cut.
+pub fn clipboard_text(units: &[u16], limit: usize) -> (String, bool) {
+    let text = unix_newlines(&String::from_utf16_lossy(until_nul(units)));
+    match text.char_indices().nth(limit) {
+        Some((i, _)) => (text[..i].to_string(), true),
+        None => (text, false),
+    }
 }
 
 /// uiautomation's ControlTypeName without "Control", lower-cased, indexed
@@ -264,6 +424,10 @@ pub fn unix_newlines(text: &str) -> String {
 pub const TOGGLE_ON: i32 = 1;
 pub const EXPANDED: i32 = 1;
 pub const PARTIALLY_EXPANDED: i32 = 2;
+/// ExpandCollapseState_LeafNode: the pattern is there, but nothing opens.
+pub const LEAF_NODE: i32 = 3;
+/// UIA_MenuItemControlTypeId.
+const MENU_ITEM: i32 = 50011;
 
 /// Everything the Python backend reads about one element, as fetched in one
 /// UIA cache request.
@@ -383,16 +547,25 @@ impl Props {
         out
     }
 
-    /// Python `_action_table` names, in order.
+    /// Python `_action_table` names, in order; but a menu entry that opens
+    /// a submenu lists expand first, its default (as Qt's "Show Menu"):
+    /// Invoke on a Win11 menu bar entry opens nothing. A leaf node has
+    /// nothing to expand.
     pub fn actions(&self) -> Vec<&'static str> {
         let mut out = Vec::new();
+        let expand = self.expand && self.expand_state != LEAF_NODE;
+        let submenu = expand && self.control_type == MENU_ITEM;
+        if submenu {
+            out.push("expand");
+            out.push("collapse");
+        }
         if self.invoke {
             out.push("invoke");
         }
         if self.toggle {
             out.push("toggle");
         }
-        if self.expand {
+        if expand && !submenu {
             out.push("expand");
             out.push("collapse");
         }
@@ -421,9 +594,542 @@ pub fn center(left: i32, top: i32, right: i32, bottom: i32) -> Option<(i32, i32)
     (w > 0 && h > 0).then(|| (left + w.div_euclid(2), top + h.div_euclid(2)))
 }
 
+/// Window classes of the shell itself (desktop, taskbars): explorer's, but
+/// not windows to list, move or close.
+const SHELL_CLASSES: [&str; 4] = [
+    "Progman",
+    "WorkerW",
+    "Shell_TrayWnd",
+    "Shell_SecondaryTrayWnd",
+];
+
+/// The frame of a Store app's window; the app runs in its CoreWindow child.
+pub const STORE_FRAME_CLASS: &str = "ApplicationFrameWindow";
+pub const STORE_CORE_CLASS: &str = "Windows.UI.Core.CoreWindow";
+/// The process behind every Store app's frame window.
+pub const STORE_FRAME_APP: &str = "applicationframehost";
+
+/// Whether a top-level window is one `windows` lists: shown, not cloaked
+/// (a suspended Store app's frame, another virtual desktop), no tool
+/// window, titled, and not part of the shell.
+pub fn listed_window(
+    visible: bool,
+    cloaked: bool,
+    tool_window: bool,
+    class: &str,
+    title: &str,
+) -> bool {
+    visible
+        && !cloaked
+        && !tool_window
+        && !title.trim().is_empty()
+        && !SHELL_CLASSES.contains(&class)
+}
+
+/// Whether a window of `app` (and, for a Store app's frame, the app it
+/// hosts) matches the lower-case query `q`: by title or app; "" matches all.
+pub fn window_matches(q: &str, title: &str, app: &str, hosted: &str) -> bool {
+    q.is_empty()
+        || title.to_lowercase().contains(q)
+        || app.contains(q)
+        || (!hosted.is_empty() && hosted.contains(q))
+}
+
+/// Whether the allowlist lets a window through: its app, or for a Store
+/// app's frame only the app it hosts (the frame's own name would get past
+/// that app's lower tier).
+pub fn window_allowed(allowed: &[String], app: &str, hosted: &str) -> bool {
+    let name = if hosted.is_empty() { app } else { hosted };
+    allowed.iter().any(|a| a == name)
+}
+
+/// The window `move_window` changes among matches in z-order: the active
+/// one, else the topmost.
+pub fn pick_window(active: &[bool]) -> Option<usize> {
+    active
+        .iter()
+        .position(|a| *a)
+        .or((!active.is_empty()).then_some(0))
+}
+
+/// A rectangle as Win32 has it: left, top, right, bottom.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Rect {
+    pub left: i32,
+    pub top: i32,
+    pub right: i32,
+    pub bottom: i32,
+}
+
+impl Rect {
+    pub fn width(&self) -> i32 {
+        self.right - self.left
+    }
+    pub fn height(&self) -> i32 {
+        self.bottom - self.top
+    }
+}
+
+/// The invisible resize borders around a window's visible frame: how far
+/// its window rectangle reaches past the frame on each side.
+pub fn borders(window: Rect, frame: Rect) -> Rect {
+    Rect {
+        left: frame.left - window.left,
+        top: frame.top - window.top,
+        right: window.right - frame.right,
+        bottom: window.bottom - frame.bottom,
+    }
+}
+
+/// The visible frame a change asks for (x, y, width, height), the values
+/// not given kept from `frame`.
+pub fn wanted_frame(
+    frame: Rect,
+    x: Option<f64>,
+    y: Option<f64>,
+    width: Option<f64>,
+    height: Option<f64>,
+) -> (i32, i32, i32, i32) {
+    let px = |v: Option<f64>, keep: i32| v.map_or(keep, |v| v.round() as i32);
+    (
+        px(x, frame.left),
+        px(y, frame.top),
+        px(width, frame.width()).max(1),
+        px(height, frame.height()).max(1),
+    )
+}
+
+/// `window` without its invisible `borders`: its visible frame.
+pub fn inset(window: Rect, borders: Rect) -> Rect {
+    Rect {
+        left: window.left + borders.left,
+        top: window.top + borders.top,
+        right: window.right - borders.right,
+        bottom: window.bottom - borders.bottom,
+    }
+}
+
+/// SetWindowPos arguments (x, y, cx, cy) that give the window the visible
+/// frame `(x, y, w, h)`, its invisible borders added around it.
+pub fn window_pos(frame: (i32, i32, i32, i32), borders: Rect) -> (i32, i32, i32, i32) {
+    let (x, y, w, h) = frame;
+    (
+        x - borders.left,
+        y - borders.top,
+        w + borders.left + borders.right,
+        h + borders.top + borders.bottom,
+    )
+}
+
+/// A restored-position rectangle (WINDOWPLACEMENT, workspace coordinates:
+/// relative to the work area) in screen coordinates.
+pub fn workspace_to_screen(r: Rect, work: Rect, monitor: Rect) -> Rect {
+    let (dx, dy) = (work.left - monitor.left, work.top - monitor.top);
+    Rect {
+        left: r.left + dx,
+        top: r.top + dy,
+        right: r.right + dx,
+        bottom: r.bottom + dy,
+    }
+}
+
+/// A monitor's name without the device prefix: "DISPLAY1" for `\\.\DISPLAY1`.
+pub fn display_name(device: &str) -> String {
+    device.trim_start_matches("\\\\.\\").to_string()
+}
+
+/// Scale factor of a monitor's effective DPI (96 is 100 %).
+pub fn dpi_scale(dpi: u32) -> f64 {
+    if dpi == 0 {
+        return 1.0;
+    }
+    (dpi as f64 / 96.0 * 100.0).round() / 100.0
+}
+
+/// The file `launch` looks for: `app` with ".exe" added unless it has it.
+pub fn exe_file(app: &str) -> String {
+    if app.to_lowercase().ends_with(".exe") {
+        app.to_string()
+    } else {
+        format!("{app}.exe")
+    }
+}
+
+/// `%NAME%` references replaced by `env(NAME)`; unknown ones are kept.
+pub fn expand_env(s: &str, env: impl Fn(&str) -> Option<String>) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('%') {
+        out.push_str(&rest[..i]);
+        let after = &rest[i + 1..];
+        match after.find('%') {
+            Some(j) if j > 0 => match env(&after[..j]) {
+                Some(v) => {
+                    out.push_str(&v);
+                    rest = &after[j + 1..];
+                }
+                None => {
+                    out.push('%');
+                    rest = after;
+                }
+            },
+            _ => {
+                out.push('%');
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// The program an App Paths entry names: its default value without the
+/// quotes some installers add, environment references expanded.
+pub fn app_path_value(raw: &str, env: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let v = raw.trim().trim_matches('"').trim();
+    (!v.is_empty()).then(|| expand_env(v, env))
+}
+
+/// Where `launch` looks for a program after App Paths: PATH (including the
+/// Store's execution aliases in WindowsApps), then System32 and the Windows
+/// folder, each folder once.
+pub fn program_dirs(
+    path: &[std::path::PathBuf],
+    system_root: Option<&str>,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs: Vec<std::path::PathBuf> = path.to_vec();
+    if let Some(root) = system_root.filter(|r| !r.is_empty()) {
+        let root = root.trim_end_matches(['\\', '/']);
+        dirs.push(format!("{root}\\System32").into());
+        dirs.push(root.into());
+    }
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|d| {
+        let key = d
+            .to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase();
+        !key.is_empty() && seen.insert(key)
+    });
+    dirs
+}
+
+/// The program to start for `file` ("notepad.exe"): the App Paths entry
+/// when it exists, else the first folder of `dirs` holding it. `exists`
+/// must accept the Store's 0-byte execution aliases.
+pub fn find_program(
+    file: &str,
+    app_path: Option<String>,
+    dirs: &[std::path::PathBuf],
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> Option<std::path::PathBuf> {
+    if let Some(p) = app_path.map(std::path::PathBuf::from)
+        && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+        && exists(&p)
+    {
+        return Some(p);
+    }
+    dirs.iter().map(|d| d.join(file)).find(|p| exists(p))
+}
+
+/// The value of attribute `name` in an XML start tag, quoted either way.
+fn xml_attr(tag: &str, name: &str) -> Option<String> {
+    let mut from = 0;
+    while let Some(i) = tag[from..].find(name) {
+        let at = from + i;
+        from = at + name.len();
+        let before = tag[..at].chars().next_back();
+        if !before.is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let rest = tag[at + name.len()..].trim_start();
+        let Some(rest) = rest.strip_prefix('=') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let q = rest.chars().next()?;
+        if q != '"' && q != '\'' {
+            continue;
+        }
+        let end = rest[1..].find(q)?;
+        return Some(rest[1..1 + end].to_string());
+    }
+    None
+}
+
+/// The start tags named `name` in `xml` (`<Application ...>`), not the
+/// ones whose name only begins with it (`<Applications>`).
+fn xml_tags<'a>(xml: &'a str, name: &str) -> Vec<&'a str> {
+    let open = format!("<{name}");
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = xml[from..].find(&open) {
+        let at = from + i;
+        let rest = &xml[at + open.len()..];
+        from = at + open.len();
+        if !rest.starts_with(|c: char| c.is_whitespace() || c == '>' || c == '/') {
+            continue;
+        }
+        let end = rest.find('>').unwrap_or(rest.len());
+        out.push(&rest[..end]);
+    }
+    out
+}
+
+/// A package's identity name and its applications (Id, Executable) from
+/// its AppxManifest.xml.
+pub fn manifest_apps(xml: &str) -> (String, Vec<(String, String)>) {
+    let name = xml_tags(xml, "Identity")
+        .first()
+        .and_then(|t| xml_attr(t, "Name"))
+        .unwrap_or_default();
+    let apps = xml_tags(xml, "Application")
+        .into_iter()
+        .filter_map(|t| {
+            Some((
+                xml_attr(t, "Id")?,
+                xml_attr(t, "Executable").unwrap_or_default(),
+            ))
+        })
+        .collect();
+    (name, apps)
+}
+
+/// The executables (lower-case stems) of a package's apps that run inside
+/// an ApplicationFrameHost frame: UWP apps listed in the Start menu, not
+/// full-trust (Win32) ones that open windows of their own, nor the hidden
+/// system ones (AppListEntry="none": shell parts, brokers, pickers).
+pub fn manifest_hosted(xml: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut rest = xml;
+    while let Some(i) = rest.find("<Application") {
+        let after = &rest[i + "<Application".len()..];
+        rest = after;
+        if !after.starts_with(char::is_whitespace) {
+            continue;
+        }
+        let end = [after.find("</Application>"), after.find("<Application")]
+            .into_iter()
+            .flatten()
+            .min()
+            .unwrap_or(after.len());
+        let body = &after[..end];
+        let tag = &body[..body.find('>').unwrap_or(body.len())];
+        let win32 = xml_attr(tag, "EntryPoint").as_deref() == Some("Windows.FullTrustApplication")
+            || ["packagedClassicApp", "win32App"]
+                .iter()
+                .any(|v| tag.contains(&format!("RuntimeBehavior=\"{v}\"")));
+        let hidden = xml_tags(body, "uap:VisualElements")
+            .iter()
+            .chain(&xml_tags(body, "VisualElements"))
+            .any(|t| xml_attr(t, "AppListEntry").as_deref() == Some("none"));
+        let exe = xml_attr(tag, "Executable").map(|e| exe_stem(&e));
+        if let Some(exe) = exe.filter(|e| !win32 && !hidden && !e.is_empty() && !e.contains('$'))
+            && !out.contains(&exe)
+        {
+            out.push(exe);
+        }
+    }
+    out
+}
+
+/// The family name of a package full name
+/// (Name_Version_Arch_ResourceId_PublisherId): Name_PublisherId.
+pub fn package_family(full: &str) -> Option<String> {
+    let parts: Vec<&str> = full.split('_').collect();
+    match parts.as_slice() {
+        [name, .., publisher] if parts.len() >= 3 && !name.is_empty() && !publisher.is_empty() => {
+            Some(format!("{name}_{publisher}"))
+        }
+        _ => None,
+    }
+}
+
+/// How well a Store app matches `app`, lower is better: its executable
+/// ("CalculatorApp.exe" for "calculatorapp"), then the last part of the
+/// package name ("Microsoft.Paint" for "paint"), then a package name
+/// holding it ("Microsoft.WindowsCalculator" for "calculator").
+pub fn store_rank(app: &str, package: &str, executable: &str) -> Option<u8> {
+    let app = app.to_lowercase();
+    let package = package.to_lowercase();
+    if !executable.is_empty() && exe_stem(executable) == app {
+        Some(0)
+    } else if package.rsplit('.').next() == Some(app.as_str()) {
+        Some(1)
+    } else if app.chars().count() >= 4 && package.contains(&app) {
+        Some(2)
+    } else {
+        None
+    }
+}
+
+/// A Store app `store_rank` matched: its rank, package name, executable
+/// and AppUserModelID.
+pub struct StoreMatch {
+    pub rank: u8,
+    pub package: String,
+    pub executable: String,
+    pub aumid: String,
+}
+
+/// The AppUserModelID to start for `app` among the matches: the best
+/// ranked one. A match by its executable is exact; one by package name is
+/// taken only when no other app matches as well, so a short name ("xbox",
+/// "store") does not start whichever of several packages comes first.
+pub fn pick_store(app: &str, matches: &[StoreMatch]) -> Result<Option<String>, String> {
+    let Some(best) = matches.iter().map(|m| m.rank).min() else {
+        return Ok(None);
+    };
+    let top: Vec<&StoreMatch> = matches.iter().filter(|m| m.rank == best).collect();
+    if best == 0 || top.len() == 1 {
+        return Ok(Some(top[0].aumid.clone()));
+    }
+    let names: Vec<String> = top
+        .iter()
+        .map(|m| match exe_stem(&m.executable) {
+            e if e.is_empty() => m.package.clone(),
+            e => format!("{e} ({})", m.package),
+        })
+        .collect();
+    Err(format!(
+        "'{app}' matches several Store apps: {}; launch one by its executable name",
+        names.join(", ")
+    ))
+}
+
+/// Arguments as one command line, quoted the way programs split it
+/// (CommandLineToArgvW): words with spaces or quotes are quoted, quotes
+/// and the backslashes before them escaped.
+pub fn command_args(args: &[String]) -> String {
+    let quote = |a: &String| {
+        if !a.is_empty() && !a.contains([' ', '\t', '"']) {
+            return a.clone();
+        }
+        let mut out = String::from('"');
+        let mut slashes = 0;
+        for c in a.chars() {
+            match c {
+                '\\' => slashes += 1,
+                '"' => {
+                    out.push_str(&"\\".repeat(slashes * 2 + 1));
+                    slashes = 0;
+                }
+                _ => {
+                    out.push_str(&"\\".repeat(slashes));
+                    slashes = 0;
+                }
+            }
+            if c != '\\' {
+                out.push(c);
+            }
+        }
+        out.push_str(&"\\".repeat(slashes * 2));
+        out.push('"');
+        out
+    };
+    args.iter().map(quote).collect::<Vec<_>>().join(" ")
+}
+
+/// Whether a started program's exit is a hand-off rather than a failure.
+/// Starters such as System32's notepad.exe, the Store's execution aliases,
+/// `explorer <folder>` (exit code 1) and `msedge <url>` pass the request to
+/// another process and end; any other code is a failure.
+pub fn handoff_exit(code: Option<i32>) -> bool {
+    matches!(code, Some(0 | 1))
+}
+
+/// An exit code as Windows tools show it: decimal, or hex for an NTSTATUS
+/// (a crash such as 0xC0000005).
+pub fn exit_code(code: u32) -> String {
+    if code >= 0x8000_0000 {
+        format!("{code:#010X}").replace("0X", "0x")
+    } else {
+        code.to_string()
+    }
+}
+
+/// Window class of a Win32 dialog box: the common item dialog (Open, Save
+/// As) is one, in the process of the app that opened it.
+pub const DIALOG_CLASS: &str = "#32770";
+pub const NOT_A_FILE_DIALOG: &str = "the active window is not a file Open/Save dialog";
+
+/// A part of the common file dialog that file_dialog uses.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DialogPart {
+    /// The file name field.
+    FileName,
+    /// The default button (Open, Save).
+    Accept,
+}
+
+/// Which part of a common file dialog an element is, by its AutomationId
+/// (the Win32 control id) and window class, both the same in every
+/// language: the Save dialog's file name Edit is 1001, the Open dialog's
+/// 1148 (in a ComboBox of that id); the default button is IDOK (1). The
+/// address bar's toolbar is also 1001 and the folder view's items reuse
+/// small ids, hence the class.
+pub fn dialog_part(automation_id: &str, class: &str) -> Option<DialogPart> {
+    match (automation_id, class) {
+        ("1001" | "1148", "Edit") => Some(DialogPart::FileName),
+        ("1", "Button") => Some(DialogPart::Accept),
+        _ => None,
+    }
+}
+
+pub const EM_SETSEL: u32 = 0x00B1;
+pub const EM_REPLACESEL: u32 = 0x00C2;
+const ES_MULTILINE: u32 = 0x0004;
+
+/// Whether a window of class `class` and style `style` is a single-line
+/// Win32 Edit control. set_text writes those with EM_REPLACESEL, as a user
+/// edit: the common file dialog ignores a name set with WM_SETTEXT (what
+/// ValuePattern.SetValue sends) and saves under the name it had.
+pub fn single_line_edit(class: &str, style: u32) -> bool {
+    class.eq_ignore_ascii_case("Edit") && style & ES_MULTILINE == 0
+}
+
+/// MSAA's STATE_SYSTEM_BUSY: a browser's document still loading.
+pub const STATE_BUSY: u32 = 0x800;
+
+/// The toolkit (`Backend::toolkit_of`) of an element from its UIA
+/// FrameworkId and its top-level window's class: "chromium" for Chromium
+/// browsers and Electron apps, "gecko" for Firefox, else "".
+pub fn web_toolkit(framework: &str, root_class: &str) -> &'static str {
+    if framework.eq_ignore_ascii_case("chrome") || root_class.starts_with("Chrome_WidgetWin") {
+        "chromium"
+    } else if framework.eq_ignore_ascii_case("gecko") || root_class == "MozillaWindowClass" {
+        "gecko"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_single_line_edits_get_their_text_replaced() {
+        assert!(single_line_edit("Edit", 0x5001_0080));
+        assert!(single_line_edit("EDIT", 0));
+        assert!(!single_line_edit("Edit", 0x5001_0084));
+        assert!(!single_line_edit("RichEditD2DPT", 0));
+        assert!(!single_line_edit("ComboBox", 0));
+    }
+
+    #[test]
+    fn file_dialog_parts_go_by_id_and_class() {
+        assert_eq!(dialog_part("1001", "Edit"), Some(DialogPart::FileName));
+        assert_eq!(dialog_part("1148", "Edit"), Some(DialogPart::FileName));
+        assert_eq!(dialog_part("1", "Button"), Some(DialogPart::Accept));
+        // The address bar, the Open dialog's ComboBox, Cancel and the
+        // folder view's items are not.
+        assert_eq!(dialog_part("1001", "ToolbarWindow32"), None);
+        assert_eq!(dialog_part("1148", "ComboBox"), None);
+        assert_eq!(dialog_part("2", "Button"), None);
+        assert_eq!(dialog_part("1", "UIItem"), None);
+    }
 
     #[test]
     fn parses_keys_like_python() {
@@ -478,54 +1184,145 @@ mod tests {
     }
 
     #[test]
-    fn unicode_typing_uses_utf16_units_and_real_enter() {
-        let b = unicode_batches("ğ😀\r\n\t");
-        assert_eq!(b.len(), 1);
-        let evs = &b[0];
-        assert_eq!(evs.len(), 2 + 4 + 2 + 2);
+    fn unicode_typing_sends_one_char_at_a_time() {
+        let b = unicode_per_char("ğ😀\r\n\t");
+        assert_eq!(b.len(), 4);
         assert_eq!(
-            evs[0],
-            KeyEv {
-                vk: 0,
-                scan: 0x011F,
-                flags: KEYEVENTF_UNICODE
-            }
+            b[0],
+            vec![
+                KeyEv {
+                    vk: 0,
+                    scan: 0x011F,
+                    flags: KEYEVENTF_UNICODE
+                },
+                KeyEv {
+                    vk: 0,
+                    scan: 0x011F,
+                    flags: KEYEVENTF_UNICODE | KEYEVENTF_KEYUP
+                }
+            ]
         );
-        assert_eq!(evs[1].flags, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP);
-        assert_eq!((evs[2].scan, evs[4].scan), (0xD83D, 0xDE00));
+        // A surrogate pair goes down together, then up.
+        let scans: Vec<(u16, u32)> = b[1].iter().map(|e| (e.scan, e.flags)).collect();
         assert_eq!(
-            evs[6],
-            KeyEv {
-                vk: VK_RETURN,
-                scan: 0,
-                flags: 0
-            }
+            scans,
+            vec![
+                (0xD83D, KEYEVENTF_UNICODE),
+                (0xDE00, KEYEVENTF_UNICODE),
+                (0xD83D, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+                (0xDE00, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)
+            ]
         );
         assert_eq!(
-            evs[7],
-            KeyEv {
-                vk: VK_RETURN,
-                scan: 0,
-                flags: KEYEVENTF_KEYUP
-            }
+            b[2],
+            vec![
+                KeyEv {
+                    vk: VK_RETURN,
+                    scan: 0,
+                    flags: 0
+                },
+                KeyEv {
+                    vk: VK_RETURN,
+                    scan: 0,
+                    flags: KEYEVENTF_KEYUP
+                }
+            ]
         );
-        assert_eq!(evs[8].vk, VK_TAB);
-        assert!(unicode_batches("").is_empty());
+        assert_eq!(b[3][0].vk, VK_TAB);
+        assert!(unicode_per_char("").is_empty());
     }
 
     #[test]
-    fn unicode_typing_batches_like_python() {
-        let sizes: Vec<usize> = unicode_batches(&"a".repeat(250))
-            .iter()
-            .map(Vec::len)
-            .collect();
-        assert_eq!(sizes, vec![200, 200, 100]);
-        // Newlines never trigger a flush on their own.
-        let sizes: Vec<usize> = unicode_batches(&"\n".repeat(150))
-            .iter()
-            .map(Vec::len)
-            .collect();
-        assert_eq!(sizes, vec![300]);
+    fn clipboard_formats_classify_like_linux_types() {
+        let f = |v: &[(u32, &str)]| -> Vec<(u32, String)> {
+            v.iter().map(|(i, n)| (*i, n.to_string())).collect()
+        };
+        assert_eq!(classify(&[]), ClipKind::Empty);
+        // Only the history opt-outs left: nothing to read.
+        assert_eq!(
+            classify(&f(&[(0xC100, HINT_HISTORY), (0xC101, HINT_CLOUD)])),
+            ClipKind::Empty
+        );
+        assert_eq!(
+            classify(&f(&[
+                (13, "CF_UNICODETEXT"),
+                (16, "CF_LOCALE"),
+                (1, "CF_TEXT")
+            ])),
+            ClipKind::Text { secret: false }
+        );
+        assert_eq!(
+            classify(&f(&[(0xC0AA, HINT_EXCLUDE), (13, "CF_UNICODETEXT")])),
+            ClipKind::Text { secret: true }
+        );
+        assert_eq!(
+            classify(&f(&[(0xC0AA, HINT_VIEWER_IGNORE), (1, "CF_TEXT")])),
+            ClipKind::Text { secret: true }
+        );
+        // Explorer's copy also offers names as text: files win.
+        assert_eq!(
+            classify(&f(&[
+                (15, "CF_HDROP"),
+                (0xC00F, "FileNameW"),
+                (13, "CF_UNICODETEXT")
+            ])),
+            ClipKind::Files
+        );
+        assert_eq!(
+            classify(&f(&[(8, "CF_DIB"), (0xC101, HINT_CLOUD), (17, "CF_DIBV5")])),
+            ClipKind::Other(vec!["CF_DIB".into(), "CF_DIBV5".into()])
+        );
+        // OLE's own formats alone: emptied through OLE.
+        assert_eq!(
+            classify(&f(&[(0xC009, "DataObject"), (0xC013, "Ole Private Data")])),
+            ClipKind::Empty
+        );
+        assert_eq!(
+            content_names(&f(&[(0xC009, "DataObject"), (15, "CF_HDROP")])),
+            vec!["CF_HDROP".to_string()]
+        );
+        assert_eq!(standard_format(17), Some("CF_DIBV5"));
+        assert_eq!(standard_format(0xC000), None);
+    }
+
+    #[test]
+    fn saving_keeps_memory_formats_and_names_the_rest() {
+        let word = [13, 1, 7, 16, 0xC0F0, 0xC0F1, 14, 3, 0xC0F2];
+        assert_eq!(keep_format(13, "CF_UNICODETEXT", &word), Keep::Copy);
+        assert_eq!(keep_format(1, "CF_TEXT", &word), Keep::Derived);
+        assert_eq!(keep_format(7, "CF_OEMTEXT", &word), Keep::Derived);
+        assert_eq!(keep_format(16, "CF_LOCALE", &word), Keep::Copy);
+        assert_eq!(keep_format(0xC0F0, "HTML Format", &word), Keep::Copy);
+        assert_eq!(keep_format(0xC0F1, "Rich Text Format", &word), Keep::Copy);
+        assert_eq!(keep_format(14, "CF_ENHMETAFILE", &word), Keep::Lost);
+        assert_eq!(keep_format(3, "CF_METAFILEPICT", &word), Keep::Derived);
+        assert_eq!(keep_format(0xC0F2, "DataObject", &word), Keep::Derived);
+        // CF_TEXT alone is the data itself.
+        assert_eq!(keep_format(1, "CF_TEXT", &[1]), Keep::Copy);
+        // An image: the DIB is kept, the bitmap made from it again.
+        let image = [8, 2, 17];
+        assert_eq!(keep_format(8, "CF_DIB", &image), Keep::Copy);
+        assert_eq!(keep_format(17, "CF_DIBV5", &image), Keep::Copy);
+        assert_eq!(keep_format(2, "CF_BITMAP", &image), Keep::Derived);
+        assert_eq!(keep_format(2, "CF_BITMAP", &[2]), Keep::Lost);
+        assert_eq!(keep_format(15, "CF_HDROP", &[15]), Keep::Copy);
+        assert_eq!(keep_format(0x80, "CF_OWNERDISPLAY", &[0x80]), Keep::Lost);
+        assert_eq!(keep_format(0x250, "format 592", &[0x250]), Keep::Lost);
+    }
+
+    #[test]
+    fn clipboard_text_round_trips_with_crlf() {
+        let units = clipboard_units("a\nb\r\nç😀");
+        assert_eq!(units.last(), Some(&0));
+        assert_eq!(String::from_utf16_lossy(until_nul(&units)), "a\r\nb\r\nç😀");
+        assert_eq!(clipboard_text(&units, 100), ("a\nb\nç😀".into(), false));
+        assert_eq!(clipboard_text(&units, 3), ("a\nb".into(), true));
+        // Data past the NUL (GlobalSize rounds up) is not text.
+        assert_eq!(
+            clipboard_text(&[104, 105, 0, 120, 120], 10),
+            ("hi".into(), false)
+        );
+        assert_eq!(clipboard_text(&[], 10), (String::new(), false));
     }
 
     #[test]
@@ -667,6 +1464,25 @@ mod tests {
             ..Default::default()
         };
         assert!(p.actions().is_empty());
+        // A menu entry opening a submenu expands by default; a leaf node
+        // has nothing to expand.
+        let entry = Props {
+            control_type: 50011,
+            invoke: true,
+            expand: true,
+            ..Default::default()
+        };
+        assert_eq!(entry.actions(), vec!["expand", "collapse", "invoke"]);
+        let leaf = Props {
+            expand_state: LEAF_NODE,
+            ..entry.clone()
+        };
+        assert_eq!(leaf.actions(), vec!["invoke"]);
+        let button = Props {
+            control_type: 50000,
+            ..entry
+        };
+        assert_eq!(button.actions(), vec!["invoke", "expand", "collapse"]);
     }
 
     #[test]
@@ -682,5 +1498,297 @@ mod tests {
             bgra_to_rgb(&[1, 2, 3, 255, 4, 5, 6, 0]),
             vec![3, 2, 1, 6, 5, 4]
         );
+    }
+
+    #[test]
+    fn shell_and_hidden_windows_are_not_listed() {
+        assert!(listed_window(true, false, false, "Notepad", "a - Notepad"));
+        assert!(!listed_window(
+            true,
+            false,
+            false,
+            "Progman",
+            "Program Manager"
+        ));
+        assert!(!listed_window(true, false, false, "Shell_TrayWnd", "x"));
+        assert!(!listed_window(
+            true,
+            true,
+            false,
+            "ApplicationFrameWindow",
+            "Calc"
+        ));
+        assert!(!listed_window(false, false, false, "Notepad", "a"));
+        assert!(!listed_window(true, false, true, "Notepad", "a"));
+        assert!(!listed_window(true, false, false, "Notepad", "  "));
+    }
+
+    #[test]
+    fn windows_match_title_app_or_hosted_app() {
+        assert!(window_matches("", "x", "notepad", ""));
+        assert!(window_matches(
+            "hesap",
+            "Hesap Makinesi",
+            "applicationframehost",
+            ""
+        ));
+        assert!(window_matches(
+            "calc",
+            "Hesap",
+            "applicationframehost",
+            "calculatorapp"
+        ));
+        assert!(!window_matches("calc", "Hesap", "applicationframehost", ""));
+        let allowed = vec!["calculatorapp".to_string()];
+        assert!(window_allowed(
+            &allowed,
+            "applicationframehost",
+            "calculatorapp"
+        ));
+        assert!(!window_allowed(&allowed, "applicationframehost", ""));
+        assert!(!window_allowed(&[String::new()], "notepad", ""));
+        // The frame's name reaches only frames that host no app.
+        let frame = vec!["applicationframehost".to_string()];
+        assert!(!window_allowed(
+            &frame,
+            "applicationframehost",
+            "calculatorapp"
+        ));
+        assert!(window_allowed(&frame, "applicationframehost", ""));
+    }
+
+    #[test]
+    fn the_active_match_is_picked_else_the_topmost() {
+        assert_eq!(pick_window(&[false, true]), Some(1));
+        assert_eq!(pick_window(&[false, false]), Some(0));
+        assert_eq!(pick_window(&[]), None);
+    }
+
+    #[test]
+    fn invisible_borders_are_added_to_the_frame_asked_for() {
+        let r = |left, top, right, bottom| Rect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let window = r(93, 80, 907, 587);
+        let frame = r(100, 80, 900, 580);
+        let b = borders(window, frame);
+        assert_eq!(b, r(7, 0, 7, 7));
+        let want = wanted_frame(frame, Some(200.0), None, None, Some(300.0));
+        assert_eq!(want, (200, 80, 800, 300));
+        assert_eq!(window_pos(want, b), (193, 80, 814, 307));
+        assert_eq!(inset(window, b), frame);
+        assert_eq!(wanted_frame(frame, None, None, Some(0.0), None).2, 1);
+    }
+
+    #[test]
+    fn workspace_rects_move_by_the_work_area_offset() {
+        let r = |left, top, right, bottom| Rect {
+            left,
+            top,
+            right,
+            bottom,
+        };
+        let mon = r(0, 0, 1920, 1080);
+        let work = r(0, 40, 1920, 1080); // taskbar on top
+        assert_eq!(
+            workspace_to_screen(r(10, 10, 110, 60), work, mon),
+            r(10, 50, 110, 100)
+        );
+    }
+
+    #[test]
+    fn monitors_are_named_and_scaled() {
+        assert_eq!(display_name("\\\\.\\DISPLAY1"), "DISPLAY1");
+        assert_eq!(display_name("DISPLAY2"), "DISPLAY2");
+        assert_eq!(dpi_scale(96), 1.0);
+        assert_eq!(dpi_scale(144), 1.5);
+        assert_eq!(dpi_scale(120), 1.25);
+        assert_eq!(dpi_scale(0), 1.0);
+    }
+    #[test]
+    fn launch_finds_app_paths_then_path_then_the_windows_folders() {
+        use std::path::{Path, PathBuf};
+        assert_eq!(exe_file("notepad"), "notepad.exe");
+        assert_eq!(exe_file("Foo.EXE"), "Foo.EXE");
+        let env = |k: &str| match k {
+            "ProgramFiles" => Some(r"C:\Program Files".to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            app_path_value(r#" "%ProgramFiles%\Edge\msedge.exe" "#, env).as_deref(),
+            Some(r"C:\Program Files\Edge\msedge.exe")
+        );
+        assert_eq!(app_path_value("\"\"", env), None);
+        assert_eq!(expand_env("%NOPE%\\a%%b%", env), "%NOPE%\\a%%b%");
+        assert_eq!(expand_env("x%ProgramFiles%y", env), r"xC:\Program Filesy");
+        let path = [
+            PathBuf::from(r"C:\WINDOWS\system32"),
+            PathBuf::from(r"C:\Users\a\AppData\Local\Microsoft\WindowsApps"),
+            PathBuf::from(""),
+        ];
+        let dirs = program_dirs(&path, Some(r"C:\WINDOWS"));
+        // System32 is on PATH already (other case): listed once.
+        assert_eq!(
+            dirs,
+            [
+                PathBuf::from(r"C:\WINDOWS\system32"),
+                PathBuf::from(r"C:\Users\a\AppData\Local\Microsoft\WindowsApps"),
+                PathBuf::from(r"C:\WINDOWS"),
+            ]
+        );
+        let have = |p: &Path| {
+            let s = p.to_string_lossy();
+            s.ends_with("WindowsApps/mspaint.exe")
+                || s.ends_with("WindowsApps\\mspaint.exe")
+                || s.contains("Edge")
+        };
+        let edge = Some(r"C:\Program Files\Edge\msedge.exe".to_string());
+        assert_eq!(
+            find_program("msedge.exe", edge, &dirs, have),
+            Some(PathBuf::from(r"C:\Program Files\Edge\msedge.exe"))
+        );
+        // An App Paths entry naming a missing file or a script is skipped.
+        let script = Some(r"C:\Program Files\Edge\run.cmd".to_string());
+        assert_eq!(find_program("x.exe", script, &dirs, have), None);
+        let paint = find_program("mspaint.exe", None, &dirs, have).unwrap();
+        assert!(paint.starts_with(&dirs[1]), "{paint:?}");
+        assert_eq!(find_program("nosuch.exe", None, &dirs, have), None);
+    }
+
+    #[test]
+    fn store_apps_come_from_their_manifest() {
+        let xml = r#"<?xml version="1.0"?><Package><Identity Name="Microsoft.WindowsCalculator"
+            Publisher="CN=Microsoft" Version="11.2607.0.0" ProcessorArchitecture="x64"/>
+            <Applications>
+              <Application Id="App" Executable="CalculatorApp.exe" EntryPoint="Calculator.App"
+                desktop4:SupportsMultipleInstances="true">
+              </Application>
+              <Application Id='Second' Executable='Tools\Other.exe'/>
+            </Applications></Package>"#;
+        let (name, apps) = manifest_apps(xml);
+        assert_eq!(name, "Microsoft.WindowsCalculator");
+        assert_eq!(
+            apps,
+            [
+                ("App".to_string(), "CalculatorApp.exe".to_string()),
+                ("Second".to_string(), r"Tools\Other.exe".to_string())
+            ]
+        );
+        assert_eq!(manifest_apps("<Package/>"), (String::new(), vec![]));
+    }
+
+    #[test]
+    fn hosted_apps_are_the_uwp_ones() {
+        let xml = r#"<Applications>
+            <Application Id="App" Executable="CalculatorApp.exe" EntryPoint="Calculator.App">
+              <uap:VisualElements DisplayName="Calc" AppListEntry="default"/>
+            </Application>
+            <Application Id="N" Executable="Notepad\Notepad.exe"
+                EntryPoint="Windows.FullTrustApplication"></Application>
+            <Application Id="P" Executable="P.exe" uap10:RuntimeBehavior="packagedClassicApp">
+            </Application>
+            <Application Id="Again" Executable="calculatorapp.exe" EntryPoint="X"/>
+            <Application Id="NoExe" EntryPoint="Y"></Application>
+            <Application Id="Hidden" Executable="Broker.exe" EntryPoint="Z">
+              <uap:VisualElements AppListEntry="none" DisplayName="B"/>
+            </Application>
+            <Application Id="T" Executable="$targetnametoken$.exe" EntryPoint="Z"/>
+        </Applications>"#;
+        assert_eq!(manifest_hosted(xml), vec!["calculatorapp"]);
+        assert_eq!(
+            package_family("Microsoft.WindowsCalculator_11.2607.0.0_x64__8wekyb3d8bbwe").as_deref(),
+            Some("Microsoft.WindowsCalculator_8wekyb3d8bbwe")
+        );
+        assert_eq!(package_family("NoUnderscore"), None);
+        let calc = "Microsoft.WindowsCalculator";
+        assert_eq!(
+            store_rank("calculatorapp", calc, "CalculatorApp.exe"),
+            Some(0)
+        );
+        assert_eq!(
+            store_rank("mspaint", "Microsoft.Paint", r"PaintApp\mspaint.exe"),
+            Some(0)
+        );
+        assert_eq!(store_rank("paint", "Microsoft.Paint", "x.exe"), Some(1));
+        assert_eq!(store_rank("calculator", calc, ""), Some(2));
+        assert_eq!(store_rank("calc", calc, "CalculatorApp.exe"), Some(2));
+        assert_eq!(store_rank("app", calc, "CalculatorApp.exe"), None);
+        assert_eq!(store_rank("paint", calc, "CalculatorApp.exe"), None);
+    }
+
+    #[test]
+    fn a_store_app_matched_by_package_name_must_be_the_only_one() {
+        let m = |rank, package: &str, executable: &str, aumid: &str| StoreMatch {
+            rank,
+            package: package.into(),
+            executable: executable.into(),
+            aumid: aumid.into(),
+        };
+        assert_eq!(pick_store("x", &[]), Ok(None));
+        let calc = [m(
+            2,
+            "Microsoft.WindowsCalculator",
+            "CalculatorApp.exe",
+            "C!App",
+        )];
+        assert_eq!(pick_store("calculator", &calc), Ok(Some("C!App".into())));
+        let xbox = [
+            m(2, "Microsoft.Xbox.TCUI", "TCUI-App.exe", "T!App"),
+            m(2, "Microsoft.XboxGamingOverlay", "GameBar.exe", "G!App"),
+        ];
+        let e = pick_store("xbox", &xbox).unwrap_err();
+        assert!(e.contains("several Store apps"), "{e}");
+        assert!(e.contains("gamebar (Microsoft.XboxGamingOverlay)"), "{e}");
+        // A better rank decides; an exact executable always does.
+        let mixed = [
+            m(2, "Microsoft.Xbox.TCUI", "TCUI-App.exe", "T!App"),
+            m(1, "Microsoft.Xbox", "", "X!App"),
+        ];
+        assert_eq!(pick_store("xbox", &mixed), Ok(Some("X!App".into())));
+        let exact = [
+            m(0, "A", "gamebar.exe", "A!1"),
+            m(0, "B", "gamebar.exe", "B!1"),
+        ];
+        assert_eq!(pick_store("gamebar", &exact), Ok(Some("A!1".into())));
+    }
+
+    #[test]
+    fn launch_args_are_quoted_for_the_command_line() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            command_args(&s(&[r"C:\mcp\a.txt", "-x"])),
+            r"C:\mcp\a.txt -x"
+        );
+        assert_eq!(
+            command_args(&s(&[r"C:\My Files\", "", r#"say "hi""#, r"a\\"])),
+            r#""C:\My Files\\" "" "say \"hi\"" a\\"#
+        );
+        assert_eq!(command_args(&s(&[r#"a\"b"#])), r#""a\\\"b""#);
+    }
+
+    #[test]
+    fn quick_exits_with_0_or_1_are_hand_offs() {
+        assert!(handoff_exit(Some(0)));
+        // explorer.exe <folder> exits with 1 after the shell opened it.
+        assert!(handoff_exit(Some(1)));
+        assert!(!handoff_exit(Some(2)));
+        assert!(!handoff_exit(Some(-1073741819)));
+        assert!(!handoff_exit(None));
+        assert_eq!(exit_code(2), "2");
+        assert_eq!(exit_code(0xC000_0005), "0xC0000005");
+    }
+
+    #[test]
+    fn web_toolkit_by_framework_or_window_class() {
+        assert_eq!(web_toolkit("Chrome", "Chrome_WidgetWin_1"), "chromium");
+        // The top-level window says Win32; its class says Chromium.
+        assert_eq!(web_toolkit("Win32", "Chrome_WidgetWin_1"), "chromium");
+        assert_eq!(web_toolkit("Gecko", ""), "gecko");
+        assert_eq!(web_toolkit("Win32", "MozillaWindowClass"), "gecko");
+        assert_eq!(web_toolkit("XAML", "ApplicationFrameWindow"), "");
+        assert_eq!(web_toolkit("Win32", "Notepad"), "");
     }
 }

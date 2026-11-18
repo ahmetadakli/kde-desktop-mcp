@@ -22,7 +22,7 @@ list like `[55] button "Save"` and acts on an element by its number.
 | Element actions | AT-SPI actions, EditableText | AT-SPI actions, EditableText | Invoke, Toggle, ExpandCollapse, SelectionItem, Value patterns |
 | Keyboard | `/dev/uinput` | `/dev/uinput` | Win32 `SendInput` |
 | Mouse | Absolute uinput pointer | Hyprland `movecursor` + uinput buttons | `SetCursorPos` + `SendInput` |
-| Typing text | Direct insertion via AT-SPI into Qt multi-line fields (clipboard untouched); elsewhere in-process clipboard + Ctrl+V, after which the previous clipboard text is put back | `wtype` (clipboard untouched); otherwise clipboard + Ctrl+V as on KDE | `KEYEVENTF_UNICODE` (clipboard untouched) |
+| Typing text | Direct insertion via AT-SPI into Qt multi-line fields (clipboard untouched); elsewhere in-process clipboard + Ctrl+V, after which the previous clipboard text is put back | `wtype` (clipboard untouched); otherwise clipboard + Ctrl+V as on KDE | Clipboard + Ctrl+V, after which the previous clipboard contents (all formats) are put back; a single character as a `KEYEVENTF_UNICODE` key |
 | Windows | KWin scripting (D-Bus) | Hyprland socket: `clients`, `monitors`, dispatchers, batched in one request | `SetForegroundWindow` |
 | Screenshot (fallback) | KWin `ScreenShot2` (D-Bus); else `spectacle` | `grim` | GDI |
 
@@ -336,8 +336,9 @@ tool; `off` turns it off). Not available on Windows yet.
   call's confirmation covers them. On Windows (roles compared without
   spaces: `checkbox`, `listitem`), check/uncheck/expand/collapse use the UI
   Automation Toggle and ExpandCollapse actions and `select` the entry's
-  SelectionItem;
-  Selection and ScrollTo are not supported there (untested on Windows).
+  SelectionItem; `scroll_to` uses ScrollItemPattern.ScrollIntoView, else the
+  wheel over the nearest scrolling ancestor (verified in Edge); Selection is
+  not supported there.
   Verified so far with unit tests only; not yet tried against Kate, Dolphin
   or Firefox.
 - Modifier clicks: `click`, `mouse` and `scroll` take `modifiers` (`ctrl`,
@@ -437,7 +438,12 @@ tool; `off` turns it off). Not available on Windows yet.
   walk of the apps (alongside, when `app`/`id` names it) and, for a
   browser, a read of its windows' states and the remembered page (one round
   trip each); a search of the window (up to 20000 nodes) when that window
-  changed, at most every 5 s for a window found without a page. A canvas that draws without
+  changed, at most every 5 s for a window found without a page. Where the
+  backend hears no change events (Windows), the visible part of the app's
+  windows is also hashed before the input and read again about every 50 ms
+  until it differs or the wait is over, so a display that changed while focus
+  and title stayed (Calculator) reads `changed`; this costs one subtree read
+  before the input and one or more after. A canvas that draws without
   accessibility events may report `no visible change`. `observe` adds a view
   in the same reply: `focus` (the focused element), `tree` (compact tree of
   the active window, or of `app`'s, at most 6000 characters) or `screenshot`
@@ -474,7 +480,7 @@ tool; `off` turns it off). Not available on Windows yet.
   apps: there it costs nothing beyond one cached toolkit lookup (and on a
   web page one state read). When the page does not change, the call takes the whole
   `settle_ms`. `mouse` clicks at coordinates do not wait.
-- What an input opened (Linux): after `act`, `menu`, `close_window` and the
+- What an input opened (Linux; Windows: menus): after `act`, `menu`, `close_window` and the
   input tools given `observe`, and after `click`, `key`, `mouse` and
   `type_text` without it, the reply lists the menus, popup menus, combo box
   lists, dialogs and alerts of allowed apps that opened, one line each, with
@@ -507,9 +513,13 @@ tool; `off` turns it off). Not available on Windows yet.
   inputs only list what showed already. When registering those events
   failed, those likely openers and `act`, `menu` and `close_window` look at
   the active app's top-level windows instead, and a surface one such look
-  listed is not read or listed again while it stays open. Not on Windows:
-  UI Automation's roles do not name menus and dialogs this way (a dialog is
-  a `window`), so nothing is looked at or waited for there.
+  listed is not read or listed again while it stays open. On Windows only
+  menus are listed: UI Automation's roles do not name dialogs this way (a
+  dialog is a `window`; `close_window` still lists the one it opened). With
+  no show events there, after those likely openers, and after `act` or
+  `click` on a menu entry or a drop-down button (one that expands), the
+  app's windows are searched for a menu showing in them (a XAML flyout sits
+  in a popup inside the window), up to 150 ms; other inputs do not look.
   Only menus already open are read: nothing here opens a menu through
   accessibility (Firefox can crash when one does).
 - Failures say what is on screen: when `find` finds nothing, or `act`,
@@ -550,18 +560,21 @@ tool; `off` turns it off). Not available on Windows yet.
   maximized, minimized), output and virtual desktop in screen coordinates,
   after the screen layout (name, area, scale) and the virtual desktops
   (KDE: number, name, the current one; Hyprland: the regular workspaces and
-  the monitor each is on) (KDE and Hyprland).
+  the monitor each is on) (KDE, Hyprland and Windows, which has no virtual
+  desktops to list).
 - `move_window`: moves, resizes, maximizes, minimizes or restores a window,
   and with `desktop` (a number or name as `windows` lists them) moves it to
   that virtual desktop (KDE: the window is then on that one only) or
   workspace (Hyprland: silently, the view stays; a new number makes the
   workspace); waits (at most 1 s) until the window has its new geometry and
-  reports the real result (KDE and Hyprland; see the Hyprland limitations).
+  reports the real result (KDE, Hyprland and Windows; see the Hyprland and
+  Windows limitations).
 - `close_window`: closes the one window whose title or app name contains
   `query` (several matches: an error listing them) as its close button does
-  (KWin `closeWindow()`, Hyprland `closewindow`), so an app with unsaved
-  changes still asks; the reply then says the window is still open and
-  lists the app's dialog (the save prompt) with its buttons' ids
+  (KWin `closeWindow()`, Hyprland `closewindow`, Windows `WM_CLOSE`), so an
+  app with unsaved changes still asks; the reply then says the window is
+  still open and lists the app's dialog (the save prompt; Windows: a window
+  it owns or a modal one inside it) with its buttons' ids
   (`showing dialog '…': [60] push button "Save" [61] "Discard" …`). Always
   needs the user's consent, as tools on the `confirm:` list do (see
   [Tiers, confirmation and password fields](#tiers-confirmation-and-password-fields)).
@@ -585,12 +598,16 @@ tool; `off` turns it off). Not available on Windows yet.
   while the app's window is in front. Firefox fills a menu only while it is open; `menu`
   does not open Firefox menus itself (doing so through accessibility hung or
   crashed a fresh Firefox in tests), so open the menu with `key` first.
+  On Windows a menu bar entry and a submenu entry are expanded to read their
+  entries (UI Automation's ExpandCollapse; Win11 Notepad and Paint), which
+  open as a flyout elsewhere in the window: `menu` takes the menu that
+  showed, not the one holding the entry.
 - `launch`: starts an allowed app (`app`, e.g. `kate`) with an optional `args`
   list (no shell; its `.desktop` file first, else the program on `PATH`) and
   waits until its window opens (`wait_ms`, default 15 s, at most 60 s; 0 does
   not wait). Prints the window as `windows` does; also finds launches handed
-  to an already running instance (firefox, kate). Window tracking works on
-  KDE and Hyprland.
+  to an already running instance (firefox, kate). Works on KDE, Hyprland and
+  Windows (see the Windows limitations).
 - Terminal windows: `windows` also lists each terminal tab's pts device,
   foreground command and directory; `activate_window` with
   `terminal: "pytest"` brings forward the terminal running that command (or in
@@ -605,7 +622,10 @@ tool; `off` turns it off). Not available on Windows yet.
   the parent window KWin reports for it belongs to an allowed app, and a
   dialog without a reported parent is refused. The portal is not added to the
   allowlist; no other element of the dialog is reachable. For
-  `action: "open"` the file must exist, for `"save"` its folder (KDE only).
+  `action: "open"` the file must exist, for `"save"` its folder. On Windows
+  it fills an allowed app's common Open/Save As dialog (see the Windows
+  limitations). It never answers an overwrite confirmation: the call then
+  fails saying the dialog is still open.
 - `doctor`: checks the setup in one report: version, allowlist, which running
   apps are allowed, the session, AT-SPI, the virtual keyboard and mouse, KWin
   scripting, screens and the screenshot path.
@@ -624,12 +644,13 @@ tool; `off` turns it off). Not available on Windows yet.
   the input, so no other call takes the focus in between; when it already is,
   nothing extra happens. Without `window` nothing is activated.
 - `clipboard_get`, `clipboard_set`: read or write the clipboard as text (Linux
-  only). Because the clipboard can hold anything the user copied anywhere
+  and Windows). Because the clipboard can hold anything the user copied anywhere
   (passwords included), both work only while a window of an allowed app is
   active. `clipboard_get` returns at most `limit` characters (default 20,000;
   the reply says when it was cut); if the clipboard holds an image or files
   rather than text, it only names the types, and it does not read content a
-  password manager marked as a password (`x-kde-passwordManagerHint`).
+  password manager marked as a password (`x-kde-passwordManagerHint`; on
+  Windows `ExcludeClipboardContentFromMonitorProcessing`).
 - `mouse`, `screenshot`: fallback only. `screenshot` returns the image inside
   the reply, shrinks it so its longer side is 1024 px by default (`max_size`)
   and reports which screen area it shows. The inline image is a JPEG
@@ -1089,10 +1110,74 @@ Hyprland:
 Windows:
 - Input cannot be sent to windows running as administrator from a server that
   is not (Windows UIPI).
-- Microsoft Store apps may show up as `applicationframehost`.
+- Microsoft Store apps run inside a frame window of ApplicationFrameHost;
+  `apps`, `windows`, `find`/`act` and the input checks name such a window
+  after the app it hosts (`calculatorapp`, `systemsettings`), also while it
+  is minimized. `applicationframehost` in the allowlist still allows every
+  Store app it hosts, running or not (installed ones are read from their
+  manifests at start), with its tier (an app's own line wins), and its
+  `confirm:` items apply to those apps too (`passwords:` items naming it do
+  not carry over).
+  A frame is reached only by its app's name: `app: "applicationframehost"`
+  finds just frames that host no app, so an app's own lower tier and confirm
+  rules cannot be passed by naming the frame.
+- Window tools: positions and sizes are physical pixels (as for `mouse`) of
+  the visible frame, without the invisible resize borders; the screen
+  areas `screenshot` reports include them. Virtual desktops are not listed
+  and `move_window` cannot change them (`desktop` is refused). A minimized
+  window reports where it goes back to; while minimized since before the
+  server saw it, that rectangle still includes the borders. The desktop
+  and taskbar (explorer's `Progman`, `Shell_TrayWnd`) are never listed.
+- `launch` looks for the program in App Paths (`msedge`), on `PATH`
+  (including the Store's execution aliases such as `mspaint`), in System32
+  and the Windows folder, then among the user's Store apps by executable or
+  package name (`calculatorapp` starts `Microsoft.WindowsCalculator`); only
+  `.exe` programs are started, never a script. Starters that pass the request
+  on and end (System32's `calc.exe`, `explorer <folder>`, which exits with
+  code 1, `msedge <url>` while Edge runs) count as a hand-off; other exit
+  codes are failures. A Store app's window shows under the app's own name,
+  as `windows` lists it. Notepad's own starter process stays running without
+  a window after handing a file to the open Notepad.
 - Key names follow the US keyboard layout positions; use `type_text` for text.
+- `type_text` pastes through the clipboard (a single character is typed as a
+  key). It saves the clipboard first, every format whose data is a memory
+  block (text with its HTML/RTF formatting, Office formats, images as DIB,
+  copied files), and puts it back once the app in front has read the paste:
+  the text is offered with delayed rendering, so the read shows as the app's
+  request for it. Formats that cannot be kept (metafiles, owner-drawn or
+  private ones) are named in the reply; contents over 16 MiB are not kept and
+  the clipboard is emptied instead. The typed text is kept out of the
+  clipboard history (Win+V) and marked for clipboard monitors, and it never
+  stays on the clipboard: when the app does not read the paste within 1 s the
+  clipboard is put back and the call fails (the text was probably not typed).
+  A paste cancelled half-way, or cut short by the server's exit, also puts
+  the clipboard back. While another app holds the clipboard open, the text is
+  typed key by key instead. Typing stops, with an error, when another window
+  comes to the front.
+- A menu bar entry or submenu entry acts by expanding (its first action is
+  `expand`); `act` lists the menu it opened as `opened: menu (…)`. A button
+  whose only action is `invoke` but opens a menu (Explorer's "Diğer
+  seçenekler") is not looked after: `find` the entries.
+- `file_dialog` works on the common Open/Save As dialog (a `#32770` window
+  in front, of the app that opened it), found by control ids rather than by
+  its language: the file name field (1001 in Save As, 1148 in Open) and the
+  default button. `~` stands for `%USERPROFILE%` unless `HOME` is set
+  (`~\` works too). When the dialog asks to confirm overwriting a file,
+  the error names that prompt and leaves it unanswered. An app's own file
+  picker of another kind is not a file dialog to it.
+- `set_text` on a single-line Win32 edit control writes as typing over a
+  selection would (EM_REPLACESEL), not with UI Automation's SetValue: the
+  common file dialog ignores a name set that way and saves under the old
+  one.
 - In very large windows (browsers, Word) `tree` and `find` can be slow because
   they fetch the whole subtree at once.
+- UI Automation sends the server no change events: the effect line of an
+  input reads the app's windows before and after it (see `observe`), and
+  `wait_idle` polls them. In Chromium browsers (Edge, Chrome) and Electron
+  apps the page is the document on screen: its title and address (the
+  document's value) name a page change, and MSAA's busy state is taken as
+  loading. A link below the fold is off screen as Chromium says (no visible
+  match); `act action=scroll_to` on its id brings it into view.
 
 All:
 - Games and canvas-based interfaces mostly show up empty in the accessibility

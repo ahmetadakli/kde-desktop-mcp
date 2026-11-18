@@ -116,7 +116,7 @@ or Enter on a web page waits for its change. wait_for: something \
 that appears or goes away (gone=true), a state or a window; never as a sleep. \
 tree(interactive=true) for large pages.
 - `observe`=effect|focus|tree|screenshot on input tools reports what changed or adds that \
-view. On Linux, menus, lists and dialogs an input opened come with ids (`opened:`). Failures \
+view. Menus an input opened (Linux: also lists, dialogs) come with ids (`opened:`). Failures \
 end with the active window and focus.
 - menu (app + path, e.g. \"File > Save As\") runs a menu entry.
 - screenshot is a last resort. To click something seen \
@@ -279,7 +279,7 @@ pub fn tools() -> Json {
         t(
             "act",
             &d(
-                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nVerified actions, preferred over toggling or clicking: `action` check, uncheck,\nexpand, collapse (already so: \"nothing sent\"), toggle; `option` (with action\nselect, or alone) picks the entry with that label in a combo box, list, tab list\nor menu button, without opening it where it can; scroll_to brings an element\nscrolled out of view (an id from a miss list) into view, else turns the wheel\nover its list (the pointer moves). Each reads the state back: the reply gives\nit, or fails saying what was sent and what it reads instead.\nThe effect line says when the active window or the web page changed (or the\npage still loads: wait_idle before reading it); a menu, combo box\nlist or dialog the action opened follows with its entries' ids (opened: …;\nLinux)."
+                "Perform an accessibility action on an element (default: its first action,\nusually click/press/invoke). Use the action names listed by tree/find (a role's usual action,\ne.g. a button's press or a link's jump, is not listed but is the default).\nshowContextMenu is never the default.\nVerified actions, preferred over toggling or clicking: `action` check, uncheck,\nexpand, collapse (already so: \"nothing sent\"), toggle; `option` (with action\nselect, or alone) picks the entry with that label in a combo box, list, tab list\nor menu button, without opening it where it can; scroll_to brings an element\nscrolled out of view (an id from a miss list) into view, else turns the wheel\nover its list (the pointer moves). Each reads the state back: the reply gives\nit, or fails saying what was sent and what it reads instead.\nThe effect line says when the active window or the web page changed (or the\npage still loads: wait_idle before reading it); a menu, combo box\nlist or dialog the action opened follows with its entries' ids (opened: …;\nLinux; Windows: menus)."
             ),
             target(&[
                 ("action", "string", Some(json!(""))),
@@ -313,7 +313,7 @@ pub fn tools() -> Json {
         t(
             "click",
             &d(
-                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. `button`: left, right or middle;\n`clicks`: 2 = double, 3 = triple (select a line). `modifiers` are held\nduring the click, e.g. [\"ctrl\"] to add to a selection, [\"shift\"] for a\nrange. A menu, combo box list or dialog the click opened is listed with its\nentries' ids (opened: …; Linux); a right click, or one on a combo box or menu\nentry, waits up to 150 ms for one to show."
+                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. `button`: left, right or middle;\n`clicks`: 2 = double, 3 = triple (select a line). `modifiers` are held\nduring the click, e.g. [\"ctrl\"] to add to a selection, [\"shift\"] for a\nrange. A menu, combo box list or dialog the click opened is listed with its\nentries' ids (opened: …; Linux; Windows: menus); a right click, or one on a combo box or menu\nentry, waits up to 150 ms for one to show."
             ),
             target(&[
                 ("button", "string", Some(json!("left"))),
@@ -374,7 +374,7 @@ pub fn tools() -> Json {
         ),
         t(
             "key",
-            "Press a key or chord in the active window, e.g. \"ctrl+s\", \"alt+tab\", \"enter\",\n\"f5\", \"left\". Only sent when the active window belongs to an allowed app.\nThe reply names the element that has focus afterwards, and a menu or dialog\nit opened with its entries' ids (opened: …; Linux); keys that usually open one\n(menu, shift+f10, f10, alt+letter, alt+down, ctrl+o/s/p/w/q) wait up to\n150 ms for it. For a slower dialog use wait_for.",
+            "Press a key or chord in the active window, e.g. \"ctrl+s\", \"alt+tab\", \"enter\",\n\"f5\", \"left\". Only sent when the active window belongs to an allowed app.\nThe reply names the element that has focus afterwards, and a menu or dialog\nit opened with its entries' ids (opened: …; Linux; Windows: menus); keys that usually open one\n(menu, shift+f10, f10, alt+letter, alt+down, ctrl+o/s/p/w/q) wait up to\n150 ms for it. For a slower dialog use wait_for.",
             schema(&[
                 ("combo", "string", None),
                 ("repeat", "integer", Some(json!(1)))
@@ -382,22 +382,22 @@ pub fn tools() -> Json {
         ),
         t(
             "type_text",
-            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. A trailing newline is pressed as Enter (it submits\nan address bar or search box); newlines inside the text stay text.\nOn Linux this may paste through the clipboard;\nthe text it held is put back afterwards (images and files are not; the reply\nsays so). The reply names the focused element and warns when it is not an\neditable field. Refused while a password field has focus, unless the user\nallowed it in the allowlist.",
+            "Type text into the focused element of the active window. Works with any\nkeyboard layout and Unicode. A trailing newline is pressed as Enter (it submits\nan address bar or search box); newlines inside the text stay text.\nThis may paste through the clipboard; what it\nheld is put back afterwards (the reply names what could not be). The reply names the focused element and warns when it is not an\neditable field. Refused while a password field has focus, unless the user\nallowed it in the allowlist.",
             schema(&[("text", "string", None)])
         ),
         t(
             "clipboard_get",
-            "Read the clipboard as text, at most `limit` characters (the reply says\nwhen it was cut). Only works while an allowed app's window is active, since\nthe clipboard may hold anything the user copied. Says so instead when it\nholds no text (an image, files) or a password marked by a password manager.\nLinux only.",
+            "Read the clipboard as text, at most `limit` characters (the reply says\nwhen it was cut). Only works while an allowed app's window is active, since\nthe clipboard may hold anything the user copied. Says so instead when it\nholds no text (an image, files) or a password marked by a password manager.\nLinux and Windows.",
             schema(&[("limit", "integer", Some(json!(20000)))])
         ),
         t(
             "clipboard_set",
-            "Put `text` on the clipboard, e.g. to paste it later with key ctrl+v or to\nhand it to the user. Only while an allowed app's window is active. Linux\nonly.",
+            "Put `text` on the clipboard, e.g. to paste it later with key ctrl+v or to\nhand it to the user. Only while an allowed app's window is active. Linux\nand Windows.",
             schema(&[("text", "string", None)])
         ),
         t(
             "mouse",
-            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple; `button` left, right or middle) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. A right click lists the menu it opened with ids (opened: …; Linux).",
+            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple; `button` left, right or middle) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. A right click lists the menu it opened with ids (opened: …; Linux; Windows: menus).",
             schema(&[
                 ("x", "integer", Some(Json::Null)),
                 ("y", "integer", Some(Json::Null)),
@@ -433,12 +433,12 @@ pub fn tools() -> Json {
         ),
         t(
             "windows",
-            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state, output and virtual desktop\n(Hyprland: workspace), after the screens (name, geometry, scale) and the\ndesktops (number, name, the current one). Terminal windows also list each\ntab's pseudo-terminal with its foreground command and directory. `query`\nfilters by title or app name. KDE Plasma and Hyprland.",
+            "List windows of allowed apps with their position and size in screen\ncoordinates, active/maximized/minimized state, output and virtual desktop\n(Hyprland: workspace), after the screens (name, geometry, scale) and the\ndesktops (number, name, the current one). Terminal windows also list each\ntab's pseudo-terminal with its foreground command and directory. `query`\nfilters by title or app name. KDE Plasma, Hyprland and Windows (no virtual\ndesktops there).",
             schema(&[("query", "string", Some(json!("")))])
         ),
         t(
             "move_window",
-            "Move and/or resize the first window of an allowed app whose title or\napp name contains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), set `state` to maximize, minimize or restore, and/or\nmove it to virtual desktop `desktop` (number or name as windows lists them;\nHyprland: a workspace, created when the number is new; the view stays).\nReplies with the new geometry. KDE Plasma and Hyprland (there a tiled\nwindow is floated to move or resize it; minimize parks it on the special\nworkspace special:minimized).",
+            "Move and/or resize the first window (Windows: the active one if it\nmatches, else the topmost) of an allowed app whose title or app name\ncontains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), set `state` to maximize, minimize or restore, and/or\nmove it to virtual desktop `desktop` (number or name as windows lists them;\nHyprland: a workspace, created when the number is new; the view stays).\nReplies with the new geometry. KDE Plasma, Hyprland (there a tiled window\nis floated to move or resize it; minimize parks it on the special workspace\nspecial:minimized) and Windows (without `desktop`).",
             schema(&[
                 ("query", "string", None),
                 ("x", "integer", Some(Json::Null)),
@@ -451,7 +451,7 @@ pub fn tools() -> Json {
         ),
         t(
             "close_window",
-            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes: the reply then lists that dialog\nwith its buttons' ids. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma and\nHyprland.",
+            "Close the one window of an allowed app whose title or app name contains\n`query` (more matches: an error listing them), as its close button does:\nthe app may still ask to save changes: the reply then lists that dialog\nwith its buttons' ids. Needs\nthe user's consent: ask them, then pass `confirm`=true. KDE Plasma,\nHyprland and Windows.",
             schema(&[
                 ("query", "string", None),
                 ("confirm", "boolean", Some(json!(false))),
@@ -464,7 +464,7 @@ pub fn tools() -> Json {
         ),
         t(
             "launch",
-            "Start an allowed app (`app` as named by apps, e.g. \"kate\") with optional\n`args` (a list, no shell), resolved through its .desktop file or PATH, and\nwait up to `wait_ms` (at most 60000) until its window appears. Replies with\nthe window as windows prints it; finds windows a running instance opens\n(single-instance apps such as firefox or kate) too. 0 = do not wait.\nWindow tracking works on KDE Plasma and Hyprland; Linux only.",
+            "Start an allowed app (`app` as named by apps, e.g. \"kate\") with optional\n`args` (a list, no shell), resolved through its .desktop file or PATH\n(Windows: App Paths, PATH, System32 or a Store app), and wait up to\n`wait_ms` (at most 60000) until its window appears. Replies with the window\nas windows prints it; finds windows a running instance opens\n(single-instance apps such as firefox or kate) too. 0 = do not wait.\nWorks on KDE Plasma, Hyprland and Windows.",
             schema(&[
                 ("app", "string", None),
                 ("args", "array", Some(Json::Null)),
@@ -473,7 +473,7 @@ pub fn tools() -> Json {
         ),
         t(
             "file_dialog",
-            "Fill in the file Open/Save dialog in front: write `path` (absolute or\n~/…) into its file name field, press its default button and wait up to\n`timeout_ms` for it to close. Works on an allowed app's own KDE dialog and\non the desktop portal's dialog (a browser's upload or download) when it\nbelongs to an allowed app's window; nothing else in the portal is reachable.\nFor `action`=\"open\" the path must exist; for \"save\" its folder must.\nOpen the dialog first (e.g. the page's upload button), then call this.\nKDE Plasma only.",
+            "Fill in the file Open/Save dialog in front: write `path` (absolute or\n~/…) into its file name field, press its default button and wait up to\n`timeout_ms` for it to close. Works on an allowed app's own KDE dialog and\non the desktop portal's dialog (a browser's upload or download) when it\nbelongs to an allowed app's window; nothing else in the portal is reachable.\nOn Windows: an allowed app's common Open/Save As dialog.\nFor `action`=\"open\" the path must exist; for \"save\" its folder must.\nOpen the dialog first (e.g. the page's upload button), then call this.\nKDE Plasma and Windows; it never confirms overwriting a file.",
             schema(&[
                 ("path", "string", None),
                 ("action", "string", Some(json!("open"))),
@@ -538,7 +538,7 @@ pub fn tools() -> Json {
                 "type": "string",
                 "enum": OBSERVE_KINDS,
                 "default": "none",
-                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed / page changed, loading), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds no effect line or view (on Linux, click, key, mouse and type_text still list a menu or dialog they opened, at no cost when none did); act, menu and close_window report the effect line, and what opened, by default."
+                "description": "After the input settled, also report: effect (one line: changed / no visible change / window changed / page changed, loading), focus (plus the focused element), tree (plus a compact tree of the active window, or of `app`'s), or screenshot (plus an inline image). none (default) adds no effect line or view (click, key, mouse and type_text still list a menu they opened, on Linux also a dialog, at no cost there when none did); act, menu and close_window report the effect line, and what opened, by default."
             });
             props["settle_ms"] = json!({
                 "type": "integer",

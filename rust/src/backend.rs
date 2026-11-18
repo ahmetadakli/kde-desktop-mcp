@@ -72,14 +72,17 @@ pub struct Fetch {
 pub const NO_AREA: &str = "element has no on-screen area";
 
 /// Window management the desktop does not offer (KDE and Hyprland do).
-pub const NO_WINDOW_CONTROL: &str = "window geometry is only available on KDE Plasma and Hyprland";
+pub const NO_WINDOW_CONTROL: &str =
+    "window geometry is only available on KDE Plasma, Hyprland and Windows";
 
-/// Clipboard access the desktop does not offer (only Linux so far).
-pub const NO_CLIPBOARD: &str = "the clipboard tools are only available on Linux (Wayland)";
+/// Clipboard access the desktop does not offer.
+pub const NO_CLIPBOARD: &str =
+    "the clipboard tools are only available on Linux (Wayland) and Windows";
+
+/// Starting apps the platform does not offer yet.
+pub const NO_LAUNCH: &str = "launch is not supported on this platform yet";
 
 /// What `clipboard_get` found on the clipboard.
-// Only the Linux backend builds one so far.
-#[cfg_attr(windows, allow(dead_code))]
 #[derive(Clone, Debug, PartialEq)]
 pub enum Clip {
     Empty,
@@ -94,7 +97,8 @@ pub enum Clip {
     Other(Vec<String>),
 }
 
-/// A top-level window and where it is, in logical screen px.
+/// A top-level window and where it is, in logical screen px (Windows:
+/// physical px, its visible frame).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct WindowGeo {
     pub title: String,
@@ -108,6 +112,9 @@ pub struct WindowGeo {
     pub maximized: bool,
     pub output: String,
     pub pid: u32,
+    /// The backend's handle of the window (Windows: its HWND), to tell
+    /// windows of one process with the same title apart; 0 when unknown.
+    pub id: u64,
     /// Pseudo-terminals the window's processes hold (terminal emulators).
     pub terminals: Vec<Terminal>,
     /// The virtual desktops (KDE: their numbers; Hyprland: the workspace
@@ -235,7 +242,7 @@ pub fn window_rank(query: &str, title: &str, apps: &[&str]) -> Option<u8> {
     }
 }
 
-pub const NO_FILE_DIALOG: &str = "file dialogs are only supported on KDE Plasma";
+pub const NO_FILE_DIALOG: &str = "file dialogs are only supported on KDE Plasma and Windows";
 
 /// The active window when it is a file Open/Save dialog.
 #[derive(Clone, Debug)]
@@ -342,6 +349,18 @@ pub trait Backend {
     fn allow_file(&self) -> PathBuf;
     fn default_allow(&self) -> &'static str;
     fn apps_note(&self) -> &'static str;
+    /// An allowlist confirm rule naming an app of this platform, for
+    /// doctor's hint.
+    fn confirm_example(&self) -> &'static str {
+        "key:konsole"
+    }
+    /// (app, alias) pairs: `app` is allowed with the alias's tier when the
+    /// allowlist names the alias but not the app. Windows: the Store apps
+    /// ApplicationFrameHost hosts (open now or installed), so an allowlist
+    /// written for their frames keeps working.
+    fn app_aliases(&self) -> Vec<(String, &'static str)> {
+        Vec::new()
+    }
     /// Roles skipped (children lifted) when unnamed and actionless.
     fn boring_roles(&self) -> &'static [&'static str];
 
@@ -349,6 +368,9 @@ pub trait Backend {
     async fn enable(&self);
     /// Create slow resources (virtual input devices) ahead of first use.
     fn warm_up(&self) {}
+    /// The server exits: undo what calls still running would have undone
+    /// (Windows: put back the clipboard a paste holds).
+    fn shutdown(&self) {}
 
     async fn list_apps(&self) -> Vec<AppEntry>;
     /// Top-level windows of every process with this (lower-case) app name;
@@ -375,6 +397,13 @@ pub trait Backend {
     /// Whether `wait_change` hears of changes (else it only paces polls).
     fn changes_live(&self) -> bool {
         false
+    }
+    /// Whether the effect line reads the app's content before and after
+    /// an input to see a change (a display whose name changed while focus
+    /// and title stayed): for backends that hear of no changes. It costs a
+    /// subtree read before the input and one or more after.
+    fn compares_content(&self) -> bool {
+        !self.changes_live()
     }
     /// Whether the app whose windows (or elements) are `near` reported a
     /// change after `mark`, or windows or apps came or went; None when the
@@ -407,6 +436,24 @@ pub trait Backend {
     /// opened can be listed. UIA's do not (a dialog is a "window").
     fn names_surfaces(&self) -> bool {
         false
+    }
+    /// Whether what an input opened can be listed at least for menus:
+    /// `names_surfaces`, or menus are found by `open_menus`.
+    fn names_menus(&self) -> bool {
+        self.names_surfaces()
+    }
+    /// The menus showing inside `windows` that are no windows of their own
+    /// and not below the entry that opened them (UIA's XAML flyouts, in a
+    /// popup inside the app's window), for a backend without show events
+    /// (`shown_since` None); None when it does not look for them.
+    async fn open_menus(&self, _windows: &[Self::Id]) -> Option<Vec<Self::Id>> {
+        None
+    }
+    /// The dialogs the window `w` shows (a save prompt), for a backend whose
+    /// roles do not name them (`names_surfaces` false): each is listed as
+    /// a dialog, whatever its role.
+    async fn dialogs_of(&self, _w: &WindowGeo) -> Vec<Self::Id> {
+        Vec::new()
     }
     /// Whether `window`, a dialog, is a file dialog `file_dialog` fills.
     async fn fills_file_dialog(&self, _window: &Self::Id) -> bool {
@@ -498,6 +545,13 @@ pub trait Backend {
     /// browser page waiting for the network sends no change events).
     async fn loading(&self, _windows: &[Self::Id]) -> bool {
         false
+    }
+
+    /// `id` as a root that the next `prefetch` reads afresh, for a read of
+    /// an element that changed since it was found (a combo box that opened
+    /// its list). Backends whose reads are always live return it as is.
+    fn live(&self, id: &Self::Id) -> Self::Id {
+        id.clone()
     }
 
     /// Whether `menu` may open the submenu entry `id` through its action
@@ -636,7 +690,7 @@ pub trait Backend {
     /// Windows of allowed apps whose title or app contains `query` (all when
     /// empty).
     async fn windows(&self, _query: &str, _allowed: &[String]) -> R<Vec<WindowGeo>> {
-        Err(NO_WINDOW_CONTROL.into())
+        Err(crate::delivery::nothing_sent(NO_WINDOW_CONTROL))
     }
     /// `windows` without what costs extra (terminals), for polling.
     async fn windows_quick(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {
@@ -652,28 +706,34 @@ pub trait Backend {
             windows,
         }
     }
-    /// Move, resize, maximize, minimize or restore the first such window.
+    /// Which of the windows `windows` lists for a query `set_window`
+    /// changes: the first, unless the backend picks another.
+    fn window_to_change(&self, list: &[WindowGeo]) -> Option<usize> {
+        (!list.is_empty()).then_some(0)
+    }
+    /// Move, resize, maximize, minimize or restore the window
+    /// `window_to_change` picks among those matching `query`.
     async fn set_window(
         &self,
         _query: &str,
         _allowed: &[String],
         _change: &WindowChange,
     ) -> R<WindowGeo> {
-        Err(NO_WINDOW_CONTROL.into())
+        Err(crate::delivery::nothing_sent(NO_WINDOW_CONTROL))
     }
     /// Ask the only window of an allowed app whose title or app contains
     /// `query` to close, as its close button does: the app may still ask to
     /// save changes. Returns that window as it was; Err when no window or
     /// more than one matches.
     async fn close_window(&self, _query: &str, _allowed: &[String]) -> R<WindowGeo> {
-        Err(NO_WINDOW_CONTROL.into())
+        Err(crate::delivery::nothing_sent(NO_WINDOW_CONTROL))
     }
     /// Read the clipboard as text, at most `limit` characters.
     async fn clipboard_get(&self, _limit: usize) -> R<Clip> {
-        Err(NO_CLIPBOARD.into())
+        Err(crate::delivery::nothing_sent(NO_CLIPBOARD))
     }
     async fn clipboard_set(&self, _text: &str) -> R<()> {
-        Err(NO_CLIPBOARD.into())
+        Err(crate::delivery::nothing_sent(NO_CLIPBOARD))
     }
     /// Start `app` (an allowed name) with `args`, without a shell, and wait
     /// up to `wait` for its window; `allowed` limits which windows are seen.
@@ -684,7 +744,7 @@ pub trait Backend {
         _allowed: &[String],
         _wait: std::time::Duration,
     ) -> R<Launched> {
-        Err("launch is not supported on this platform yet".into())
+        Err(crate::delivery::nothing_sent(NO_LAUNCH))
     }
     async fn screens(&self) -> Vec<Screen> {
         Vec::new()
@@ -699,7 +759,13 @@ pub trait Backend {
     async fn indicate(&self, _label: &str) {}
     /// The active window as a file dialog; Err when it is none.
     async fn active_file_dialog(&self) -> R<FileDialog<Self::Id>> {
-        Err(NO_FILE_DIALOG.into())
+        Err(crate::delivery::nothing_sent(NO_FILE_DIALOG))
+    }
+    /// Title of the window a file dialog `window` shows in front of itself
+    /// (Windows' overwrite confirmation, an error box); None when it shows
+    /// none or the platform does not say.
+    async fn file_dialog_prompt(&self, _window: &Self::Id) -> Option<String> {
+        None
     }
     /// Platform checks for `doctor`.
     async fn doctor(&self) -> Vec<Check> {
@@ -710,8 +776,6 @@ pub trait Backend {
 }
 
 /// Why `close_window` closed nothing: no window or several match `query`.
-// The Windows backend has no window control yet.
-#[cfg_attr(windows, allow(dead_code))]
 pub fn not_one_window(query: &str, matches: &[WindowGeo]) -> String {
     // Nothing was closed: the caller's write sent nothing.
     if matches.is_empty() {

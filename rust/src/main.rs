@@ -9,6 +9,7 @@
 mod backend;
 mod delivery;
 mod flow;
+mod launch_pick;
 #[cfg(target_os = "linux")]
 mod linux;
 mod policy;
@@ -812,6 +813,10 @@ const WAIT_MIN_GAP: Duration = Duration::from_millis(50);
 /// How often `wait_idle` reads the tree where no change events come.
 const IDLE_POLL: Duration = Duration::from_millis(100);
 
+/// How often the effect line reads an app's content again while it waits
+/// for a change, where the backend gets no change events.
+const CONTENT_POLL: Duration = Duration::from_millis(50);
+
 /// What `wait_for` `state` asks of the element.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WaitState {
@@ -1088,6 +1093,10 @@ struct Fingerprint<Id> {
     app: Option<(String, Vec<Id>)>,
     /// The page the app's window shows (`Backend::page`).
     page: Option<backend::Page>,
+    /// A hash of what the app's windows show (`content_hash`), read only
+    /// when the backend gets no change events: an input that changes a
+    /// display but neither focus nor title still shows.
+    content: Option<u64>,
 }
 
 /// After an input to a window showing a web page, how much longer than
@@ -1174,6 +1183,14 @@ fn effect_text<Id: PartialEq>(
             "no visible change (the page was already loading: wait_idle before reading it)".into()
         }
         _ if events == Some(true) => "changed".into(),
+        // No events to go by: what the app shows differs.
+        _ if events.is_none()
+            && before.content.is_some()
+            && after.content.is_some()
+            && before.content != after.content =>
+        {
+            "changed".into()
+        }
         _ => "no visible change".into(),
     }
 }
@@ -1281,6 +1298,11 @@ fn indicator_label(tool: &str, a: &Json) -> Option<String> {
 const MENU_FETCH_ROUNDS: usize = 50;
 /// How long `menu` waits for a submenu it opened to list its entries.
 const MENU_OPEN_WAIT: Duration = Duration::from_millis(2000);
+/// Between looks for a menu that is no window of its own (`open_menus`).
+const MENU_POLL: Duration = Duration::from_millis(30);
+/// After this long, a menu that showed before a submenu was opened may be
+/// that submenu (opened again) rather than one about to close.
+const MENU_OLD_AFTER: Duration = Duration::from_millis(400);
 
 /// The action that runs a menu entry: press, click and the like, else its
 /// only (or first) action; None without any.
@@ -1354,6 +1376,13 @@ fn window_reached(w: &WindowGeo, c: &WindowChange) -> bool {
         _ => true,
     };
     state && near(c.x, w.x) && near(c.y, w.y) && near(c.width, w.width) && near(c.height, w.height)
+}
+
+/// Whether two reads of windows can be the same window by their handles
+/// (`id`, 0 where the backend has none): two windows of a process can
+/// share a title.
+fn same_id(a: &WindowGeo, b: &WindowGeo) -> bool {
+    a.id == 0 || b.id == 0 || a.id == b.id
 }
 
 /// `"title" [app] at (x,y) WxH {active,maximized} on OUTPUT, desktop 2`.
@@ -1443,17 +1472,38 @@ fn file_dialog_owner<Id>(d: &FileDialog<Id>, allowed: &[String]) -> R<String> {
     ))
 }
 
+/// What separates `~` from the rest of a path: also `\\` on Windows.
+const HOME_SEPS: &[char] = if cfg!(windows) { &['/', '\\'] } else { &['/'] };
+
+/// The home folder `~` stands for: HOME, else (Windows, where it is
+/// usually unset) USERPROFILE.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| {
+            cfg!(windows)
+                .then(|| std::env::var_os("USERPROFILE"))
+                .flatten()
+        })
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+}
+
 /// `raw` with a leading `~` expanded to `home`; Err unless the result is an
 /// absolute path on one line.
 fn expand_path(raw: &str, home: Option<&std::path::Path>) -> R<PathBuf> {
+    expand_path_with(raw, home, HOME_SEPS)
+}
+
+/// `expand_path` with `seps` as the separators after `~`.
+fn expand_path_with(raw: &str, home: Option<&std::path::Path>, seps: &[char]) -> R<PathBuf> {
     let raw = raw.trim();
     if raw.is_empty() || raw.contains(['\n', '\r']) {
         return Err("path must be one non-empty line".into());
     }
     let path = match raw.strip_prefix('~') {
-        Some(rest) if rest.is_empty() || rest.starts_with('/') => home
-            .ok_or("cannot expand ~: HOME is not set")?
-            .join(rest.trim_start_matches('/')),
+        Some(rest) if rest.is_empty() || rest.starts_with(seps) => home
+            .ok_or("cannot expand ~: the home folder is not set")?
+            .join(rest.trim_start_matches(seps)),
         Some(_) => return Err("only ~ and ~/… are expanded, not ~user".into()),
         None => PathBuf::from(raw),
     };
@@ -2024,6 +2074,14 @@ impl<B: Backend> Server<B> {
     /// The allowlist file, parsed (see `policy`); created with the
     /// backend's default list when missing.
     fn policy(&self) -> Policy {
+        let mut p = self.policy_file();
+        p.add_aliases(&self.b.app_aliases());
+        p
+    }
+
+    /// The allowlist file as written, without the apps allowed through an
+    /// alias.
+    fn policy_file(&self) -> Policy {
         if !self.allow_file.exists() {
             if let Some(dir) = self.allow_file.parent() {
                 let _ = std::fs::create_dir_all(dir);
@@ -2937,12 +2995,13 @@ impl<B: Backend> Server<B> {
     /// OPENER_ROLES element) it first waits up to SETTLE_MS for a menu,
     /// list or dialog to show; otherwise only what showed already counts.
     async fn opened_note(&self, tool: &str, a: &Json, mark: u64) -> String {
-        if !self.b.names_surfaces() {
+        if !self.b.names_menus() {
             return String::new();
         }
         let opener =
             opens_surface(tool, a) || GATE.try_with(|g| g.borrow().opener).unwrap_or(false);
         if opener {
+            let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
             let wait = Duration::from_millis(SETTLE_MS as u64);
             trace::time("wait_shown", self.b.wait_shown(&[], mark, wait)).await;
         }
@@ -2957,7 +3016,7 @@ impl<B: Backend> Server<B> {
     /// windows are looked at, and what the last scan listed is not again.
     /// What shows after this is left to the next input's reply.
     async fn surfaces_note(&self, mark: u64, scan: bool) -> String {
-        if !self.b.names_surfaces() {
+        if !self.b.names_menus() {
             return String::new();
         }
         let next = self.b.change_mark();
@@ -2992,10 +3051,33 @@ impl<B: Backend> Server<B> {
                     return Vec::new();
                 }
                 let app = app.to_lowercase();
-                match self.b.app_windows(&app).await {
-                    Some(windows) => self.surfaces(windows, true, Some(&app), &[]).await,
-                    None => Vec::new(),
+                let Some(mut windows) = self.b.app_windows(&app).await else {
+                    return Vec::new();
+                };
+                // Menus inside the windows (`open_menus`), looked for after
+                // an input likely to open one (a search of the whole app),
+                // which may show a little later: up to SETTLE_MS.
+                if GATE.try_with(|g| g.borrow().opener).unwrap_or(false) {
+                    let start = Instant::now();
+                    while let Some(menus) = self.b.open_menus(&windows).await {
+                        if !menus.is_empty() {
+                            // Opened by this input, though the last look
+                            // listed it (the same flyout, opened again).
+                            let hashes: Vec<u64> = menus.iter().map(id_hash).collect();
+                            self.seen_surfaces
+                                .lock()
+                                .await
+                                .retain(|h| !hashes.contains(h));
+                            windows.extend(menus);
+                            break;
+                        }
+                        if start.elapsed() >= Duration::from_millis(SETTLE_MS as u64) {
+                            break;
+                        }
+                        tokio::time::sleep(MENU_POLL).await;
+                    }
                 }
+                self.surfaces(windows, true, Some(&app), &[]).await
             }
             None => Vec::new(),
         }
@@ -3007,7 +3089,7 @@ impl<B: Backend> Server<B> {
     /// before this call's input; said with its own "opened:" lines. No
     /// round trip when nothing was shown.
     async fn opened_before(&self) -> String {
-        if !self.b.names_surfaces() {
+        if !self.b.names_menus() {
             return String::new();
         }
         let Some((mark, listed)) = self.shown_pending.lock().await.clone() else {
@@ -3039,6 +3121,20 @@ impl<B: Backend> Server<B> {
         app: Option<&str>,
         skip: &[u64],
     ) -> Vec<String> {
+        self.surfaces_as(candidates, scanned, app, skip, false)
+            .await
+    }
+
+    /// `surfaces`; with `dialogs`, every candidate is taken for a dialog
+    /// (`dialogs_of`'s, whose roles do not say so).
+    async fn surfaces_as(
+        &self,
+        candidates: Vec<B::Id>,
+        scanned: bool,
+        app: Option<&str>,
+        skip: &[u64],
+        dialogs: bool,
+    ) -> Vec<String> {
         if candidates.is_empty() {
             return Vec::new();
         }
@@ -3059,7 +3155,13 @@ impl<B: Backend> Server<B> {
         let mut picked: Vec<(B::Id, String, render::Surface)> = candidates
             .into_iter()
             .zip(roles)
-            .filter_map(|((c, app), (role, _))| Some((c, app, render::surface_kind(&role)?)))
+            .filter_map(|((c, app), (role, _))| {
+                let kind = match dialogs {
+                    true => render::Surface::Dialog,
+                    false => render::surface_kind(&role)?,
+                };
+                Some((c, app, kind))
+            })
             .collect();
         // A list counts only under a combo box.
         let keep = futures_util::future::join_all(picked.iter().map(|(c, _, kind)| async move {
@@ -3245,13 +3347,20 @@ impl<B: Backend> Server<B> {
             focus: focus.map(|f| (f.id, f.info.role, f.info.name, f.info.states)),
             app: None,
             page: None,
+            content: None,
         }
     }
 
     /// What an input's effect line compares before and after it: the
     /// `fingerprint`, and for `app` (the app the input names, else the
     /// active window's), when allowed, its windows and the page shown.
-    async fn input_fingerprint(&self, app: Option<String>) -> Fingerprint<B::Id> {
+    /// `content`: the app's content hash when just read (else read here,
+    /// for a backend without change events).
+    async fn input_fingerprint(
+        &self,
+        app: Option<String>,
+        content: Option<u64>,
+    ) -> Fingerprint<B::Id> {
         let named = app.map(|a| a.to_lowercase());
         let allowed = named.clone().filter(|a| self.is_allowed(a));
         // An app named: its windows read alongside.
@@ -3278,6 +3387,12 @@ impl<B: Backend> Server<B> {
         };
         if let (Some(app), Some(windows)) = (app, windows) {
             print.page = trace::time("page", self.page_of(&app, &windows)).await;
+            if self.b.compares_content() {
+                print.content = match content {
+                    Some(c) => Some(c),
+                    None => Some(trace::time("content", self.content_hash(&windows)).await),
+                };
+            }
             print.app = Some((app, windows));
         }
         print
@@ -3397,20 +3512,39 @@ impl<B: Backend> Server<B> {
             near.extend(windows.iter().cloned());
         }
         near.extend(content);
-        if settle > 0 {
-            self.b
-                .wait_change(&near, mark, Duration::from_millis(settle))
-                .await;
-        }
-        let mut events = self.b.changed_since(&near, mark);
-        // A page answers late: wait a little longer for it to start (not
-        // when nothing was sent).
-        if settle > 0 && sent && before.page.is_some() && events != Some(true) {
-            trace::time("page settle", self.b.wait_change(&near, mark, PAGE_SETTLE)).await;
-            events = self.b.changed_since(&near, mark);
-        }
+        // Without change events, the app's content is read again until it
+        // differs: a display that changed shows although focus and title
+        // stayed. A page answers late: a little longer.
+        let mut content_now = None;
+        let events = if let (Some(was), Some((_, windows)), None) = (
+            before.content,
+            &before.app,
+            self.b.changed_since(&near, mark),
+        ) {
+            let mut limit = Duration::from_millis(settle);
+            if settle > 0 && sent && before.page.is_some() {
+                limit += PAGE_SETTLE;
+            }
+            let now = trace::time("content settle", self.content_settle(windows, was, limit)).await;
+            content_now = Some(now);
+            None
+        } else {
+            if settle > 0 {
+                self.b
+                    .wait_change(&near, mark, Duration::from_millis(settle))
+                    .await;
+            }
+            let mut events = self.b.changed_since(&near, mark);
+            // A page answers late: wait a little longer for it to start
+            // (not when nothing was sent).
+            if settle > 0 && sent && before.page.is_some() && events != Some(true) {
+                trace::time("page settle", self.b.wait_change(&near, mark, PAGE_SETTLE)).await;
+                events = self.b.changed_since(&near, mark);
+            }
+            events
+        };
         let app = before.app.as_ref().map(|(app, _)| app.clone());
-        let after = self.input_fingerprint(app).await;
+        let after = self.input_fingerprint(app, content_now).await;
         let allowed = self.allowed();
         let is_allowed = |app: &str| allowed.contains(&app.to_lowercase());
         let mut text = format!(
@@ -3592,9 +3726,9 @@ impl<B: Backend> Server<B> {
         let policy = self.policy();
         let allowed = policy.names();
         if let Ok(list) = self.b.windows(&query, &allowed).await
-            && let Some(first) = list.first()
+            && let Some(w) = self.b.window_to_change(&list).and_then(|i| list.get(i))
         {
-            self.permit(&self.window_app(first).await).await?;
+            self.permit(&self.window_app(w).await).await?;
         }
         let tiered = policy.names_with(policy::needed_tier("move_window", a));
         let mut w = self.b.set_window(&query, &tiered, &change).await?;
@@ -3604,7 +3738,7 @@ impl<B: Backend> Server<B> {
         while !window_reached(&w, &change) && start.elapsed() < WINDOW_SETTLE {
             tokio::time::sleep(Duration::from_millis(25)).await;
             let now = self.b.windows(&w.title, &allowed).await?;
-            match now.into_iter().find(|n| n.app == w.app) {
+            match now.into_iter().find(|n| n.app == w.app && same_id(n, &w)) {
                 Some(n) => w = n,
                 None => break,
             }
@@ -3645,7 +3779,12 @@ impl<B: Backend> Server<B> {
                 .await
                 .unwrap_or_default()
                 .iter()
-                .any(|n| n.app == closed.app && n.pid == closed.pid && n.title == closed.title);
+                .any(|n| {
+                    n.app == closed.app
+                        && n.pid == closed.pid
+                        && n.title == closed.title
+                        && same_id(n, &closed)
+                });
             if !open || start.elapsed() >= CLOSE_SETTLE {
                 break !open;
             }
@@ -3655,16 +3794,17 @@ impl<B: Backend> Server<B> {
             return Ok(format!("closed {what}"));
         }
         // The app's dialogs (a save prompt), with their buttons' ids.
-        let windows = match self.b.names_surfaces() {
+        let named = self.b.names_surfaces();
+        let windows = match named {
             true => self
                 .b
                 .app_windows(&app.to_lowercase())
                 .await
                 .unwrap_or_default(),
-            false => Vec::new(),
+            false => self.b.dialogs_of(&closed).await,
         };
         let shown = self
-            .surfaces(windows, false, Some(&app.to_lowercase()), &[])
+            .surfaces_as(windows, false, Some(&app.to_lowercase()), &[], !named)
             .await;
         Ok(if shown.is_empty() {
             format!(
@@ -3743,14 +3883,24 @@ impl<B: Backend> Server<B> {
             ));
         };
         row(true, "update", &update);
+        let listed = self.policy_file();
+        let aliased: Vec<String> = allow
+            .iter()
+            .filter(|a| listed.tier(a).is_none())
+            .cloned()
+            .collect();
+        let aliased = match aliased.is_empty() {
+            true => String::new(),
+            false => format!("; allowed through an alias: {}", aliased.join(", ")),
+        };
         row(
             !allow.is_empty(),
             "allowlist",
             &format!(
-                "{} ({} apps: {})",
+                "{} ({} apps: {}){aliased}",
                 self.allow_file.display(),
-                allow.len(),
-                policy.apps_line()
+                listed.apps.len(),
+                listed.apps_line()
             ),
         );
         for w in &policy.warnings {
@@ -3765,7 +3915,10 @@ impl<B: Backend> Server<B> {
             true,
             "confirm",
             &if policy.confirm.is_empty() {
-                "none (add e.g. 'confirm: key:konsole' to the allowlist)".to_string()
+                format!(
+                    "none (add e.g. 'confirm: {}' to the allowlist)",
+                    self.b.confirm_example()
+                )
             } else {
                 let list: Vec<String> = policy.confirm.iter().map(|r| r.to_string()).collect();
                 format!("{}; {asks}", list.join(", "))
@@ -4101,6 +4254,20 @@ impl<B: Backend> Server<B> {
         };
         let t = self.target(a).await?;
         let id = &t.id;
+        // Expanding a menu entry opens its submenu: the reply waits for it
+        // (`opened_note`).
+        let opens = |name: &str| ["expand", "show menu"].contains(&name.to_lowercase().as_str());
+        let menu_like =
+            render::role_in(&t.role, &OPENER_ROLES) || render::role_in(&t.role, &DROP_DOWN_ROLES);
+        if menu_like && (verb == Some(Verb::Expand) || opens(&action)) {
+            let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
+        }
+        // A drop-down button (UIA: a button that expands) opens a menu
+        // whatever its action.
+        let drop_down = |names: &[String]| {
+            render::role_in(&t.role, &DROP_DOWN_ROLES)
+                && names.iter().any(|n| n.eq_ignore_ascii_case("expand"))
+        };
         if let Some(verb) = verb {
             let done = self.verified(&t, verb, &action, option.as_deref()).await;
             // None: not of the kind, but it has an action of that name.
@@ -4136,6 +4303,9 @@ impl<B: Backend> Server<B> {
                     let list: Vec<String> = names.iter().map(|n| render::py_repr(n)).collect();
                     format!("action '{action}' not in [{}]", list.join(", "))
                 })?;
+        }
+        if (render::role_in(&t.role, &OPENER_ROLES) && opens(&names[idx])) || drop_down(&names) {
+            let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
         }
         let pre = self.pre_content(Some(id));
         let ok = self.b.do_action(id, idx).await?;
@@ -4484,7 +4654,8 @@ impl<B: Backend> Server<B> {
             stop_roles: &[],
             offscreen: false,
         };
-        let mut next = vec![control.clone()];
+        // Its entries may have come or gone since it was found.
+        let mut next = vec![self.b.live(control)];
         for _ in 0..MENU_FETCH_ROUNDS {
             self.b.prefetch_with(&mut cache, next, &fetch).await;
             let (items, missing) = semantic::walk_options(&cache, control);
@@ -4780,7 +4951,9 @@ impl<B: Backend> Server<B> {
             }
             let menus: Vec<B::Id> = popups
                 .iter()
-                .filter(|(_, i)| i.showing && matches!(i.role.as_str(), "menu" | "popup menu"))
+                .filter(|(_, i)| {
+                    i.showing && render::surface_kind(&i.role) == Some(render::Surface::Menu)
+                })
                 .map(|(id, _)| id.clone())
                 .collect();
             let found: Vec<B::Id> = menus
@@ -5133,6 +5306,47 @@ impl<B: Backend> Server<B> {
         Ok(())
     }
 
+    /// The entries of the submenu `node` opened when they are not below it
+    /// (`open_menus`): of the first menu showing that does not hold `node`,
+    /// one that showed before it was opened (`before`) only with `old`.
+    async fn detached_entries(
+        &self,
+        cache: &mut Cache<B::Id>,
+        node: &B::Id,
+        windows: &[B::Id],
+        before: &[B::Id],
+        old: bool,
+    ) -> Vec<B::Id> {
+        let Some(menus) = self.b.open_menus(windows).await else {
+            return Vec::new();
+        };
+        let (new, seen): (Vec<B::Id>, Vec<B::Id>) =
+            menus.into_iter().partition(|m| !before.contains(m));
+        let menus = match old {
+            true => new.into_iter().chain(seen).collect(),
+            false => new,
+        };
+        for menu in menus {
+            let mut one = Cache::new();
+            self.b
+                .prefetch_with(
+                    &mut one,
+                    vec![menu.clone()],
+                    &search_fetch(0, render::FIND_MAX_SEEN),
+                )
+                .await;
+            if render::holds(&one, &menu, node) {
+                continue;
+            }
+            let items = self.menu_entries(&mut one, &menu).await;
+            cache.extend(one);
+            if !items.is_empty() {
+                return items;
+            }
+        }
+        Vec::new()
+    }
+
     async fn open_submenu(
         &self,
         cache: &mut Cache<B::Id>,
@@ -5151,13 +5365,35 @@ impl<B: Backend> Server<B> {
         let idx = actions
             .iter()
             .position(|a| {
-                ["show menu", "open", "click", "press", "activate"]
+                ["show menu", "expand", "open", "click", "press", "activate"]
                     .contains(&a.to_lowercase().as_str())
             })
             .or((!actions.is_empty()).then_some(0))
             .ok_or(
                 "its entries are not in the accessibility tree and it has no action to open it",
             )?;
+        // Menus open already (the one holding `node`, or one left open) are
+        // not the submenu, unless nothing else shows.
+        let mut before = self.b.open_menus(windows).await.unwrap_or_default();
+        // Open already (a listing left it so): closed first, with what it
+        // opened in turn, so the menu that shows is its own.
+        if !before.is_empty()
+            && let Some(c) = actions
+                .iter()
+                .position(|a| a.eq_ignore_ascii_case("collapse"))
+            && self.b.info(node, 0).await.states.contains(&"expanded")
+        {
+            self.b.do_action(node, c).await?;
+            let start = Instant::now();
+            while start.elapsed() < MENU_OLD_AFTER {
+                tokio::time::sleep(MENU_POLL).await;
+                let now = self.b.open_menus(windows).await.unwrap_or_default();
+                if now.len() < before.len() {
+                    before = now;
+                    break;
+                }
+            }
+        }
         let mut mark = self.b.change_mark();
         self.b.do_action(node, idx).await?;
         let start = Instant::now();
@@ -5165,7 +5401,13 @@ impl<B: Backend> Server<B> {
             // Read the entry afresh: what the cache holds predates the popup.
             let mut fresh = Cache::new();
             fresh.insert(node.clone(), self.b.info(node, 0).await);
-            let items = self.menu_entries(&mut fresh, node).await;
+            let mut items = self.menu_entries(&mut fresh, node).await;
+            if items.is_empty() {
+                let old = start.elapsed() >= MENU_OLD_AFTER;
+                items = self
+                    .detached_entries(&mut fresh, node, windows, &before, old)
+                    .await;
+            }
             cache.extend(fresh);
             if !items.is_empty() {
                 return Ok(items);
@@ -5595,6 +5837,20 @@ impl<B: Backend> Server<B> {
         }
     }
 
+    /// `content_hash` of `windows` read until it differs from `was` or
+    /// `limit` passed (read at least once): the last hash read.
+    async fn content_settle(&self, windows: &[B::Id], was: u64, limit: Duration) -> u64 {
+        let start = Instant::now();
+        loop {
+            let now = self.content_hash(windows).await;
+            let left = limit.saturating_sub(start.elapsed());
+            if now != was || left.is_zero() {
+                return now;
+            }
+            tokio::time::sleep(left.min(CONTENT_POLL)).await;
+        }
+    }
+
     /// A hash of what the visible part of `windows` shows.
     async fn content_hash(&self, windows: &[B::Id]) -> u64 {
         let mut cache = Cache::new();
@@ -5638,7 +5894,7 @@ impl<B: Backend> Server<B> {
             self.check_button_free(&button)?;
         }
         let (t, (x, y)) = self.target_center(a).await?;
-        if clicks > 0 && OPENER_ROLES.contains(&t.role.as_str()) {
+        if clicks > 0 && render::role_in(&t.role, &OPENER_ROLES) {
             let _ = GATE.try_with(|g| g.borrow_mut().opener = true);
         }
         let pre = self.pre_content(Some(&t.id));
@@ -6126,8 +6382,7 @@ impl<B: Backend> Server<B> {
     /// it to close. Nothing else in the dialog (or the portal) is exposed.
     async fn file_dialog(&self, a: &Json) -> R<String> {
         let action = arg_s(a, "action", "open").to_lowercase();
-        let home = std::env::var_os("HOME").map(PathBuf::from);
-        let path = expand_path(&req_s(a, "path")?, home.as_deref())?;
+        let path = expand_path(&req_s(a, "path")?, home_dir().as_deref())?;
         check_dialog_path(&path, &action)?;
         let (limit_ms, note) = wait_ms(a, "timeout_ms", 5000);
         self.b.enable().await;
@@ -6136,7 +6391,11 @@ impl<B: Backend> Server<B> {
         let owner = file_dialog_owner(&d, &allowed)
             .map_err(|e| refusal(format!("{e} (allowlist: {})", self.allow_file.display())))?;
         self.permit(&owner).await?;
-        let text = path.display().to_string();
+        let mut text = path.display().to_string();
+        if cfg!(windows) {
+            // `~/x` joined to the profile folder; the dialog's own form.
+            text = text.replace('/', "\\");
+        }
         // file_dialog found the dialog in front and checked whose it is.
         if matches!(
             self.write_text(&d.field, &text, true).await?,
@@ -6194,9 +6453,16 @@ impl<B: Backend> Server<B> {
         .await;
         let ms = start.elapsed().as_millis();
         if !closed {
+            let shows = match self.b.file_dialog_prompt(&d.window).await {
+                Some(t) => format!(
+                    "it shows {} in front (an overwrite confirmation or an error), \
+                     left unanswered",
+                    render::py_repr(&t)
+                ),
+                None => "it may ask to confirm overwriting a file, or show an error".into(),
+            };
             return Err(format!(
-                "wrote {text} and {how}, but the dialog is still open after {ms} ms{note}: \
-                 it may ask to confirm overwriting a file, or show an error"
+                "wrote {text} and {how}, but the dialog is still open after {ms} ms{note}: {shows}"
             ));
         }
         *self.last_active.lock().await = self.active_title().await;
@@ -6689,7 +6955,7 @@ impl<B: Backend> Server<B> {
                 self.b.change_mark(),
                 trace::time(
                     "fingerprint before",
-                    self.input_fingerprint(self.input_app(a).await),
+                    self.input_fingerprint(self.input_app(a).await, None),
                 )
                 .await,
             )),
@@ -6934,6 +7200,10 @@ const SURFACE_TOOLS: [&str; 4] = ["click", "mouse", "key", "type_text"];
 /// Roles of elements a click on likely opens a menu, list or dialog with.
 const OPENER_ROLES: [&str; 4] = ["combo box", "push button menu", "menu", "menu item"];
 
+/// Roles of a button that opens a menu when it also has an "expand"
+/// action (UIA's drop-down and split buttons).
+const DROP_DOWN_ROLES: [&str; 3] = ["button", "push button", "split button"];
+
 /// Whether an input is likely to open a menu, list or dialog, so its reply
 /// waits (up to SETTLE_MS) for one to show: a right click, the menu key,
 /// F10 or alt + a letter (menus), alt+down (a combo box's list), and the
@@ -7088,6 +7358,7 @@ async fn serve<B: Backend + 'static>(backend: B) -> R<()> {
     // On a signal the calls still running were dropped with run_loop:
     // release what they or `hold` left pressed before exiting.
     let _ = server.release_all().await;
+    server.b.shutdown();
     result
 }
 
@@ -7491,6 +7762,8 @@ mod tests {
         next: RefCell<Vec<u32>>,
         /// Parent of an element, by id.
         parents: RefCell<HashMap<u32, u32>>,
+        /// `dialogs_of` names the dialog `close_window` opens.
+        names_dialogs: std::cell::Cell<bool>,
         /// `close_window` leaves the window open and opens this dialog
         /// window; without it, the fake has no window control.
         close_opens: std::cell::Cell<Option<u32>>,
@@ -7503,7 +7776,14 @@ mod tests {
         uia_roles: std::cell::Cell<bool>,
         /// Dialogs `fills_file_dialog` takes for file dialogs.
         file_dialogs: RefCell<Vec<u32>>,
+        /// Submenus open apart from their entry, as UIA's XAML flyouts:
+        /// expanding entry k shows menu `flyouts[k]` in the pane
+        /// FAKE_POPUP_HOST; `open_menus` finds them.
+        flyouts: RefCell<HashMap<u32, u32>>,
     }
+
+    /// Where the fake shows a flyout (`FakeShown::flyouts`).
+    const FAKE_POPUP_HOST: u32 = 40;
 
     impl FakeShown {
         /// The elements an input shows appear, with an event each.
@@ -7541,6 +7821,8 @@ mod tests {
         /// `changed_since` says the app changed when asked about this
         /// element of it (the app's windows), when Some.
         events_on: std::cell::Cell<Option<u32>>,
+        /// The effect line compares the app's content (`compares_content`).
+        content: std::cell::Cell<bool>,
         /// `wait_change` hears of changes (`changes_live`): each bumps the
         /// change mark (`FakeShown::seq`) and `changes`.
         events: std::cell::Cell<bool>,
@@ -7587,6 +7869,13 @@ mod tests {
         }
         fn apps_note(&self) -> &'static str {
             ""
+        }
+        fn confirm_example(&self) -> &'static str {
+            "key:fake"
+        }
+        /// As a Store app hosted by the allowed "fake".
+        fn app_aliases(&self) -> Vec<(String, &'static str)> {
+            vec![("hosted".into(), "fake")]
         }
         fn boring_roles(&self) -> &'static [&'static str] {
             &[]
@@ -7661,18 +7950,49 @@ mod tests {
         fn names_surfaces(&self) -> bool {
             !self.shown.uia_roles.get()
         }
+        fn names_menus(&self) -> bool {
+            self.names_surfaces() || !self.shown.flyouts.borrow().is_empty()
+        }
+        async fn open_menus(&self, windows: &[u32]) -> Option<Vec<u32>> {
+            if self.shown.flyouts.borrow().is_empty() {
+                return None;
+            }
+            let mut out = Vec::new();
+            let mut stack: Vec<u32> = Vec::new();
+            for w in windows {
+                stack.extend(self.info(w, 0).await.children);
+            }
+            while let Some(id) = stack.pop() {
+                let info = self.info(&id, 0).await;
+                if !info.showing {
+                    continue;
+                }
+                if info.role == "menu" {
+                    out.push(id);
+                }
+                stack.extend(info.children);
+            }
+            Some(out)
+        }
         async fn fills_file_dialog(&self, window: &u32) -> bool {
             self.shown.file_dialogs.borrow().contains(window)
         }
         async fn app_name(&self, id: &u32) -> Option<String> {
             (!self.shown.nameless.borrow().contains(id)).then(|| "fake".into())
         }
+        async fn dialogs_of(&self, _w: &WindowGeo) -> Vec<u32> {
+            // The dialog `close_window` opened, when set to name it.
+            match self.shown.names_dialogs.get() {
+                true => self.shown.close_opens.get().into_iter().collect(),
+                false => Vec::new(),
+            }
+        }
         async fn close_window(&self, query: &str, allowed: &[String]) -> R<WindowGeo> {
             let dialog = self
                 .shown
                 .close_opens
                 .get()
-                .ok_or(backend::NO_WINDOW_CONTROL)?;
+                .ok_or_else(|| delivery::nothing_sent(backend::NO_WINDOW_CONTROL))?;
             let list = self.windows(query, allowed).await?;
             let [w] = list.as_slice() else {
                 return Err(backend::not_one_window(query, &list));
@@ -7687,6 +8007,9 @@ mod tests {
         }
         fn changes_live(&self) -> bool {
             self.reads.events.get()
+        }
+        fn compares_content(&self) -> bool {
+            self.reads.content.get()
         }
         fn changed_since(&self, near: &[u32], mark: u64) -> Option<bool> {
             // Events on one element of the app (its windows), when set;
@@ -7884,6 +8207,18 @@ mod tests {
                 }
             }
             let mut nodes = self.nodes.borrow_mut();
+            let flyouts = self.shown.flyouts.borrow();
+            if let Some(menu) = flyouts.get(id)
+                && let Some(host) = nodes.get_mut(&FAKE_POPUP_HOST)
+            {
+                match action.as_deref() {
+                    Some("expand") if !host.children.contains(menu) => host.children.push(*menu),
+                    // Closes the submenus opened from it too (higher ids).
+                    Some("collapse") => host.children.retain(|m| m < menu),
+                    _ => {}
+                }
+            }
+            drop(flyouts);
             if let Some(n) = nodes.get_mut(id)
                 && n.role == "menu"
                 && n.children.is_empty()
@@ -8716,6 +9051,104 @@ mod tests {
         });
     }
 
+    /// The fake window as Win11 Notepad through UIA: menu bar entries
+    /// that expand, whose submenus open as flyouts in a popup host.
+    fn fake_flyout_menus(s: &Session) {
+        *s.focus.borrow_mut() = Info {
+            role: "window".into(),
+            name: "notes.txt - Fake".into(),
+            showing: true,
+            states: vec!["active"],
+            children: vec![FAKE_POPUP_HOST, 41],
+            ..Info::default()
+        };
+        let entry = |name: &str, kids: &[u32]| Info {
+            actions: vec!["expand".into(), "collapse".into(), "invoke".into()],
+            operable: true,
+            ..fake_node("menuitem", name, kids)
+        };
+        let leaf = |name: &str| Info {
+            actions: vec!["invoke".into()],
+            ..fake_node("menuitem", name, &[])
+        };
+        let mut n = s.nodes.borrow_mut();
+        n.insert(FAKE_POPUP_HOST, fake_node("pane", "PopupHost", &[]));
+        n.insert(41, fake_node("menubar", "", &[42]));
+        n.insert(42, entry("Dosya", &[43]));
+        // The entry's label is a button of the same name.
+        n.insert(43, fake_node("button", "Dosya", &[]));
+        n.insert(44, fake_node("menu", "", &[45, 46]));
+        n.insert(45, leaf("Farklı kaydet"));
+        n.insert(46, entry("En Son", &[]));
+        n.insert(47, fake_node("menu", "", &[48]));
+        n.insert(48, leaf("a.txt"));
+        s.shown.uia_roles.set(true);
+        *s.shown.flyouts.borrow_mut() = HashMap::from([(42, 44), (46, 47)]);
+    }
+
+    #[test]
+    fn menus_open_as_flyouts_apart_from_their_entries() {
+        local(async {
+            let mut s = session("menu-flyout");
+            fake_flyout_menus(&s);
+            let r = call_tool(&mut s, 2, "menu", json!({"app": "fake", "path": "Dosya"})).await;
+            let text = reply_text(&r).to_string();
+            assert!(text.starts_with("\"Dosya\":\n"), "{text}");
+            assert!(text.contains("menuitem \"Farklı kaydet\""), "{text}");
+            assert!(
+                text.contains("\"En Son\" actions=click (submenu)"),
+                "{text}"
+            );
+            assert!(text.contains("(opened \"Dosya\" to read it"), "{text}");
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 42");
+            // The submenu of En Son, not the flyout holding it.
+            let r = call_tool(
+                &mut s,
+                3,
+                "menu",
+                json!({"app": "fake", "path": "Dosya > En Son"}),
+            )
+            .await;
+            let text = reply_text(&r).to_string();
+            assert!(text.contains("menuitem \"a.txt\""), "{text}");
+            assert!(!text.contains("Farklı kaydet"), "{text}");
+            let r = call_tool(
+                &mut s,
+                4,
+                "menu",
+                json!({"app": "fake", "path": "Dosya > Farklı kaydet"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).starts_with("\"Dosya > Farklı kaydet\" -> ok"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 45");
+            // act takes the entry, not its label's button, expands it by
+            // default and lists the flyout it opened.
+            s.nodes
+                .borrow_mut()
+                .get_mut(&FAKE_POPUP_HOST)
+                .unwrap()
+                .children
+                .clear();
+            let r = call_tool(&mut s, 5, "act", json!({"app": "fake", "query": "Dosya"})).await;
+            let text = reply_text(&r);
+            assert!(text.contains("menuitem \"Dosya\""), "{text}");
+            assert!(text.contains("expand -> ok"), "{text}");
+            assert!(
+                text.contains("\nopened: menu (2 entries): [") && text.contains("\"En Son\""),
+                "{text}"
+            );
+            // Opened again (the same flyout): listed again.
+            let r = call_tool(&mut s, 6, "act", json!({"app": "fake", "query": "Dosya"})).await;
+            assert!(
+                reply_text(&r).contains("\nopened: menu (2 entries): ["),
+                "{r}"
+            );
+        });
+    }
+
     #[test]
     fn close_window_names_one_window_and_needs_confirmation() {
         local(async {
@@ -8744,8 +9177,55 @@ mod tests {
                 json!({"query": "notes", "confirm": true}),
             )
             .await;
-            assert!(reply_text(&r).contains(backend::NO_WINDOW_CONTROL), "{r}");
+            let text = reply_text(&r);
+            assert!(text.contains(backend::NO_WINDOW_CONTROL), "{r}");
+            assert!(
+                text.ends_with("; nothing sent") && !text.contains(delivery::MAYBE_SENT),
+                "{text}"
+            );
             assert!(s.keys.borrow().is_empty());
+        });
+    }
+
+    #[test]
+    fn move_window_without_window_control_says_nothing_sent() {
+        local(async {
+            let mut s = session("move-unsupported");
+            let r = call_tool(&mut s, 2, "move_window", json!({"query": "notes", "x": 1})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(text.contains(backend::NO_WINDOW_CONTROL), "{text}");
+            assert!(
+                text.ends_with("; nothing sent") && !text.contains(delivery::MAYBE_SENT),
+                "{text}"
+            );
+        });
+    }
+
+    #[test]
+    fn doctor_confirm_hint_names_an_app_of_the_platform() {
+        local(async {
+            let mut s = session("doctor-hint");
+            let r = call_tool(&mut s, 2, "doctor", json!({})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("none (add e.g. 'confirm: key:fake' to the allowlist)"),
+                "{text}"
+            );
+            assert!(!text.contains("konsole"), "{text}");
+        });
+    }
+
+    #[test]
+    fn doctor_lists_the_file_and_names_apps_allowed_through_an_alias() {
+        local(async {
+            let mut s = session("doctor-alias");
+            let r = call_tool(&mut s, 2, "doctor", json!({})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("(1 apps: fake); allowed through an alias: hosted"),
+                "{text}"
+            );
         });
     }
 
@@ -8814,7 +9294,12 @@ mod tests {
             assert!(text(&r).contains("args must be a list of strings"), "{r}");
             // Allowed: it reaches the backend, which cannot launch here.
             let r = call_tool(&mut s, 4, "launch", json!({"app": " Fake ", "args": ["x"]})).await;
-            assert!(text(&r).contains("not supported"), "{r}");
+            let t = text(&r);
+            assert!(t.contains(backend::NO_LAUNCH), "{t}");
+            assert!(
+                t.ends_with("; nothing sent") && !t.contains(delivery::MAYBE_SENT),
+                "{t}"
+            );
         });
         assert_eq!(
             indicator_label("launch", &json!({"app": "kate"})).as_deref(),
@@ -9174,6 +9659,7 @@ mod tests {
             focus: focus.map(|n| (1u32, "push button".to_string(), n.to_string(), vec![])),
             app: None,
             page: None,
+            content: None,
         };
         let allowed = |app: &str| app != "secret";
         let kate = Some(("kate", "a.txt — Kate"));
@@ -9203,6 +9689,37 @@ mod tests {
         assert_eq!(
             effect(&fp(None, None), None),
             "window changed (none active now)"
+        );
+    }
+
+    #[test]
+    fn effect_without_events_compares_the_content() {
+        let fp = |content: Option<u64>| Fingerprint {
+            window: Some(("calculatorapp".to_string(), "Hesap Makinesi".to_string())),
+            focus: Some((1u32, "button".to_string(), "Yedi".to_string(), vec![])),
+            app: None,
+            page: None,
+            content,
+        };
+        let allowed = |_: &str| true;
+        // Only the display changed: focus and title stayed.
+        assert_eq!(
+            effect_text(&fp(Some(1)), &fp(Some(2)), None, allowed),
+            "changed"
+        );
+        assert_eq!(
+            effect_text(&fp(Some(1)), &fp(Some(1)), None, allowed),
+            "no visible change"
+        );
+        // Not read on one side: nothing to compare.
+        assert_eq!(
+            effect_text(&fp(None), &fp(Some(2)), None, allowed),
+            "no visible change"
+        );
+        // Events, where the backend gets them, decide.
+        assert_eq!(
+            effect_text(&fp(Some(1)), &fp(Some(2)), Some(false), allowed),
+            "no visible change"
         );
     }
 
@@ -9761,6 +10278,16 @@ mod tests {
         assert!(exp("/tmp/a\nb").is_err());
         assert!(exp("").is_err());
         assert!(expand_path("~/x", None).is_err());
+        // On Windows `~\` expands too; elsewhere a backslash is part of
+        // a file name.
+        let home = std::path::Path::new("/home/u");
+        let win = |p: &str| expand_path_with(p, Some(home), &['/', '\\']);
+        assert_eq!(
+            win("~\\Belgeler\\a.txt").unwrap(),
+            home.join("Belgeler\\a.txt")
+        );
+        assert_eq!(win("~/a.txt").unwrap(), home.join("a.txt"));
+        assert!(expand_path_with("~\\a", Some(home), &['/']).is_err());
     }
 
     #[test]
@@ -9788,6 +10315,7 @@ mod tests {
             assert_eq!(r["result"]["isError"], true, "{r}");
             let text = r["result"]["content"][0]["text"].as_str().unwrap();
             assert!(text.contains(backend::NO_FILE_DIALOG), "{text}");
+            assert!(text.ends_with("; nothing sent"), "{text}");
         });
     }
 
@@ -11057,6 +11585,39 @@ mod tests {
             );
             // Listed once, not again after the effect line.
             assert!(!text.contains("opened:"), "{text}");
+            let save = id_before(text, "Save");
+            let r = call_tool(&mut s, 3, "act", json!({"id": save})).await;
+            assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
+        });
+    }
+
+    #[test]
+    fn close_window_lists_a_dialog_the_backend_names_without_its_role() {
+        local(async {
+            let mut s = session("surface-close-uia");
+            fake_surfaces(&s);
+            s.shown.uia_roles.set(true);
+            s.shown.names_dialogs.set(true);
+            // UIA calls a save prompt a "window", with plain buttons.
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.get_mut(&60).unwrap().role = "window".into();
+                nodes.get_mut(&62).unwrap().role = "button".into();
+            }
+            s.shown.close_opens.set(Some(60));
+            let r = call_tool(
+                &mut s,
+                2,
+                "close_window",
+                json!({"query": "notes", "confirm": true}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("still open, showing dialog 'Save?'")
+                    && text.contains("] button \"Save\" ["),
+                "{text}"
+            );
             let save = id_before(text, "Save");
             let r = call_tool(&mut s, 3, "act", json!({"id": save})).await;
             assert!(reply_text(&r).starts_with("Press -> ok"), "{r}");
@@ -13171,6 +13732,37 @@ mod tests {
     }
 
     #[test]
+    fn without_events_the_effect_line_sees_a_display_change() {
+        local(async {
+            let mut s = session("content-effect");
+            s.reads.content.set(true);
+            fake_window(&s, &[41]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(41, fake_node("push button", "Plus", &[]));
+            }
+            // The window's text changes after the press; focus and title
+            // stay. (The fake's prefetch reads only the roots it is given.)
+            let focus = s.focus.clone();
+            let later = tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                focus.borrow_mut().text = Some("12".into());
+            });
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "Plus"})).await;
+            later.await.unwrap();
+            assert!(reply_text(&r).ends_with("; effect: changed"), "{r}");
+            // Nothing changes: said so after the settle.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "Plus"})).await;
+            assert!(
+                reply_text(&r).ends_with("; effect: no visible change"),
+                "{r}"
+            );
+            assert!(start.elapsed() < Duration::from_millis(500));
+        });
+    }
+
+    #[test]
     fn content_waits_are_short_or_absent_when_nothing_changes() {
         local(async {
             let mut s = session("content-cost");
@@ -13856,6 +14448,7 @@ mod tests {
             focus: Some((1u32, "link".to_string(), focus.to_string(), vec![])),
             app: None,
             page,
+            content: None,
         };
         let allowed = |_: &str| true;
         let busy = Some(page("Mail", "u1", true));
@@ -14128,6 +14721,7 @@ mod tests {
             focus: None::<(u32, String, String, Vec<&'static str>)>,
             app: None,
             page,
+            content: None,
         };
         let allowed = |_: &str| true;
         let before = fp("Inbox", Some(page("Inbox", "u1", false)));

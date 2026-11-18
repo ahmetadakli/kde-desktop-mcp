@@ -9,6 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, SAFEARRAY,
 };
@@ -16,7 +17,7 @@ use windows::Win32::System::Variant::{VARIANT, VT_ARRAY, VT_BOOL, VT_BSTR, VT_I4
 use windows::Win32::UI::Accessibility::*;
 use windows::core::{BSTR, Interface};
 
-use super::logic::Props;
+use super::logic::{self, Props};
 use crate::backend::R;
 
 /// Properties fetched with every element, in `Props` order.
@@ -52,6 +53,13 @@ const WINDOW_PROPS: &[UIA_PROPERTY_ID] = &[
     UIA_ControlTypePropertyId,
     UIA_NativeWindowHandlePropertyId,
     UIA_ProcessIdPropertyId,
+    UIA_RuntimeIdPropertyId,
+];
+
+/// Properties `logic::dialog_part` goes by.
+const PART_PROPS: &[UIA_PROPERTY_ID] = &[
+    UIA_AutomationIdPropertyId,
+    UIA_ClassNamePropertyId,
     UIA_RuntimeIdPropertyId,
 ];
 
@@ -197,6 +205,8 @@ struct Requests {
     element: IUIAutomationCacheRequest,
     /// Top-level windows: just what `apps` and matching need.
     windows: IUIAutomationCacheRequest,
+    /// What tells a file dialog's parts apart (`logic::dialog_part`).
+    parts: IUIAutomationCacheRequest,
     all: IUIAutomationCondition,
 }
 
@@ -221,10 +231,19 @@ impl Requests {
                 subtree: request(PROPS, TreeScope_Subtree)?,
                 element: request(PROPS, TreeScope_Element)?,
                 windows: request(WINDOW_PROPS, TreeScope_Element)?,
+                parts: request(PART_PROPS, TreeScope_Element)?,
                 all,
             })
         }
     }
+}
+
+/// What `Uia::file_dialog` found.
+pub struct FileDialogParts {
+    pub window: Elem,
+    pub name: String,
+    pub field: Option<Elem>,
+    pub accept: Option<Elem>,
 }
 
 pub struct Uia {
@@ -298,6 +317,126 @@ impl Uia {
             .collect()
     }
 
+    /// The dialogs of the top-level window `h`: the windows it owns
+    /// (`owned`, a Win32 save prompt) and the modal windows inside it (a
+    /// XAML one, as Win11 Notepad's).
+    pub fn dialogs(&self, h: HWND, owned: &[HWND], pids: &[u32]) -> Vec<Elem> {
+        let Some(req) = &self.req else {
+            return Vec::new();
+        };
+        let mut out: Vec<Elem> = owned
+            .iter()
+            .filter_map(|o| unsafe { self.auto.ElementFromHandleBuildCache(*o, &req.windows) }.ok())
+            .map(|el| Self::wrap(el, false))
+            .collect();
+        let modal = unsafe {
+            let window = VARIANT::from(UIA_WindowControlTypeId.0);
+            let yes = VARIANT::from(true);
+            self.auto
+                .CreatePropertyCondition(UIA_ControlTypePropertyId, &window)
+                .and_then(|w| {
+                    let m = self
+                        .auto
+                        .CreatePropertyCondition(UIA_WindowIsModalPropertyId, &yes)?;
+                    self.auto.CreateAndCondition(&w, &m)
+                })
+        };
+        if let Ok(cond) = modal
+            && let Ok(root) = unsafe { self.auto.ElementFromHandle(h) }
+        {
+            let found =
+                unsafe { root.FindAllBuildCache(TreeScope_Descendants, &cond, &req.windows) };
+            out.extend(Self::elems(found.ok(), false));
+        }
+        // Another process's window owned by (or inside) this one, e.g. a
+        // credential prompt, is not this app's to read.
+        out.retain(|e| pids.contains(&props(&e.el).pid));
+        out
+    }
+
+    /// The menus showing below `roots` (not the roots themselves): a XAML
+    /// flyout (Win11 Notepad's "Dosya" menu) sits in a popup window inside
+    /// the app's window, not below the entry that opened it.
+    pub fn showing_menus(&self, roots: &[IUIAutomationElement]) -> Vec<Elem> {
+        let Some(req) = &self.req else {
+            return Vec::new();
+        };
+        let cond = unsafe {
+            let menu = VARIANT::from(UIA_MenuControlTypeId.0);
+            let no = VARIANT::from(false);
+            self.auto
+                .CreatePropertyCondition(UIA_ControlTypePropertyId, &menu)
+                .and_then(|m| {
+                    let shown = self
+                        .auto
+                        .CreatePropertyCondition(UIA_IsOffscreenPropertyId, &no)?;
+                    self.auto.CreateAndCondition(&m, &shown)
+                })
+        };
+        let Ok(cond) = cond else {
+            return Vec::new();
+        };
+        roots
+            .iter()
+            .flat_map(|root| {
+                let found =
+                    unsafe { root.FindAllBuildCache(TreeScope_Descendants, &cond, &req.windows) };
+                Self::elems(found.ok(), false)
+            })
+            .collect()
+    }
+
+    /// The common file dialog in the window `h` (a #32770): the window
+    /// with its name, and its file name field and default button when
+    /// found (`logic::dialog_part`).
+    pub fn file_dialog(&self, h: HWND) -> Option<FileDialogParts> {
+        let req = self.req.as_ref()?;
+        let window = unsafe { self.auto.ElementFromHandleBuildCache(h, &req.windows) }.ok()?;
+        let name = props(&window).name.trim().to_string();
+        let cond = unsafe {
+            let edit = VARIANT::from(BSTR::from("Edit"));
+            let button = VARIANT::from(BSTR::from("Button"));
+            self.auto
+                .CreatePropertyCondition(UIA_ClassNamePropertyId, &edit)
+                .and_then(|e| {
+                    let b = self
+                        .auto
+                        .CreatePropertyCondition(UIA_ClassNamePropertyId, &button)?;
+                    self.auto.CreateOrCondition(&e, &b)
+                })
+        }
+        .ok()?;
+        let found =
+            unsafe { window.FindAllBuildCache(TreeScope_Descendants, &cond, &req.parts) }.ok();
+        let mut out = FileDialogParts {
+            window: Self::wrap(window, false),
+            name,
+            field: None,
+            accept: None,
+        };
+        let n = found
+            .as_ref()
+            .map_or(0, |a| unsafe { a.Length() }.unwrap_or(0));
+        for i in 0..n {
+            let Some(el) = found.as_ref().and_then(|a| unsafe { a.GetElement(i) }.ok()) else {
+                continue;
+            };
+            let s = |id| cached(&el, id).and_then(|v| v.string()).unwrap_or_default();
+            let slot = match logic::dialog_part(
+                &s(UIA_AutomationIdPropertyId),
+                &s(UIA_ClassNamePropertyId),
+            ) {
+                Some(logic::DialogPart::FileName) => &mut out.field,
+                Some(logic::DialogPart::Accept) => &mut out.accept,
+                None => continue,
+            };
+            if slot.is_none() {
+                *slot = Some(Self::wrap(el, false));
+            }
+        }
+        Some(out)
+    }
+
     /// Fetch `el` and everything below it in one cross-process call.
     pub fn fetch_subtree(&self, el: &IUIAutomationElement) -> Option<IUIAutomationElement> {
         unsafe { el.BuildUpdatedCache(&self.req.as_ref()?.subtree).ok() }
@@ -325,6 +464,15 @@ impl Uia {
 
     pub fn set_focus(&self, el: &IUIAutomationElement) -> bool {
         unsafe { el.SetFocus() }.is_ok()
+    }
+
+    /// The element's own native handle, None when it has none (a
+    /// windowless element).
+    pub fn own_handle(&self, el: &IUIAutomationElement) -> Option<i32> {
+        unsafe { el.CurrentNativeWindowHandle() }
+            .ok()
+            .map(|h| h.0 as usize as u32 as i32)
+            .filter(|h| *h != 0)
     }
 
     /// Native handle of the element or its nearest ancestor that has one.
@@ -381,6 +529,70 @@ impl Uia {
         unsafe { vp.SetValue(&BSTR::from(text)) }.is_ok()
     }
 
+    /// The live FrameworkId ("Win32", "XAML", "Chrome", ...).
+    pub fn framework(&self, el: &IUIAutomationElement) -> String {
+        unsafe { el.CurrentFrameworkId() }
+            .map(|s| s.to_string())
+            .unwrap_or_default()
+    }
+
+    /// The first web document below `el` that is on screen (a browser
+    /// tab's page), in one cross-process call.
+    pub fn showing_document(&self, el: &IUIAutomationElement) -> Option<Elem> {
+        let cond = unsafe {
+            let doc = VARIANT::from(UIA_DocumentControlTypeId.0);
+            let no = VARIANT::from(false);
+            self.auto
+                .CreatePropertyCondition(UIA_ControlTypePropertyId, &doc)
+                .and_then(|d| {
+                    let shown = self
+                        .auto
+                        .CreatePropertyCondition(UIA_IsOffscreenPropertyId, &no)?;
+                    self.auto.CreateAndCondition(&d, &shown)
+                })
+        }
+        .ok()?;
+        let found = unsafe { el.FindFirst(TreeScope_Descendants, &cond) }.ok()?;
+        Some(Self::wrap(found, false))
+    }
+
+    /// The MSAA state bits (LegacyIAccessiblePattern), live.
+    pub fn legacy_state(&self, el: &IUIAutomationElement) -> Option<u32> {
+        let p: IUIAutomationLegacyIAccessiblePattern =
+            Self::pattern(el, UIA_LegacyIAccessiblePatternId)?;
+        unsafe { p.CurrentState() }.ok()
+    }
+
+    /// ScrollItemPattern.ScrollIntoView: Some(whether the app accepted
+    /// it), None when the element has no such pattern.
+    pub fn scroll_into_view(&self, el: &IUIAutomationElement) -> Option<bool> {
+        let p: IUIAutomationScrollItemPattern = Self::pattern(el, UIA_ScrollItemPatternId)?;
+        Some(unsafe { p.ScrollIntoView() }.is_ok())
+    }
+
+    /// The nearest ancestor of `el` that is on screen and scrolls (a
+    /// ScrollPattern that says it can): a list, a web page.
+    pub fn scroll_container(&self, el: &IUIAutomationElement) -> Option<Elem> {
+        let walker = unsafe { self.auto.ControlViewWalker() }.ok()?;
+        let mut cur = el.clone();
+        for _ in 0..64 {
+            cur = unsafe { walker.GetParentElement(&cur) }.ok()?;
+            let off = unsafe { cur.CurrentIsOffscreen() }.map_or(true, |b| b.as_bool());
+            if off {
+                continue;
+            }
+            if let Some(p) = Self::pattern::<IUIAutomationScrollPattern>(&cur, UIA_ScrollPatternId)
+            {
+                let v = unsafe { p.CurrentVerticallyScrollable() }.is_ok_and(|b| b.as_bool());
+                let h = unsafe { p.CurrentHorizontallyScrollable() }.is_ok_and(|b| b.as_bool());
+                if v || h {
+                    return Some(Self::wrap(cur, false));
+                }
+            }
+        }
+        None
+    }
+
     /// Run one entry of the Python action table.
     pub fn perform(&self, el: &IUIAutomationElement, action: &str) -> bool {
         unsafe {
@@ -413,6 +625,13 @@ impl Uia {
             }
         }
     }
+}
+
+/// Whether `el`, fetched with its properties cached, is on screen.
+pub fn cached_onscreen(el: &IUIAutomationElement) -> bool {
+    cached(el, UIA_IsOffscreenPropertyId)
+        .and_then(|v| v.bool())
+        .is_some_and(|off| !off)
 }
 
 /// Cached control type, or the live one for elements fetched without it.
