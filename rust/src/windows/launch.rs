@@ -178,24 +178,27 @@ pub fn installed_hosted_apps() -> Vec<String> {
 }
 
 /// The AppUserModelID of the user's Store app best matching `app` (see
-/// `logic::store_rank`), from the installed packages' manifests.
-fn store_app(app: &str) -> Option<String> {
-    let mut best: Option<(u8, String)> = None;
+/// `logic::store_rank` and `logic::pick_store`), from the installed
+/// packages' manifests.
+fn store_app(app: &str) -> R<Option<String>> {
+    let mut matches: Vec<logic::StoreMatch> = Vec::new();
     for (family, xml) in packages() {
         let (name, apps) = logic::manifest_apps(&xml);
         for (id, exe) in apps {
-            let Some(rank) = logic::store_rank(app, &name, &exe) else {
-                continue;
-            };
-            if best.as_ref().is_none_or(|b| rank < b.0) {
-                best = Some((rank, format!("{family}!{id}")));
+            if let Some(rank) = logic::store_rank(app, &name, &exe) {
+                matches.push(logic::StoreMatch {
+                    rank,
+                    package: name.clone(),
+                    executable: exe,
+                    aumid: format!("{family}!{id}"),
+                });
             }
         }
-        if best.as_ref().is_some_and(|b| b.0 == 0) {
+        if matches.iter().any(|m| m.rank == 0) {
             break;
         }
     }
-    best.map(|b| b.1)
+    logic::pick_store(app, &matches)
 }
 
 /// A file, or a Store execution alias (a 0-byte reparse point that only
@@ -220,7 +223,7 @@ pub fn resolve(app: &str, args: &[String]) -> R<Resolved> {
     let dirs = logic::program_dirs(&path, std::env::var("SystemRoot").ok().as_deref());
     let target = match logic::find_program(&file, app_path, &dirs, exists) {
         Some(p) => Target::Program(p),
-        None => match store_app(app) {
+        None => match store_app(app)? {
             Some(aumid) => Target::Store(aumid),
             None => {
                 return Err(format!(

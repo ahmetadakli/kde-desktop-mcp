@@ -926,6 +926,40 @@ pub fn store_rank(app: &str, package: &str, executable: &str) -> Option<u8> {
     }
 }
 
+/// A Store app `store_rank` matched: its rank, package name, executable
+/// and AppUserModelID.
+pub struct StoreMatch {
+    pub rank: u8,
+    pub package: String,
+    pub executable: String,
+    pub aumid: String,
+}
+
+/// The AppUserModelID to start for `app` among the matches: the best
+/// ranked one. A match by its executable is exact; one by package name is
+/// taken only when no other app matches as well, so a short name ("xbox",
+/// "store") does not start whichever of several packages comes first.
+pub fn pick_store(app: &str, matches: &[StoreMatch]) -> Result<Option<String>, String> {
+    let Some(best) = matches.iter().map(|m| m.rank).min() else {
+        return Ok(None);
+    };
+    let top: Vec<&StoreMatch> = matches.iter().filter(|m| m.rank == best).collect();
+    if best == 0 || top.len() == 1 {
+        return Ok(Some(top[0].aumid.clone()));
+    }
+    let names: Vec<String> = top
+        .iter()
+        .map(|m| match exe_stem(&m.executable) {
+            e if e.is_empty() => m.package.clone(),
+            e => format!("{e} ({})", m.package),
+        })
+        .collect();
+    Err(format!(
+        "'{app}' matches several Store apps: {}; launch one by its executable name",
+        names.join(", ")
+    ))
+}
+
 /// Arguments as one command line, quoted the way programs split it
 /// (CommandLineToArgvW): words with spaces or quotes are quoted, quotes
 /// and the backslashes before them escaped.
@@ -1620,6 +1654,42 @@ mod tests {
         assert_eq!(store_rank("calc", calc, "CalculatorApp.exe"), Some(2));
         assert_eq!(store_rank("app", calc, "CalculatorApp.exe"), None);
         assert_eq!(store_rank("paint", calc, "CalculatorApp.exe"), None);
+    }
+
+    #[test]
+    fn a_store_app_matched_by_package_name_must_be_the_only_one() {
+        let m = |rank, package: &str, executable: &str, aumid: &str| StoreMatch {
+            rank,
+            package: package.into(),
+            executable: executable.into(),
+            aumid: aumid.into(),
+        };
+        assert_eq!(pick_store("x", &[]), Ok(None));
+        let calc = [m(
+            2,
+            "Microsoft.WindowsCalculator",
+            "CalculatorApp.exe",
+            "C!App",
+        )];
+        assert_eq!(pick_store("calculator", &calc), Ok(Some("C!App".into())));
+        let xbox = [
+            m(2, "Microsoft.Xbox.TCUI", "TCUI-App.exe", "T!App"),
+            m(2, "Microsoft.XboxGamingOverlay", "GameBar.exe", "G!App"),
+        ];
+        let e = pick_store("xbox", &xbox).unwrap_err();
+        assert!(e.contains("several Store apps"), "{e}");
+        assert!(e.contains("gamebar (Microsoft.XboxGamingOverlay)"), "{e}");
+        // A better rank decides; an exact executable always does.
+        let mixed = [
+            m(2, "Microsoft.Xbox.TCUI", "TCUI-App.exe", "T!App"),
+            m(1, "Microsoft.Xbox", "", "X!App"),
+        ];
+        assert_eq!(pick_store("xbox", &mixed), Ok(Some("X!App".into())));
+        let exact = [
+            m(0, "A", "gamebar.exe", "A!1"),
+            m(0, "B", "gamebar.exe", "B!1"),
+        ];
+        assert_eq!(pick_store("gamebar", &exact), Ok(Some("A!1".into())));
     }
 
     #[test]
