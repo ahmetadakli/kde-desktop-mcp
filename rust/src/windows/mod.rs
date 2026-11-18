@@ -688,10 +688,19 @@ impl Backend for WindowsBackend {
 
     async fn dialogs_of(&self, w: &WindowGeo) -> Vec<Elem> {
         let all = [w.app.clone()];
-        match wm::find(w, &all) {
-            Some(n) => self.uia.dialogs(n.hwnd, &wm::owned(n.hwnd)),
-            None => Vec::new(),
-        }
+        let Some(n) = wm::find(w, &all) else {
+            return Vec::new();
+        };
+        // The app's own process, and for a Store app's frame the hosted one.
+        let pids: Vec<u32> = [input::hwnd_pid(n.hwnd), n.hosted_pid]
+            .into_iter()
+            .filter(|p| *p != 0)
+            .collect();
+        let owned: Vec<_> = wm::owned(n.hwnd)
+            .into_iter()
+            .filter(|o| pids.contains(&input::hwnd_pid(*o)))
+            .collect();
+        self.uia.dialogs(n.hwnd, &owned, &pids)
     }
 
     async fn windows(&self, query: &str, allowed: &[String]) -> R<Vec<WindowGeo>> {

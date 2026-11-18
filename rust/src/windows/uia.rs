@@ -320,7 +320,7 @@ impl Uia {
     /// The dialogs of the top-level window `h`: the windows it owns
     /// (`owned`, a Win32 save prompt) and the modal windows inside it (a
     /// XAML one, as Win11 Notepad's).
-    pub fn dialogs(&self, h: HWND, owned: &[HWND]) -> Vec<Elem> {
+    pub fn dialogs(&self, h: HWND, owned: &[HWND], pids: &[u32]) -> Vec<Elem> {
         let Some(req) = &self.req else {
             return Vec::new();
         };
@@ -348,6 +348,9 @@ impl Uia {
                 unsafe { root.FindAllBuildCache(TreeScope_Descendants, &cond, &req.windows) };
             out.extend(Self::elems(found.ok(), false));
         }
+        // Another process's window owned by (or inside) this one, e.g. a
+        // credential prompt, is not this app's to read.
+        out.retain(|e| pids.contains(&props(&e.el).pid));
         out
     }
 
