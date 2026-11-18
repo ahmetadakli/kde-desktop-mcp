@@ -696,7 +696,13 @@ pub trait Backend {
             windows,
         }
     }
-    /// Move, resize, maximize, minimize or restore the first such window.
+    /// Which of the windows `windows` lists for a query `set_window`
+    /// changes: the first, unless the backend picks another.
+    fn window_to_change(&self, list: &[WindowGeo]) -> Option<usize> {
+        (!list.is_empty()).then_some(0)
+    }
+    /// Move, resize, maximize, minimize or restore the window
+    /// `window_to_change` picks among those matching `query`.
     async fn set_window(
         &self,
         _query: &str,

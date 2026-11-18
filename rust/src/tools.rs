@@ -438,7 +438,7 @@ pub fn tools() -> Json {
         ),
         t(
             "move_window",
-            "Move and/or resize the first window of an allowed app whose title or\napp name contains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), set `state` to maximize, minimize or restore, and/or\nmove it to virtual desktop `desktop` (number or name as windows lists them;\nHyprland: a workspace, created when the number is new; the view stays).\nReplies with the new geometry. KDE Plasma, Hyprland (there a tiled window\nis floated to move or resize it; minimize parks it on the special workspace\nspecial:minimized) and Windows (without `desktop`).",
+            "Move and/or resize the first window (Windows: the active one if it\nmatches, else the topmost) of an allowed app whose title or app name\ncontains `query` (`x`/`y`/`width`/`height` in screen coordinates;\nomitted ones stay), set `state` to maximize, minimize or restore, and/or\nmove it to virtual desktop `desktop` (number or name as windows lists them;\nHyprland: a workspace, created when the number is new; the view stays).\nReplies with the new geometry. KDE Plasma, Hyprland (there a tiled window\nis floated to move or resize it; minimize parks it on the special workspace\nspecial:minimized) and Windows (without `desktop`).",
             schema(&[
                 ("query", "string", None),
                 ("x", "integer", Some(Json::Null)),

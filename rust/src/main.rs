@@ -3726,9 +3726,9 @@ impl<B: Backend> Server<B> {
         let policy = self.policy();
         let allowed = policy.names();
         if let Ok(list) = self.b.windows(&query, &allowed).await
-            && let Some(first) = list.first()
+            && let Some(w) = self.b.window_to_change(&list).and_then(|i| list.get(i))
         {
-            self.permit(&self.window_app(first).await).await?;
+            self.permit(&self.window_app(w).await).await?;
         }
         let tiered = policy.names_with(policy::needed_tier("move_window", a));
         let mut w = self.b.set_window(&query, &tiered, &change).await?;

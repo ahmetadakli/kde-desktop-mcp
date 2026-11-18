@@ -701,6 +701,11 @@ impl Backend for WindowsBackend {
             .collect())
     }
 
+    fn window_to_change(&self, list: &[WindowGeo]) -> Option<usize> {
+        let active: Vec<bool> = list.iter().map(|w| w.active).collect();
+        logic::pick_window(&active)
+    }
+
     async fn set_window(
         &self,
         query: &str,
