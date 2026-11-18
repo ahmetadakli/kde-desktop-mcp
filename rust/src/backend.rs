@@ -547,6 +547,13 @@ pub trait Backend {
         false
     }
 
+    /// `id` as a root that the next `prefetch` reads afresh, for a read of
+    /// an element that changed since it was found (a combo box that opened
+    /// its list). Backends whose reads are always live return it as is.
+    fn live(&self, id: &Self::Id) -> Self::Id {
+        id.clone()
+    }
+
     /// Whether `menu` may open the submenu entry `id` through its action
     /// to read entries the app lists only while it is open.
     async fn may_open_menu(&self, _id: &Self::Id) -> bool {

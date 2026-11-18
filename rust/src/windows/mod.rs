@@ -288,6 +288,15 @@ impl Drop for PutBack<'_> {
 impl Backend for WindowsBackend {
     type Id = Elem;
 
+    /// A found element carries the subtree read with it; a root without it
+    /// is read again in one cross-process call.
+    fn live(&self, id: &Elem) -> Elem {
+        Elem {
+            subtree: false,
+            ..id.clone()
+        }
+    }
+
     fn allow_file(&self) -> PathBuf {
         let base = std::env::var_os("APPDATA")
             .filter(|v| !v.is_empty())

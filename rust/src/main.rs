@@ -4654,7 +4654,8 @@ impl<B: Backend> Server<B> {
             stop_roles: &[],
             offscreen: false,
         };
-        let mut next = vec![control.clone()];
+        // Its entries may have come or gone since it was found.
+        let mut next = vec![self.b.live(control)];
         for _ in 0..MENU_FETCH_ROUNDS {
             self.b.prefetch_with(&mut cache, next, &fetch).await;
             let (items, missing) = semantic::walk_options(&cache, control);
