@@ -271,10 +271,14 @@ tool; `off` turns it off). Not available on Windows yet.
   saying what the field holds (a length limit, reformatting). Firefox's input
   fields report accessibility writes as successful and do nothing, so when
   single-line text does not take, it focuses the element, selects all with
-  Ctrl+A and types it. An editable element without a text interface (Qt 6's
-  editable combo boxes, such as a KDE file dialog's name field) is typed into
-  the same way and read back from its name. Password fields cannot be read
-  back.
+  Ctrl+A and types it (empty text: Ctrl+A, BackSpace). On Linux, Firefox's
+  fields are typed into right away: their write never took. An editable
+  element without a text interface (Qt 6's editable combo boxes, such as a
+  KDE file dialog's name field) is typed into the same way and read back from
+  its name. When it could not type (another window in front, no focus) and
+  the field holds what it held before, the reply says why and "nothing
+  changed"; a write the field ignored then counts as nothing sent. Password
+  fields cannot be read back.
 - `scroll`: turns the wheel over an element (a list, a page, a panel).
 - Verified actions of `act` (one tool rather than new ones: `act` is loaded
   up front, so they cost no tool-search turn, and the schema grew by about

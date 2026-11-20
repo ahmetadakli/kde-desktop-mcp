@@ -5684,55 +5684,135 @@ impl<B: Backend> Server<B> {
         if t.protected() && !self.passwords_allowed(&t.app) {
             return Err(t.reply(&self.password_refusal("set_text", &t.app)));
         }
-        let typed = match self.write_text(&t.id, &text, false).await? {
-            Written::Refused => return Ok(t.reply("failed")),
-            Written::Set => false,
-            Written::Typed => true,
-        };
         if t.protected() {
-            return Ok(t.reply("ok (password field: contents cannot be read back)"));
-        }
-        if typed {
-            let how = "; typed: the element has no text interface";
-            return match self.read_back(&t.id, &text, SET_TEXT_VERIFY).await {
-                Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
-                Ok(Some(now)) => Err(t.reply(&written_mismatch(&now, &text, how))),
-                Err(e) => Ok(t.reply(&format!("ok (not verified: {e}{how})"))),
+            return match self.write_text(&t.id, &text, false).await? {
+                Written::Refused => Ok(t.reply("failed")),
+                _ => Ok(t.reply("ok (password field: contents cannot be read back)")),
             };
         }
+        // What the field held, to tell a write that changed nothing.
+        let limit = text.chars().count() + 64;
+        let before = self.b.full_text(&t.id, limit).await.ok();
         // Firefox reports success for accessibility writes and changes
         // nothing. Retype through the keyboard when the element takes focus;
         // never with a newline, which Enter would turn into a submit.
         let retypable = !text.contains('\n');
         let key = self.b.app_key(&t.id);
-        let inert = match &key {
-            Some(k) if retypable => self.inert_writes.lock().await.contains(k),
-            _ => false,
-        };
-        // Where writes are known to do nothing, one look instead of waiting
-        // SET_TEXT_VERIFY for the write to show.
-        let patience = if inert {
-            Duration::ZERO
-        } else {
-            SET_TEXT_VERIFY
-        };
+        // Gecko on Linux: every set_text into it had to be typed, so its
+        // write is not tried at all. Elsewhere: once a write did nothing.
+        let gecko =
+            retypable && cfg!(target_os = "linux") && self.b.toolkit_of(&t.id).await == "gecko";
+        let inert = gecko
+            || match &key {
+                Some(k) if retypable => self.inert_writes.lock().await.contains(k),
+                _ => false,
+            };
         let mut how = "";
-        let mut seen = self.read_back(&t.id, &text, patience).await;
-        if matches!(&seen, Ok(Some(_))) && retypable && self.retype(&t.id, &text, false).await {
-            how = "; typed, the accessibility write had no effect";
-            seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
-            if let (Ok(None), Some(k)) = (&seen, key) {
-                self.inert_writes.lock().await.insert(k);
+        // Why the keyboard could not be used, and whether it was.
+        let mut not_typed: Option<String> = None;
+        let mut keyboard = false;
+        let pre = delivery::so_far();
+        if inert {
+            let (r, wrote) = delivery::track(self.retype(&t.id, &text, false)).await;
+            keyboard = wrote;
+            match r {
+                Ok(()) => {
+                    how = if gecko {
+                        "; typed: accessibility writes have no effect in Firefox"
+                    } else {
+                        "; typed, the accessibility write had no effect"
+                    };
+                    let seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+                    return self.set_outcome(&t, &text, seen, &before, how, None, keyboard, pre);
+                }
+                Err(why) if gecko => {
+                    let seen = self.read_back(&t.id, &text, Duration::ZERO).await;
+                    return self.set_outcome(
+                        &t,
+                        &text,
+                        seen,
+                        &before,
+                        "",
+                        Some(why),
+                        keyboard,
+                        pre,
+                    );
+                }
+                // Could not retype: try the write after all, with its usual
+                // time to show.
+                Err(why) => not_typed = Some(why),
             }
-        } else if inert && matches!(&seen, Ok(Some(_))) {
-            // Could not retype: give the write its usual time after all.
-            seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
         }
-        match seen {
-            Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
-            Ok(Some(now)) => Err(t.reply(&written_mismatch(&now, &text, how))),
-            Err(e) => Ok(t.reply(&format!("ok (not verified: {e})"))),
+        let typed = match self.write_text(&t.id, &text, false).await? {
+            Written::Refused => return Ok(t.reply("failed")),
+            Written::Set => false,
+            Written::Typed => true,
+        };
+        if typed {
+            let how = "; typed: the element has no text interface";
+            let seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+            return self.set_outcome(&t, &text, seen, &before, how, None, true, pre);
         }
+        let mut seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+        if matches!(&seen, Ok(Some(_))) && retypable && not_typed.is_none() {
+            let (r, wrote) = delivery::track(self.retype(&t.id, &text, false)).await;
+            keyboard |= wrote;
+            match r {
+                Ok(()) => {
+                    how = "; typed, the accessibility write had no effect";
+                    seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+                    if let (Ok(None), Some(k)) = (&seen, key) {
+                        self.inert_writes.lock().await.insert(k);
+                    }
+                }
+                Err(why) => not_typed = Some(why),
+            }
+        } else if !retypable {
+            not_typed =
+                Some("text with a line break is never typed (Enter could submit it)".into());
+        }
+        self.set_outcome(&t, &text, seen, &before, how, not_typed, keyboard, pre)
+    }
+
+    /// set_text's reply once the field was read back (`seen`, see
+    /// `read_back`): `before` what it held first, `how` it was written,
+    /// `not_typed` why typing it was not possible, `keyboard` whether keys
+    /// (or focus) went out, `pre` whether the call had written anything
+    /// before set_text's own write. A field left as it was says "nothing
+    /// changed", and when only an accessibility write it ignored went out,
+    /// the reply says nothing was sent: a retry is safe.
+    #[allow(clippy::too_many_arguments)]
+    fn set_outcome(
+        &self,
+        t: &Target<B::Id>,
+        text: &str,
+        seen: R<Option<String>>,
+        before: &Option<String>,
+        how: &str,
+        not_typed: Option<String>,
+        keyboard: bool,
+        pre: bool,
+    ) -> R<String> {
+        let now = match seen {
+            Ok(None) => return Ok(t.reply(&format!("ok (verified{how})"))),
+            Err(e) => return Ok(t.reply(&format!("ok (not verified: {e}{how})"))),
+            Ok(Some(now)) => now,
+        };
+        if before.as_deref() != Some(now.as_str()) {
+            return Err(t.reply(&written_mismatch(&now, text, how)));
+        }
+        let shown = shown_value(&now);
+        let what = match (not_typed, keyboard) {
+            (Some(why), _) => format!("it could not be typed: {why}"),
+            (None, true) => format!("typing it changed nothing{how}"),
+            (None, false) => "the accessibility write had no effect".into(),
+        };
+        if !keyboard {
+            delivery::ignored(pre);
+        }
+        Err(t.reply(&format!(
+            "{what}; the field still holds {shown}: nothing changed"
+        )))
     }
 
     /// Write `text` into an element: through its text interface, else, for an
@@ -5753,13 +5833,9 @@ impl<B: Backend> Server<B> {
                 if text.contains('\n') || !editable {
                     return Err(e);
                 }
-                if self.retype(id, text, front_checked).await {
-                    Ok(Written::Typed)
-                } else {
-                    Err(format!(
-                        "{e}, and it would not take the focus to be typed into (not the \
-                         field itself? find it by role, e.g. role \"text\"); nothing typed"
-                    ))
+                match self.retype(id, text, front_checked).await {
+                    Ok(()) => Ok(Written::Typed),
+                    Err(why) => Err(format!("{e}, and it could not be typed: {why}")),
                 }
             }
         }
@@ -5783,17 +5859,29 @@ impl<B: Backend> Server<B> {
         }
     }
 
-    /// Focus the element, select all and type `text`; false when the element
-    /// would not take focus in an allowed active window (nothing typed).
-    /// Runs under the input lock `set_text` (an INPUT_TOOLS entry) holds.
-    async fn retype(&self, id: &B::Id, text: &str, front_checked: bool) -> bool {
-        if !front_checked && self.require_input_front().await.is_err() {
-            return false;
+    /// Focus the element, select all and type `text` (empty: delete the
+    /// selection); Err(why) when the window in front is not one to type
+    /// into or the element would not take focus (nothing typed then), or
+    /// a key failed. Runs under the input lock `set_text` (an INPUT_TOOLS
+    /// entry) holds.
+    async fn retype(&self, id: &B::Id, text: &str, front_checked: bool) -> R<()> {
+        if !front_checked && let Err(e) = self.require_input_front().await {
+            return Err(e);
         }
         if !matches!(self.b.try_focus(id).await, Ok(Some(_))) && !self.b.is_focused(id).await {
-            return false;
+            return Err(
+                "it would not take the keyboard focus (not the field itself? find it \
+                 by role, e.g. role \"text\")"
+                    .into(),
+            );
         }
-        self.b.press_combo("ctrl+a").await.is_ok() && self.b.type_text(text).await.is_ok()
+        self.b.press_combo("ctrl+a").await?;
+        if text.is_empty() {
+            // Typing nothing leaves the selection: delete it.
+            self.b.press_combo("backspace").await
+        } else {
+            self.b.type_text(text).await.map(|_| ())
+        }
     }
 
     /// Why a password field is not filled in, and how the user can allow it.
@@ -7454,14 +7542,20 @@ enum Written {
 
 /// The reply when a written field holds something else than `text`.
 fn written_mismatch(now: &str, text: &str, how: &str) -> String {
-    let shown: String = now.chars().take(120).collect();
-    let more = if now.chars().count() > 120 { "…" } else { "" };
     format!(
-        "written, but the field now holds {shown:?}{more} ({} chars, {} asked{how}); \
+        "written, but the field now holds {} ({} chars, {} asked{how}); \
          it may limit or reformat input",
+        shown_value(now),
         now.chars().count(),
         text.chars().count()
     )
+}
+
+/// A field's value as a reply quotes it: its first 120 characters.
+fn shown_value(now: &str) -> String {
+    let shown: String = now.chars().take(120).collect();
+    let more = if now.chars().count() > 120 { "…" } else { "" };
+    format!("{shown:?}{more}")
 }
 
 /// Longest wait for a parent menu `open_parents` opened to show.
@@ -8574,6 +8668,9 @@ mod tests {
             Ok(field.unwrap_or_default())
         }
         async fn set_text(&self, _: &u32, _: &str) -> R<bool> {
+            if self.field.borrow().is_some() {
+                self.keys.borrow_mut().push("write".into());
+            }
             Ok(true)
         }
         fn app_key(&self, id: &u32) -> Option<String> {
@@ -8606,6 +8703,12 @@ mod tests {
         }
         async fn press_combo(&self, combo: &str) -> R<()> {
             self.keys.borrow_mut().push(format!("down {combo}"));
+            // Deletes the field's text, which ctrl+a selected.
+            if combo == "backspace"
+                && let Some(f) = self.field.borrow_mut().as_mut()
+            {
+                f.clear();
+            }
             self.shown.input();
             self.content_input();
             if let Some(n) = self.sem.user_after_presses.get() {
@@ -12321,9 +12424,102 @@ mod tests {
             // Text with a newline is never retyped: the usual wait, unchanged.
             let start = Instant::now();
             let r = call_tool(&mut s, 5, "set_text", json!({"id": id, "text": "a\nb"})).await;
-            assert!(r.to_string().contains("the field now holds"), "{r}");
+            assert!(
+                reply_text(&r).starts_with(
+                    "Error executing tool set_text: it could not be typed: text with a line \
+                     break is never typed (Enter could submit it); the field still holds \"two\": \
+                     nothing changed; nothing sent\n"
+                ),
+                "{r}"
+            );
             assert!(start.elapsed() >= SET_TEXT_VERIFY);
             assert_eq!(s.field.borrow().as_deref(), Some("two"));
+        });
+    }
+
+    #[test]
+    fn set_text_says_nothing_changed_when_it_could_not_type() {
+        local(async {
+            let mut s = session("untyped");
+            *s.field.borrow_mut() = Some(String::new());
+            let id = focus_id(&mut s, 2).await;
+            // The agent's client in front: the write did nothing and typing
+            // was refused, so the field is as it was and a retry is safe.
+            *s.active.borrow_mut() = (FAKE_WINDOWS[0].0.into(), FAKE_WINDOWS[0].1.into());
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                3,
+                "set_text",
+                json!({"id": id, "text": "05551234567"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with("Error executing tool set_text: it could not be typed: "),
+                "{r}"
+            );
+            assert!(
+                text.contains("; the field still holds \"\": nothing changed; nothing sent"),
+                "{r}"
+            );
+            assert!(!text.contains("maybe sent"), "{r}");
+            assert_eq!(s.field.borrow().as_deref(), Some(""));
+            assert!(!s.keys.borrow().iter().any(|k| k.starts_with("down")));
+        });
+    }
+
+    #[test]
+    fn set_text_types_into_firefox_without_trying_its_write() {
+        local(async {
+            let mut s = session("gecko");
+            *s.field.borrow_mut() = Some("old".into());
+            *s.sem.toolkit.borrow_mut() = "gecko".into();
+            let id = focus_id(&mut s, 2).await;
+            s.keys.borrow_mut().clear();
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "set_text", json!({"id": id, "text": "new"})).await;
+            assert_eq!(
+                reply_text(&r),
+                "ok (verified; typed: accessibility writes have no effect in Firefox)",
+                "{r}"
+            );
+            assert!(start.elapsed() < SET_TEXT_VERIFY, "{:?}", start.elapsed());
+            assert!(
+                !s.keys.borrow().contains(&"write".to_string()),
+                "{:?}",
+                s.keys.borrow()
+            );
+            // In the background, nothing at all goes out.
+            *s.active.borrow_mut() = (FAKE_WINDOWS[0].0.into(), FAKE_WINDOWS[0].1.into());
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 4, "set_text", json!({"id": id, "text": "x"})).await;
+            assert!(
+                reply_text(&r)
+                    .contains("the field still holds \"new\": nothing changed; nothing sent"),
+                "{r}"
+            );
+            assert_eq!(*s.keys.borrow(), ["read", "read"]);
+        });
+    }
+
+    #[test]
+    fn set_text_clears_a_field_with_backspace_when_the_write_did_nothing() {
+        local(async {
+            let mut s = session("clear");
+            *s.field.borrow_mut() = Some("draft".into());
+            let id = focus_id(&mut s, 2).await;
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 3, "set_text", json!({"id": id, "text": ""})).await;
+            assert_eq!(
+                reply_text(&r),
+                "ok (verified; typed, the accessibility write had no effect)",
+                "{r}"
+            );
+            assert_eq!(s.field.borrow().as_deref(), Some(""));
+            let keys = s.keys.borrow();
+            assert!(keys.contains(&"down ctrl+a".to_string()), "{keys:?}");
+            assert!(keys.contains(&"down backspace".to_string()), "{keys:?}");
         });
     }
 
