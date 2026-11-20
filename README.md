@@ -268,7 +268,11 @@ tool; `off` turns it off). Not available on Windows yet.
   rest after that element (ids are stable, so pages join up exactly).
   `screenshot: true` adds the image of the app's window when it is in front.
 - `set_text` reads back what it wrote: the reply says "verified", or it fails
-  saying what the field holds (a length limit, reformatting). Firefox's input
+  saying what the field holds (a length limit, other text). A field that only
+  formatted the text (the same letters and digits, spaced, punctuated or
+  cased: `0555 123 45 67`) or dropped characters of a kind it takes none of
+  (the letters in a phone number) is no error: the reply gives the value it
+  holds. Firefox's input
   fields report accessibility writes as successful and do nothing, so when
   single-line text does not take, it focuses the element, selects all with
   Ctrl+A and types it (empty text: Ctrl+A, BackSpace). On Linux, Firefox's

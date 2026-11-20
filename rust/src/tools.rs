@@ -289,7 +289,7 @@ pub fn tools() -> Json {
         t(
             "set_text",
             &d(
-                "Replace the contents of an editable text element, then read it back:\nthe reply says \"verified\", or fails with what the field holds instead\n(a length limit, reformatting). Refused on a password field unless the\nuser allowed it in the allowlist (then it is not read back)."
+                "Replace the contents of an editable text element, then read it back:\nthe reply says \"verified\" (with the value when the field formatted it or\ndropped characters it does not take), or fails with what it holds instead.\nRefused on a password field unless the\nuser allowed it in the allowlist (then it is not read back)."
             ),
             target(&[("text", "string", None)])
         ),

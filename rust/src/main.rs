@@ -5798,6 +5798,27 @@ impl<B: Backend> Server<B> {
             Err(e) => return Ok(t.reply(&format!("ok (not verified: {e}{how})"))),
             Ok(Some(now)) => now,
         };
+        let counts = format!(
+            "{} chars, {} asked{how}",
+            now.chars().count(),
+            text.chars().count()
+        );
+        match text_fit(text, &now) {
+            Fit::Formatted => {
+                let shown = shown_value(&now);
+                return Ok(t.reply(&format!(
+                    "ok (verified; the field formatted it as {shown}: {counts})"
+                )));
+            }
+            Fit::Filtered(dropped) => {
+                let shown = shown_value(&now);
+                return Ok(t.reply(&format!(
+                    "ok with a warning: the field dropped {dropped:?}, which it does not \
+                     accept; it holds {shown} ({counts})"
+                )));
+            }
+            Fit::Wrong => {}
+        }
         if before.as_deref() != Some(now.as_str()) {
             return Err(t.reply(&written_mismatch(&now, text, how)));
         }
@@ -7551,6 +7572,86 @@ fn written_mismatch(now: &str, text: &str, how: &str) -> String {
     )
 }
 
+/// How a field's value differs from the text written into it, when
+/// `written_matches` says it does (see `text_fit`).
+#[derive(Debug, PartialEq)]
+enum Fit {
+    /// The same letters and digits, in the same order: the field only
+    /// spaced, punctuated or cased them ("0555 123 45 67").
+    Formatted,
+    /// A mask: it left out characters of a kind it holds none of (the
+    /// letters typed into a phone number); with them.
+    Filtered(String),
+    /// Anything else: empty, cut short, other characters.
+    Wrong,
+}
+
+/// `Fit` of the field value `now` for the text `asked`. Spaces, '(', ')',
+/// '/' and a '-' between two letters or digits are formatting; '.', ',',
+/// a leading '-' and every other character count (1.5 is not 15, -5 not
+/// 5). Characters are compared ignoring case. A value holding the asked
+/// characters minus some is a mask only when every one left out is of a
+/// kind (digit, letter, other) the value holds none of, and none is a '.',
+/// ',' or '-', which change a number: a field that dropped "abc" from
+/// "0555abc12" takes digits only, while "abc" for "abcdef" was cut short,
+/// which stays an error.
+fn text_fit(asked: &str, now: &str) -> Fit {
+    fn core(s: &str) -> Vec<char> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = Vec::new();
+        for (i, &c) in chars.iter().enumerate() {
+            let between = i > 0
+                && chars[i - 1].is_alphanumeric()
+                && chars.get(i + 1).is_some_and(|n| n.is_alphanumeric());
+            let format = c.is_whitespace() || matches!(c, '(' | ')' | '/') || (c == '-' && between);
+            if !format {
+                out.push(c);
+            }
+        }
+        out
+    }
+    fn same(a: char, b: char) -> bool {
+        a == b || a.to_lowercase().eq(b.to_lowercase())
+    }
+    fn kind(c: char) -> u8 {
+        if c.is_numeric() {
+            0
+        } else if c.is_alphabetic() {
+            1
+        } else {
+            2
+        }
+    }
+    let (a, n) = (core(asked), core(now));
+    if n.is_empty() {
+        return Fit::Wrong;
+    }
+    if a.len() == n.len() && a.iter().zip(&n).all(|(x, y)| same(*x, *y)) {
+        return Fit::Formatted;
+    }
+    let mut kept = n.iter().peekable();
+    let mut dropped = String::new();
+    for &c in &a {
+        match kept.peek() {
+            Some(&&k) if same(c, k) => {
+                kept.next();
+            }
+            _ => dropped.push(c),
+        }
+    }
+    let mask = kept.peek().is_none()
+        && !dropped.is_empty()
+        && !dropped.contains(['.', ',', '-'])
+        && !dropped
+            .chars()
+            .any(|d| n.iter().any(|k| kind(*k) == kind(d)));
+    if mask {
+        Fit::Filtered(dropped)
+    } else {
+        Fit::Wrong
+    }
+}
+
 /// A field's value as a reply quotes it: its first 120 characters.
 fn shown_value(now: &str) -> String {
     let shown: String = now.chars().take(120).collect();
@@ -8091,7 +8192,12 @@ mod tests {
         adds: std::cell::Cell<bool>,
         /// The user types once this many more key presses went out.
         user_after_presses: std::cell::Cell<Option<usize>>,
+        /// What the field keeps of typed text (an input mask), when Some.
+        mask: std::cell::Cell<Option<FakeMask>>,
     }
+
+    /// What a fake field keeps of the text typed into it.
+    type FakeMask = fn(&str) -> String;
 
     /// The fake's node `id` (the focus element too), changed by `f`.
     fn fake_edit(
@@ -8774,7 +8880,10 @@ mod tests {
         }
         async fn type_text(&self, text: &str) -> R<String> {
             if let Some(f) = self.field.borrow_mut().as_mut() {
-                *f = text.to_string();
+                *f = match self.sem.mask.get() {
+                    Some(mask) => mask(text),
+                    None => text.to_string(),
+                };
             }
             Ok(String::new())
         }
@@ -10407,6 +10516,29 @@ mod tests {
         assert!(written_matches("", ""));
         assert!(!written_matches("hello world", "hello"));
         assert!(!written_matches("Ahmet", "ahmet"));
+    }
+
+    #[test]
+    fn set_text_tells_formatting_and_masks_from_wrong_values() {
+        use Fit::*;
+        assert_eq!(text_fit("05551234567", "0555 123 45 67"), Formatted);
+        assert_eq!(text_fit("05551234567", "(0555) 123-45-67"), Formatted);
+        assert_eq!(text_fit("tr12ab", "TR12 AB"), Formatted);
+        assert_eq!(text_fit("0555abc12", "055512"), Filtered("abc".into()));
+        assert_eq!(text_fit("+90 555", "90555"), Filtered("+".into()));
+        // Cut short, a sign or a decimal point lost, other text: wrong.
+        assert_eq!(text_fit("abcdef", "abc"), Wrong);
+        assert_eq!(text_fit("05551234567", "0555123"), Wrong);
+        assert_eq!(text_fit("1.5", "15"), Wrong);
+        assert_eq!(text_fit("-5", "5"), Wrong);
+        assert_eq!(text_fit("a+b@x.com", "ab@x.com"), Wrong);
+        assert_eq!(
+            text_fit("deliveredto:ahmet+853@gmail.com", "ahmet+853@gmail.com "),
+            Wrong
+        );
+        assert_eq!(text_fit("05551234567", ""), Wrong);
+        assert_eq!(text_fit("0555", "0556"), Wrong);
+        assert_eq!(text_fit("12", "123"), Wrong);
     }
 
     fn log(s: &Session) -> Vec<String> {
@@ -12520,6 +12652,44 @@ mod tests {
             let keys = s.keys.borrow();
             assert!(keys.contains(&"down ctrl+a".to_string()), "{keys:?}");
             assert!(keys.contains(&"down backspace".to_string()), "{keys:?}");
+        });
+    }
+
+    #[test]
+    fn set_text_warns_of_a_mask_and_fails_a_value_cut_short() {
+        local(async {
+            let mut s = session("mask");
+            *s.field.borrow_mut() = Some(String::new());
+            s.sem.mask.set(Some(|t| {
+                t.chars().filter(char::is_ascii_digit).take(8).collect()
+            }));
+            let id = focus_id(&mut s, 2).await;
+            let r = call_tool(
+                &mut s,
+                3,
+                "set_text",
+                json!({"id": id, "text": "0555abc12"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "ok with a warning: the field dropped \"abc\", which it does not accept; it \
+                 holds \"055512\" (6 chars, 9 asked; typed, the accessibility write had no effect)"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "set_text",
+                json!({"id": id, "text": "05551234567"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r)
+                    .contains("written, but the field now holds \"05551234\" (8 chars, 11 asked"),
+                "{r}"
+            );
         });
     }
 
