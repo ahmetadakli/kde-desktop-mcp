@@ -65,6 +65,10 @@ const AMBIGUOUS_SHOWN: usize = 6;
 const AREA_CHECK_MAX: usize = 2 * AMBIGUOUS_SHOWN;
 /// Off-screen matches or close names a missed search offers.
 const MISS_SUGGESTIONS: usize = 5;
+/// Elements of a stale id's role and name offered at most, and matches of
+/// its name looked through for them.
+const STALE_SHOWN: usize = 3;
+const STALE_SEARCHED: usize = 20;
 /// Nodes of a web page fetched when looking for matches scrolled out of
 /// view (see `Server::miss_report`).
 const OFFSCREEN_FETCH: usize = 3000;
@@ -2494,12 +2498,56 @@ impl<B: Backend> Server<B> {
             } else {
                 format!("now {}", render::role_and_name(&role, &name))
             };
-            return Err(format!(
-                "stale id {rid} (was {}, {now}); call tree/find again",
-                render::role_and_name(&r.role, &r.name)
-            ));
+            let was = render::role_and_name(&r.role, &r.name);
+            let same = self.same_role_and_name(&r).await;
+            return Err(if same.is_empty() {
+                format!("stale id {rid} (was {was}, {now}); call tree/find again")
+            } else {
+                format!(
+                    "stale id {rid} (was {was}, {now}); not acted on. visible now with its \
+                     role and name (pass one id):\n{same}"
+                )
+            });
         }
         Ok(r)
+    }
+
+    /// The lines (with fresh ids) of the visible elements of `r`'s app with
+    /// its role and name, at most STALE_SHOWN; "" when there are none or
+    /// the name is empty. Offered on a stale id (a page that re-rendered
+    /// often gives the same button a new object), never acted on.
+    async fn same_role_and_name(&self, r: &Ref<B::Id>) -> String {
+        if r.name.trim().is_empty() {
+            return String::new();
+        }
+        let Some(windows) = self.b.app_windows(&r.app).await else {
+            return String::new();
+        };
+        let (hits, mut cache, _) = self
+            .read_app(
+                None,
+                &windows,
+                Cache::new(),
+                search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
+                search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
+                |c| render::find(c, &windows, &r.name, &r.role, STALE_SEARCHED),
+            )
+            .await;
+        let name = render::fold(&r.name);
+        let same: Vec<B::Id> = hits
+            .into_iter()
+            .filter(|id| cache[id].role == r.role && render::fold(&cache[id].name) == name)
+            .take(STALE_SHOWN)
+            .collect();
+        if same.is_empty() {
+            return String::new();
+        }
+        self.b.fill_actions(&mut cache, &same).await;
+        let lines = same
+            .into_iter()
+            .map(|id| Line::Node { depth: 0, id })
+            .collect();
+        self.print(lines, &cache, &r.app).await.0
     }
 
     /// The allowlist name of `w`'s app, found as the window list allows
@@ -14710,6 +14758,51 @@ mod tests {
                 "{r}"
             );
             assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+        });
+    }
+
+    #[test]
+    fn a_stale_id_lists_elements_of_its_role_and_name_without_acting() {
+        local(async {
+            let mut s = session("stale-same");
+            fake_frame(&s, true, &[40]);
+            s.nodes
+                .borrow_mut()
+                .insert(40, fake_node("push button", "Gönder", &[]));
+            let r = call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "Gönder"})).await;
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Gönder\""),
+                "{r}"
+            );
+            // The page re-rendered: the button is a new object.
+            fake_frame(&s, true, &[41, 42]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.remove(&40);
+                n.insert(41, fake_node("push button", "Gönder", &[]));
+                // Other role or name: not offered.
+                n.insert(42, fake_node("link", "Gönder", &[]));
+            }
+            let r = call_tool(&mut s, 3, "act", json!({"id": 1})).await;
+            let text = error_text(&r);
+            assert!(
+                text.starts_with(
+                    "stale id 1 (was push button \"Gönder\", now gone or not answering); \
+                     not acted on. visible now with its role and name (pass one id):\n\
+                     [2] push button \"Gönder\""
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("link"), "{text}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // None left of its role and name: call tree/find again.
+            s.nodes.borrow_mut().remove(&41);
+            let r = call_tool(&mut s, 4, "act", json!({"id": 1})).await;
+            assert_eq!(
+                error_text(&r).lines().next().unwrap(),
+                "stale id 1 (was push button \"Gönder\", now gone or not answering); \
+                 call tree/find again; nothing sent"
+            );
         });
     }
 

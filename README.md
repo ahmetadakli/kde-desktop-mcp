@@ -544,7 +544,9 @@ tool; `off` turns it off). Not available on Windows yet.
   round trip). If the element is gone, or its role or name changed (the page
   was redrawn, the object path now belongs to another element), nothing is
   done and the reply is `stale id N (was <role> "<name>", now ...); call
-  tree/find again`. For elements whose name follows their content or title
+  tree/find again`. When elements of the same role and name are visible in
+  the app now (a page that re-rendered), the reply lists up to 3 of them with
+  fresh ids instead; none is acted on. For elements whose name follows their content or title
   (windows, tabs, documents, labels, status bars, text fields, combo boxes,
   editable elements) and for unnamed elements, only the role is compared.
 - `wait_for`: waits until an element appears or disappears (checks every
