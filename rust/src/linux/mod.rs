@@ -585,6 +585,13 @@ fn named_by_class(names: &HashMap<i64, String>, pid: Option<i64>) -> bool {
         .is_some_and(|n| !n.is_empty())
 }
 
+/// Whether the compositor's caption of a window and its AT-SPI title name
+/// the same window (KWin may add " — App" after the title).
+fn same_caption(caption: &str, title: &str) -> bool {
+    let (c, t) = (caption.trim(), title.trim());
+    !t.is_empty() && (c == t || c.starts_with(&format!("{t} ")))
+}
+
 /// A screenshot's target from KWin's active frame.
 fn kde_target(names: &HashMap<i64, String>, f: kwin::Frame) -> R<ShotTarget> {
     let handle = f.handle.ok_or_else(|| {
@@ -705,6 +712,43 @@ impl LinuxBackend {
     }
 
     /// The compositor's caption of the active window.
+    /// `Backend::shot_target` by the pid of the window in front alone.
+    async fn shot_target_by_pid(&self) -> R<ShotTarget> {
+        match &self.comp {
+            Compositor::Kde(kwin) => {
+                let frame = kwin.active_frame().await?.ok_or("no active window")?;
+                let Some(pid) = frame.pid else {
+                    return kde_target(&HashMap::new(), frame);
+                };
+                // The AT-SPI app in front, when it is this window's
+                // process, spares a scan of every app.
+                let name = self.a11y.active_app().await;
+                let names = match !name.is_empty() && self.active_pid().await == Some(pid) {
+                    true => HashMap::from([(i64::from(pid), name)]),
+                    false => self.app_names_by_pid().await,
+                };
+                kde_target(&names, frame)
+            }
+            Compositor::Hyprland(h) => {
+                let c = h.active_window().await?.ok_or("no active window")?;
+                Ok(hypr_target(&self.app_names_by_pid().await, &c))
+            }
+        }
+    }
+
+    /// (app name, window title) of the first AT-SPI window with the
+    /// ACTIVE state.
+    async fn a11y_active_window(&self) -> Option<(String, String)> {
+        for (_, name, windows) in self.a11y.apps_with_windows().await {
+            for w in windows {
+                if self.a11y.has_state(&w, atspi::ACTIVE).await {
+                    return Some((name, self.a11y.identity(&w).await.1));
+                }
+            }
+        }
+        None
+    }
+
     async fn active_caption(&self) -> Option<String> {
         let w = match &self.comp {
             Compositor::Kde(kwin) => kwin.active_parent().await.ok().flatten()?,
@@ -2464,26 +2508,20 @@ impl Backend for LinuxBackend {
     }
 
     async fn shot_target(&self) -> R<ShotTarget> {
-        match &self.comp {
-            Compositor::Kde(kwin) => {
-                let frame = kwin.active_frame().await?.ok_or("no active window")?;
-                let Some(pid) = frame.pid else {
-                    return kde_target(&HashMap::new(), frame);
-                };
-                // The AT-SPI app in front, when it is this window's
-                // process, spares a scan of every app.
-                let name = self.a11y.active_app().await;
-                let names = match !name.is_empty() && self.active_pid().await == Some(pid) {
-                    true => HashMap::from([(i64::from(pid), name)]),
-                    false => self.app_names_by_pid().await,
-                };
-                kde_target(&names, frame)
-            }
-            Compositor::Hyprland(h) => {
-                let c = h.active_window().await?.ok_or("no active window")?;
-                Ok(hypr_target(&self.app_names_by_pid().await, &c))
-            }
+        let mut t = self.shot_target_by_pid().await?;
+        // A sandboxed app (Flatpak) reaches the accessibility bus through
+        // a proxy, whose pid is not its window's: name it by the window
+        // the toolkit reports ACTIVE, as key and click do, when its title
+        // is the one in front.
+        if t.by_class
+            && let Some((app, title)) = self.a11y_active_window().await
+            && same_caption(&t.caption, &title)
+            && !app.trim().is_empty()
+        {
+            t.app = app.trim().to_lowercase();
+            t.by_class = false;
         }
+        Ok(t)
     }
 
     async fn screenshot(&self, target: &ShotTarget) -> R<Shot> {
@@ -2800,6 +2838,11 @@ mod tests {
         assert!(!t.by_class);
         let t = kde_target(&names, frame(None, Some("{a-b}"))).unwrap();
         assert_eq!((t.app.as_str(), t.by_class), ("org.mozilla.firefox", true));
+        // A Flatpak's window: named by the AT-SPI window of that title.
+        assert!(same_caption("Inbox", "Inbox"));
+        assert!(same_caption("Inbox — Telegram", "Inbox"));
+        assert!(!same_caption("Inboxes", "Inbox"));
+        assert!(!same_caption("Inbox", ""));
         // No handle: nothing to capture this window by.
         let e = kde_target(&names, frame(Some(4242), None)).unwrap_err();
         assert!(
