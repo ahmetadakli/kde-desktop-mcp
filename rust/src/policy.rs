@@ -1,6 +1,6 @@
 //! The allowlist file: which apps may be used, how far (tiers), which tool
-//! calls need the user's confirmation, and where password fields may be
-//! filled in.
+//! calls need the user's confirmation, where password fields may be
+//! filled in, and whether input may reach the agent's own client.
 //!
 //! ```text
 //! firefox              # full: everything (the default)
@@ -8,6 +8,7 @@
 //! dolphin:click        # plus act, click, focus, scroll, drag, mouse
 //! confirm: close_window, key:konsole
 //! passwords: keepassxc
+//! self-client: allow   # input may reach the agent's own terminal tab
 //! ```
 //!
 //! Lines without a `:` are plain app names, as in files from before tiers,
@@ -109,6 +110,9 @@ pub struct Policy {
     /// Apps whose password fields set_text and type_text may fill in;
     /// `*` for all.
     pub passwords: Vec<String>,
+    /// `self-client: allow`: input may reach the agent's own client (its
+    /// terminal tab, its window); the guard refuses it otherwise.
+    pub self_client: bool,
     /// Lines that could not be read as meant, for doctor.
     pub warnings: Vec<String>,
 }
@@ -118,7 +122,7 @@ pub struct Policy {
 pub const PASSWORDS_ENV: &str = "DESKTOP_MCP_ALLOW_PASSWORDS";
 
 /// Directive lines: `name: item, item…`.
-const DIRECTIVES: [&str; 2] = ["confirm", "passwords"];
+const DIRECTIVES: [&str; 3] = ["confirm", "passwords", "self-client"];
 
 /// Items of a directive: comma- or space-separated, lower case.
 fn items(rest: &str) -> impl Iterator<Item = String> + '_ {
@@ -169,6 +173,14 @@ impl Policy {
                             }
                         }
                     }
+                    "self-client" => match rest.trim() {
+                        "allow" => p.self_client = true,
+                        "refuse" => p.self_client = false,
+                        other => p.warnings.push(format!(
+                            "self-client '{other}' is not 'allow' or 'refuse'; input to the \
+                             agent's own client stays refused"
+                        )),
+                    },
                     _ => {
                         for app in items(rest) {
                             let app = if app == "all" { "*".into() } else { app };
@@ -357,6 +369,18 @@ mod tests {
         assert!(!p.passwords_allowed("firefox", Some("0")));
         assert!(p.passwords_allowed("firefox", Some("1")));
         assert!(Policy::parse("passwords: *").passwords_allowed("x", None));
+    }
+
+    #[test]
+    fn self_client_opt_out() {
+        assert!(!Policy::parse("konsole\n").self_client);
+        let p = Policy::parse("konsole\nSelf-Client: allow  # my sudo tab\n");
+        assert!(p.self_client);
+        assert!(p.tier("self-client").is_none(), "not read as an app");
+        let p = Policy::parse("self-client: yes\n");
+        assert!(!p.self_client);
+        assert_eq!(p.warnings.len(), 1, "{:?}", p.warnings);
+        assert!(!Policy::parse("self-client: allow\nself-client: refuse\n").self_client);
     }
 
     #[test]

@@ -529,6 +529,21 @@ impl Uia {
         unsafe { vp.SetValue(&BSTR::from(text)) }.is_ok()
     }
 
+    /// The name of the element `el` is labelled by and its help text
+    /// (browsers: the placeholder or title), the empty ones left out.
+    pub fn labels(&self, el: &IUIAutomationElement) -> Vec<String> {
+        let label = unsafe { el.CurrentLabeledBy() }
+            .ok()
+            .and_then(|l| unsafe { l.CurrentName() }.ok());
+        let help = unsafe { el.CurrentHelpText() }.ok();
+        [label, help]
+            .into_iter()
+            .flatten()
+            .map(|s| s.to_string())
+            .filter(|s| !s.trim().is_empty())
+            .collect()
+    }
+
     /// The live FrameworkId ("Win32", "XAML", "Chrome", ...).
     pub fn framework(&self, el: &IUIAutomationElement) -> String {
         unsafe { el.CurrentFrameworkId() }

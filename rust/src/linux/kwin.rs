@@ -56,11 +56,40 @@ pub struct RawImage {
     pub data: Vec<u8>,
 }
 
-/// A window's frame in logical px, (x, y, width, height), and its
-/// ScreenShot2 handle when KWin gave one.
+/// KWin's active window: its frame in logical px, (x, y, width, height),
+/// its ScreenShot2 handle when KWin gave one, and what tells whose it is.
+#[derive(Debug, PartialEq)]
 pub struct Frame {
     pub area: (f64, f64, f64, f64),
     pub handle: Option<String>,
+    pub pid: Option<u32>,
+    pub caption: String,
+    pub class: String,
+}
+
+/// Parse what FRAME reports; None without an active window.
+pub fn frame_of(raw: &str) -> R<Option<Frame>> {
+    let g: Json = serde_json::from_str(raw).map_err(|e| format!("KWin: {e} in '{raw}'"))?;
+    if g.is_null() {
+        return Ok(None);
+    }
+    let num = |k: &str| {
+        g[k].as_f64()
+            .ok_or_else(|| format!("KWin: no '{k}' in the active window's frame '{raw}'"))
+    };
+    Ok(Some(Frame {
+        area: (num("x")?, num("y")?, num("width")?, num("height")?),
+        handle: g["id"]
+            .as_str()
+            .filter(|id| id.starts_with('{'))
+            .map(str::to_string),
+        pid: g["pid"]
+            .as_u64()
+            .and_then(|p| u32::try_from(p).ok())
+            .filter(|p| *p > 0),
+        caption: g["caption"].as_str().unwrap_or_default().to_string(),
+        class: g["cls"].as_str().unwrap_or_default().to_string(),
+    }))
 }
 
 /// (x0, y0, x1, y1) in logical px.
@@ -277,11 +306,12 @@ const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow
      return {x: g.x, y: g.y, width: g.width, height: g.height, caption: w.caption, \
      cls: w.resourceClass, screen: {x: s.x, y: s.y, width: s.width, height: s.height}}; })())";
 
-/// The active window's frame and its internal id, the handle ScreenShot2's
-/// CaptureWindow takes ("{uuid}").
+/// The active window's frame, its internal id (the handle ScreenShot2's
+/// CaptureWindow takes, "{uuid}"), and its process, caption and class, so
+/// a screenshot checks the window it captures.
 const FRAME: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
      const g = w.frameGeometry; return {x: g.x, y: g.y, width: g.width, height: g.height, \
-     id: String(w.internalId)}; })())";
+     id: String(w.internalId), pid: w.pid, caption: w.caption, cls: w.resourceClass || ''}; })())";
 
 /// The active window's caption and process, and the window it is a
 /// transient (dialog) for. A portal dialog gets its parent from the window
@@ -526,31 +556,21 @@ impl KWin {
         Ok((!v.is_null()).then_some(v))
     }
 
-    /// Frame (with title bar) of KWin's active window in logical px, and
-    /// the window's handle for `capture_window`.
-    pub async fn active_frame(&self) -> Option<Frame> {
-        let raw = self.query(FRAME).await.ok()??;
-        let g: Json = serde_json::from_str(&raw).ok()?;
-        Some(Frame {
-            area: (
-                g["x"].as_f64()?,
-                g["y"].as_f64()?,
-                g["width"].as_f64()?,
-                g["height"].as_f64()?,
-            ),
-            handle: g["id"]
-                .as_str()
-                .filter(|id| id.starts_with('{'))
-                .map(str::to_string),
-        })
+    /// Frame (with title bar) of KWin's active window in logical px, the
+    /// window's handle for `capture_window`, its pid, caption and class;
+    /// None without an active window.
+    pub async fn active_frame(&self) -> R<Option<Frame>> {
+        match self.query(FRAME).await? {
+            Some(raw) => frame_of(&raw),
+            None => Err("KWin: the active-window script did not answer".into()),
+        }
     }
 
     /// Capture a window (with its title bar, without the shadow) through
-    /// ScreenShot2: the one with this `active_frame` handle, so the image
-    /// matches the frame read with it even if focus moved since, or else
-    /// whichever is active. KWin writes the raw pixels into a pipe after
-    /// replying with their layout.
-    pub async fn capture_window(&self, handle: Option<&str>) -> R<RawImage> {
+    /// ScreenShot2: the one with this `active_frame` handle, so the image is
+    /// of the window checked with it even if focus moved since. KWin writes
+    /// the raw pixels into a pipe after replying with their layout.
+    pub async fn capture_window(&self, handle: &str) -> R<RawImage> {
         let (mut reader, writer) = std::io::pipe().map_err(|e| format!("pipe: {e}"))?;
         // Read concurrently: KWin blocks on a full pipe until it is drained.
         let pixels = tokio::task::spawn_blocking(move || {
@@ -564,29 +584,17 @@ impl KWin {
             ("native-resolution", Value::from(true)),
         ]);
         let fd = Fd::from(&writer);
-        let bus = Some("org.kde.KWin");
-        let (method, reply) = match handle {
-            Some(h) => {
-                let body = (h, options, fd);
-                let m = "CaptureWindow";
-                (
-                    m,
-                    self.session
-                        .call_method(bus, SHOT_PATH, Some(SHOT_IFACE), m, &body)
-                        .await,
-                )
-            }
-            None => {
-                let body = (options, fd);
-                let m = "CaptureActiveWindow";
-                (
-                    m,
-                    self.session
-                        .call_method(bus, SHOT_PATH, Some(SHOT_IFACE), m, &body)
-                        .await,
-                )
-            }
-        };
+        let method = "CaptureWindow";
+        let reply = self
+            .session
+            .call_method(
+                Some("org.kde.KWin"),
+                SHOT_PATH,
+                Some(SHOT_IFACE),
+                method,
+                &(handle, options, fd),
+            )
+            .await;
         // KWin holds its own duplicate; ours must go for the read to end.
         drop(writer);
         let reply = match reply {
@@ -844,6 +852,29 @@ mod tests {
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn the_frame_names_the_window_it_belongs_to() {
+        let raw = r#"{"x":1,"y":2,"width":30,"height":40,"id":"{abc}","pid":77,
+                      "caption":"Inbox","cls":"firefox"}"#;
+        assert_eq!(
+            frame_of(raw).unwrap(),
+            Some(Frame {
+                area: (1.0, 2.0, 30.0, 40.0),
+                handle: Some("{abc}".into()),
+                pid: Some(77),
+                caption: "Inbox".into(),
+                class: "firefox".into(),
+            })
+        );
+        assert_eq!(frame_of("null").unwrap(), None);
+        // KWin's internal id is a uuid in braces; a pid of 0 is no pid.
+        let f = frame_of(r#"{"x":0,"y":0,"width":1,"height":1,"id":"7","pid":0}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!((f.handle, f.pid), (None, None));
+        assert!(frame_of(r#"{"x":0}"#).unwrap_err().contains("'y'"));
     }
 
     #[test]

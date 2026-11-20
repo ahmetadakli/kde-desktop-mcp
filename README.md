@@ -268,13 +268,21 @@ tool; `off` turns it off). Not available on Windows yet.
   rest after that element (ids are stable, so pages join up exactly).
   `screenshot: true` adds the image of the app's window when it is in front.
 - `set_text` reads back what it wrote: the reply says "verified", or it fails
-  saying what the field holds (a length limit, reformatting). Firefox's input
+  saying what the field holds (a length limit, other text). A field that only
+  formatted the text (the same letters and digits, spaced, punctuated or
+  cased: `0555 123 45 67`) or dropped characters of a kind it takes none of
+  (the letters in a phone number) is no error: the reply gives the value it
+  holds. Firefox's input
   fields report accessibility writes as successful and do nothing, so when
   single-line text does not take, it focuses the element, selects all with
-  Ctrl+A and types it. An editable element without a text interface (Qt 6's
-  editable combo boxes, such as a KDE file dialog's name field) is typed into
-  the same way and read back from its name. Password fields cannot be read
-  back.
+  Ctrl+A and types it (empty text: Ctrl+A, BackSpace). On Linux, Firefox's
+  fields are typed into right away: their write never took. An editable
+  element without a text interface (Qt 6's editable combo boxes, such as a
+  KDE file dialog's name field) is typed into the same way and read back from
+  its name. When it could not type (another window in front, no focus) and
+  the field holds what it held before, the reply says why and "nothing
+  changed"; a write the field ignored then counts as nothing sent. Password
+  fields cannot be read back.
 - `scroll`: turns the wheel over an element (a list, a page, a panel).
 - Verified actions of `act` (one tool rather than new ones: `act` is loaded
   up front, so they cost no tool-search turn, and the schema grew by about
@@ -363,11 +371,17 @@ tool; `off` turns it off). Not available on Windows yet.
   coordinate, or with `image: true` a pixel of the last screenshot.
 - `act`, `set_text`, `focus`, `click`: act on an element. The element is picked
   by its `tree`/`find` number (`id`) or in one call by `app` + `query`
-  (+ `role`): a visible element whose name equals `query`, else one whose
+  (+ `role`): a visible element whose name or text equals `query` (a
+  button named "Artır" showing "+"), else one whose
   name or text contains it. Window, tab and page titles (frame, window, page
   tab, and a web page's document) count only when nothing else matches or
   `role` names that role; `wait_for` skips them unless `role` names them.
-  Last come elements holding every word of the query, accents aside.
+  Last come elements holding every word of the query, accents aside. When
+  nothing matches, a visible field (an editable element) whose label (the
+  AT-SPI labelled-by relation, UIA LabeledBy), placeholder text or
+  description the query names is taken, if exactly one fits best; the reply
+  says so (`(labelled 'Red gerekçesi')`). A web form's entry is often named
+  after something other than the label beside it.
 - `role` (in `find`, `wait_for` and the `app` + `query` targets) compares
   without case, spaces, `_` or `-` (`Push_Button`, `pushbutton` and UIA's
   `checkbox` for `check box`). A role that matches nothing is tried again as
@@ -395,7 +409,12 @@ tool; `off` turns it off). Not available on Windows yet.
   and of stacked dialogs the one opened last (listed last) wins. Then,
   wherever they are: (4) an element one operates (a button, entry, list
   item: an interactive role or state) beats one that only shows the name (a
-  label, a heading, a list named the same); (5) for input tools, an element
+  label, a heading, a list named the same); (5) an enabled element beats a
+  disabled one; (6) in a browser window (one with a tab strip), an element
+  of the web page beats the browser's own tool bars and tabs, and the reply
+  says `(picked over N browser-chrome matches)`; (7) the focused element
+  beats the others; (8) one in a dialog inside the window (a web page's
+  modal) beats the others; (9) for input tools, an element
   with an on-screen area beats one without (zero size), whether its window
   is in front or not (checked for up to 12 candidates). A tie left after
   that is refused by the input tools (`act`, `click`, `focus`, `set_text`,
@@ -538,7 +557,9 @@ tool; `off` turns it off). Not available on Windows yet.
   round trip). If the element is gone, or its role or name changed (the page
   was redrawn, the object path now belongs to another element), nothing is
   done and the reply is `stale id N (was <role> "<name>", now ...); call
-  tree/find again`. For elements whose name follows their content or title
+  tree/find again`. When elements of the same role and name are visible in
+  the app now (a page that re-rendered), the reply lists up to 3 of them with
+  fresh ids instead; none is acted on. For elements whose name follows their content or title
   (windows, tabs, documents, labels, status bars, text fields, combo boxes,
   editable elements) and for unnamed elements, only the role is compared.
 - `wait_for`: waits until an element appears or disappears (checks every
@@ -548,7 +569,11 @@ tool; `off` turns it off). Not available on Windows yet.
   that state (with `gone`, until it no longer does). `window` instead of
   `query` waits for a window of an allowed app whose title or app name
   contains it to open, or with `gone` to close (KDE and Hyprland window
-  lists, re-read when AT-SPI reports a window change).
+  lists, re-read when AT-SPI reports a window change). A timeout names the
+  app's window title and, waiting for an element to appear, lists up to 3
+  visible elements with the closest names (with ids); when nothing comes
+  close and the query reads as written to time out (`zz-never`,
+  `nonexistent`), it says a fixed wait is `pause`.
 - `wait_idle`: waits until an app's accessibility tree has not changed for
   `quiet_ms` (default 300) and no browser page is still marked busy (loading
   from the network): after opening a URL or a link, use it instead of a fixed
@@ -666,7 +691,17 @@ tool; `off` turns it off). Not available on Windows yet.
   and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
   in pixels of the last screenshot captures again and returns only that part,
   cropped before shrinking, at up to full resolution (`max_size` still
-  applies); `image_x`/`image_y` then refer to the zoomed image.
+  applies); `image_x`/`image_y` then refer to the zoomed image. The
+  allowlist is checked on the window that is captured: KDE reads KWin's
+  active window (its process, caption and class) once and captures it by its
+  handle; `spectacle` (older KWin), `grim` (Hyprland) and the Windows screen
+  copy are only kept when that window was in front before and after. An app
+  without an accessibility name is refused by its caption and class, so the
+  user knows what to allowlist. A failure says why (`grim` or `spectacle`
+  missing or failing with its error, KWin's `ScreenShot2` error, the
+  temporary file). A screenshot whose `window` is already in front sends no
+  input: it does not wait for the user's typing, and as a batch's last step
+  it is not stopped by the user starting to use the seat.
 - `batch`: runs several tools in order in one call and stops at the first
   error; reduces Claude's number of turns. A step with `"optional": true`
   (typically a `wait_for`) may fail without stopping the batch: it is reported
@@ -777,6 +812,27 @@ app is on a `passwords:` line (`passwords: all` for every app) or the server
 runs with `DESKTOP_MCP_ALLOW_PASSWORDS=1`. `doctor` shows the tiers, the
 confirm list and the password setting.
 
+Input never goes to the agent's own client. At start the server reads its
+ancestor processes (Claude Code and the terminal it runs in, or Claude
+Desktop) and their terminals; keys, typing and pointer input are refused
+("nothing sent") while the window in front is the client's window or, for a
+terminal, while its tab in front runs the agent. Konsole's tab in front is
+read over D-Bus, so the other tabs of the same window stay usable; for other
+terminals, whose tab in front cannot be read (kitty, foot's server,
+gnome-terminal), the window is refused while any terminal of its process
+runs the agent. Pointer input at a point outside the window in front is
+refused over the agent's window. Element tools refuse the client's own
+elements (Claude Desktop's buttons) and a terminal's entries that send
+input into it (Paste, Copy Input To), `close_window` refuses its window, and
+`window`/`activate_window` prefer another window that matches as well. Run
+in tmux or screen, the agent's terminal window is not known (the
+multiplexer's server left it), so the guard cannot see it; `doctor` warns. On
+Windows only the foreground window's process is compared: a console window
+whose shell runs the agent is refused, but Windows Terminal's and editors'
+tabs cannot be told apart, so those windows are not. A
+`self-client: allow` line turns the guard off; `doctor` names the client it
+found.
+
 ## Installation
 
 Each [GitHub release](https://github.com/ahmetadakli/kde-desktop-mcp/releases)
@@ -830,7 +886,8 @@ claude mcp add --scope user desktop -- "$PWD/target/release/desktop-mcp"
 Requirements:
 - A Hyprland session (the `movecursor` dispatcher)
 - System packages (Arch): `at-spi2-core`, `wl-clipboard`; recommended: `wtype`
-  (typing without touching the clipboard), `grim` (fallback screenshots)
+  (typing without touching the clipboard), `grim` (screenshots; `doctor` warns
+  when it is missing)
 - A working AT-SPI bus in the session. Qt apps may need
   `env = QT_LINUX_ACCESSIBILITY_ALWAYS_ON,1` in the Hyprland configuration.
 - Write access for the user on `/dev/uinput`

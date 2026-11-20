@@ -1164,9 +1164,16 @@ fn matches<Id>(info: &Info<Id>, q: &Query, role: &str) -> Option<Hit> {
     if name == q.text {
         return Some(Hit::Exact);
     }
+    // A button showing "+" as its text, named "Artır": exact too. Not a
+    // field holding the query: after typing "Ara" into a search box, the
+    // button named "Ara" is still the one meant.
+    let text = fold(&text_preview(info, FIND_TEXT_LIMIT));
+    if !q.text.is_empty() && text == q.text && !editable(info) {
+        return Some(Hit::Exact);
+    }
     let mut hay = name;
     hay.push(' ');
-    hay.push_str(&fold(&text_preview(info, FIND_TEXT_LIMIT)));
+    hay.push_str(&text);
     if !role.is_empty() {
         hay.push(' ');
         hay.push_str(&info.role);
@@ -1176,6 +1183,25 @@ fn matches<Id>(info: &Info<Id>, q: &Query, role: &str) -> Option<Hit> {
     }
     let hay = unaccent(&hay);
     (!q.words.is_empty() && q.words.iter().all(|w| hay.contains(w.as_str()))).then_some(Hit::Loose)
+}
+
+/// How well `label` (a field's label, placeholder or description) names
+/// `query`, as `matches` compares a name: 0 equal, 1 containing it, 2 all
+/// its words without accents; None when it does not.
+pub fn label_rank(label: &str, query: &str) -> Option<u8> {
+    let q = Query::new(query);
+    if q.text.is_empty() {
+        return None;
+    }
+    let label = fold(label);
+    if label == q.text {
+        Some(0)
+    } else if label.contains(&q.text) {
+        Some(1)
+    } else {
+        let label = unaccent(&label);
+        (!q.words.is_empty() && q.words.iter().all(|w| label.contains(w.as_str()))).then_some(2)
+    }
 }
 
 /// A window, tab or page title, which ranks below every other element.
@@ -1277,6 +1303,13 @@ fn push_showing<'a, Id: Clone + Eq + Hash>(
 /// app's other windows (see `locate_all`).
 const DIALOG_ROLES: [&str; 4] = ["dialog", "alert", "file chooser", "color chooser"];
 
+/// Whether `info` is a field one types into: its text is what it holds,
+/// not a label.
+fn editable<Id>(info: &Info<Id>) -> bool {
+    info.states.contains(&"editable")
+        || ["entry", "password text", "edit"].contains(&info.role.as_str())
+}
+
 /// Whether `info` is a dialog window (DIALOG_ROLES).
 pub fn is_dialog<Id>(info: &Info<Id>) -> bool {
     DIALOG_ROLES.contains(&info.role.as_str())
@@ -1292,6 +1325,9 @@ pub struct Matches<Id> {
     /// They matched the synonyms of the `role` asked for, not the role
     /// itself (`with_role_synonyms`); set by the caller.
     pub by_synonym: bool,
+    /// Matches in a browser's chrome (tool bars, tab strip) left out for
+    /// ones in its page: the reply says so.
+    pub over_chrome: usize,
 }
 
 impl<Id> Matches<Id> {
@@ -1308,8 +1344,23 @@ fn narrow<T>(items: &mut Vec<T>, keep: impl Fn(&T) -> bool) {
     }
 }
 
-/// Number of different windows among `hits` (element, root index).
-fn window_count<Id>(hits: &[(&Id, usize)]) -> usize {
+/// Roles of a browser's page, whose elements beat the browser's own
+/// (`locate_all`), and of the tab strip that marks a window as a browser's.
+/// AT-SPI names only: UIA calls an office document and a ribbon the same
+/// as a page and a tab strip.
+const PAGE_ROLE: &str = "document web";
+const TAB_STRIP_ROLE: &str = "page tab list";
+
+/// Where a match sits (`locate_all`): bits of these.
+const IN_PAGE: u8 = 1;
+const IN_DIALOG: u8 = 2;
+
+/// A match of `locate_all`: the element, the index of its root, and where
+/// it sits (IN_PAGE, IN_DIALOG).
+type Hit3<'a, Id> = (&'a Id, usize, u8);
+
+/// Number of different windows among `hits`.
+fn window_count<Id>(hits: &[Hit3<'_, Id>]) -> usize {
     let mut w: Vec<usize> = hits.iter().map(|h| h.1).collect();
     w.sort_unstable();
     w.dedup();
@@ -1348,7 +1399,18 @@ pub fn locate<Id: Clone + Eq + Hash>(
 /// 4. an element one operates (`interactive`: a button, an entry, a list
 ///    item) beats one that only shows the name (a label, a list or
 ///    heading named the same);
-/// 5. a menu entry beats what it holds: WinUI's menu bar entry holds a
+/// 5. an enabled element beats a disabled one (a browser's greyed-out
+///    "Forward" against the page's button);
+/// 6. in a browser's window (one with a tab strip, TAB_STRIP_ROLE), an
+///    element of the page (PAGE_ROLE) beats the browser's own tool bars and
+///    tabs ("Close" of each tab against the page's "Close"); how many were
+///    left out is counted (`over_chrome`). A dialog in the window is no
+///    chrome, and the page never beats a focused or editable chrome
+///    element: the page can name its elements anything;
+/// 7. the focused element beats the others;
+/// 8. one in a dialog inside the window (a web page's modal) beats the
+///    others;
+/// 9. a menu entry beats what it holds: WinUI's menu bar entry holds a
 ///    button named the same.
 ///
 /// Ok(None) when nothing matches.
@@ -1361,10 +1423,12 @@ pub fn locate_all<Id: Clone + Eq + Hash>(
     window: &str,
 ) -> Result<Option<Matches<Id>>, Vec<Id>> {
     let q = Query::new(query);
-    // Matches per rank, with the index of their root.
-    let mut best: [Vec<(&Id, usize)>; 6] = Default::default();
+    // Matches per rank, with the index of their root and where they sit.
+    let mut best: [Vec<Hit3<'_, Id>>; 6] = Default::default();
     let mut missing = Vec::new();
-    let mut stack: Vec<(&Id, usize)> = Vec::new();
+    let mut stack: Vec<Hit3<'_, Id>> = Vec::new();
+    // Per root: it shows a tab strip outside its pages (a browser).
+    let mut tabbed = vec![false; roots.len()];
     let showing = |ids: &'_ [Id], missing: &mut Vec<Id>| -> Vec<usize> {
         let mut out = Vec::new();
         for (i, o) in ids.iter().enumerate() {
@@ -1377,10 +1441,10 @@ pub fn locate_all<Id: Clone + Eq + Hash>(
         out
     };
     for i in showing(roots, &mut missing).into_iter().rev() {
-        stack.push((&roots[i], i));
+        stack.push((&roots[i], i, 0));
     }
     let mut seen = 0;
-    while let Some((id, w)) = stack.pop() {
+    while let Some((id, w, at)) = stack.pop() {
         seen += 1;
         if seen > FIND_MAX_SEEN {
             break;
@@ -1390,10 +1454,22 @@ pub fn locate_all<Id: Clone + Eq + Hash>(
         if let Some(hit) = matches(info, &q, role)
             && (titles || !title)
         {
-            best[rank(hit, title) as usize].push((id, w));
+            best[rank(hit, title) as usize].push((id, w, at));
+        }
+        if info.role == TAB_STRIP_ROLE && at & IN_PAGE == 0 {
+            tabbed[w] = true;
+        }
+        // What the children sit in; the root window itself is no dialog
+        // inside a window.
+        let mut below = at;
+        if info.role == PAGE_ROLE {
+            below |= IN_PAGE;
+        }
+        if is_dialog(info) && *id != roots[w] {
+            below |= IN_DIALOG;
         }
         for i in showing(&info.children, &mut missing).into_iter().rev() {
-            stack.push((&info.children[i], w));
+            stack.push((&info.children[i], w, below));
         }
     }
     let Some(mut hits) = best.into_iter().find(|b| !b.is_empty()) else {
@@ -1421,6 +1497,26 @@ pub fn locate_all<Id: Clone + Eq + Hash>(
         hits.retain(|h| h.1 == last);
     }
     narrow(&mut hits, |h| interactive(&cache[h.0]));
+    narrow(&mut hits, |h| !cache[h.0].states.contains(&"disabled"));
+    // A dialog in the browser's window is no chrome: Firefox draws a
+    // page's confirm() outside the page, in front of it.
+    let chrome = |h: &Hit3<'_, Id>| tabbed[h.1] && h.2 & (IN_PAGE | IN_DIALOG) == 0;
+    // The page, which anyone can write, never takes a field of the
+    // browser's (its address bar) or the control just focused.
+    let kept = |h: &Hit3<'_, Id>| {
+        let info = &cache[h.0];
+        editable(info) || info.states.contains(&"focused")
+    };
+    let mut over_chrome = 0;
+    if hits.len() > 1
+        && hits.iter().any(|h| !chrome(h))
+        && !hits.iter().any(|h| chrome(h) && kept(h))
+    {
+        over_chrome = hits.iter().filter(|h| chrome(h)).count();
+        hits.retain(|h| !chrome(h));
+    }
+    narrow(&mut hits, |h| cache[h.0].states.contains(&"focused"));
+    narrow(&mut hits, |h| h.2 & IN_DIALOG != 0);
     if hits.len() > 1 {
         let entries: Vec<&Id> = hits
             .iter()
@@ -1431,12 +1527,13 @@ pub fn locate_all<Id: Clone + Eq + Hash>(
     }
     let picked = hits
         .into_iter()
-        .map(|(id, w)| (id.clone(), roots[w].clone()))
+        .map(|(id, w, _)| (id.clone(), roots[w].clone()))
         .collect();
     done(
         Some(Matches {
             picked,
             by_synonym: false,
+            over_chrome,
         }),
         missing,
     )
@@ -3054,6 +3151,162 @@ mod tests {
         );
         // Partial matches tie when nothing matches exactly.
         assert_eq!(picked(&cache, &["/w"], "kayde", "", "").len(), 3);
+    }
+
+    /// A browser window as Firefox shows it: tool bars with the tab strip
+    /// (a close button per tab), a disabled "İleri", the new-tab and
+    /// bookmark buttons, then the page with its own buttons.
+    fn browser() -> Cache<&'static str> {
+        let mut c = Cache::new();
+        let w = node(
+            "frame",
+            "Ödeme — Mozilla Firefox",
+            true,
+            &["active"],
+            &["/bar", "/if"],
+        );
+        c.insert("/w", w);
+        let bar = &["/tabs", "/back", "/fwd0", "/new", "/mark"];
+        c.insert("/bar", node("tool bar", "Gezinme", true, &[], bar));
+        c.insert(
+            "/tabs",
+            node("page tab list", "", true, &[], &["/t1", "/t2"]),
+        );
+        c.insert("/t1", node("page tab", "Ödeme", true, &[], &["/x1"]));
+        c.insert("/x1", node("push button", "Kapat", true, &[], &[]));
+        c.insert("/t2", node("page tab", "İzinler", true, &[], &["/x2"]));
+        c.insert("/x2", node("push button", "Kapat", true, &[], &[]));
+        c.insert("/back", node("push button", "Geri", true, &[], &[]));
+        c.insert(
+            "/fwd0",
+            node("push button", "İleri", true, &["disabled"], &[]),
+        );
+        c.insert(
+            "/new",
+            node("push button", "Yeni sekme aç (Ctrl+T)", true, &[], &[]),
+        );
+        let mark = node(
+            "push button",
+            "Bu sayfayı yer imlerine ekle (Ctrl+D)",
+            true,
+            &[],
+            &[],
+        );
+        c.insert("/mark", mark);
+        c.insert("/if", node("internal frame", "", true, &[], &["/doc"]));
+        let page = &["/plus", "/fwd", "/close"];
+        c.insert("/doc", node("document web", "Ödeme", true, &[], page));
+        let mut plus = node("push button", "Artır", true, &[], &[]);
+        plus.text = Some("+".into());
+        c.insert("/plus", plus);
+        let mut fwd = node("push button", "İleri", true, &[], &[]);
+        fwd.text = Some("İleri ".into());
+        c.insert("/fwd", fwd);
+        c.insert("/close", node("push button", "Kapat", true, &[], &[]));
+        c
+    }
+
+    fn located(c: &Cache<&'static str>, query: &str, role: &str) -> Matches<&'static str> {
+        locate_all(c, &["/w"], query, role, true, "")
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn a_browser_page_beats_its_chrome_and_says_how_many_it_left_out() {
+        let mut c = browser();
+        // "+" is the text of the page's "Artır": exact, against the
+        // chrome's "(Ctrl+T)" and "(Ctrl+D)".
+        let m = located(&c, "+", "push button");
+        assert_eq!((m.picked, m.over_chrome), (vec![("/plus", "/w")], 0));
+        // The chrome's "İleri" is disabled; the page's has a trailing space.
+        let m = located(&c, "İleri", "push button");
+        assert_eq!((m.picked, m.over_chrome), (vec![("/fwd", "/w")], 0));
+        // Two tabs' close buttons and the page's.
+        let m = located(&c, "Kapat", "push button");
+        assert_eq!((m.picked, m.over_chrome), (vec![("/close", "/w")], 2));
+        // Only chrome matches: still a tie, nothing left out.
+        c.get_mut("/close").unwrap().name = "Tamam".into();
+        let m = located(&c, "Kapat", "push button");
+        assert_eq!(m.picked.len(), 2);
+        assert_eq!(m.over_chrome, 0);
+        // A window without a tab strip has no chrome: an app whose own
+        // tool bar and document both have "Kapat".
+        let mut c = browser();
+        c.get_mut("/tabs").unwrap().role = "panel".into();
+        let m = located(&c, "Kapat", "push button");
+        assert_eq!((m.picked.len(), m.over_chrome), (3, 0));
+    }
+
+    #[test]
+    fn the_focused_element_then_one_in_a_page_dialog_break_ties() {
+        let mut c = browser();
+        // The page's "Kapat" twice: in a modal dialog and on the page.
+        c.get_mut("/doc").unwrap().children = vec!["/close", "/dlg"];
+        c.insert(
+            "/dlg",
+            node("dialog", "İzin talebi", true, &[], &["/close2"]),
+        );
+        c.insert("/close2", node("push button", "Kapat", true, &[], &[]));
+        let m = located(&c, "Kapat", "push button");
+        assert_eq!((m.picked, m.over_chrome), (vec![("/close2", "/w")], 2));
+        // The focused one wins over the dialog's.
+        c.get_mut("/close").unwrap().states = vec!["focused"];
+        let m = located(&c, "Kapat", "push button");
+        assert_eq!(m.picked, vec![("/close", "/w")]);
+        // A focused chrome button is not taken over by the page.
+        c.get_mut("/close").unwrap().states.clear();
+        c.get_mut("/x1").unwrap().states = vec!["focused"];
+        let m = located(&c, "Kapat", "push button");
+        assert_eq!((m.picked, m.over_chrome), (vec![("/x1", "/w")], 0));
+        c.get_mut("/x1").unwrap().states.clear();
+        // Without the dialog, two plain page buttons still tie.
+        c.get_mut("/dlg").unwrap().role = "section".into();
+        assert_eq!(located(&c, "Kapat", "push button").picked.len(), 2);
+    }
+
+    #[test]
+    fn a_dialog_in_the_browsers_window_beats_the_page_behind_it() {
+        // Firefox's confirm(): a dialog beside the page, outside it.
+        let mut c = browser();
+        c.get_mut("/w").unwrap().children.push("/prompt");
+        c.insert("/prompt", node("dialog", "", true, &[], &["/cancel"]));
+        c.insert("/cancel", node("push button", "Kapat", true, &[], &[]));
+        let m = located(&c, "Kapat", "push button");
+        assert_eq!((m.picked, m.over_chrome), (vec![("/cancel", "/w")], 2));
+    }
+
+    #[test]
+    fn the_page_never_takes_a_field_of_the_browser() {
+        // A page's look-alike of the address bar: a tie, refused.
+        let mut c = browser();
+        c.get_mut("/w").unwrap().children.push("/url");
+        let bar = "Search or enter address";
+        c.insert("/url", node("entry", bar, true, &["editable"], &[]));
+        c.get_mut("/doc").unwrap().children.push("/fake");
+        c.insert("/fake", node("entry", bar, true, &["editable"], &[]));
+        let m = located(&c, bar, "");
+        assert_eq!((m.picked.len(), m.over_chrome), (2, 0));
+    }
+
+    #[test]
+    fn a_field_holding_the_query_does_not_tie_with_the_button_named_so() {
+        let mut c = browser();
+        c.get_mut("/doc").unwrap().children = vec!["/q", "/go"];
+        let mut q = node("entry", "Arama", true, &["focused", "editable"], &[]);
+        q.text = Some("Ara".into());
+        c.insert("/q", q);
+        c.insert("/go", node("push button", "Ara", true, &[], &[]));
+        assert_eq!(located(&c, "ara", "").picked, vec![("/go", "/w")]);
+    }
+
+    #[test]
+    fn an_empty_query_does_not_match_text_exactly() {
+        // `role` alone names the first element of the role: a named one
+        // without text is no exact hit of "".
+        let c = browser();
+        let m = located(&c, "", "document web");
+        assert_eq!(m.picked, vec![("/doc", "/w")]);
     }
 
     /// Two windows of an app, each with a push button "OK": "/w1" (`r1`)

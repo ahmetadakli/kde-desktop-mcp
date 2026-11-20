@@ -36,3 +36,12 @@ pub async fn time<T>(name: &str, fut: impl Future<Output = T>) -> T {
     );
     out
 }
+
+/// Print "trace <text>" when tracing is on: a decision or a measure that
+/// is no span (why a wait was skipped, when a change came).
+pub fn note(text: &str) {
+    if on() {
+        let depth = DEPTH.with(|d| d.get());
+        eprintln!("trace {}{text}", "  ".repeat(depth));
+    }
+}

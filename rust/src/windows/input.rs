@@ -3,14 +3,15 @@
 
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{CloseHandle, GetLastError, HWND, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, GetLastError, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC,
     SRCCOPY, SelectObject,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, MOUSE_EVENT_FLAGS,
@@ -267,6 +268,24 @@ pub fn hosted_apps() -> Vec<String> {
     out
 }
 
+/// When process `pid` started (100 ns units since 1601); None when it
+/// cannot be opened.
+pub fn process_created(pid: u32) -> Option<u64> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        let ok = GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user);
+        let _ = CloseHandle(h);
+        ok.ok()?;
+        Some(u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
+    }
+}
+
 fn image_stem(pid: u32) -> String {
     unsafe {
         let Ok(h) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) else {
@@ -284,18 +303,34 @@ fn image_stem(pid: u32) -> String {
     }
 }
 
-/// Grab the screen rectangle of the foreground window as 24-bit RGB rows.
-fn grab_foreground() -> Option<(u32, u32, Vec<u8>, RECT)> {
-    let h = foreground();
-    if h.is_invalid() {
-        return None;
+/// Grab the screen rectangle of window `h` as 24-bit RGB rows. The screen
+/// shows whatever is in front there: `h` must be the foreground window
+/// before and after, or the grab fails.
+fn grab_foreground(h: HWND) -> R<(u32, u32, Vec<u8>, RECT)> {
+    let changed = || {
+        "the foreground window changed during the screenshot; nothing captured, \
+                      take a new one"
+            .to_string()
+    };
+    if h.is_invalid() || foreground() != h {
+        return Err(changed());
     }
     let mut r = RECT::default();
-    unsafe { GetWindowRect(h, &mut r) }.ok()?;
+    unsafe { GetWindowRect(h, &mut r) }
+        .map_err(|_| format!("[Errno {}] GetWindowRect failed", last_error()))?;
     let (w, ht) = (r.right - r.left, r.bottom - r.top);
     if w <= 0 || ht <= 0 {
-        return None;
+        return Err(format!("the window has no area ({w}x{ht})"));
     }
+    let grabbed = grab_rect(w, ht, r).ok_or("the screen could not be copied (BitBlt)")?;
+    if foreground() != h {
+        return Err(changed());
+    }
+    Ok(grabbed)
+}
+
+/// The screen rectangle `r` (`w` x `ht`) as 24-bit RGB rows.
+fn grab_rect(w: i32, ht: i32, r: RECT) -> Option<(u32, u32, Vec<u8>, RECT)> {
     unsafe {
         let screen = GetDC(None);
         let mem = CreateCompatibleDC(Some(screen));
@@ -346,10 +381,11 @@ fn grab_foreground() -> Option<(u32, u32, Vec<u8>, RECT)> {
     }
 }
 
-/// Capture the foreground window: its RGB pixels and screen rectangle,
-/// plus a new private file in %TEMP% for the PNG made from them.
-pub fn screenshot() -> Option<(String, shot::Pixels, RECT)> {
-    let (width, height, data, rect) = grab_foreground()?;
+/// Capture window `h`, which must be the foreground window: its RGB pixels
+/// and screen rectangle, plus a new private file in %TEMP% for the PNG made
+/// from them.
+pub fn screenshot(h: HWND) -> R<(String, shot::Pixels, RECT)> {
+    let (width, height, data, rect) = grab_foreground(h)?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -359,12 +395,12 @@ pub fn screenshot() -> Option<(String, shot::Pixels, RECT)> {
         .write(true)
         .create_new(true)
         .open(&path)
-        .ok()?;
+        .map_err(|e| format!("screenshot: cannot create {}: {e}", path.display()))?;
     let pixels = shot::Pixels {
         width,
         height,
         channels: 3,
         data,
     };
-    Some((path.display().to_string(), pixels, rect))
+    Ok((path.display().to_string(), pixels, rect))
 }

@@ -135,6 +135,7 @@ impl Input {
                 .build()
                 .map_err(io)?;
             std::thread::sleep(DEVICE_SETTLE);
+            crate::trace::note("uinput keyboard created (waited DEVICE_SETTLE)");
             *slot = Some(dev);
         }
         f(slot.as_mut().unwrap())
@@ -172,6 +173,7 @@ impl Input {
                 .build()
                 .map_err(io)?;
             std::thread::sleep(DEVICE_SETTLE);
+            crate::trace::note("uinput pointer created (waited DEVICE_SETTLE)");
             *slot = Some(dev);
         }
         f(slot.as_mut().unwrap())

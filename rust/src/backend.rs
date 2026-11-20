@@ -71,6 +71,67 @@ pub struct Fetch {
 /// elements leaves such ones out.
 pub const NO_AREA: &str = "element has no on-screen area";
 
+/// Levels `Backend::window_title` walks up at most.
+const WINDOW_WALK_MAX: usize = 64;
+
+/// The walk up from an element to its window: the nearest frame, window
+/// or dialog, but not a dialog inside a page (a web page's modal, role
+/// dialog under "document web"), which is no window one can activate.
+/// Feed it each level from the element up (`step`), then `end`.
+pub struct WindowWalk<T> {
+    dialog: Option<T>,
+}
+
+impl<T> Default for WindowWalk<T> {
+    fn default() -> Self {
+        WindowWalk { dialog: None }
+    }
+}
+
+impl<T> WindowWalk<T> {
+    /// The window, when the level `node` of role `role` settles it.
+    pub fn step(&mut self, node: T, role: &str) -> Option<T> {
+        if self.dialog.is_some() {
+            if matches!(role, "document web" | "document frame") {
+                // The dialog sat in a page: keep walking.
+                self.dialog = None;
+            } else if matches!(role, "frame" | "window") {
+                return self.dialog.take();
+            }
+            return None;
+        }
+        match role {
+            "frame" | "window" => Some(node),
+            "dialog" => {
+                self.dialog = Some(node);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// At the top: the dialog met on the way, if any.
+    pub fn end(self) -> Option<T> {
+        self.dialog
+    }
+}
+
+/// The error `element_center` gives for an element whose window is not in
+/// front (a click there would land on the window covering it). The tool
+/// layer names the window (`not_active`) when the backend does not.
+pub const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
+
+/// NOT_ACTIVE naming the element's window `title` (quoted and cut as
+/// `render::short_title` does): what to pass as `window`, or `act`, which
+/// needs no window in front.
+pub fn not_active(title: &str) -> String {
+    if title.trim().is_empty() {
+        return NOT_ACTIVE.into();
+    }
+    let t = crate::render::short_title(title);
+    format!("element's window {t} is not active; pass window={t} or use act")
+}
+
 /// Window management the desktop does not offer (KDE and Hyprland do).
 pub const NO_WINDOW_CONTROL: &str =
     "window geometry is only available on KDE Plasma, Hyprland and Windows";
@@ -211,6 +272,39 @@ pub struct Shot {
     /// external tool already wrote a PNG to `path`.
     pub pixels: Option<crate::shot::Convert>,
     pub area: Option<(f64, f64, f64, f64)>,
+}
+
+/// The window a screenshot captures, read once so that the allowlist check
+/// and the capture are of the same window.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShotTarget {
+    /// Its app as the allowlist names it (the accessibility name of its
+    /// process, else its class); "" when not known.
+    pub app: String,
+    /// `app` is the window's class (its process has no accessibility
+    /// name): an allowlist entry the class contains allows it, as for the
+    /// window tools.
+    pub by_class: bool,
+    pub caption: String,
+    /// The window's class (KWin resource class, Hyprland class, Win32
+    /// class name), for the user to allowlist an unknown app by.
+    pub class: String,
+    /// Its frame, in the coordinates `pointer` takes.
+    pub area: Option<(f64, f64, f64, f64)>,
+    /// The backend's handle of the window (KWin's internal id, Hyprland's
+    /// address, the HWND): the capture must be of this window.
+    pub handle: String,
+}
+
+impl ShotTarget {
+    /// How a refusal names the window: its caption and class.
+    pub fn describe(&self) -> String {
+        let mut out = format!("'{}'", self.caption);
+        if !self.class.is_empty() {
+            out.push_str(&format!(" (class '{}')", self.class));
+        }
+        out
+    }
 }
 
 /// File dialogs the server can fill in (only KDE's so far).
@@ -469,6 +563,23 @@ pub trait Backend {
     async fn parent(&self, _id: &Self::Id) -> Option<Self::Id> {
         None
     }
+    /// Title of the window `id` is in (`WindowWalk`), for a NOT_ACTIVE
+    /// refusal; None when it is not found.
+    async fn window_title(&self, id: &Self::Id) -> Option<String> {
+        let mut walk = WindowWalk::default();
+        let mut cur = id.clone();
+        for _ in 0..WINDOW_WALK_MAX {
+            let (role, name) = self.identity(&cur).await;
+            if let Some(name) = walk.step(name, &role) {
+                return Some(name);
+            }
+            match self.parent(&cur).await {
+                Some(p) => cur = p,
+                None => break,
+            }
+        }
+        walk.end()
+    }
     /// A mark for `unchanged_since`, taken before a read that may be kept
     /// and reused; None when the backend cannot tell that an app's tree
     /// stayed the same (no events for all that a read sees), so reads are
@@ -496,6 +607,27 @@ pub trait Backend {
     }
     /// App name owning the foreground window, "" when unknown.
     async fn active_app(&self) -> String;
+    /// The processes of the client running this server (its ancestors and
+    /// their terminals), read once at start for the self-client guard;
+    /// empty where the platform cannot tell.
+    async fn self_client(&self) -> crate::selfguard::SelfClient {
+        crate::selfguard::SelfClient::default()
+    }
+    /// Process id of the app owning the foreground window, after an
+    /// `active_app` call; None when unknown.
+    async fn active_pid(&self) -> Option<u32> {
+        None
+    }
+    /// What the window of process `pid` titled `title` (None: the active
+    /// window) shows of its terminals: those its processes hold and the tab
+    /// in front, as far as the platform tells.
+    async fn term_view(&self, _pid: u32, _title: Option<&str>) -> crate::selfguard::TermView {
+        crate::selfguard::TermView::default()
+    }
+    /// Process id of the app the element belongs to; None when unknown.
+    async fn element_pid(&self, _id: &Self::Id) -> Option<u32> {
+        None
+    }
 
     async fn info(&self, id: &Self::Id, text_limit: usize) -> Info<Self::Id>;
     /// Role and name only, as cheaply as the platform allows (one round
@@ -565,6 +697,12 @@ pub trait Backend {
     /// e.g. `…QMenuBar.file.file.file_save_as`); empty when it has none.
     async fn object_id(&self, _id: &Self::Id) -> String {
         String::new()
+    }
+    /// What else names a field besides its name: the names of the labels
+    /// it is labelled by, its placeholder text and its description; empty
+    /// when it has none (or the backend reads none).
+    async fn labels(&self, _id: &Self::Id) -> Vec<String> {
+        Vec::new()
     }
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
     /// The element's states as `act`'s verified actions read them, fresh.
@@ -771,8 +909,15 @@ pub trait Backend {
     async fn doctor(&self) -> Vec<Check> {
         Vec::new()
     }
-    /// Capture the active window; `path` is a new private file.
-    async fn screenshot(&self) -> Option<Shot>;
+    /// The active window a screenshot would capture, with its app as the
+    /// allowlist names it; Err with the cause when there is none or it
+    /// cannot be read.
+    async fn shot_target(&self) -> R<ShotTarget>;
+    /// Capture `target` (from `shot_target`) and nothing else: a capture
+    /// that could show another window fails instead. `path` is a new
+    /// private file. Err names the real cause (a tool missing or failing,
+    /// the compositor's error, the temporary file).
+    async fn screenshot(&self, target: &ShotTarget) -> R<Shot>;
 }
 
 /// Why `close_window` closed nothing: no window or several match `query`.
@@ -796,6 +941,43 @@ pub fn not_one_window(query: &str, matches: &[WindowGeo]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// What `WindowWalk` picks over these levels, element first.
+    fn window_of(levels: &[(&'static str, &'static str)]) -> Option<&'static str> {
+        let mut walk = super::WindowWalk::default();
+        for (name, role) in levels {
+            if let Some(w) = walk.step(*name, role) {
+                return Some(w);
+            }
+        }
+        walk.end()
+    }
+
+    #[test]
+    fn a_page_modal_is_no_window_but_a_dialog_window_is() {
+        let firefox = ("İzinler — Mozilla Firefox", "frame");
+        // A button in a web page's modal: the browser's frame.
+        let modal = [
+            ("Personel", "combo box"),
+            ("İzin talebi", "dialog"),
+            ("İzinler", "section"),
+            ("İzinler", "document web"),
+            ("", "internal frame"),
+            firefox,
+            ("Firefox", "application"),
+        ];
+        assert_eq!(window_of(&modal), Some(firefox.0));
+        // A dialog window, and a plain element of the frame.
+        let save = [("Kaydet", "push button"), ("Farklı Kaydet", "dialog")];
+        assert_eq!(window_of(&save), Some("Farklı Kaydet"));
+        let save = [("OK", "push button"), ("Ayarlar", "dialog"), firefox];
+        assert_eq!(window_of(&save), Some("Ayarlar"));
+        assert_eq!(
+            window_of(&[("OK", "push button"), firefox]),
+            Some(firefox.0)
+        );
+        assert_eq!(window_of(&[("OK", "push button")]), None);
+    }
+
     #[test]
     fn windows_rank_title_then_app_then_parts() {
         let rank = |q, t, a| super::window_rank(q, t, &[a]);

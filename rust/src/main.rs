@@ -14,6 +14,7 @@ mod launch_pick;
 mod linux;
 mod policy;
 mod render;
+mod selfguard;
 mod semantic;
 mod shot;
 mod takeover;
@@ -64,6 +65,38 @@ const AMBIGUOUS_SHOWN: usize = 6;
 const AREA_CHECK_MAX: usize = 2 * AMBIGUOUS_SHOWN;
 /// Off-screen matches or close names a missed search offers.
 const MISS_SUGGESTIONS: usize = 5;
+/// Elements of a stale id's role and name offered at most, and matches of
+/// its name looked through for them.
+const STALE_SHOWN: usize = 3;
+const STALE_SEARCHED: usize = 20;
+/// Most elements a `wait_for` timeout offers as the closest.
+const WAIT_CLOSEST: usize = 3;
+
+/// Whether a `wait_for` query names nothing an app would show, but is
+/// written to time out: a sleep ("zz-never", "nonexistent", "dummy").
+fn looks_like_sleep(query: &str) -> bool {
+    const SLEEPY: [&str; 12] = [
+        "never",
+        "nonexist",
+        "non-exist",
+        "not exist",
+        "notexist",
+        "nothing",
+        "dummy",
+        "sleep",
+        "zzz",
+        "zz-",
+        "asdf",
+        "xyzzy",
+    ];
+    let q = query.to_lowercase();
+    q.trim().is_empty() || SLEEPY.iter().any(|w| q.contains(w))
+}
+
+/// Roles of fields whose labels `by_label` reads besides editable ones.
+const FIELD_ROLES: &[&str] = &["entry", "text", "password text", "spin button", "combo box"];
+/// Most fields whose labels one `by_label` reads.
+const LABEL_FIELDS: usize = 60;
 /// Nodes of a web page fetched when looking for matches scrolled out of
 /// view (see `Server::miss_report`).
 const OFFSCREEN_FETCH: usize = 3000;
@@ -438,6 +471,8 @@ struct Server<B: Backend> {
     /// NO_PAGE_RECHECK after that look). Never locked across an await.
     #[allow(clippy::type_complexity)]
     page_docs: std::sync::Mutex<HashMap<String, (B::Id, Option<B::Id>, Instant)>>,
+    /// The client running this server (`selfguard`), read on first use.
+    self_client: tokio::sync::OnceCell<selfguard::SelfClient>,
 }
 
 /// A key or mouse button the server pressed and has not released.
@@ -557,6 +592,10 @@ struct Gate {
     /// "before it, opened: …" lines for what showed after the previous
     /// input's reply (`Server::opened_before`), said with this call's.
     before: String,
+    /// `act` ran a verified action (check, expand, select, scroll_to): it
+    /// read the state back already, so the effect line does not wait
+    /// PAGE_SETTLE for a page to react on top.
+    verified: bool,
 }
 
 tokio::task_local! {
@@ -1104,6 +1143,49 @@ struct Fingerprint<Id> {
 /// link or a web app's row starts loading the next page only after a
 /// round trip of its own.
 const PAGE_SETTLE: Duration = Duration::from_millis(400);
+
+/// Keys (`chord_keys`, joined) after which the effect line waits
+/// PAGE_SETTLE for a web page to start reacting: they submit a form,
+/// press the focused link or button, go back or forward, or reload.
+/// Other keys (ctrl+l, Escape, Tab, a letter) show their effect at once
+/// or not at all.
+const PAGE_KEYS: [&str; 9] = [
+    "enter",
+    "kpenter",
+    "space",
+    "alt+left",
+    "alt+right",
+    "f5",
+    "ctrl+f5",
+    "ctrl+r",
+    "ctrl+shift+r",
+];
+
+/// Whether the effect line after `tool` (arguments `a`) on a web page
+/// waits PAGE_SETTLE past its settle for the page to start reacting: not
+/// after a verified action (`act` read the state back already), a key
+/// that loads or presses nothing (PAGE_KEYS), text typed without a final
+/// Enter, a field written or an element focused.
+fn waits_for_page(tool: &str, a: &Json, verified: bool) -> bool {
+    match tool {
+        _ if verified => false,
+        "key" => {
+            let sorted = |c: &str| {
+                let mut k = chord_keys(c);
+                k.sort();
+                k
+            };
+            let keys = sorted(a.get("combo").and_then(Json::as_str).unwrap_or_default());
+            PAGE_KEYS.iter().any(|p| sorted(p) == keys)
+        }
+        "type_text" => a
+            .get("text")
+            .and_then(Json::as_str)
+            .is_some_and(|t| t.ends_with('\n')),
+        "set_text" | "focus" => false,
+        _ => true,
+    }
+}
 
 /// How long `page_of` trusts that a browser's window shows no web page (a
 /// dialog, a mail app's window without a web view) before searching it
@@ -1721,6 +1803,7 @@ impl<B: Backend> Server<B> {
             link: Default::default(),
             reads: std::sync::Mutex::new(Reads::new()),
             page_docs: std::sync::Mutex::new(HashMap::new()),
+            self_client: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -1889,12 +1972,21 @@ impl<B: Backend> Server<B> {
         let left = || limit.saturating_sub(c.at.elapsed());
         let ms = || c.at.elapsed().as_millis();
         if !c.pre.busy && !self.b.wait_change(near, c.pre.mark, left()).await {
+            trace::note(&format!("content: no change in {} ms", ms()));
             return format!("; no page change seen in {} ms", ms());
         }
         let quiet = match c.pre.busy || c.at.elapsed() < CONTENT_EARLY {
             true => CONTENT_QUIET_EARLY,
             false => CONTENT_QUIET,
         };
+        // The first change's delay (the busy app's: none) and the quiet it
+        // chose: what a per-app quiet window would be tuned from.
+        trace::note(&format!(
+            "content: change seen after {} ms (busy={}), quiet {} ms",
+            ms(),
+            c.pre.busy,
+            quiet.as_millis()
+        ));
         let mut cap = Instant::now() + CONTENT_BURST;
         let mut windows: Option<Vec<B::Id>> = None;
         let mut loading = false;
@@ -2254,21 +2346,226 @@ impl<B: Backend> Server<B> {
     async fn require_active_allowed(&self) -> R<String> {
         let name = self.b.active_app().await;
         if !self.is_allowed(&name) {
-            // Name the window this server last brought forward, so the
-            // retry (with `window`) fixes it.
-            let hint = match self.last_active.lock().await.as_deref() {
-                Some(t) if !t.is_empty() => format!(" (last used: '{t}')"),
-                _ => String::new(),
+            // An app without an accessibility name: its window's caption
+            // and class tell the user what to allowlist.
+            let target = match name.is_empty() {
+                true => self.b.shot_target().await.ok(),
+                false => None,
             };
-            return Err(refusal(format!(
-                "active window app '{}' is not in {}; pass window=<title or app> to \
-                 activate an allowed window first{hint}",
-                if name.is_empty() { "unknown" } else { &name },
-                self.allow_file.display()
-            )));
+            return Err(self.active_refusal(&name, target.as_ref()).await);
         }
         self.permit(&name).await?;
         Ok(name)
+    }
+
+    /// The allowlist name of a screenshot's window: its app, or for a
+    /// window named by its class (no accessibility name), the entry the
+    /// class contains ("konsole" for org.kde.konsole), as the window tools
+    /// match it.
+    fn shot_app(&self, t: &backend::ShotTarget) -> String {
+        if !t.by_class || self.is_allowed(&t.app) {
+            return t.app.clone();
+        }
+        let class = t.class.to_lowercase();
+        self.allowed()
+            .into_iter()
+            .find(|a| !a.is_empty() && class.contains(a.as_str()))
+            .unwrap_or_else(|| t.app.clone())
+    }
+
+    /// The refusal for an active window of `app`, not allowed; `target`
+    /// (its window) names its caption and class.
+    async fn active_refusal(&self, app: &str, target: Option<&backend::ShotTarget>) -> String {
+        // Name the window this server last brought forward, so the retry
+        // (with `window`) fixes it.
+        let hint = match self.last_active.lock().await.as_deref() {
+            Some(t) if !t.is_empty() => format!(" (last used: '{t}')"),
+            _ => String::new(),
+        };
+        let what = match (app.is_empty(), target) {
+            (true, Some(t)) => format!("active window {} of an unknown app", t.describe()),
+            (true, None) => "active window app 'unknown'".to_string(),
+            (false, Some(t)) => format!("active window {} of app '{app}'", t.describe()),
+            (false, None) => format!("active window app '{app}'"),
+        };
+        refusal(format!(
+            "{what} is not in {}; pass window=<title or app> to activate an allowed window \
+             first{hint}",
+            self.allow_file.display()
+        ))
+    }
+
+    /// `require_active_allowed` for a tool about to send input to the
+    /// window in front, which must not be the agent's own client
+    /// (`guard_front`).
+    async fn require_input_front(&self) -> R<String> {
+        let app = self.require_active_allowed().await?;
+        self.guard_front().await?;
+        Ok(app)
+    }
+
+    // ------------------------------------------------------------ self-client guard
+
+    /// The client running this server (`selfguard`), read once; None when
+    /// the guard is off (`self-client: allow`) or no client was found.
+    async fn guarded_client(&self) -> Option<&selfguard::SelfClient> {
+        if self.policy().self_client {
+            return None;
+        }
+        let me = self
+            .self_client
+            .get_or_init(|| async { self.b.self_client().await })
+            .await;
+        (!me.is_empty()).then_some(me)
+    }
+
+    fn allow_file_text(&self) -> String {
+        self.allow_file.display().to_string()
+    }
+
+    /// Refuse input to the window in front when it is the agent's own: its
+    /// terminal tab, or the window of the client running this server.
+    /// Asks the backend for terminals only when the window in front
+    /// belongs to one of the client's processes.
+    async fn guard_front(&self) -> R<()> {
+        let Some(me) = self.guarded_client().await else {
+            return Ok(());
+        };
+        let Some(pid) = self.b.active_pid().await else {
+            return Ok(());
+        };
+        if me.ancestor(pid).is_none() {
+            return Ok(());
+        }
+        let view = self.b.term_view(pid, None).await;
+        match me.front_owner(pid, &view) {
+            None => Ok(()),
+            Some(own) => {
+                let title = self.active_title().await.unwrap_or_default();
+                Err(refusal(selfguard::refusal(
+                    &own,
+                    &title,
+                    &self.allow_file_text(),
+                )))
+            }
+        }
+    }
+
+    /// Refuse a tool that acts on element `id` (click tier and up) when the
+    /// element belongs to the agent's own client (Claude Desktop's own
+    /// buttons). A terminal's own elements (its tabs) stay usable, but not
+    /// its entries that send input into the agent's terminal (Paste).
+    async fn guard_element(&self, id: &B::Id) -> R<()> {
+        let (tool, args) = GATE
+            .try_with(|g| {
+                let g = g.borrow();
+                (g.tool.clone(), g.args.clone())
+            })
+            .unwrap_or_else(|_| (String::new(), Json::Null));
+        if policy::needed_tier(&tool, &args) < Tier::Click || tool == "move_window" {
+            return Ok(());
+        }
+        let Some(me) = self.guarded_client().await else {
+            return Ok(());
+        };
+        let Some(pid) = self.b.element_pid(id).await else {
+            return Ok(());
+        };
+        if me.ancestor(pid).is_none() {
+            return Ok(());
+        }
+        let view = self.b.term_view(pid, Some("")).await;
+        let name = if view.ptys.is_empty() {
+            String::new()
+        } else {
+            self.b.identity(id).await.1
+        };
+        match me.element_owner(pid, &view, &name) {
+            None => Ok(()),
+            Some(own) => Err(refusal(selfguard::element_refusal(
+                &own,
+                &self.allow_file_text(),
+            ))),
+        }
+    }
+
+    /// Refuse pointer input at screen point (`x`, `y`) outside the window
+    /// in front, over a window of the agent's own (its terminal tab
+    /// beside the browser in front): the press would land there, past
+    /// `guard_front`. Windows are listed with the client's processes
+    /// added to the allowlist, so a terminal not on it is seen too. A
+    /// point inside the window in front, or a list that cannot be read,
+    /// passes.
+    async fn guard_point(&self, x: i64, y: i64) -> R<()> {
+        let Some(me) = self.guarded_client().await else {
+            return Ok(());
+        };
+        let mut names = self.allowed();
+        names.extend(me.chain.iter().map(|p| p.name.clone()));
+        let Ok(list) = self.b.windows_quick("", &names).await else {
+            return Ok(());
+        };
+        let (px, py) = (x as f64, y as f64);
+        let over = |w: &&WindowGeo| {
+            !w.minimized
+                && w.width > 0.0
+                && w.height > 0.0
+                && (w.x..w.x + w.width).contains(&px)
+                && (w.y..w.y + w.height).contains(&py)
+        };
+        if list.iter().filter(over).any(|w| w.active) {
+            return Ok(());
+        }
+        for w in list.iter().filter(over) {
+            if me.ancestor(w.pid).is_none() {
+                continue;
+            }
+            let view = self.b.term_view(w.pid, Some(&w.title)).await;
+            if let Some(own) = me.front_owner(w.pid, &view) {
+                return Err(refusal(selfguard::point_refusal(
+                    &own,
+                    (x, y),
+                    &w.title,
+                    &self.allow_file_text(),
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `w` is the agent's own window: what input to it in front
+    /// would reach (`SelfClient::front_owner`).
+    async fn is_own_window(&self, me: &selfguard::SelfClient, w: &WindowGeo) -> bool {
+        if me.ancestor(w.pid).is_none() {
+            return false;
+        }
+        let view = self.b.term_view(w.pid, Some(&w.title)).await;
+        me.front_owner(w.pid, &view).is_some()
+    }
+
+    /// Of the windows in `list` that match `query` best (`window_rank`),
+    /// the title of one that is not the agent's own, when one of them is
+    /// (a second Konsole window rather than the agent's tab); None to keep
+    /// the usual pick.
+    async fn other_than_own(&self, query: &str, list: &[WindowGeo]) -> Option<String> {
+        let me = self.guarded_client().await?;
+        if !list.iter().any(|w| me.ancestor(w.pid).is_some()) {
+            return None;
+        }
+        let ranked: Vec<(u8, &WindowGeo)> = list
+            .iter()
+            .filter_map(|w| backend::window_rank(query, &w.title, &[&w.app]).map(|r| (r, w)))
+            .collect();
+        let best = ranked.iter().map(|(r, _)| *r).min()?;
+        let (mut own, mut other) = (false, None);
+        for (_, w) in ranked.iter().filter(|(r, _)| *r == best) {
+            if self.is_own_window(me, w).await {
+                own = true;
+            } else if other.is_none() {
+                other = Some(w.title.clone());
+            }
+        }
+        if own { other } else { None }
     }
 
     // ------------------------------------------------------------ ids
@@ -2335,12 +2632,56 @@ impl<B: Backend> Server<B> {
             } else {
                 format!("now {}", render::role_and_name(&role, &name))
             };
-            return Err(format!(
-                "stale id {rid} (was {}, {now}); call tree/find again",
-                render::role_and_name(&r.role, &r.name)
-            ));
+            let was = render::role_and_name(&r.role, &r.name);
+            let same = self.same_role_and_name(&r).await;
+            return Err(if same.is_empty() {
+                format!("stale id {rid} (was {was}, {now}); call tree/find again")
+            } else {
+                format!(
+                    "stale id {rid} (was {was}, {now}); not acted on. visible now with its \
+                     role and name (pass one id):\n{same}"
+                )
+            });
         }
         Ok(r)
+    }
+
+    /// The lines (with fresh ids) of the visible elements of `r`'s app with
+    /// its role and name, at most STALE_SHOWN; "" when there are none or
+    /// the name is empty. Offered on a stale id (a page that re-rendered
+    /// often gives the same button a new object), never acted on.
+    async fn same_role_and_name(&self, r: &Ref<B::Id>) -> String {
+        if r.name.trim().is_empty() {
+            return String::new();
+        }
+        let Some(windows) = self.b.app_windows(&r.app).await else {
+            return String::new();
+        };
+        let (hits, mut cache, _) = self
+            .read_app(
+                None,
+                &windows,
+                Cache::new(),
+                search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
+                search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
+                |c| render::find(c, &windows, &r.name, &r.role, STALE_SEARCHED),
+            )
+            .await;
+        let name = render::fold(&r.name);
+        let same: Vec<B::Id> = hits
+            .into_iter()
+            .filter(|id| cache[id].role == r.role && render::fold(&cache[id].name) == name)
+            .take(STALE_SHOWN)
+            .collect();
+        if same.is_empty() {
+            return String::new();
+        }
+        self.b.fill_actions(&mut cache, &same).await;
+        let lines = same
+            .into_iter()
+            .map(|id| Line::Node { depth: 0, id })
+            .collect();
+        self.print(lines, &cache, &r.app).await.0
     }
 
     /// The allowlist name of `w`'s app, found as the window list allows
@@ -2839,6 +3180,7 @@ impl<B: Backend> Server<B> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
             let r = trace::time("resolve_ref", self.resolve_ref(rid)).await?;
             trace::time("permit", self.permit(&r.app)).await?;
+            self.guard_element(&r.id).await?;
             note_step_element(rid as u64, true);
             let t = Target {
                 id: r.id,
@@ -2868,23 +3210,36 @@ impl<B: Backend> Server<B> {
         let window = a.get("window").and_then(Json::as_str).unwrap_or("");
         let app_key = app.to_lowercase();
         let mut kept = true;
-        let (id, cache, at, ties, synonym) = loop {
+        // The label, placeholder or description that named a field.
+        let mut labelled: Option<String> = None;
+        let (id, cache, at, ties, synonym, over_chrome) = loop {
             let located = self.locate(app, query, &role, true, kept, window);
             let located = trace::time("locate", located).await?;
             let (mut m, mut cache, cached) = match located {
                 Located::Found(m, cache, cached) => (m, cache, cached),
                 Located::Missed(windows, mut cache) => {
-                    let with_role = if role.is_empty() {
-                        String::new()
+                    if let Some((id, label)) = self.by_label(&cache, query, &role).await {
+                        let window = frame_in(&cache, &id).unwrap_or_else(|| windows[0].clone());
+                        let m = render::Matches {
+                            picked: vec![(id, window)],
+                            by_synonym: false,
+                            over_chrome: 0,
+                        };
+                        labelled = Some(label);
+                        (m, cache, false)
                     } else {
-                        format!(" with role '{role}'")
-                    };
-                    let report = self
-                        .miss_report(&windows, &mut cache, &app_key, query, &role)
-                        .await;
-                    return Err(format!(
-                        "no visible element in '{app}' matches '{query}'{with_role}{report}"
-                    ));
+                        let with_role = if role.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" with role '{role}'")
+                        };
+                        let report = self
+                            .miss_report(&windows, &mut cache, &app_key, query, &role)
+                            .await;
+                        return Err(format!(
+                            "no visible element in '{app}' matches '{query}'{with_role}{report}"
+                        ));
+                    }
                 }
             };
             if input && m.picked.len() > 1 {
@@ -2897,6 +3252,7 @@ impl<B: Backend> Server<B> {
                 self.untie(&mut m, &mut cache, app, query, &role).await?;
             }
             let ties = m.picked.len();
+            let over_chrome = m.over_chrome;
             let roles: Vec<&str> = m
                 .picked
                 .iter()
@@ -2928,7 +3284,7 @@ impl<B: Backend> Server<B> {
                 }
             );
             if there {
-                break (id, cache, at, ties, synonym);
+                break (id, cache, at, ties, synonym, over_chrome);
             }
             // Gone or hidden without an event: read afresh.
             self.forget_reads(&app_key);
@@ -2940,11 +3296,21 @@ impl<B: Backend> Server<B> {
         if ties > 1 {
             found.push_str(&format!(" (first of {ties} matches)"));
         }
+        if over_chrome > 0 {
+            let s = if over_chrome == 1 { "" } else { "es" };
+            found.push_str(&format!(
+                " (picked over {over_chrome} browser-chrome match{s})"
+            ));
+        }
         if !synonym.is_empty() {
             found.push_str(&format!(" ({synonym})"));
         }
+        if let Some(label) = labelled {
+            found.push_str(&format!(" (labelled {})", render::py_repr(&label)));
+        }
         let found = Some(found);
         let role = cache[&id].role.clone();
+        self.guard_element(&id).await?;
         let t = Target {
             id,
             found,
@@ -2952,6 +3318,61 @@ impl<B: Backend> Server<B> {
             role,
         };
         Ok((t, at))
+    }
+
+    /// The one visible field (an editable element) that its label,
+    /// placeholder or description names `query` best (`render::label_rank`),
+    /// with that text, for a query that matched no element's name or text:
+    /// a web form's label sits outside the entry, which is named after
+    /// something else ("Red gerekçesi" over an entry named "Not ·
+    /// reddederken zorunlu"). None on no match or a tie. Reads the labels
+    /// of at most LABEL_FIELDS fields of `cache`.
+    async fn by_label(
+        &self,
+        cache: &Cache<B::Id>,
+        query: &str,
+        role: &str,
+    ) -> Option<(B::Id, String)> {
+        if query.trim().is_empty() {
+            return None;
+        }
+        let synonyms = render::role_synonyms(role).unwrap_or_default();
+        let fields: Vec<&B::Id> = cache
+            .iter()
+            .filter(|(_, i)| {
+                i.showing
+                    && (i.states.contains(&"editable") || render::role_in(&i.role, FIELD_ROLES))
+                    && (render::role_matches(&i.role, role)
+                        || (!synonyms.is_empty() && render::role_matches(&i.role, &synonyms)))
+            })
+            .map(|(id, _)| id)
+            .take(LABEL_FIELDS)
+            .collect();
+        if fields.is_empty() {
+            return None;
+        }
+        let labels =
+            futures_util::future::join_all(fields.iter().map(|id| self.b.labels(id))).await;
+        let mut best: Option<(u8, &B::Id, String)> = None;
+        let mut tied = false;
+        for (id, texts) in fields.into_iter().zip(labels) {
+            let Some((rank, text)) = texts
+                .into_iter()
+                .filter_map(|t| Some((render::label_rank(&t, query)?, t)))
+                .min_by_key(|(r, _)| *r)
+            else {
+                continue;
+            };
+            match &best {
+                Some((b, _, _)) if *b < rank => {}
+                Some((b, _, _)) if *b == rank => tied = true,
+                _ => {
+                    best = Some((rank, id, text));
+                    tied = false;
+                }
+            }
+        }
+        best.filter(|_| !tied).map(|(_, id, t)| (id.clone(), t))
     }
 
     /// What is on screen, for a reply that found nothing or failed: the
@@ -3504,6 +3925,17 @@ impl<B: Backend> Server<B> {
             Some(_) => 0,
             None => arg_i(a, "settle_ms", SETTLE_MS).clamp(0, MAX_SETTLE_MS) as u64,
         };
+        let verified = GATE.try_with(|g| g.borrow().verified).unwrap_or(false);
+        // A page answers late: a little longer, after an input that may
+        // load one or press something on it (not when nothing was sent).
+        let page_settle =
+            settle > 0 && sent && before.page.is_some() && waits_for_page(tool, a, verified);
+        if trace::on() && settle > 0 && before.page.is_some() {
+            trace::note(&format!(
+                "page settle {}: {tool} sent={sent} verified={verified}",
+                if page_settle { "on" } else { "skipped" }
+            ));
+        }
         // The focused element's app reacts (its bus, on Linux), the app the
         // input went to (`act` reaches a browser behind the terminal), and
         // the element whose page the content wait watched.
@@ -3522,7 +3954,7 @@ impl<B: Backend> Server<B> {
             self.b.changed_since(&near, mark),
         ) {
             let mut limit = Duration::from_millis(settle);
-            if settle > 0 && sent && before.page.is_some() {
+            if page_settle {
                 limit += PAGE_SETTLE;
             }
             let now = trace::time("content settle", self.content_settle(windows, was, limit)).await;
@@ -3535,9 +3967,7 @@ impl<B: Backend> Server<B> {
                     .await;
             }
             let mut events = self.b.changed_since(&near, mark);
-            // A page answers late: wait a little longer for it to start
-            // (not when nothing was sent).
-            if settle > 0 && sent && before.page.is_some() && events != Some(true) {
+            if page_settle && events != Some(true) {
                 trace::time("page settle", self.b.wait_change(&near, mark, PAGE_SETTLE)).await;
                 events = self.b.changed_since(&near, mark);
             }
@@ -3766,6 +4196,18 @@ impl<B: Backend> Server<B> {
         // unsaved work may go with it.
         let app = self.window_app(w).await;
         self.permit(&app).await?;
+        if let Some(me) = self.guarded_client().await
+            && me.ancestor(w.pid).is_some()
+        {
+            let view = self.b.term_view(w.pid, Some(&w.title)).await;
+            if let Some(own) = me.close_owner(w.pid, &view) {
+                return Err(refusal(selfguard::close_refusal(
+                    &own,
+                    &w.title,
+                    &self.allow_file_text(),
+                )));
+            }
+        }
         if !GATE.try_with(|g| g.borrow().confirmed).unwrap_or(false) {
             self.confirm("close_window", Some(&app), a).await?;
         }
@@ -3937,6 +4379,29 @@ impl<B: Backend> Server<B> {
                 (false, false) => format!(
                     "never read; filled in only in: {}",
                     policy.passwords.join(", ")
+                ),
+            },
+        );
+        let me = self
+            .self_client
+            .get_or_init(|| async { self.b.self_client().await })
+            .await;
+        row(
+            policy.self_client || me.multiplexer().is_none(),
+            "self-client guard",
+            &match (policy.self_client, me.is_empty()) {
+                (true, _) => format!(
+                    "off ('{}' in the allowlist): input may reach the agent's own client, {}",
+                    selfguard::OPT_OUT,
+                    me.describe()
+                ),
+                (false, true) => {
+                    "no client process found above this server: nothing to guard".into()
+                }
+                (false, false) => format!(
+                    "input never goes to the agent's own terminal tab or client window; \
+                     client: {}",
+                    me.describe()
                 ),
             },
         );
@@ -4272,6 +4737,7 @@ impl<B: Backend> Server<B> {
             let done = self.verified(&t, verb, &action, option.as_deref()).await;
             // None: not of the kind, but it has an action of that name.
             if let Some(reply) = done.map_err(|e| t.reply(&e))? {
+                let _ = GATE.try_with(|g| g.borrow_mut().verified = true);
                 return Ok(t.reply(&reply));
             }
         }
@@ -5017,7 +5483,7 @@ impl<B: Backend> Server<B> {
             ));
         };
         let (active, pane_at, at) = tokio::join!(
-            self.require_active_allowed(),
+            self.require_input_front(),
             self.b.wheel_point(&pane),
             self.b.element_center(id)
         );
@@ -5067,6 +5533,7 @@ impl<B: Backend> Server<B> {
         let app_key = app.to_lowercase();
         let mut cache = Cache::new();
         let bar = self.menu_bar(&app, &windows, &mut cache).await?;
+        self.guard_element(&bar).await?;
         let hidden = !cache[&bar].showing;
         let mut node = bar;
         let mut trail: Vec<String> = Vec::new();
@@ -5432,55 +5899,158 @@ impl<B: Backend> Server<B> {
         if t.protected() && !self.passwords_allowed(&t.app) {
             return Err(t.reply(&self.password_refusal("set_text", &t.app)));
         }
-        let typed = match self.write_text(&t.id, &text, false).await? {
-            Written::Refused => return Ok(t.reply("failed")),
-            Written::Set => false,
-            Written::Typed => true,
-        };
         if t.protected() {
-            return Ok(t.reply("ok (password field: contents cannot be read back)"));
-        }
-        if typed {
-            let how = "; typed: the element has no text interface";
-            return match self.read_back(&t.id, &text, SET_TEXT_VERIFY).await {
-                Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
-                Ok(Some(now)) => Err(t.reply(&written_mismatch(&now, &text, how))),
-                Err(e) => Ok(t.reply(&format!("ok (not verified: {e}{how})"))),
+            return match self.write_text(&t.id, &text, false).await? {
+                Written::Refused => Ok(t.reply("failed")),
+                _ => Ok(t.reply("ok (password field: contents cannot be read back)")),
             };
         }
+        // What the field held, to tell a write that changed nothing.
+        let limit = text.chars().count() + 64;
+        let before = self.b.full_text(&t.id, limit).await.ok();
         // Firefox reports success for accessibility writes and changes
         // nothing. Retype through the keyboard when the element takes focus;
         // never with a newline, which Enter would turn into a submit.
         let retypable = !text.contains('\n');
         let key = self.b.app_key(&t.id);
-        let inert = match &key {
-            Some(k) if retypable => self.inert_writes.lock().await.contains(k),
-            _ => false,
-        };
-        // Where writes are known to do nothing, one look instead of waiting
-        // SET_TEXT_VERIFY for the write to show.
-        let patience = if inert {
-            Duration::ZERO
-        } else {
-            SET_TEXT_VERIFY
-        };
+        // Gecko on Linux: every set_text into it had to be typed, so its
+        // write is not tried at all. Elsewhere: once a write did nothing.
+        let gecko =
+            retypable && cfg!(target_os = "linux") && self.b.toolkit_of(&t.id).await == "gecko";
+        let inert = gecko
+            || match &key {
+                Some(k) if retypable => self.inert_writes.lock().await.contains(k),
+                _ => false,
+            };
         let mut how = "";
-        let mut seen = self.read_back(&t.id, &text, patience).await;
-        if matches!(&seen, Ok(Some(_))) && retypable && self.retype(&t.id, &text, false).await {
-            how = "; typed, the accessibility write had no effect";
-            seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
-            if let (Ok(None), Some(k)) = (&seen, key) {
-                self.inert_writes.lock().await.insert(k);
+        // Why the keyboard could not be used, and whether it was.
+        let mut not_typed: Option<String> = None;
+        let mut keyboard = false;
+        let pre = delivery::so_far();
+        if inert {
+            let (r, wrote) = delivery::track(self.retype(&t.id, &text, false)).await;
+            keyboard = wrote;
+            match r {
+                Ok(()) => {
+                    how = if gecko {
+                        "; typed: accessibility writes have no effect in Gecko apps"
+                    } else {
+                        "; typed, the accessibility write had no effect"
+                    };
+                    let seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+                    return self.set_outcome(&t, &text, seen, &before, how, None, keyboard, pre);
+                }
+                Err(why) if gecko => {
+                    let seen = self.read_back(&t.id, &text, Duration::ZERO).await;
+                    return self.set_outcome(
+                        &t,
+                        &text,
+                        seen,
+                        &before,
+                        "",
+                        Some(why),
+                        keyboard,
+                        pre,
+                    );
+                }
+                // Could not retype: try the write after all, with its usual
+                // time to show.
+                Err(why) => not_typed = Some(why),
             }
-        } else if inert && matches!(&seen, Ok(Some(_))) {
-            // Could not retype: give the write its usual time after all.
-            seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
         }
-        match seen {
-            Ok(None) => Ok(t.reply(&format!("ok (verified{how})"))),
-            Ok(Some(now)) => Err(t.reply(&written_mismatch(&now, &text, how))),
-            Err(e) => Ok(t.reply(&format!("ok (not verified: {e})"))),
+        let typed = match self.write_text(&t.id, &text, false).await? {
+            Written::Refused => return Ok(t.reply("failed")),
+            Written::Set => false,
+            Written::Typed => true,
+        };
+        if typed {
+            let how = "; typed: the element has no text interface";
+            let seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+            return self.set_outcome(&t, &text, seen, &before, how, None, true, pre);
         }
+        let mut seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+        if matches!(&seen, Ok(Some(_))) && retypable && not_typed.is_none() {
+            let (r, wrote) = delivery::track(self.retype(&t.id, &text, false)).await;
+            keyboard |= wrote;
+            match r {
+                Ok(()) => {
+                    how = "; typed, the accessibility write had no effect";
+                    seen = self.read_back(&t.id, &text, SET_TEXT_VERIFY).await;
+                    if let (Ok(None), Some(k)) = (&seen, key) {
+                        self.inert_writes.lock().await.insert(k);
+                    }
+                }
+                Err(why) => not_typed = Some(why),
+            }
+        } else if !retypable {
+            not_typed =
+                Some("text with a line break is never typed (Enter could submit it)".into());
+        }
+        self.set_outcome(&t, &text, seen, &before, how, not_typed, keyboard, pre)
+    }
+
+    /// set_text's reply once the field was read back (`seen`, see
+    /// `read_back`): `before` what it held first, `how` it was written,
+    /// `not_typed` why typing it was not possible, `keyboard` whether keys
+    /// (or focus) went out, `pre` whether the call had written anything
+    /// before set_text's own write. A field left as it was says "nothing
+    /// changed", and when only an accessibility write it ignored went out,
+    /// the reply says nothing was sent: a retry is safe.
+    #[allow(clippy::too_many_arguments)]
+    fn set_outcome(
+        &self,
+        t: &Target<B::Id>,
+        text: &str,
+        seen: R<Option<String>>,
+        before: &Option<String>,
+        how: &str,
+        not_typed: Option<String>,
+        keyboard: bool,
+        pre: bool,
+    ) -> R<String> {
+        let now = match seen {
+            Ok(None) => return Ok(t.reply(&format!("ok (verified{how})"))),
+            Err(e) => return Ok(t.reply(&format!("ok (not verified: {e}{how})"))),
+            Ok(Some(now)) => now,
+        };
+        let counts = format!(
+            "{} chars, {} asked{how}",
+            now.chars().count(),
+            text.chars().count()
+        );
+        match text_fit(text, &now) {
+            Fit::Formatted => {
+                let shown = shown_value(&now);
+                return Ok(t.reply(&format!(
+                    "ok (verified; the field formatted it as {shown}: {counts})"
+                )));
+            }
+            // Only when the write changed the field: one that still holds
+            // what it held ignored the write, whatever it would drop.
+            Fit::Filtered(dropped) if before.as_deref() != Some(now.as_str()) => {
+                let shown = shown_value(&now);
+                return Ok(t.reply(&format!(
+                    "ok with a warning: the field dropped {dropped:?}, which it does not \
+                     accept; it holds {shown} ({counts})"
+                )));
+            }
+            Fit::Filtered(_) | Fit::Wrong => {}
+        }
+        if before.as_deref() != Some(now.as_str()) {
+            return Err(t.reply(&written_mismatch(&now, text, how)));
+        }
+        let shown = shown_value(&now);
+        let what = match (not_typed, keyboard) {
+            (Some(why), _) => format!("it could not be typed: {why}"),
+            (None, true) => format!("typing it changed nothing{how}"),
+            (None, false) => "the accessibility write had no effect".into(),
+        };
+        if !keyboard {
+            delivery::ignored(pre);
+        }
+        Err(t.reply(&format!(
+            "{what}; the field still holds {shown}: nothing changed"
+        )))
     }
 
     /// Write `text` into an element: through its text interface, else, for an
@@ -5501,13 +6071,9 @@ impl<B: Backend> Server<B> {
                 if text.contains('\n') || !editable {
                     return Err(e);
                 }
-                if self.retype(id, text, front_checked).await {
-                    Ok(Written::Typed)
-                } else {
-                    Err(format!(
-                        "{e}, and it would not take the focus to be typed into (not the \
-                         field itself? find it by role, e.g. role \"text\"); nothing typed"
-                    ))
+                match self.retype(id, text, front_checked).await {
+                    Ok(()) => Ok(Written::Typed),
+                    Err(why) => Err(format!("{e}, and it could not be typed: {why}")),
                 }
             }
         }
@@ -5531,17 +6097,29 @@ impl<B: Backend> Server<B> {
         }
     }
 
-    /// Focus the element, select all and type `text`; false when the element
-    /// would not take focus in an allowed active window (nothing typed).
-    /// Runs under the input lock `set_text` (an INPUT_TOOLS entry) holds.
-    async fn retype(&self, id: &B::Id, text: &str, front_checked: bool) -> bool {
-        if !front_checked && self.require_active_allowed().await.is_err() {
-            return false;
+    /// Focus the element, select all and type `text` (empty: delete the
+    /// selection); Err(why) when the window in front is not one to type
+    /// into or the element would not take focus (nothing typed then), or
+    /// a key failed. Runs under the input lock `set_text` (an INPUT_TOOLS
+    /// entry) holds.
+    async fn retype(&self, id: &B::Id, text: &str, front_checked: bool) -> R<()> {
+        if !front_checked && let Err(e) = self.require_input_front().await {
+            return Err(e);
         }
         if !matches!(self.b.try_focus(id).await, Ok(Some(_))) && !self.b.is_focused(id).await {
-            return false;
+            return Err(
+                "it would not take the keyboard focus (not the field itself? find it \
+                 by role, e.g. role \"text\")"
+                    .into(),
+            );
         }
-        self.b.press_combo("ctrl+a").await.is_ok() && self.b.type_text(text).await.is_ok()
+        self.b.press_combo("ctrl+a").await?;
+        if text.is_empty() {
+            // Typing nothing leaves the selection: delete it.
+            self.b.press_combo("backspace").await
+        } else {
+            self.b.type_text(text).await.map(|_| ())
+        }
     }
 
     /// Why a password field is not filled in, and how the user can allow it.
@@ -5693,8 +6271,14 @@ impl<B: Backend> Server<B> {
                     (Some(s), false) => format!("to be {}", s.name()),
                     (Some(s), true) => format!("to stop being {}", s.name()),
                 };
+                let hint = match (state, gone) {
+                    (None, false) => self.wait_miss_hint(&windows, &app, &query).await,
+                    _ => String::new(),
+                };
+                let title = self.app_title(&app).await;
                 return Err(format!(
-                    "timed out after {ms} ms waiting for '{query}' in '{app}' {what}{note}"
+                    "timed out after {ms} ms waiting for '{query}' in '{app}' {what}{note}\
+                     {title}{hint}"
                 ));
             }
             let checked = Instant::now();
@@ -5705,6 +6289,61 @@ impl<B: Backend> Server<B> {
             // Never more often than the old poll, however busy the app.
             tokio::time::sleep(WAIT_MIN_GAP.saturating_sub(checked.elapsed()).min(left)).await;
         }
+    }
+
+    /// "; window 'title'": the title of `app`'s active window, else of its
+    /// first; "" when it has none.
+    async fn app_title(&self, app: &str) -> String {
+        let key = app.to_lowercase();
+        self.b
+            .list_apps()
+            .await
+            .into_iter()
+            .filter(|a| a.name.to_lowercase() == key)
+            .flat_map(|a| a.windows)
+            .min_by_key(|w| !w.active)
+            .map(|w| format!("; window {}", render::py_repr(&w.title)))
+            .unwrap_or_default()
+    }
+
+    /// What a `wait_for` that timed out waiting for `query` to appear in
+    /// `windows` adds: up to WAIT_CLOSEST visible elements with the closest
+    /// names, with ids (a misspelt or reworded query); with none, and a
+    /// query that names nothing an app would show ("zz-never"), that a
+    /// fixed wait is `pause`.
+    async fn wait_miss_hint(&self, windows: &[B::Id], app: &str, query: &str) -> String {
+        if windows.is_empty() {
+            return String::new();
+        }
+        // Read as a search does, every part it needs.
+        let (_, mut cache, _) = self
+            .read_app(
+                None,
+                windows,
+                Cache::new(),
+                search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
+                search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
+                |c| render::locate_all(c, windows, query, "", false, "").map(|_| ()),
+            )
+            .await;
+        let near = render::closest(&cache, windows, query, WAIT_CLOSEST);
+        if near.is_empty() {
+            return if looks_like_sleep(query) {
+                "; nothing there comes close: wait_for is no sleep, to wait a fixed time \
+                 use pause"
+                    .into()
+            } else {
+                String::new()
+            };
+        }
+        self.b.fill_actions(&mut cache, &near).await;
+        let key = app.to_lowercase();
+        let mut lines = Vec::new();
+        for id in &near {
+            let rid = self.add_ref(id, &cache[id], &key).await;
+            lines.push(render::describe(&cache[id], rid));
+        }
+        format!("; closest:\n{}", lines.join("\n"))
     }
 
     /// `wait_for` a window of an allowed app (`app`, when given) whose
@@ -5790,19 +6429,8 @@ impl<B: Backend> Server<B> {
             }
             if since.elapsed() >= quiet {
                 let ms = start.elapsed().as_millis();
-                // Which page it settled on, so no find is needed to check:
-                // the app's active window, else its first.
-                let key = app.to_lowercase();
-                let title = self
-                    .b
-                    .list_apps()
-                    .await
-                    .into_iter()
-                    .filter(|a| a.name.to_lowercase() == key)
-                    .flat_map(|a| a.windows)
-                    .min_by_key(|w| !w.active)
-                    .map(|w| format!("; window {}", render::py_repr(&w.title)))
-                    .unwrap_or_default();
+                // Which page it settled on, so no find is needed to check.
+                let title = self.app_title(&app).await;
                 return Ok(format!(
                     "idle after {ms} ms (no change for {} ms){title}{note}",
                     quiet.as_millis()
@@ -5915,10 +6543,23 @@ impl<B: Backend> Server<B> {
     /// to be an allowed app's. Both lookups are reads and independent, so
     /// they run together; the allowlist error still comes first.
     async fn active_center(&self, id: &B::Id) -> R<(i32, i32)> {
-        let (active, center) =
-            tokio::join!(self.require_active_allowed(), self.b.element_center(id));
+        let (active, center) = tokio::join!(self.require_input_front(), self.b.element_center(id));
         active?;
-        center
+        self.name_window(id, center).await
+    }
+
+    /// `center` of `id`, its NOT_ACTIVE error naming the element's window
+    /// when the backend did not: the agent passes that title as `window`
+    /// (its usual miss is a hit in another window of the app, such as a
+    /// private browser window behind).
+    async fn name_window(&self, id: &B::Id, center: R<(i32, i32)>) -> R<(i32, i32)> {
+        match center {
+            Err(e) if e == backend::NOT_ACTIVE => Err(match self.b.window_title(id).await {
+                Some(title) => backend::not_active(&title),
+                None => e,
+            }),
+            other => other,
+        }
     }
 
     /// The element a pointer tool names and its centre, once the active
@@ -5928,7 +6569,7 @@ impl<B: Backend> Server<B> {
     /// window, then the centre.
     async fn target_center(&self, a: &Json) -> R<(Target<B::Id>, (i32, i32))> {
         let (active, found) = tokio::join!(
-            trace::time("require_active_allowed", self.require_active_allowed()),
+            trace::time("require_input_front", self.require_input_front()),
             async {
                 let target = self.target_and_center(a, true, true);
                 let (t, center) = trace::time("target", target).await?;
@@ -5941,7 +6582,8 @@ impl<B: Backend> Server<B> {
         );
         let (t, center) = found?;
         active?;
-        Ok((t, center?))
+        let center = self.name_window(&t.id, center).await?;
+        Ok((t, center))
     }
 
     /// One end of a drag: `<end>_id` (an element, resolved), else
@@ -5950,6 +6592,7 @@ impl<B: Backend> Server<B> {
         if let Some(rid) = a.get(format!("{end}_id")).and_then(Json::as_i64) {
             let (id, app) = self.resolve_with_app(rid).await?;
             self.permit(&app).await?;
+            self.guard_element(&id).await?;
             return Ok(DragEnd::Element(id));
         }
         let (x, y) = (
@@ -5970,7 +6613,7 @@ impl<B: Backend> Server<B> {
     /// order they would come one by one: active window, `from`, `to`.
     async fn drag_points(&self, a: &Json) -> R<(String, (i64, i64), (i64, i64))> {
         let (app, from, to) = tokio::join!(
-            self.require_active_allowed(),
+            self.require_input_front(),
             self.drag_end(a, "from"),
             self.drag_end(a, "to")
         );
@@ -5982,12 +6625,18 @@ impl<B: Backend> Server<B> {
                 _ => None,
             })
             .collect();
-        let mut centers = if ids.is_empty() {
-            Vec::new()
-        } else {
-            self.b.element_centers(&ids).await
+        let mut named = Vec::new();
+        if !ids.is_empty() {
+            for (id, c) in ids.iter().zip(self.b.element_centers(&ids).await) {
+                named.push(self.name_window(id, c).await);
+            }
         }
-        .into_iter();
+        for end in [&from, &to] {
+            if let Ok(DragEnd::Point((x, y))) = end {
+                self.guard_point(*x, *y).await?;
+            }
+        }
+        let mut centers = named.into_iter();
         let mut point = |end: R<DragEnd<B::Id>>| -> R<(i64, i64)> {
             match end? {
                 DragEnd::Point(p) => Ok(p),
@@ -6064,10 +6713,12 @@ impl<B: Backend> Server<B> {
             ));
         }
         let send = keys.join("+");
-        let app = self.require_active_allowed().await?;
+        let app = trace::time("require_input_front", self.require_input_front()).await?;
         // Enter submits, alt+left goes back: the page may change.
         let content = match CONTENT_KEYS.contains(&send.as_str()) && self.b.changes_live() {
-            true => self.b.focused().await.map(|f| (f.id, f.info.role)),
+            true => trace::time("focused", self.b.focused())
+                .await
+                .map(|f| (f.id, f.info.role)),
             false => None,
         };
         let pre = self.pre_content(content.as_ref().map(|(id, _)| id));
@@ -6078,19 +6729,19 @@ impl<B: Backend> Server<B> {
                     .await
                     .map_err(|e| format!("{e} after {i} of {times} presses of {send}"))?;
             }
-            self.b.press_combo(&send).await?;
+            trace::time("press", self.b.press_combo(&send)).await?;
         }
         if let Some((id, role)) = &content {
             // Enter in a search field submits it.
-            self.note_content(pre, id, role, true).await;
+            trace::time("note_content", self.note_content(pre, id, role, true)).await;
         }
-        let focus = self.focus_note(false).await;
+        let focus = trace::time("focus_note", self.focus_note(false)).await;
         Ok(format!("sent {combo} x{repeat} to {app}{focus}"))
     }
 
     async fn type_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
-        let app = self.require_active_allowed().await?;
+        let app = self.require_input_front().await?;
         if let Some(f) = self.b.focused().await
             && render::is_protected_role(&f.info.role)
             && !self.passwords_allowed(&f.app)
@@ -6206,7 +6857,8 @@ impl<B: Backend> Server<B> {
         if clicks > 0 {
             self.check_button_free(&button)?;
         }
-        let app = self.require_active_allowed().await?;
+        let app = self.require_input_front().await?;
+        self.guard_point(x, y).await?;
         self.with_modifiers(
             &mods,
             self.b.pointer(x, y, &button, clicks, arg_i(a, "scroll", 0)),
@@ -6260,7 +6912,7 @@ impl<B: Backend> Server<B> {
         };
         let what = items.iter().map(|h| h.name()).collect::<Vec<_>>().join("+");
         if down {
-            let app = self.require_active_allowed().await?;
+            let app = self.require_input_front().await?;
             for h in &items {
                 if !self.is_held(h) {
                     self.press_held(h).await?;
@@ -6292,9 +6944,9 @@ impl<B: Backend> Server<B> {
     async fn activate_window(&self, a: &Json) -> R<String> {
         let query = match a.get("terminal").and_then(Json::as_str) {
             Some(t) => self.terminal_window(t).await?,
-            None => req_s(a, "query")?,
+            None => self.prefer_other(&req_s(a, "query")?).await,
         };
-        let (_, app) = self.activate(&query).await?;
+        let (_, app) = trace::time("activate", self.activate(&query)).await?;
         Ok(format!(
             "active app now: {}",
             if app.is_empty() { "unknown" } else { &app }
@@ -6323,7 +6975,9 @@ impl<B: Backend> Server<B> {
         if !self.is_allowed(&app) {
             return false;
         }
-        match self.b.windows(query, &self.allowed()).await {
+        // Titles and apps only: the terminals `windows` adds cost a scan
+        // of the processes of each terminal window.
+        match self.b.windows_quick(query, &self.allowed()).await {
             // In front only if it is (one of) the best match: "Claude" with
             // a terminal titled "~ : claude" in front still activates
             // Claude Desktop (backend::window_rank).
@@ -6348,16 +7002,39 @@ impl<B: Backend> Server<B> {
         }
     }
 
+    /// Whether `window` (an argument) needs no activation: the window
+    /// `ensure_window` would bring forward is already in front.
+    async fn window_in_front(&self, query: &str) -> bool {
+        let query = self.prefer_other(query).await;
+        self.window_is_active(&query).await
+    }
+
     /// An input tool's `window`: activate the matching window unless it is
     /// already in front. Some(title) when it activated one. Runs inside
     /// `call`, under the input lock, so nothing else takes the focus
     /// between this and the tool's input.
     async fn ensure_window(&self, query: &str) -> R<Option<String>> {
-        if self.window_is_active(query).await {
+        let query = self.prefer_other(query).await;
+        if trace::time("window_is_active", self.window_is_active(&query)).await {
+            trace::note("window in front already: not activated");
             return Ok(None);
         }
-        let (title, _) = self.activate(query).await?;
-        Ok(Some(title.unwrap_or_else(|| query.to_string())))
+        let (title, _) = trace::time("activate", self.activate(&query)).await?;
+        Ok(Some(title.unwrap_or(query)))
+    }
+
+    /// `query`, or the title of another window it matches as well when the
+    /// one it would pick is the agent's own (`other_than_own`).
+    async fn prefer_other(&self, query: &str) -> String {
+        if self.guarded_client().await.is_none() {
+            return query.to_string();
+        }
+        let Ok(list) = self.b.windows_quick(query, &self.allowed()).await else {
+            return query.to_string();
+        };
+        self.other_than_own(query, &list)
+            .await
+            .unwrap_or_else(|| query.to_string())
     }
 
     /// Title of the allowed window whose terminal runs a command, or is in a
@@ -6391,6 +7068,7 @@ impl<B: Backend> Server<B> {
         let owner = file_dialog_owner(&d, &allowed)
             .map_err(|e| refusal(format!("{e} (allowlist: {})", self.allow_file.display())))?;
         self.permit(&owner).await?;
+        self.guard_front().await?;
         let mut text = path.display().to_string();
         if cfg!(windows) {
             // `~/x` joined to the profile folder; the dialog's own form.
@@ -6476,7 +7154,16 @@ impl<B: Backend> Server<B> {
     /// resolution, mapped so image_x/image_y refer to the zoomed image.
     async fn screenshot(&self, a: &Json) -> R<Out> {
         let region = region_arg(a)?;
-        trace::time("require_active_allowed", self.require_active_allowed()).await?;
+        // The window captured is the one checked: read once, its app by
+        // its process.
+        let target = trace::time("shot_target", self.b.shot_target())
+            .await
+            .map_err(|e| format!("screenshot failed: {e}"))?;
+        let app = self.shot_app(&target);
+        if !self.is_allowed(&app) {
+            return Err(self.active_refusal(&target.app, Some(&target)).await);
+        }
+        self.permit(&app).await?;
         // The zoom's screen area, from the map of the image it was read in.
         let zoom = match region {
             Some(r) => {
@@ -6487,9 +7174,9 @@ impl<B: Backend> Server<B> {
             None => None,
         };
         *self.last_shot.lock().await = None;
-        let Shot { path, pixels, area } = trace::time("capture", self.b.screenshot())
+        let Shot { path, pixels, area } = trace::time("capture", self.b.screenshot(&target))
             .await
-            .ok_or("screenshot failed")?;
+            .map_err(|e| format!("screenshot failed: {e}"))?;
         let frac = match (zoom, area) {
             (None, _) => shot::Frac::ALL,
             (Some((_, want)), Some(area)) => region_frac(area, want).ok_or_else(|| {
@@ -6719,7 +7406,12 @@ impl<B: Backend> Server<B> {
         }
         let (((result, refused), element), wrote) =
             delivery::track(STEP_ELEMENT.scope(std::cell::Cell::new(None), async {
-                let r = with_refusals(self.call_inner(&call.tool, &args, held, settle)).await;
+                let step = format!("step {n} {}", call.tool);
+                let r = with_refusals(trace::time(
+                    &step,
+                    self.call_inner(&call.tool, &args, held, settle),
+                ))
+                .await;
                 (r, STEP_ELEMENT.with(|e| e.get()))
             }))
             .await;
@@ -6868,6 +7560,7 @@ impl<B: Backend> Server<B> {
             quiet: false,
             reported: Vec::new(),
             before: String::new(),
+            verified: false,
         };
         Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
             let (result, wrote) = delivery::track(self.call_body(name, a, held, settle)).await;
@@ -6887,6 +7580,14 @@ impl<B: Backend> Server<B> {
     /// `call_inner`'s work, inside its GATE scope.
     async fn call_body(&self, name: &str, a: &Json, held: bool, settle: bool) -> R<Out> {
         let window = window_arg(name, a)?;
+        // A screenshot whose window is in front already sends no input:
+        // it neither waits for the user's input to stop nor counts as a
+        // run's input (a batch's last look after its input went through),
+        // and takes no input lock.
+        let window = match window {
+            Some(q) if READ_ONLY_TOOLS.contains(&name) && self.window_in_front(&q).await => None,
+            w => w,
+        };
         // Tools that reach no app through `permit` are confirmed here,
         // by their `app` argument if any.
         if NO_PERMIT_TOOLS.contains(&name) {
@@ -6976,7 +7677,7 @@ impl<B: Backend> Server<B> {
         // that opened after its reply): said before this input's result.
         let pre_note = match observe {
             None if WINDOW_NOTE_TOOLS.contains(&name) && window.is_none() => {
-                self.window_change_note().await
+                trace::time("window_change_note", self.window_change_note()).await
             }
             _ => String::new(),
         };
@@ -7083,7 +7784,8 @@ impl<B: Backend> Server<B> {
                     o.text
                         .push_str(&format!("; before it, {before} had come to the front"));
                 }
-                o.text.push_str(&self.window_change_note().await);
+                o.text
+                    .push_str(&trace::time("window_change_note", self.window_change_note()).await);
                 o.text.push_str(&opened);
                 Ok(o)
             }
@@ -7146,14 +7848,103 @@ enum Written {
 
 /// The reply when a written field holds something else than `text`.
 fn written_mismatch(now: &str, text: &str, how: &str) -> String {
-    let shown: String = now.chars().take(120).collect();
-    let more = if now.chars().count() > 120 { "…" } else { "" };
     format!(
-        "written, but the field now holds {shown:?}{more} ({} chars, {} asked{how}); \
+        "written, but the field now holds {} ({} chars, {} asked{how}); \
          it may limit or reformat input",
+        shown_value(now),
         now.chars().count(),
         text.chars().count()
     )
+}
+
+/// How a field's value differs from the text written into it, when
+/// `written_matches` says it does (see `text_fit`).
+#[derive(Debug, PartialEq)]
+enum Fit {
+    /// The same letters and digits, in the same order: the field only
+    /// spaced, punctuated or cased them ("0555 123 45 67").
+    Formatted,
+    /// A mask: it left out characters of a kind it holds none of (the
+    /// letters typed into a phone number); with them.
+    Filtered(String),
+    /// Anything else: empty, cut short, other characters.
+    Wrong,
+}
+
+/// `Fit` of the field value `now` for the text `asked`. Spaces, '(', ')',
+/// '/' and a '-' between two letters or digits are formatting; '.', ',',
+/// a leading '-' and every other character count (1.5 is not 15, -5 not
+/// 5). Characters are compared ignoring case. A value holding the asked
+/// characters minus some is a mask only when every one left out is of a
+/// kind (digit, letter, other) the value holds none of, and none is a '.',
+/// ',' or '-', which change a number, and not all of them come after the
+/// last one kept: a field that dropped "abc" from "0555abc12" takes digits
+/// only, while "abc" for "abcdef" or "username" for "username2024" was cut
+/// short (a length limit), which stays an error.
+fn text_fit(asked: &str, now: &str) -> Fit {
+    fn core(s: &str) -> Vec<char> {
+        let chars: Vec<char> = s.chars().collect();
+        let mut out = Vec::new();
+        for (i, &c) in chars.iter().enumerate() {
+            let between = i > 0
+                && chars[i - 1].is_alphanumeric()
+                && chars.get(i + 1).is_some_and(|n| n.is_alphanumeric());
+            let format = c.is_whitespace() || matches!(c, '(' | ')' | '/') || (c == '-' && between);
+            if !format {
+                out.push(c);
+            }
+        }
+        out
+    }
+    fn same(a: char, b: char) -> bool {
+        a == b || a.to_lowercase().eq(b.to_lowercase())
+    }
+    fn kind(c: char) -> u8 {
+        if c.is_numeric() {
+            0
+        } else if c.is_alphabetic() {
+            1
+        } else {
+            2
+        }
+    }
+    let (a, n) = (core(asked), core(now));
+    if n.is_empty() {
+        return Fit::Wrong;
+    }
+    if a.len() == n.len() && a.iter().zip(&n).all(|(x, y)| same(*x, *y)) {
+        return Fit::Formatted;
+    }
+    let mut kept = n.iter().peekable();
+    let mut dropped = String::new();
+    for &c in &a {
+        match kept.peek() {
+            Some(&&k) if same(c, k) => {
+                kept.next();
+            }
+            _ => dropped.push(c),
+        }
+    }
+    let cut_short = n.len() < a.len() && n.iter().zip(&a).all(|(k, c)| same(*k, *c));
+    let mask = kept.peek().is_none()
+        && !cut_short
+        && !dropped.is_empty()
+        && !dropped.contains(['.', ',', '-'])
+        && !dropped
+            .chars()
+            .any(|d| n.iter().any(|k| kind(*k) == kind(d)));
+    if mask {
+        Fit::Filtered(dropped)
+    } else {
+        Fit::Wrong
+    }
+}
+
+/// A field's value as a reply quotes it: its first 120 characters.
+fn shown_value(now: &str) -> String {
+    let shown: String = now.chars().take(120).collect();
+    let more = if now.chars().count() > 120 { "…" } else { "" };
+    format!("{shown:?}{more}")
 }
 
 /// Longest wait for a parent menu `open_parents` opened to show.
@@ -7608,6 +8399,9 @@ mod tests {
     /// push button "OK" unless a test changes it between calls), so finds
     /// for it hit and `wait_for` anything else keeps polling until its
     /// timeout; key presses and actions are logged.
+    /// A window's x, y, width and height.
+    type Frame = (f64, f64, f64, f64);
+
     struct FakeBackend {
         allow_file: PathBuf,
         keys: Rc<RefCell<Vec<String>>>,
@@ -7646,6 +8440,23 @@ mod tests {
         shown: Rc<FakeShown>,
         /// What `act`'s verified actions meet: see `FakeSemantic`.
         sem: Rc<FakeSemantic>,
+        /// The client running the server (`selfguard`), and what each
+        /// pid's window shows of its terminals. Window pids: `fake_pid`.
+        client: Rc<RefCell<selfguard::SelfClient>>,
+        /// Frames (x, y, width, height) of FAKE_WINDOWS by pid; none: 0x0.
+        frames: Rc<RefCell<HashMap<u32, Frame>>>,
+        views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
+    }
+
+    /// The pid of a fake window's process: Konsole 100, each Fake window a
+    /// process of its own (notes 200, todo 201).
+    fn fake_pid(app: &str, title: &str) -> u32 {
+        match (app, title.starts_with("todo")) {
+            ("konsole", _) => 100,
+            ("fake", false) => 200,
+            ("fake", true) => 201,
+            _ => 0,
+        }
     }
 
     /// How the fake answers `act`'s verified actions. Actions flip a check
@@ -7674,7 +8485,14 @@ mod tests {
         adds: std::cell::Cell<bool>,
         /// The user types once this many more key presses went out.
         user_after_presses: std::cell::Cell<Option<usize>>,
+        /// `labels` per element.
+        labels: RefCell<HashMap<u32, Vec<String>>>,
+        /// What the field keeps of typed text (an input mask), when Some.
+        mask: std::cell::Cell<Option<FakeMask>>,
     }
+
+    /// What a fake field keeps of the text typed into it.
+    type FakeMask = fn(&str) -> String;
 
     /// The fake's node `id` (the focus element too), changed by `f`.
     fn fake_edit(
@@ -7780,6 +8598,8 @@ mod tests {
         /// expanding entry k shows menu `flyouts[k]` in the pane
         /// FAKE_POPUP_HOST; `open_menus` finds them.
         flyouts: RefCell<HashMap<u32, u32>>,
+        /// `screenshot` fails with this cause.
+        shot_error: RefCell<Option<String>>,
     }
 
     /// Where the fake shows a flyout (`FakeShown::flyouts`).
@@ -7916,6 +8736,19 @@ mod tests {
         }
         async fn active_app(&self) -> String {
             self.active.borrow().0.clone()
+        }
+        async fn self_client(&self) -> selfguard::SelfClient {
+            self.client.borrow().clone()
+        }
+        async fn active_pid(&self) -> Option<u32> {
+            let (app, title) = self.active.borrow().clone();
+            Some(fake_pid(&app, &title))
+        }
+        async fn term_view(&self, pid: u32, _: Option<&str>) -> selfguard::TermView {
+            self.views.borrow().get(&pid).cloned().unwrap_or_default()
+        }
+        async fn element_pid(&self, _: &u32) -> Option<u32> {
+            Some(fake_pid(&self.focus_app.borrow(), ""))
         }
         async fn info(&self, id: &u32, _: usize) -> Info<u32> {
             match *id {
@@ -8150,6 +8983,14 @@ mod tests {
         async fn toolkit_of(&self, _: &u32) -> String {
             self.sem.toolkit.borrow().clone()
         }
+        async fn labels(&self, id: &u32) -> Vec<String> {
+            self.sem
+                .labels
+                .borrow()
+                .get(id)
+                .cloned()
+                .unwrap_or_default()
+        }
         /// "multi line" stands for the state tree and find do not show.
         async fn edit_states(&self, id: &u32) -> Option<(bool, bool)> {
             let st = self.info(id, 0).await.states;
@@ -8236,6 +9077,9 @@ mod tests {
             Ok(field.unwrap_or_default())
         }
         async fn set_text(&self, _: &u32, _: &str) -> R<bool> {
+            if self.field.borrow().is_some() {
+                self.keys.borrow_mut().push("write".into());
+            }
             Ok(true)
         }
         fn app_key(&self, id: &u32) -> Option<String> {
@@ -8255,7 +9099,7 @@ mod tests {
                 return Err(backend::NO_AREA.into());
             }
             if self.background.get() {
-                return Err("element's window is not active; call activate_window first".into());
+                return Err(backend::NOT_ACTIVE.into());
             }
             Ok((0, 0))
         }
@@ -8268,6 +9112,12 @@ mod tests {
         }
         async fn press_combo(&self, combo: &str) -> R<()> {
             self.keys.borrow_mut().push(format!("down {combo}"));
+            // Deletes the field's text, which ctrl+a selected.
+            if combo == "backspace"
+                && let Some(f) = self.field.borrow_mut().as_mut()
+            {
+                f.clear();
+            }
             self.shown.input();
             self.content_input();
             if let Some(n) = self.sem.user_after_presses.get() {
@@ -8333,7 +9183,10 @@ mod tests {
         }
         async fn type_text(&self, text: &str) -> R<String> {
             if let Some(f) = self.field.borrow_mut().as_mut() {
-                *f = text.to_string();
+                *f = match self.sem.mask.get() {
+                    Some(mask) => mask(text),
+                    None => text.to_string(),
+                };
             }
             Ok(String::new())
         }
@@ -8440,19 +9293,55 @@ mod tests {
                     allowed.iter().any(|a| a == app)
                         && (title.to_lowercase().contains(&q) || app.contains(&q))
                 })
-                .map(|(app, title)| WindowGeo {
-                    title: title.into(),
-                    app: app.into(),
-                    active: (app, title) == (active.0.as_str(), active.1.as_str()),
-                    ..WindowGeo::default()
+                .map(|(app, title)| {
+                    let pid = fake_pid(app, title);
+                    let (x, y, width, height) =
+                        self.frames.borrow().get(&pid).copied().unwrap_or_default();
+                    WindowGeo {
+                        title: title.into(),
+                        app: app.into(),
+                        active: (app, title) == (active.0.as_str(), active.1.as_str()),
+                        pid,
+                        x,
+                        y,
+                        width,
+                        height,
+                        ..WindowGeo::default()
+                    }
                 })
                 .collect())
         }
-        async fn screenshot(&self) -> Option<Shot> {
+        async fn shot_target(&self) -> R<backend::ShotTarget> {
+            // "classy": an app without an accessibility name, known by its
+            // window class only.
+            let (app, title) = self.active.borrow().clone();
+            let class = match app.as_str() {
+                "" => "org.example.mystery".to_string(),
+                "classy" => "org.example.Fake".to_string(),
+                _ => app.clone(),
+            };
+            let by_class = app == "classy";
+            Ok(backend::ShotTarget {
+                app: if by_class { class.to_lowercase() } else { app },
+                by_class,
+                class,
+                caption: title.clone(),
+                area: Some((10.0, 20.0, 400.0, 200.0)),
+                handle: title,
+            })
+        }
+        async fn screenshot(&self, target: &backend::ShotTarget) -> R<Shot> {
+            if let Some(e) = self.shown.shot_error.borrow().clone() {
+                return Err(e);
+            }
+            // The capture is of the window checked, or fails.
+            if self.active.borrow().1 != target.handle {
+                return Err("the active window changed".into());
+            }
             // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.
             let path = self.allow_file.with_extension("png");
-            std::fs::write(&path, b"").ok()?;
-            Some(Shot {
+            std::fs::write(&path, b"").map_err(|e| e.to_string())?;
+            Ok(Shot {
                 path: path.display().to_string(),
                 pixels: Some(Box::new(|| {
                     Ok(shot::Pixels {
@@ -8462,7 +9351,7 @@ mod tests {
                         data: vec![128; 200 * 100 * 3],
                     })
                 })),
-                area: Some((10.0, 20.0, 400.0, 200.0)),
+                area: target.area,
             })
         }
     }
@@ -8504,6 +9393,9 @@ mod tests {
         background: Rc<std::cell::Cell<bool>>,
         shown: Rc<FakeShown>,
         sem: Rc<FakeSemantic>,
+        client: Rc<RefCell<selfguard::SelfClient>>,
+        views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
+        frames: Rc<RefCell<HashMap<u32, Frame>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -8540,7 +9432,13 @@ mod tests {
         let background = Rc::new(std::cell::Cell::new(false));
         let shown = Rc::new(FakeShown::default());
         let sem = Rc::new(FakeSemantic::default());
+        let client = Rc::new(RefCell::new(selfguard::SelfClient::default()));
+        let views = Rc::new(RefCell::new(HashMap::new()));
+        let frames = Rc::new(RefCell::new(HashMap::new()));
         let server = Rc::new(Server::new(FakeBackend {
+            frames: frames.clone(),
+            client: client.clone(),
+            views: views.clone(),
             shown: shown.clone(),
             sem: sem.clone(),
             lag: lag.clone(),
@@ -8580,6 +9478,9 @@ mod tests {
             background,
             shown,
             sem,
+            client,
+            views,
+            frames,
         }
     }
 
@@ -9931,6 +10832,32 @@ mod tests {
         assert!(written_matches("", ""));
         assert!(!written_matches("hello world", "hello"));
         assert!(!written_matches("Ahmet", "ahmet"));
+    }
+
+    #[test]
+    fn set_text_tells_formatting_and_masks_from_wrong_values() {
+        use Fit::*;
+        assert_eq!(text_fit("05551234567", "0555 123 45 67"), Formatted);
+        assert_eq!(text_fit("05551234567", "(0555) 123-45-67"), Formatted);
+        assert_eq!(text_fit("tr12ab", "TR12 AB"), Formatted);
+        assert_eq!(text_fit("0555abc12", "055512"), Filtered("abc".into()));
+        assert_eq!(text_fit("+90 555", "90555"), Filtered("+".into()));
+        // Cut short, a sign or a decimal point lost, other text: wrong.
+        assert_eq!(text_fit("abcdef", "abc"), Wrong);
+        assert_eq!(text_fit("05551234567", "0555123"), Wrong);
+        // A length limit, though the value holds no digits.
+        assert_eq!(text_fit("username2024", "username"), Wrong);
+        assert_eq!(text_fit("abc123", "abc"), Wrong);
+        assert_eq!(text_fit("1.5", "15"), Wrong);
+        assert_eq!(text_fit("-5", "5"), Wrong);
+        assert_eq!(text_fit("a+b@x.com", "ab@x.com"), Wrong);
+        assert_eq!(
+            text_fit("deliveredto:ahmet+853@gmail.com", "ahmet+853@gmail.com "),
+            Wrong
+        );
+        assert_eq!(text_fit("05551234567", ""), Wrong);
+        assert_eq!(text_fit("0555", "0556"), Wrong);
+        assert_eq!(text_fit("12", "123"), Wrong);
     }
 
     fn log(s: &Session) -> Vec<String> {
@@ -11948,10 +12875,320 @@ mod tests {
             // Text with a newline is never retyped: the usual wait, unchanged.
             let start = Instant::now();
             let r = call_tool(&mut s, 5, "set_text", json!({"id": id, "text": "a\nb"})).await;
-            assert!(r.to_string().contains("the field now holds"), "{r}");
+            assert!(
+                reply_text(&r).starts_with(
+                    "Error executing tool set_text: it could not be typed: text with a line \
+                     break is never typed (Enter could submit it); the field still holds \"two\": \
+                     nothing changed; nothing sent\n"
+                ),
+                "{r}"
+            );
             assert!(start.elapsed() >= SET_TEXT_VERIFY);
             assert_eq!(s.field.borrow().as_deref(), Some("two"));
         });
+    }
+
+    #[test]
+    fn set_text_says_nothing_changed_when_it_could_not_type() {
+        local(async {
+            let mut s = session("untyped");
+            *s.field.borrow_mut() = Some(String::new());
+            let id = focus_id(&mut s, 2).await;
+            // A window not on the allowlist in front: the write did nothing
+            // and typing was refused, so the field is as it was and a retry
+            // is safe.
+            *s.active.borrow_mut() = (FAKE_WINDOWS[0].0.into(), FAKE_WINDOWS[0].1.into());
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                3,
+                "set_text",
+                json!({"id": id, "text": "05551234567"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with("Error executing tool set_text: it could not be typed: "),
+                "{r}"
+            );
+            assert!(
+                text.contains("; the field still holds \"\": nothing changed; nothing sent"),
+                "{r}"
+            );
+            assert!(!text.contains("maybe sent"), "{r}");
+            assert_eq!(s.field.borrow().as_deref(), Some(""));
+            assert!(!s.keys.borrow().iter().any(|k| k.starts_with("down")));
+            // A field already holding the start of the text: what typing
+            // would have added is no mask the field applied.
+            *s.field.borrow_mut() = Some("Room".into());
+            let r = call_tool(&mut s, 4, "set_text", json!({"id": id, "text": "Room 12"})).await;
+            assert!(
+                reply_text(&r).contains("the field still holds \"Room\": nothing changed"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn set_text_never_types_into_the_agents_own_tab() {
+        local(async {
+            let mut s = session("untyped-self");
+            set_allow("untyped-self", "fake\nkonsole\n");
+            *s.field.borrow_mut() = Some(String::new());
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            let id = focus_id(&mut s, 2).await;
+            *s.active.borrow_mut() = (FAKE_WINDOWS[0].0.into(), FAKE_WINDOWS[0].1.into());
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 3, "set_text", json!({"id": id, "text": "rm -rf x"})).await;
+            let text = reply_text(&r);
+            assert!(text.contains("it could not be typed: "), "{text}");
+            assert!(
+                text.contains("is konsole's tab running this agent (pts/0)"),
+                "{text}"
+            );
+            assert!(text.contains("nothing changed; nothing sent"), "{text}");
+            assert_eq!(s.field.borrow().as_deref(), Some(""));
+            assert!(!s.keys.borrow().iter().any(|k| k.starts_with("down")));
+        });
+    }
+
+    #[test]
+    fn set_text_types_into_firefox_without_trying_its_write() {
+        local(async {
+            let mut s = session("gecko");
+            *s.field.borrow_mut() = Some("old".into());
+            *s.sem.toolkit.borrow_mut() = "gecko".into();
+            let id = focus_id(&mut s, 2).await;
+            s.keys.borrow_mut().clear();
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "set_text", json!({"id": id, "text": "new"})).await;
+            assert_eq!(
+                reply_text(&r),
+                "ok (verified; typed: accessibility writes have no effect in Gecko apps)",
+                "{r}"
+            );
+            assert!(start.elapsed() < SET_TEXT_VERIFY, "{:?}", start.elapsed());
+            assert!(
+                !s.keys.borrow().contains(&"write".to_string()),
+                "{:?}",
+                s.keys.borrow()
+            );
+            // In the background, nothing at all goes out.
+            *s.active.borrow_mut() = (FAKE_WINDOWS[0].0.into(), FAKE_WINDOWS[0].1.into());
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 4, "set_text", json!({"id": id, "text": "x"})).await;
+            assert!(
+                reply_text(&r)
+                    .contains("the field still holds \"new\": nothing changed; nothing sent"),
+                "{r}"
+            );
+            assert_eq!(*s.keys.borrow(), ["read", "read"]);
+        });
+    }
+
+    #[test]
+    fn set_text_clears_a_field_with_backspace_when_the_write_did_nothing() {
+        local(async {
+            let mut s = session("clear");
+            *s.field.borrow_mut() = Some("draft".into());
+            let id = focus_id(&mut s, 2).await;
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 3, "set_text", json!({"id": id, "text": ""})).await;
+            assert_eq!(
+                reply_text(&r),
+                "ok (verified; typed, the accessibility write had no effect)",
+                "{r}"
+            );
+            assert_eq!(s.field.borrow().as_deref(), Some(""));
+            let keys = s.keys.borrow();
+            assert!(keys.contains(&"down ctrl+a".to_string()), "{keys:?}");
+            assert!(keys.contains(&"down backspace".to_string()), "{keys:?}");
+        });
+    }
+
+    #[test]
+    fn set_text_warns_of_a_mask_and_fails_a_value_cut_short() {
+        local(async {
+            let mut s = session("mask");
+            *s.field.borrow_mut() = Some(String::new());
+            s.sem.mask.set(Some(|t| {
+                t.chars().filter(char::is_ascii_digit).take(8).collect()
+            }));
+            let id = focus_id(&mut s, 2).await;
+            let r = call_tool(
+                &mut s,
+                3,
+                "set_text",
+                json!({"id": id, "text": "0555abc12"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], false, "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "ok with a warning: the field dropped \"abc\", which it does not accept; it \
+                 holds \"055512\" (6 chars, 9 asked; typed, the accessibility write had no effect)"
+            );
+            let r = call_tool(
+                &mut s,
+                4,
+                "set_text",
+                json!({"id": id, "text": "05551234567"}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r)
+                    .contains("written, but the field now holds \"05551234\" (8 chars, 11 asked"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn set_text_finds_a_field_by_its_label_placeholder_or_description() {
+        local(async {
+            let mut s = session("labels");
+            *s.field.borrow_mut() = Some(String::new());
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                let entry = |name: &str| Info {
+                    states: vec!["editable"],
+                    ..fake_node("entry", name, &[])
+                };
+                nodes.insert(30, entry("Not · reddederken zorunlu"));
+                nodes.insert(31, entry("Sicil no"));
+                nodes.insert(32, entry(""));
+                nodes.insert(33, fake_node("label", "Telefon", &[]));
+            }
+            s.focus.borrow_mut().children = vec![30, 31, 32, 33];
+            {
+                let mut labels = s.sem.labels.borrow_mut();
+                labels.insert(30, vec!["Red gerekçesi".into()]);
+                labels.insert(31, vec!["Personelin sicil numarası".into()]);
+                labels.insert(32, vec!["Telefon".into(), "05XX XXX XX XX".into()]);
+            }
+            let r = call_tool(
+                &mut s,
+                2,
+                "set_text",
+                json!({"app": "fake", "query": "Red gerekçesi", "text": "red"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(text.contains("entry \"Not · reddederken zorunlu\""), "{r}");
+            assert!(
+                text.contains("(labelled 'Red gerekçesi'): ok (verified"),
+                "{r}"
+            );
+            // A placeholder, with a role; the label element itself is no
+            // field, and its name does not win over the entry's label.
+            let r = call_tool(
+                &mut s,
+                3,
+                "get_text",
+                json!({"app": "fake", "query": "05xx xxx", "role": "textbox"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("(labelled '05XX XXX XX XX')"),
+                "{r}"
+            );
+            // Words in any order, without accents.
+            let r = call_tool(
+                &mut s,
+                4,
+                "get_text",
+                json!({"app": "fake", "query": "sicil personelin"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("entry \"Sicil no\""), "{r}");
+            // A name match still comes first; a miss still says so.
+            let r = call_tool(
+                &mut s,
+                5,
+                "get_text",
+                json!({"app": "fake", "query": "Telefon"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("label \"Telefon\""), "{r}");
+            let r = call_tool(
+                &mut s,
+                6,
+                "get_text",
+                json!({"app": "fake", "query": "Adres"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("no visible element in 'fake' matches 'Adres'"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_wait_for_timeout_offers_the_closest_and_says_pause_for_sleeps() {
+        local(async {
+            let mut s = session("wait-hints");
+            s.nodes
+                .borrow_mut()
+                .insert(30, fake_node("push button", "Yayımla", &[]));
+            s.focus.borrow_mut().children = vec![30];
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_for",
+                json!({"app": "fake", "query": "Yayınla", "timeout_ms": 0}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with(
+                    "Error executing tool wait_for: timed out after 0 ms waiting for 'Yayınla' \
+                     in 'fake' to appear; window 'notes.txt — Fake'; closest:\n["
+                ),
+                "{r}"
+            );
+            assert!(text.contains("] push button \"Yayımla\""), "{r}");
+            assert!(!text.contains("pause"), "{r}");
+            // Written to time out: a sleep.
+            let r = call_tool(
+                &mut s,
+                3,
+                "wait_for",
+                json!({"app": "fake", "query": "zz-never", "timeout_ms": 0}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(
+                    "to appear; window 'notes.txt — Fake'; nothing there comes close: wait_for \
+                     is no sleep, to wait a fixed time use pause"
+                ),
+                "{r}"
+            );
+            // Something not there yet, nothing like it: no advice.
+            let r = call_tool(
+                &mut s,
+                4,
+                "wait_for",
+                json!({"app": "fake", "query": "Download complete", "timeout_ms": 0}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("to appear; window 'notes.txt — Fake'\n"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn sleeps_are_told_from_queries() {
+        assert!(looks_like_sleep("zz-never"));
+        assert!(looks_like_sleep("nonexistent-never"));
+        assert!(looks_like_sleep("Does not exist"));
+        assert!(!looks_like_sleep("Yayın öncesi yapılacaklar"));
+        assert!(!looks_like_sleep("Install"));
+        assert!(!looks_like_sleep("Project Zomboid"));
     }
 
     #[test]
@@ -12852,6 +14089,7 @@ mod tests {
             );
             // The user keeps typing: refused, nothing sent, said once.
             keep_typing(&s.takeover, 4000);
+            s.keys.borrow_mut().clear();
             let r = call_tool(&mut s, 10, "key", json!({"combo": "a"})).await;
             assert_eq!(r["result"]["isError"], true, "{r}");
             assert_eq!(marker(reply_text(&r)), "no", "{r}");
@@ -13245,6 +14483,105 @@ mod tests {
     }
 
     #[test]
+    fn a_screenshot_of_the_window_in_front_is_never_paused() {
+        local(async {
+            let mut s = session("shot-ungated");
+            // The user is typing: input would wait, a look does not.
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Keyboard);
+            let started = Instant::now();
+            let r = call_tool(&mut s, 2, "screenshot", json!({"window": "notes"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).starts_with("200x100 px"), "{r}");
+            assert!(started.elapsed() < Duration::from_millis(500));
+            // A batch's last look after its input went through, while the
+            // user started using the mouse; one whose window must come to
+            // the front first is input: it stops there.
+            for (n, window, ok) in [(3, "notes", true), (4, "todo", false)] {
+                let mut s = session(&format!("shot-ungated-{n}"));
+                let t = s.takeover.clone();
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    t.user_input(Instant::now(), takeover::Device::Pointer);
+                });
+                let steps = json!({"steps": [
+                    {"tool": "key", "args": {"combo": "a", "window": "notes"}},
+                    {"tool": "pause", "args": {"ms": 300}},
+                    {"tool": "screenshot", "args": {"window": window}},
+                ]});
+                let r = call_tool(&mut s, n, "batch", steps).await;
+                let text = reply_text(&r);
+                match ok {
+                    true => {
+                        assert_ne!(r["result"]["isError"], true, "{r}");
+                        assert!(text.contains("[3] screenshot: 200x100 px"), "{r}");
+                    }
+                    false => {
+                        assert_eq!(r["result"]["isError"], true, "{r}");
+                        assert!(text.contains("[3] screenshot failed: interrupted"), "{r}");
+                    }
+                }
+                assert_eq!(s.active.borrow().1, FAKE_WINDOWS[1].1);
+            }
+        });
+    }
+
+    #[test]
+    fn a_screenshot_checks_the_window_it_captures() {
+        local(async {
+            let mut s = session("shot-fence");
+            set_active(&s, 0);
+            let r = call_tool(&mut s, 2, "screenshot", json!({})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "active window '~ : bash — Konsole' (class 'konsole') of app 'konsole' \
+                     is not in"
+                ),
+                "{r}"
+            );
+            // An app without an accessibility name: its caption and class
+            // tell the user what to allowlist, for input tools as well.
+            *s.active.borrow_mut() = (String::new(), "Mystery".into());
+            for (id, tool, args) in [
+                (3, "screenshot", json!({})),
+                (4, "key", json!({"combo": "a"})),
+            ] {
+                let r = call_tool(&mut s, id, tool, args).await;
+                assert!(
+                    reply_text(&r).contains(
+                        "active window 'Mystery' (class 'org.example.mystery') of an unknown \
+                         app is not in"
+                    ),
+                    "{tool}: {r}"
+                );
+            }
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // Known by its class only: an allowlist entry the class
+            // contains allows it ("fake" in org.example.Fake).
+            *s.active.borrow_mut() = ("classy".into(), "Notes".into());
+            let r = call_tool(&mut s, 5, "screenshot", json!({})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    #[test]
+    fn a_failed_screenshot_says_why() {
+        local(async {
+            let mut s = session("shot-cause");
+            *s.shown.shot_error.borrow_mut() =
+                Some("grim is not installed; screenshots on Hyprland need it".into());
+            let r = call_tool(&mut s, 2, "screenshot", json!({})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r)
+                    .contains("screenshot failed: grim is not installed; screenshots on Hyprland"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
     fn the_stop_shortcut_ends_a_drag_and_releases_the_button() {
         local(async {
             let mut s = session("takeover-drag");
@@ -13333,6 +14670,266 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// Claude Code in Konsole's tab pts/0 (the server below it), as in
+    /// the 2026-11-13 incident.
+    fn agent_in_konsole(s: &Session) {
+        *s.client.borrow_mut() = selfguard::SelfClient::walk(60, |pid| match pid {
+            60 => Some((50, "claude".into(), Some("pts/0".into()))),
+            50 => Some((100, "fish".into(), Some("pts/0".into()))),
+            100 => Some((1, "konsole".into(), None)),
+            _ => None,
+        });
+    }
+
+    fn konsole_tab(s: &Session, shown: &str) {
+        s.views.borrow_mut().insert(
+            100,
+            selfguard::TermView {
+                ptys: vec!["pts/0".into(), "pts/5".into()],
+                shown: Some(shown.into()),
+                tabs: Some(vec!["pts/0".into(), "pts/5".into()]),
+            },
+        );
+    }
+
+    #[test]
+    fn input_never_goes_to_the_agents_own_terminal_tab() {
+        local(async {
+            let mut s = session("self-tab");
+            set_allow("self-tab", "fake\nkonsole\n");
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            *s.field.borrow_mut() = Some(String::new());
+            let args =
+                json!({"text": "sudo parted -s /dev/sda mklabel gpt\n", "window": "konsole"});
+            let r = call_tool(&mut s, 2, "type_text", args.clone()).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("is konsole's tab running this agent (pts/0)"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            assert!(text.contains("'self-client: allow'"), "{text}");
+            assert_eq!(
+                s.field.borrow().as_deref(),
+                Some(""),
+                "typed into the agent"
+            );
+            for (id, tool, a) in [
+                (3, "key", json!({"combo": "enter"})),
+                (4, "mouse", json!({"x": 5, "y": 5})),
+                (5, "hold", json!({"key": "ctrl"})),
+            ] {
+                let r = call_tool(&mut s, id, tool, a).await;
+                assert!(reply_text(&r).contains("running this agent"), "{tool}: {r}");
+            }
+            assert!(
+                s.keys.borrow().iter().all(|k| k.starts_with("activate")),
+                "{:?}",
+                s.keys.borrow()
+            );
+            // A batch stops there as at a refusal: its on_fail is not run.
+            let r = call_tool(
+                &mut s,
+                6,
+                "batch",
+                json!({"steps": [{"tool": "key", "args": {"combo": "a"},
+                                  "on_fail": [{"tool": "key", "args": {"combo": "b"}}]}]}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("running this agent"), "{r}");
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("down")), "{r}");
+            // Reads still work in that tab.
+            let r = call_tool(&mut s, 7, "screenshot", json!({})).await;
+            assert!(!reply_text(&r).contains("running this agent"), "{r}");
+            // The user's other tab (pts/5), where they type sudo on purpose.
+            konsole_tab(&s, "pts/5");
+            let r = call_tool(&mut s, 8, "type_text", args).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(
+                s.field.borrow().as_deref(),
+                Some("sudo parted -s /dev/sda mklabel gpt")
+            );
+            // With the tab unknown, refused only when every tab is the agent's.
+            s.views.borrow_mut().insert(
+                100,
+                selfguard::TermView {
+                    ptys: vec!["pts/0".into()],
+                    ..Default::default()
+                },
+            );
+            let r = call_tool(&mut s, 9, "key", json!({"combo": "a"})).await;
+            assert!(
+                reply_text(&r).contains("every terminal in it runs this agent"),
+                "{r}"
+            );
+            // Unknown with other tabs too (kitty, Konsole not answering):
+            // still refused, as the agent's tab may be the one in front.
+            s.views.borrow_mut().insert(
+                100,
+                selfguard::TermView {
+                    ptys: vec!["pts/0".into(), "pts/5".into()],
+                    ..Default::default()
+                },
+            );
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 10, "key", json!({"combo": "a"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("one of whose terminals runs this agent"),
+                "{text}"
+            );
+            assert!(text.contains("pass window=<title or app>"), "{text}");
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("down")));
+        });
+    }
+
+    #[test]
+    fn the_pointer_never_lands_on_the_agents_tab_beside_the_window_in_front() {
+        local(async {
+            let mut s = session("self-point");
+            // Konsole is not even on the allowlist: its window is still seen.
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            s.frames.borrow_mut().insert(100, (0.0, 0.0, 500.0, 800.0));
+            s.frames
+                .borrow_mut()
+                .insert(200, (500.0, 0.0, 500.0, 800.0));
+            // A middle click over the agent's tab would paste into it.
+            let r = call_tool(
+                &mut s,
+                2,
+                "mouse",
+                json!({"x": 100, "y": 100, "button": "middle"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("(100,100) is outside the window in front, over konsole's window"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            let r = call_tool(
+                &mut s,
+                3,
+                "drag",
+                json!({"from_x": 600, "from_y": 100, "to_x": 100, "to_y": 100}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("over konsole's window"), "{r}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // Inside the window in front, or with the user's tab shown, it
+            // goes through.
+            let r = call_tool(&mut s, 4, "mouse", json!({"x": 600, "y": 100})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            konsole_tab(&s, "pts/5");
+            let r = call_tool(&mut s, 5, "mouse", json!({"x": 100, "y": 100})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    #[test]
+    fn a_terminals_paste_entry_is_refused_while_it_holds_the_agent() {
+        local(async {
+            let mut s = session("self-paste");
+            set_allow("self-paste", "fake\nkonsole\n");
+            agent_in_konsole(&s);
+            // The user's tab in front: Paste still goes to a session of
+            // the window that runs the agent, Copy Input To to all of them.
+            konsole_tab(&s, "pts/5");
+            *s.focus_app.borrow_mut() = "konsole".into();
+            s.focus.borrow_mut().name = "Paste".into();
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "Paste"})).await;
+            assert!(
+                reply_text(&r).contains("that entry of konsole sends input into its terminals"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0);
+            // Its other entries stay usable.
+            s.focus.borrow_mut().name = "New Tab".into();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "New Tab"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    #[test]
+    fn the_user_can_let_input_reach_the_agents_client() {
+        local(async {
+            let mut s = session("self-allow");
+            set_allow("self-allow", "fake\nkonsole\nself-client: allow\n");
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            *s.active.borrow_mut() = ("konsole".into(), "~ : bash — Konsole".into());
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(s.keys.borrow().contains(&"down a".to_string()));
+            let r = call_tool(&mut s, 3, "doctor", json!({})).await;
+            assert!(
+                reply_text(&r).contains(
+                    "[ok] self-client guard: off ('self-client: allow' in the allowlist): \
+                     input may reach the agent's own client, konsole (100) > fish (50) > \
+                     claude (60) on pts/0"
+                ),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_client_window_and_its_elements_get_no_input() {
+        local(async {
+            let mut s = session("self-window");
+            // The server runs under the Fake app of "notes.txt — Fake"
+            // (pid 200), as under Claude Desktop.
+            *s.client.borrow_mut() = selfguard::SelfClient::walk(300, |pid| match pid {
+                300 => Some((200, "disclaimer".into(), None)),
+                200 => Some((1, "fake".into(), None)),
+                _ => None,
+            });
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("belongs to fake (200), the client running this agent"),
+                "{text}"
+            );
+            // Its approval buttons: act and click refuse, reads work.
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "OK"})).await;
+            assert!(
+                reply_text(&r).contains("that element belongs to fake"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 4, "click", json!({"app": "fake", "query": "OK"})).await;
+            assert!(
+                reply_text(&r).contains("that element belongs to fake"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0);
+            let r = call_tool(&mut s, 5, "find", json!({"app": "fake", "query": "OK"})).await;
+            assert!(reply_text(&r).contains("OK"), "{r}");
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            // window="fake" picks the other Fake window, not the client's.
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "a", "window": "fake"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.active.borrow().1, "todo.txt — Fake");
+            assert!(s.keys.borrow().contains(&"down a".to_string()));
+            // Closing the client is refused before asking anyone.
+            let r = call_tool(&mut s, 7, "close_window", json!({"query": "notes"})).await;
+            assert!(
+                reply_text(&r).contains("closing it would end the agent"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 8, "doctor", json!({})).await;
+            assert!(
+                reply_text(&r).contains(
+                    "[ok] self-client guard: input never goes to the agent's own terminal \
+                     tab or client window; client: fake (200) > disclaimer (300)"
+                ),
+                "{r}"
+            );
+        });
     }
 
     #[test]
@@ -13623,7 +15220,8 @@ mod tests {
                     "batch",
                     json!({"steps": [{"tool": "key", "args": {"combo": "b"}}]}),
                 ),
-                ("screenshot", json!({"window": "notes"})),
+                // Activating its window first (notes is in front).
+                ("screenshot", json!({"window": "todo"})),
             ] {
                 let r = call_tool(&mut s, call, tool, args).await;
                 assert_ne!(r["result"]["isError"], true, "{tool}: {r}");
@@ -13862,6 +15460,93 @@ mod tests {
     }
 
     #[test]
+    fn only_inputs_that_may_load_a_page_wait_page_settle() {
+        let key = |c: &str| json!({ "combo": c });
+        for c in [
+            "enter",
+            "Return",
+            "space",
+            "alt+left",
+            "F5",
+            "ctrl+r",
+            "shift+ctrl+r",
+        ] {
+            assert!(waits_for_page("key", &key(c), false), "{c}");
+        }
+        for c in ["ctrl+l", "Escape", "tab", "ctrl+a", "a", "ctrl+t", "End"] {
+            assert!(!waits_for_page("key", &key(c), false), "{c}");
+        }
+        let text = |t: &str| json!({ "text": t });
+        assert!(waits_for_page("type_text", &text("query\n"), false));
+        assert!(!waits_for_page("type_text", &text("query"), false));
+        assert!(!waits_for_page("set_text", &text("x"), false));
+        assert!(!waits_for_page("focus", &json!({}), false));
+        // A press or a click may load a page; a verified action read its
+        // state back already.
+        for tool in ["act", "click", "mouse", "menu", "scroll"] {
+            assert!(waits_for_page(tool, &json!({}), false), "{tool}");
+            assert!(!waits_for_page(tool, &json!({}), true), "{tool}");
+        }
+    }
+
+    /// `fake_mail` with a check box and a text field on its page, which
+    /// sends change events but none for the inputs below.
+    fn fake_mail_quiet(s: &Session) {
+        fake_mail(s);
+        s.reads.events.set(true);
+        *s.reads.page.borrow_mut() = Some(page("Inbox (3)", "https://mail/#inbox", false));
+        let mut n = s.nodes.borrow_mut();
+        n.insert(
+            45,
+            with_actions(
+                fake_node("check box", "Remember me", &[]),
+                &["Toggle", "click"],
+            ),
+        );
+        n.get_mut(&40).unwrap().children.push(45);
+    }
+
+    #[test]
+    fn a_verified_action_on_a_page_waits_no_page_settle() {
+        local(async {
+            let mut s = session("verified-page-settle");
+            fake_mail_quiet(&s);
+            let act =
+                |action: &str| json!({"app": "fake", "query": "Remember me", "action": action});
+            // A plain action on the page: the effect line waits for the
+            // page to start reacting on top of its settle.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "act", act("click")).await;
+            assert!(reply_text(&r).contains("click -> ok; effect:"), "{r}");
+            assert!(start.elapsed() >= PAGE_SETTLE, "{:?}", start.elapsed());
+            // A verified one read its state back: the settle only.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", act("toggle")).await;
+            assert!(reply_text(&r).contains("(verified); effect:"), "{r}");
+            assert!(start.elapsed() < PAGE_SETTLE, "{:?}", start.elapsed());
+        });
+    }
+
+    #[test]
+    fn a_key_that_loads_nothing_waits_no_page_settle() {
+        local(async {
+            let mut s = session("key-page-settle");
+            fake_mail_quiet(&s);
+            s.focus.borrow_mut().states = vec!["focused", "editable"];
+            let key = |combo: &str| json!({"combo": combo, "observe": "effect"});
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "key", key("ctrl+l")).await;
+            assert!(reply_text(&r).contains("effect: "), "{r}");
+            assert!(start.elapsed() < PAGE_SETTLE, "{:?}", start.elapsed());
+            // Space presses the focused button: it may load a page.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "key", key("space")).await;
+            assert!(reply_text(&r).contains("effect: "), "{r}");
+            assert!(start.elapsed() >= PAGE_SETTLE, "{:?}", start.elapsed());
+        });
+    }
+
+    #[test]
     fn toggles_and_typing_get_no_content_wait() {
         local(async {
             let mut s = session("content-toggles");
@@ -14054,6 +15739,109 @@ mod tests {
         assert_eq!(r["result"]["isError"], true, "{r}");
         let text = reply_text(r);
         text.split_once(": ").map_or(text, |(_, m)| m)
+    }
+
+    #[test]
+    fn a_browser_page_button_is_picked_over_the_chrome_and_the_reply_says_so() {
+        local(async {
+            let mut s = session("chrome");
+            // A tab's close button in the tab strip, and the page's.
+            fake_frame(&s, true, &[50, 51]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(50, fake_node("page tab list", "", &[52]));
+                n.insert(51, fake_node("document web", "Ödeme", &[53]));
+                n.insert(52, fake_node("push button", "Kapat", &[]));
+                n.insert(53, fake_node("push button", "Kapat", &[]));
+            }
+            let q = json!({"app": "fake", "query": "Kapat", "role": "push button"});
+            let r = call_tool(&mut s, 2, "act", q).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r)
+                    .starts_with("[1] push button \"Kapat\" (picked over 1 browser-chrome match):"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 53");
+        });
+    }
+
+    #[test]
+    fn a_click_in_a_background_window_names_the_window_to_pass() {
+        local(async {
+            let mut s = session("background");
+            fake_frame(&s, true, &[40]);
+            s.nodes
+                .borrow_mut()
+                .insert(40, fake_node("push button", "Kaydet", &[]));
+            s.background.set(true);
+            let q = json!({"app": "fake", "query": "Kaydet"});
+            // The way up to the window is not known: the plain refusal.
+            let r = call_tool(&mut s, 2, "click", q.clone()).await;
+            assert_eq!(
+                error_text(&r).lines().next().unwrap(),
+                "element's window is not active; call activate_window first; nothing sent"
+            );
+            s.shown.parents.borrow_mut().insert(40, FAKE_FOCUS);
+            let r = call_tool(&mut s, 3, "click", q).await;
+            assert_eq!(
+                error_text(&r).lines().next().unwrap(),
+                "element's window 'notes.txt — Fake' is not active; pass \
+                 window='notes.txt — Fake' or use act; nothing sent"
+            );
+            // By id too, and nothing was clicked.
+            let r = call_tool(&mut s, 4, "click", json!({"id": 1})).await;
+            assert!(
+                error_text(&r).starts_with("element's window 'notes.txt — Fake' is not active"),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+        });
+    }
+
+    #[test]
+    fn a_stale_id_lists_elements_of_its_role_and_name_without_acting() {
+        local(async {
+            let mut s = session("stale-same");
+            fake_frame(&s, true, &[40]);
+            s.nodes
+                .borrow_mut()
+                .insert(40, fake_node("push button", "Gönder", &[]));
+            let r = call_tool(&mut s, 2, "find", json!({"app": "fake", "query": "Gönder"})).await;
+            assert!(
+                reply_text(&r).starts_with("[1] push button \"Gönder\""),
+                "{r}"
+            );
+            // The page re-rendered: the button is a new object.
+            fake_frame(&s, true, &[41, 42]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.remove(&40);
+                n.insert(41, fake_node("push button", "Gönder", &[]));
+                // Other role or name: not offered.
+                n.insert(42, fake_node("link", "Gönder", &[]));
+            }
+            let r = call_tool(&mut s, 3, "act", json!({"id": 1})).await;
+            let text = error_text(&r);
+            assert!(
+                text.starts_with(
+                    "stale id 1 (was push button \"Gönder\", now gone or not answering); \
+                     not acted on. visible now with its role and name (pass one id):\n\
+                     [2] push button \"Gönder\""
+                ),
+                "{text}"
+            );
+            assert!(!text.contains("link"), "{text}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // None left of its role and name: call tree/find again.
+            s.nodes.borrow_mut().remove(&41);
+            let r = call_tool(&mut s, 4, "act", json!({"id": 1})).await;
+            assert_eq!(
+                error_text(&r).lines().next().unwrap(),
+                "stale id 1 (was push button \"Gönder\", now gone or not answering); \
+                 call tree/find again; nothing sent"
+            );
+        });
     }
 
     #[test]

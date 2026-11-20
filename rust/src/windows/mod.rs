@@ -26,7 +26,7 @@ use windows::Win32::UI::HiDpi::{
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_AREA, Page, R,
-    Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    Screen, Shot, ShotTarget, WindowChange, WindowEntry, WindowGeo,
 };
 use crate::delivery::nothing_sent;
 use crate::launch_pick::{self as pick, Found};
@@ -391,6 +391,60 @@ impl Backend for WindowsBackend {
         input::hwnd_proc_name(input::foreground())
     }
 
+    /// The server's ancestors from a process snapshot. A console window
+    /// reports the shell attached to it as its process; the console hosts
+    /// (conhost) of the client's processes count too. Windows Terminal's
+    /// and editors' tabs cannot be told apart: `selfguard` leaves those
+    /// windows alone unless closing them.
+    async fn self_client(&self) -> crate::selfguard::SelfClient {
+        let procs = tokio::task::spawn_blocking(launch::processes)
+            .await
+            .unwrap_or_default();
+        let me_pid = std::process::id();
+        let by_pid: std::collections::HashMap<u32, (u32, &str)> = procs
+            .iter()
+            .map(|(p, pp, n)| (*p, (*pp, n.as_str())))
+            .collect();
+        let Some((parent, _)) = by_pid.get(&me_pid) else {
+            return crate::selfguard::SelfClient::default();
+        };
+        // Windows keeps a dead parent's pid as the parent of its children,
+        // and the pid may belong to another process by now.
+        let mut me = crate::selfguard::SelfClient::walk(*parent, |pid| {
+            by_pid.get(&pid).map(|(pp, n)| {
+                let pp = crate::selfguard::live_parent(
+                    *pp,
+                    input::process_created(pid),
+                    input::process_created(*pp),
+                );
+                (pp, n.to_string(), None)
+            })
+        });
+        let hosts: Vec<(u32, String)> = procs
+            .iter()
+            .filter(|(_, pp, n)| {
+                me.ancestor(*pp).is_some()
+                    && matches!(
+                        crate::selfguard::norm(n).as_str(),
+                        "conhost" | "openconsole"
+                    )
+            })
+            .map(|(p, _, n)| (*p, n.clone()))
+            .collect();
+        for (pid, name) in hosts {
+            me.add(pid, &name, None);
+        }
+        me
+    }
+
+    async fn active_pid(&self) -> Option<u32> {
+        Some(input::hwnd_pid(input::foreground())).filter(|p| *p != 0)
+    }
+
+    async fn element_pid(&self, id: &Elem) -> Option<u32> {
+        self.uia.fetch(&id.el).map(|p| p.pid).filter(|p| *p != 0)
+    }
+
     async fn info(&self, id: &Elem, text_limit: usize) -> Info<Elem> {
         let Some(el) = self.uia.fetch_subtree(&id.el) else {
             return dead();
@@ -465,6 +519,10 @@ impl Backend for WindowsBackend {
                 break;
             }
         }
+    }
+
+    async fn labels(&self, id: &Elem) -> Vec<String> {
+        self.uia.labels(&id.el)
     }
 
     async fn actions(&self, id: &Elem) -> Vec<String> {
@@ -580,10 +638,11 @@ impl Backend for WindowsBackend {
     async fn element_center(&self, id: &Elem) -> R<(i32, i32)> {
         // Like the Linux backends: a click at a background element's
         // coordinates would land on whatever window covers them.
-        if let Some(h) = self.uia.window_handle(&id.el)
-            && input::root(input::hwnd_from_i32(h)) != input::root(input::foreground())
-        {
-            return Err("element's window is not active; call activate_window first".into());
+        if let Some(h) = self.uia.window_handle(&id.el) {
+            let root = input::root(input::hwnd_from_i32(h));
+            if root != input::root(input::foreground()) {
+                return Err(crate::backend::not_active(&wm::title(root)));
+            }
         }
         self.uia
             .bounds(&id.el)
@@ -993,9 +1052,41 @@ impl Backend for WindowsBackend {
         }]
     }
 
-    async fn screenshot(&self) -> Option<Shot> {
+    async fn shot_target(&self) -> R<ShotTarget> {
+        let h = input::foreground();
+        if h.is_invalid() {
+            return Err("no foreground window".into());
+        }
+        let mut r = windows::Win32::Foundation::RECT::default();
+        let area = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(h, &mut r) }
+            .ok()
+            .map(|_| {
+                (
+                    r.left as f64,
+                    r.top as f64,
+                    (r.right - r.left) as f64,
+                    (r.bottom - r.top) as f64,
+                )
+            });
+        Ok(ShotTarget {
+            app: input::hwnd_proc_name(h),
+            by_class: false,
+            caption: wm::title(h),
+            class: wm::class_name(h),
+            area,
+            handle: (h.0 as usize).to_string(),
+        })
+    }
+
+    async fn screenshot(&self, target: &ShotTarget) -> R<Shot> {
+        let h = target
+            .handle
+            .parse::<usize>()
+            .map(|v| HWND(v as *mut core::ffi::c_void))
+            .map_err(|_| format!("bad window handle '{}'", target.handle))?;
         // The process is DPI aware: image pixels are screen pixels.
-        input::screenshot().map(|(path, pixels, r)| Shot {
+        let (path, pixels, r) = input::screenshot(h)?;
+        Ok(Shot {
             path,
             pixels: Some(Box::new(move || Ok(pixels))),
             area: Some((

@@ -8,6 +8,7 @@ mod image;
 pub mod indicator;
 mod indicator_draw;
 mod input;
+mod konsole;
 mod kwin;
 mod launch;
 mod roles;
@@ -15,7 +16,7 @@ mod takeover;
 mod terminals;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -26,7 +27,8 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    Layout, NO_AREA, R, Screen, Shot, Toggles, WindowChange, WindowEntry, WindowGeo,
+    Layout, NO_AREA, NOT_ACTIVE, R, Screen, Shot, ShotTarget, Toggles, WindowChange, WindowEntry,
+    WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -133,8 +135,6 @@ fn clip_offset(pane: (i32, i32, i32, i32), window: (i32, i32, i32, i32)) -> Opti
         (mid(y0, y1) - mid(py, py + ph)) as i32,
     ))
 }
-
-const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
 
 /// Whether extents (x, y, w, h) have no on-screen area: zero width or
 /// height.
@@ -521,7 +521,7 @@ async fn wl_copy(text: &str) -> R<()> {
 /// A new, empty file only this user can read, for a screenshot. Creating it
 /// exclusively means a planted file or symlink in /tmp makes this fail
 /// instead of being written through.
-fn temp_png() -> Option<(PathBuf, std::fs::File)> {
+fn temp_png() -> R<(PathBuf, std::fs::File)> {
     use std::os::unix::fs::OpenOptionsExt;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -533,19 +533,124 @@ fn temp_png() -> Option<(PathBuf, std::fs::File)> {
         .create_new(true)
         .mode(0o600)
         .open(&path)
-        .ok()?;
-    Some((path, file))
+        .map_err(|e| format!("screenshot: cannot create {}: {e}", path.display()))?;
+    Ok((path, file))
 }
 
-/// The file only counts once something was written into it.
-fn keep_if_written(path: PathBuf) -> Option<String> {
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() > 0) {
-        Some(path.display().to_string())
-    } else {
-        let _ = std::fs::remove_file(&path);
-        None
+/// Whether an external capture tool (`tool`) wrote the image: Err with
+/// the real cause (not installed, its exit status and stderr, an empty
+/// file). The file goes on failure.
+fn tool_wrote(tool: &str, out: std::io::Result<std::process::Output>, path: &Path) -> R<()> {
+    let failed = match out {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            Some(format!("{tool} is not installed"))
+        }
+        Err(e) => Some(format!("{tool} could not run: {e}")),
+        Ok(o) if !o.status.success() => {
+            let err = String::from_utf8_lossy(&o.stderr);
+            let err = err.trim();
+            Some(match err.is_empty() {
+                true => format!("{tool} failed ({})", o.status),
+                false => format!("{tool} failed ({}): {err}", o.status),
+            })
+        }
+        Ok(_) if !std::fs::metadata(path).is_ok_and(|m| m.len() > 0) => {
+            Some(format!("{tool} wrote no image"))
+        }
+        Ok(_) => None,
+    };
+    match failed {
+        Some(e) => {
+            let _ = std::fs::remove_file(path);
+            Err(e)
+        }
+        None => Ok(()),
     }
 }
+
+/// The app of a window as the allowlist names it: the AT-SPI name of its
+/// process, so one allowlist works everywhere; else its class, for apps
+/// without accessibility.
+fn app_by_pid_or_class(names: &HashMap<i64, String>, pid: Option<i64>, class: &str) -> String {
+    pid.and_then(|p| names.get(&p))
+        .filter(|n| !n.is_empty())
+        .map(String::as_str)
+        .unwrap_or(class)
+        .to_lowercase()
+}
+
+/// Whether `app_by_pid_or_class` fell back to the class.
+fn named_by_class(names: &HashMap<i64, String>, pid: Option<i64>) -> bool {
+    !pid.and_then(|p| names.get(&p))
+        .is_some_and(|n| !n.is_empty())
+}
+
+/// Whether the compositor's caption of a window and its AT-SPI title name
+/// the same window (KWin may add " — App" after the title).
+fn same_caption(caption: &str, title: &str) -> bool {
+    let (c, t) = (caption.trim(), title.trim());
+    !t.is_empty() && (c == t || c.starts_with(&format!("{t} ")))
+}
+
+/// A screenshot's target from KWin's active frame.
+fn kde_target(names: &HashMap<i64, String>, f: kwin::Frame) -> R<ShotTarget> {
+    let handle = f.handle.ok_or_else(|| {
+        format!(
+            "KWin gave no capture handle for the active window '{}'",
+            f.caption
+        )
+    })?;
+    let pid = f.pid.map(i64::from);
+    Ok(ShotTarget {
+        app: app_by_pid_or_class(names, pid, &f.class),
+        by_class: named_by_class(names, pid),
+        caption: f.caption,
+        class: f.class,
+        area: Some(f.area),
+        handle,
+    })
+}
+
+/// A screenshot's target from Hyprland's active client.
+fn hypr_target(names: &HashMap<i64, String>, c: &Json) -> ShotTarget {
+    let class = c["class"].as_str().unwrap_or_default().to_string();
+    ShotTarget {
+        app: app_by_pid_or_class(names, c["pid"].as_i64(), &class),
+        by_class: named_by_class(names, c["pid"].as_i64()),
+        caption: c["title"].as_str().unwrap_or_default().to_string(),
+        class,
+        area: hypr_area(c),
+        handle: c["address"].as_str().unwrap_or_default().to_string(),
+    }
+}
+
+/// A Hyprland client's (x, y, width, height).
+fn hypr_area(c: &Json) -> Option<(f64, f64, f64, f64)> {
+    Some((
+        c["at"][0].as_f64()?,
+        c["at"][1].as_f64()?,
+        c["size"][0].as_f64()?,
+        c["size"][1].as_f64()?,
+    ))
+}
+
+/// Err unless the window in front now (`now`, its handle) is the one the
+/// screenshot was checked for: a capture of whatever is in front would
+/// otherwise show a window nobody checked.
+fn still_target(target: &ShotTarget, now: Option<&str>) -> R<()> {
+    match now {
+        Some(h) if h == target.handle => Ok(()),
+        _ => Err(format!(
+            "the active window changed from {} during the screenshot; nothing captured, \
+             take a new one",
+            target.describe()
+        )),
+    }
+}
+
+/// How recent `active_app`'s look at the app in front must be for
+/// `active_pid` to take its answer (it runs right after one).
+const ACTIVE_PID_AGE: Duration = Duration::from_millis(1000);
 
 impl LinuxBackend {
     /// Hyprland when HYPRLAND_INSTANCE_SIGNATURE is set, otherwise KDE;
@@ -604,6 +709,55 @@ impl LinuxBackend {
 
     fn app_of(o: &Obj) -> Obj {
         Obj::new(&o.bus, OwnedObjectPath::try_from(APP_ROOT).unwrap())
+    }
+
+    /// The compositor's caption of the active window.
+    /// `Backend::shot_target` by the pid of the window in front alone.
+    async fn shot_target_by_pid(&self) -> R<ShotTarget> {
+        match &self.comp {
+            Compositor::Kde(kwin) => {
+                let frame = kwin.active_frame().await?.ok_or("no active window")?;
+                let Some(pid) = frame.pid else {
+                    return kde_target(&HashMap::new(), frame);
+                };
+                // The AT-SPI app in front, when it is this window's
+                // process, spares a scan of every app.
+                let name = self.a11y.active_app().await;
+                let names = match !name.is_empty() && self.active_pid().await == Some(pid) {
+                    true => HashMap::from([(i64::from(pid), name)]),
+                    false => self.app_names_by_pid().await,
+                };
+                kde_target(&names, frame)
+            }
+            Compositor::Hyprland(h) => {
+                let c = h.active_window().await?.ok_or("no active window")?;
+                Ok(hypr_target(&self.app_names_by_pid().await, &c))
+            }
+        }
+    }
+
+    /// (app name, window title) of the first AT-SPI window with the
+    /// ACTIVE state.
+    async fn a11y_active_window(&self) -> Option<(String, String)> {
+        for (_, name, windows) in self.a11y.apps_with_windows().await {
+            for w in windows {
+                if self.a11y.has_state(&w, atspi::ACTIVE).await {
+                    return Some((name, self.a11y.identity(&w).await.1));
+                }
+            }
+        }
+        None
+    }
+
+    async fn active_caption(&self) -> Option<String> {
+        let w = match &self.comp {
+            Compositor::Kde(kwin) => kwin.active_parent().await.ok().flatten()?,
+            Compositor::Hyprland(h) => h.active_window().await.ok().flatten()?,
+        };
+        w.get("caption")
+            .or(w.get("title"))
+            .and_then(Json::as_str)
+            .map(str::to_string)
     }
 
     async fn pid(&self, bus: &str) -> Option<u32> {
@@ -744,14 +898,11 @@ impl LinuxBackend {
     /// Prefer the AT-SPI name so one allowlist works for every Linux
     /// backend; fall back to the window class for apps without accessibility.
     fn client_app_name(names: &HashMap<i64, String>, client: &Json) -> String {
-        let by_pid = client["pid"]
-            .as_i64()
-            .and_then(|p| names.get(&p))
-            .filter(|n| !n.is_empty());
-        by_pid
-            .map(String::as_str)
-            .unwrap_or(client["class"].as_str().unwrap_or(""))
-            .to_lowercase()
+        app_by_pid_or_class(
+            names,
+            client["pid"].as_i64(),
+            client["class"].as_str().unwrap_or(""),
+        )
     }
 
     async fn same_window(&self, frame: &Obj, client: &Json) -> bool {
@@ -1030,6 +1181,7 @@ impl LinuxBackend {
                 });
             }
             if start.elapsed() >= ACTIVATE_WAIT {
+                crate::trace::note("activation: no window of its app reported ACTIVE in time");
                 return None;
             }
             // A round reads only this app's windows: cheap enough to look often.
@@ -1190,6 +1342,11 @@ impl Backend for LinuxBackend {
         self.a11y.parent(id).await
     }
 
+    async fn window_title(&self, id: &Obj) -> Option<String> {
+        let frame = self.a11y.frame_of(id).await?;
+        Some(self.a11y.identity(&frame).await.1)
+    }
+
     fn read_mark(&self) -> Option<u64> {
         self.a11y.read_mark()
     }
@@ -1232,6 +1389,65 @@ impl Backend for LinuxBackend {
                 None => String::new(),
             },
         }
+    }
+
+    async fn self_client(&self) -> crate::selfguard::SelfClient {
+        let mut me = crate::selfguard::SelfClient::walk(
+            std::os::unix::process::parent_id(),
+            terminals::proc_entry,
+        );
+        // The Konsole tab the client was started in, also when the client
+        // outlived the process that started it (a daemon reparented).
+        if let Some((konsole, shell)) = konsole::own_session(&self.session).await {
+            me.add(konsole, "konsole", terminals::tty_of(shell));
+        }
+        me
+    }
+
+    async fn active_pid(&self) -> Option<u32> {
+        match &self.comp {
+            Compositor::Kde(_) => {
+                let bus = match self.a11y.recent_active_bus(ACTIVE_PID_AGE) {
+                    Some(bus) => bus,
+                    None => {
+                        self.a11y.active_app().await;
+                        self.a11y.recent_active_bus(ACTIVE_PID_AGE)?
+                    }
+                };
+                self.pid(&bus).await
+            }
+            Compositor::Hyprland(h) => {
+                let c = h.active_window().await.ok().flatten()?;
+                c["pid"].as_u64().and_then(|p| u32::try_from(p).ok())
+            }
+        }
+    }
+
+    async fn term_view(&self, pid: u32, title: Option<&str>) -> crate::selfguard::TermView {
+        let ptys =
+            tokio::task::spawn_blocking(move || terminals::ptys_of(pid, &terminals::read_stats()))
+                .await
+                .unwrap_or_default();
+        let mut view = crate::selfguard::TermView {
+            ptys,
+            ..Default::default()
+        };
+        if view.ptys.is_empty() {
+            return view;
+        }
+        let caption = async || match title {
+            Some(t) => Some(t.to_string()),
+            None => self.active_caption().await,
+        };
+        if let Some(tabs) = konsole::tabs(&self.session, pid, caption).await {
+            view.shown = terminals::tty_of(tabs.shown);
+            view.tabs = Some(tabs.all.into_iter().filter_map(terminals::tty_of).collect());
+        }
+        view
+    }
+
+    async fn element_pid(&self, id: &Obj) -> Option<u32> {
+        self.pid(&id.bus).await
     }
 
     async fn info(&self, id: &Obj, text_limit: usize) -> Info<Obj> {
@@ -1305,6 +1521,10 @@ impl Backend for LinuxBackend {
 
     async fn object_id(&self, id: &Obj) -> String {
         self.a11y.accessible_id(id).await
+    }
+
+    async fn labels(&self, id: &Obj) -> Vec<String> {
+        self.a11y.labels(id).await
     }
 
     async fn actions(&self, id: &Obj) -> Vec<String> {
@@ -1783,19 +2003,22 @@ impl Backend for LinuxBackend {
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let apps = self.apps_with_pids().await;
+                let apps = crate::trace::time("apps_with_pids", self.apps_with_pids()).await;
                 let allow = Self::allow_of(allowed, &apps);
-                let Some(raised) = kwin.activate(query, &allow).await? else {
+                let raised = crate::trace::time("kwin activate", kwin.activate(query, &allow));
+                let Some(raised) = raised.await? else {
                     return Err(crate::delivery::nothing_sent(format!(
                         "no window of an allowed app matches '{query}'"
                     )));
                 };
                 // KWin switches at once; the toolkit reports ACTIVE a moment later.
                 if apps.iter().any(|(pid, ..)| *pid == Some(raised.pid)) {
-                    return Ok(self.kde_wait_active(&raised, &apps).await);
+                    let waited = self.kde_wait_active(&raised, &apps);
+                    return Ok(crate::trace::time("wait active", waited).await);
                 }
                 // Its process has no AT-SPI app under that pid: by title.
-                poll(ACTIVATE_WAIT, || self.kde_frame_active(&raised.caption)).await;
+                let polled = poll(ACTIVATE_WAIT, || self.kde_frame_active(&raised.caption));
+                crate::trace::time("wait active (by title)", polled).await;
             }
             Compositor::Hyprland(h) => {
                 let q = query.to_lowercase();
@@ -2248,10 +2471,12 @@ impl Backend for LinuxBackend {
                 out.push(Check {
                     name: "screenshot",
                     ok: !fallback || which("spectacle"),
-                    detail: if fallback {
-                        "KWin refused ScreenShot2; using spectacle (slower)".into()
-                    } else {
-                        "KWin ScreenShot2 (spectacle as fallback)".into()
+                    detail: match (fallback, which("spectacle")) {
+                        (true, true) => "KWin refused ScreenShot2; using spectacle (slower)".into(),
+                        (true, false) => "KWin refused ScreenShot2 and spectacle is not \
+                                          installed: no screenshots"
+                            .into(),
+                        (false, _) => "KWin ScreenShot2 (spectacle if KWin refuses it)".into(),
                     },
                 });
             }
@@ -2268,84 +2493,118 @@ impl Backend for LinuxBackend {
                     ok: !screens.is_empty(),
                     detail: screens_line(&screens),
                 });
+                let grim = which("grim");
+                out.push(Check {
+                    name: "screenshot",
+                    ok: grim,
+                    detail: match grim {
+                        true => "grim".into(),
+                        false => "grim is not installed: no screenshots (install grim)".into(),
+                    },
+                });
             }
         }
         out
     }
 
-    async fn screenshot(&self) -> Option<Shot> {
+    async fn shot_target(&self) -> R<ShotTarget> {
+        let mut t = self.shot_target_by_pid().await?;
+        // A sandboxed app (Flatpak) reaches the accessibility bus through
+        // a proxy, whose pid is not its window's: name it by the window
+        // the toolkit reports ACTIVE, as key and click do, when its title
+        // is the one in front.
+        if t.by_class
+            && let Some((app, title)) = self.a11y_active_window().await
+            && same_caption(&t.caption, &title)
+            && !app.trim().is_empty()
+        {
+            t.app = app.trim().to_lowercase();
+            t.by_class = false;
+        }
+        Ok(t)
+    }
+
+    async fn screenshot(&self, target: &ShotTarget) -> R<Shot> {
         self.hide_indicator().await;
-        let area;
-        let mut cmd = match &self.comp {
+        match &self.comp {
             Compositor::Kde(kwin) => {
-                // One script run gives the frame and the window's handle, so
-                // the capture is of the window the area belongs to.
-                let frame = kwin.active_frame().await;
-                area = frame.as_ref().map(|f| f.area);
                 if !self.shot_unauthorized.load(Ordering::Relaxed) {
-                    let handle = frame.as_ref().and_then(|f| f.handle.as_deref());
-                    let mut captured = kwin.capture_window(handle).await;
-                    // The window closed meanwhile, or the handle was refused:
-                    // the active window still beats spectacle.
-                    if handle.is_some()
-                        && captured
-                            .as_ref()
-                            .is_err_and(|e| !e.starts_with(kwin::SHOT_NOT_AUTHORIZED))
-                    {
-                        captured = kwin.capture_window(None).await;
-                    }
-                    match captured {
+                    // By its handle: the window checked, even if another
+                    // came to the front meanwhile; never the active one
+                    // instead.
+                    match kwin.capture_window(&target.handle).await {
                         Ok(raw) => {
                             let (path, file) = temp_png()?;
                             drop(file);
-                            return Some(Shot {
+                            return Ok(Shot {
                                 path: path.display().to_string(),
                                 pixels: Some(Box::new(move || image::to_pixels(&raw))),
-                                area,
+                                area: target.area,
                             });
                         }
                         // Older KWin without the desktop-file grant: stop asking.
                         Err(e) if e.starts_with(kwin::SHOT_NOT_AUTHORIZED) => {
                             self.shot_unauthorized.store(true, Ordering::Relaxed);
                         }
-                        Err(_) => {}
+                        Err(e) => {
+                            return Err(format!(
+                                "KWin could not capture {}: {e}",
+                                target.describe()
+                            ));
+                        }
                     }
                 }
-                // spectacle is authorised by its own desktop file.
-                let mut c = tokio::process::Command::new("spectacle");
-                c.args(["-b", "-n", "-a", "-o"]);
-                c
+                // spectacle (authorised by its own desktop file) captures
+                // whatever is active: kept only when the window checked
+                // was in front before and after it ran.
+                let front = |f: R<Option<kwin::Frame>>| f.ok().flatten().and_then(|f| f.handle);
+                still_target(target, front(kwin.active_frame().await).as_deref())?;
+                let (path, file) = temp_png()?;
+                drop(file);
+                let out = tokio::process::Command::new("spectacle")
+                    .args(["-b", "-n", "-a", "-o"])
+                    .arg(&path)
+                    .output()
+                    .await;
+                tool_wrote("spectacle (KWin refused ScreenShot2)", out, &path)?;
+                if let Err(e) = still_target(target, front(kwin.active_frame().await).as_deref()) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(e);
+                }
+                Ok(Shot {
+                    path: path.display().to_string(),
+                    pixels: None,
+                    area: target.area,
+                })
             }
             Compositor::Hyprland(h) => {
-                let aw = h.active_window().await.ok().flatten()?;
-                area = (|| {
-                    Some((
-                        aw["at"][0].as_f64()?,
-                        aw["at"][1].as_f64()?,
-                        aw["size"][0].as_f64()?,
-                        aw["size"][1].as_f64()?,
-                    ))
-                })();
+                // grim captures a screen area: only once the client checked
+                // is still the one in front, at its geometry now.
+                let now = h.active_window().await?;
+                let handle = now.as_ref().and_then(|c| c["address"].as_str());
+                still_target(target, handle)?;
+                let area = now.as_ref().and_then(hypr_area).ok_or_else(|| {
+                    format!("Hyprland gave no geometry for {}", target.describe())
+                })?;
                 if !which("grim") {
-                    return None;
+                    return Err("grim is not installed; screenshots on Hyprland need it".into());
                 }
-                let geo = format!(
-                    "{},{} {}x{}",
-                    aw["at"][0], aw["at"][1], aw["size"][0], aw["size"][1]
-                );
-                let mut c = tokio::process::Command::new("grim");
-                c.args(["-g", &geo]);
-                c
+                let (path, file) = temp_png()?;
+                drop(file);
+                let (x, y, w, h) = area;
+                let out = tokio::process::Command::new("grim")
+                    .args(["-g", &format!("{x},{y} {w}x{h}")])
+                    .arg(&path)
+                    .output()
+                    .await;
+                tool_wrote("grim", out, &path)?;
+                Ok(Shot {
+                    path: path.display().to_string(),
+                    pixels: None,
+                    area: Some(area),
+                })
             }
-        };
-        let (path, file) = temp_png()?;
-        drop(file);
-        let _ = cmd.arg(&path).output().await;
-        keep_if_written(path).map(|path| Shot {
-            path,
-            pixels: None,
-            area,
-        })
+        }
     }
 }
 
@@ -2557,6 +2816,96 @@ mod tests {
         assert_eq!(LinuxBackend::client_app_name(&names, &firefox), "firefox");
         assert_eq!(LinuxBackend::client_app_name(&names, &xterm), "xterm");
         assert_eq!(LinuxBackend::client_app_name(&names, &json!({})), "");
+    }
+
+    #[test]
+    fn a_screenshot_target_is_named_by_its_process_then_its_class() {
+        let names = HashMap::from([(4242, "Firefox".to_string())]);
+        let frame = |pid: Option<u32>, handle: Option<&str>| kwin::Frame {
+            area: (1.0, 2.0, 30.0, 40.0),
+            handle: handle.map(str::to_string),
+            pid,
+            caption: "Inbox".into(),
+            class: "org.mozilla.firefox".into(),
+        };
+        let t = kde_target(&names, frame(Some(4242), Some("{a-b}"))).unwrap();
+        assert_eq!(t.app, "firefox");
+        assert_eq!(t.handle, "{a-b}");
+        assert_eq!(t.area, Some((1.0, 2.0, 30.0, 40.0)));
+        assert_eq!(t.describe(), "'Inbox' (class 'org.mozilla.firefox')");
+        // Without accessibility (or a pid): the class, which the user can
+        // allowlist.
+        assert!(!t.by_class);
+        let t = kde_target(&names, frame(None, Some("{a-b}"))).unwrap();
+        assert_eq!((t.app.as_str(), t.by_class), ("org.mozilla.firefox", true));
+        // A Flatpak's window: named by the AT-SPI window of that title.
+        assert!(same_caption("Inbox", "Inbox"));
+        assert!(same_caption("Inbox — Telegram", "Inbox"));
+        assert!(!same_caption("Inboxes", "Inbox"));
+        assert!(!same_caption("Inbox", ""));
+        // No handle: nothing to capture this window by.
+        let e = kde_target(&names, frame(Some(4242), None)).unwrap_err();
+        assert!(
+            e.contains("no capture handle") && e.contains("'Inbox'"),
+            "{e}"
+        );
+        let c = json!({"pid": 4242, "class": "firefox", "title": "Inbox",
+                       "address": "0x55", "at": [10, 20], "size": [300, 200]});
+        let t = hypr_target(&names, &c);
+        assert_eq!(
+            (t.app.as_str(), t.handle.as_str(), t.area),
+            ("firefox", "0x55", Some((10.0, 20.0, 300.0, 200.0)))
+        );
+    }
+
+    #[test]
+    fn a_capture_of_whatever_is_in_front_needs_the_checked_window_there() {
+        let t = ShotTarget {
+            caption: "Inbox".into(),
+            handle: "{a}".into(),
+            ..ShotTarget::default()
+        };
+        assert!(still_target(&t, Some("{a}")).is_ok());
+        let e = still_target(&t, Some("{b}")).unwrap_err();
+        assert!(e.contains("changed from 'Inbox'"), "{e}");
+        assert!(still_target(&t, None).is_err());
+    }
+
+    #[test]
+    fn a_capture_tool_failure_says_why() {
+        use std::os::unix::process::ExitStatusExt;
+        let (path, file) = temp_png().unwrap();
+        drop(file);
+        let out = |code: i32, err: &str| {
+            Ok(std::process::Output {
+                status: std::process::ExitStatus::from_raw(code << 8),
+                stdout: Vec::new(),
+                stderr: err.as_bytes().to_vec(),
+            })
+        };
+        let missing = Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        assert_eq!(
+            tool_wrote("grim", missing, &path).unwrap_err(),
+            "grim is not installed"
+        );
+        let e = tool_wrote("spectacle", out(1, "cannot connect\n"), &path).unwrap_err();
+        assert!(
+            e.starts_with("spectacle failed (") && e.ends_with("): cannot connect"),
+            "{e}"
+        );
+        // Success with an empty file is no image; the file goes.
+        let (path, file) = temp_png().unwrap();
+        drop(file);
+        assert_eq!(
+            tool_wrote("grim", out(0, ""), &path).unwrap_err(),
+            "grim wrote no image"
+        );
+        assert!(!path.exists());
+        let (path, file) = temp_png().unwrap();
+        drop(file);
+        std::fs::write(&path, b"png").unwrap();
+        assert!(tool_wrote("grim", out(0, ""), &path).is_ok());
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

@@ -77,7 +77,7 @@ pub fn class_name(h: HWND) -> String {
 
 /// The title, read without sending the window a message (a hung app
 /// cannot block it).
-fn title(h: HWND) -> String {
+pub fn title(h: HWND) -> String {
     let mut buf = [0u16; 512];
     let n = unsafe { GetWindowTextW(h, &mut buf) };
     wide(&buf, n)

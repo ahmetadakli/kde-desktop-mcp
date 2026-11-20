@@ -37,6 +37,20 @@ pub fn sent() {
     let _ = SENT.try_with(|s| s.set(true));
 }
 
+/// Whether the call running in this `track` scope wrote anything so far.
+pub fn so_far() -> bool {
+    SENT.try_with(Cell::get).unwrap_or(false)
+}
+
+/// The writes since `so_far` said `before` verifiably changed nothing (a
+/// text field that ignored its accessibility write): the call counts as
+/// having sent nothing more, so its reply says a retry is safe.
+pub fn ignored(before: bool) {
+    if !before {
+        let _ = SENT.try_with(|s| s.set(false));
+    }
+}
+
 /// For a backend: the write running now fails with `e` before sending
 /// anything (an unknown key or button name, no window matches). Returns `e`.
 pub fn nothing_sent(e: impl Into<String>) -> String {

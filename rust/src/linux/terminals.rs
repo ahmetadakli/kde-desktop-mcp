@@ -44,11 +44,26 @@ pub fn terminals_of(
     stats: &HashMap<u32, Stat>,
     describe: impl Fn(u32) -> (String, String),
 ) -> Vec<Terminal> {
+    held_ttys(root, stats)
+        .into_iter()
+        .filter_map(|(tty, fg)| {
+            let fg = u32::try_from(fg).ok().filter(|&p| p > 0)?;
+            let (command, cwd) = describe(fg);
+            Some(Terminal {
+                tty: pts_name(tty)?,
+                command,
+                cwd,
+            })
+        })
+        .collect()
+}
+
+/// Every pty `root` and its descendants hold, with its foreground group.
+fn held_ttys(root: u32, stats: &HashMap<u32, Stat>) -> BTreeMap<u32, i32> {
     let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
     for (&pid, s) in stats {
         children.entry(s.ppid).or_default().push(pid);
     }
-    // Every pty some descendant holds, and its foreground group.
     let mut ttys: BTreeMap<u32, i32> = BTreeMap::new();
     let mut seen = HashSet::new();
     let mut stack = vec![root];
@@ -63,17 +78,47 @@ pub fn terminals_of(
         }
         stack.extend(children.get(&pid).into_iter().flatten());
     }
-    ttys.into_iter()
-        .filter_map(|(tty, fg)| {
-            let fg = u32::try_from(fg).ok().filter(|&p| p > 0)?;
-            let (command, cwd) = describe(fg);
-            Some(Terminal {
-                tty: pts_name(tty)?,
-                command,
-                cwd,
-            })
-        })
+    ttys
+}
+
+/// The ptys ("pts/N") `root` and its descendants hold.
+pub fn ptys_of(root: u32, stats: &HashMap<u32, Stat>) -> Vec<String> {
+    held_ttys(root, stats)
+        .into_keys()
+        .filter_map(pts_name)
         .collect()
+}
+
+fn read_stat(pid: u32) -> Option<Stat> {
+    parse_stat(&std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?)
+}
+
+/// The pty ("pts/N") process `pid` runs in; None for none.
+pub fn tty_of(pid: u32) -> Option<String> {
+    pts_name(read_stat(pid)?.tty_nr)
+}
+
+/// The name a process goes by: its first argument's file name (Claude
+/// Code's process calls itself by its version number), else its comm.
+fn name_of(argv0: &[u8], comm: &str) -> String {
+    // A process that renamed itself may hold its whole command line in
+    // its first argument ("claude bg-pty-host --bg-pty-host /tmp/...").
+    let arg = String::from_utf8_lossy(argv0);
+    let first = arg.split_whitespace().next().unwrap_or_default();
+    match first.rsplit('/').next().map(str::trim) {
+        Some(n) if !n.is_empty() => n.to_string(),
+        _ => comm.trim().to_string(),
+    }
+}
+
+/// A process' parent, name and pty, for the self-client walk.
+pub fn proc_entry(pid: u32) -> Option<(u32, String, Option<String>)> {
+    let stat = read_stat(pid)?;
+    let base = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let cmdline = std::fs::read(base.join("cmdline")).unwrap_or_default();
+    let argv0 = cmdline.split(|&b| b == 0).next().unwrap_or_default();
+    let comm = std::fs::read_to_string(base.join("comm")).unwrap_or_default();
+    Some((stat.ppid, name_of(argv0, &comm), pts_name(stat.tty_nr)))
 }
 
 /// Read every process' stat from /proc.
@@ -188,5 +233,19 @@ mod tests {
             ]
         );
         assert!(terminals_of(900_000, &stats, |_| unreachable!()).is_empty());
+        assert_eq!(ptys_of(100, &stats), vec!["pts/1", "pts/2"]);
+        assert!(ptys_of(400, &stats) == vec!["pts/2"]);
+    }
+
+    #[test]
+    fn processes_go_by_their_first_argument() {
+        assert_eq!(name_of(b"/usr/bin/konsole", "konsole\n"), "konsole");
+        assert_eq!(name_of(b"claude", "2.1.329\n"), "claude");
+        assert_eq!(name_of(b"claude bg-spare --x /tmp/a.sock", "x"), "claude");
+        assert_eq!(name_of(b"", "kworker\n"), "kworker");
+        // This process: its parent can be read too.
+        let (ppid, name, _) = proc_entry(std::process::id()).unwrap();
+        assert_eq!(ppid, std::os::unix::process::parent_id());
+        assert!(!name.is_empty());
     }
 }
