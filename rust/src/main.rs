@@ -6545,6 +6545,13 @@ impl<B: Backend> Server<B> {
         }
     }
 
+    /// Whether `window` (an argument) needs no activation: the window
+    /// `ensure_window` would bring forward is already in front.
+    async fn window_in_front(&self, query: &str) -> bool {
+        let query = self.prefer_other(query).await;
+        self.window_is_active(&query).await
+    }
+
     /// An input tool's `window`: activate the matching window unless it is
     /// already in front. Some(title) when it activated one. Runs inside
     /// `call`, under the input lock, so nothing else takes the focus
@@ -7109,6 +7116,14 @@ impl<B: Backend> Server<B> {
     /// `call_inner`'s work, inside its GATE scope.
     async fn call_body(&self, name: &str, a: &Json, held: bool, settle: bool) -> R<Out> {
         let window = window_arg(name, a)?;
+        // A screenshot whose window is in front already sends no input:
+        // it neither waits for the user's input to stop nor counts as a
+        // run's input (a batch's last look after its input went through),
+        // and takes no input lock.
+        let window = match window {
+            Some(q) if READ_ONLY_TOOLS.contains(&name) && self.window_in_front(&q).await => None,
+            w => w,
+        };
         // Tools that reach no app through `permit` are confirmed here,
         // by their `app` argument if any.
         if NO_PERMIT_TOOLS.contains(&name) {
@@ -13532,6 +13547,50 @@ mod tests {
     }
 
     #[test]
+    fn a_screenshot_of_the_window_in_front_is_never_paused() {
+        local(async {
+            let mut s = session("shot-ungated");
+            // The user is typing: input would wait, a look does not.
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Keyboard);
+            let started = Instant::now();
+            let r = call_tool(&mut s, 2, "screenshot", json!({"window": "notes"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).starts_with("200x100 px"), "{r}");
+            assert!(started.elapsed() < Duration::from_millis(500));
+            // A batch's last look after its input went through, while the
+            // user started using the mouse; one whose window must come to
+            // the front first is input: it stops there.
+            for (n, window, ok) in [(3, "notes", true), (4, "todo", false)] {
+                let mut s = session(&format!("shot-ungated-{n}"));
+                let t = s.takeover.clone();
+                tokio::task::spawn_local(async move {
+                    tokio::time::sleep(Duration::from_millis(150)).await;
+                    t.user_input(Instant::now(), takeover::Device::Pointer);
+                });
+                let steps = json!({"steps": [
+                    {"tool": "key", "args": {"combo": "a", "window": "notes"}},
+                    {"tool": "pause", "args": {"ms": 300}},
+                    {"tool": "screenshot", "args": {"window": window}},
+                ]});
+                let r = call_tool(&mut s, n, "batch", steps).await;
+                let text = reply_text(&r);
+                match ok {
+                    true => {
+                        assert_ne!(r["result"]["isError"], true, "{r}");
+                        assert!(text.contains("[3] screenshot: 200x100 px"), "{r}");
+                    }
+                    false => {
+                        assert_eq!(r["result"]["isError"], true, "{r}");
+                        assert!(text.contains("[3] screenshot failed: interrupted"), "{r}");
+                    }
+                }
+                assert_eq!(s.active.borrow().1, FAKE_WINDOWS[1].1);
+            }
+        });
+    }
+
+    #[test]
     fn a_screenshot_checks_the_window_it_captures() {
         local(async {
             let mut s = session("shot-fence");
@@ -14139,7 +14198,8 @@ mod tests {
                     "batch",
                     json!({"steps": [{"tool": "key", "args": {"combo": "b"}}]}),
                 ),
-                ("screenshot", json!({"window": "notes"})),
+                // Activating its window first (notes is in front).
+                ("screenshot", json!({"window": "todo"})),
             ] {
                 let r = call_tool(&mut s, call, tool, args).await;
                 assert_ne!(r["result"]["isError"], true, "{tool}: {r}");

@@ -674,7 +674,9 @@ tool; `off` turns it off). Not available on Windows yet.
   without an accessibility name is refused by its caption and class, so the
   user knows what to allowlist. A failure says why (`grim` or `spectacle`
   missing or failing with its error, KWin's `ScreenShot2` error, the
-  temporary file).
+  temporary file). A screenshot whose `window` is already in front sends no
+  input: it does not wait for the user's typing, and as a batch's last step
+  it is not stopped by the user starting to use the seat.
 - `batch`: runs several tools in order in one call and stops at the first
   error; reduces Claude's number of turns. A step with `"optional": true`
   (typically a `wait_for`) may fail without stopping the batch: it is reported
