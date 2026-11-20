@@ -6121,7 +6121,21 @@ impl<B: Backend> Server<B> {
     async fn active_center(&self, id: &B::Id) -> R<(i32, i32)> {
         let (active, center) = tokio::join!(self.require_input_front(), self.b.element_center(id));
         active?;
-        center
+        self.name_window(id, center).await
+    }
+
+    /// `center` of `id`, its NOT_ACTIVE error naming the element's window
+    /// when the backend did not: the agent passes that title as `window`
+    /// (its usual miss is a hit in another window of the app, such as a
+    /// private browser window behind).
+    async fn name_window(&self, id: &B::Id, center: R<(i32, i32)>) -> R<(i32, i32)> {
+        match center {
+            Err(e) if e == backend::NOT_ACTIVE => Err(match self.b.window_title(id).await {
+                Some(title) => backend::not_active(&title),
+                None => e,
+            }),
+            other => other,
+        }
     }
 
     /// The element a pointer tool names and its centre, once the active
@@ -6144,7 +6158,8 @@ impl<B: Backend> Server<B> {
         );
         let (t, center) = found?;
         active?;
-        Ok((t, center?))
+        let center = self.name_window(&t.id, center).await?;
+        Ok((t, center))
     }
 
     /// One end of a drag: `<end>_id` (an element, resolved), else
@@ -6186,12 +6201,13 @@ impl<B: Backend> Server<B> {
                 _ => None,
             })
             .collect();
-        let mut centers = if ids.is_empty() {
-            Vec::new()
-        } else {
-            self.b.element_centers(&ids).await
+        let mut named = Vec::new();
+        if !ids.is_empty() {
+            for (id, c) in ids.iter().zip(self.b.element_centers(&ids).await) {
+                named.push(self.name_window(id, c).await);
+            }
         }
-        .into_iter();
+        let mut centers = named.into_iter();
         let mut point = |end: R<DragEnd<B::Id>>| -> R<(i64, i64)> {
             match end? {
                 DragEnd::Point(p) => Ok(p),
@@ -8529,7 +8545,7 @@ mod tests {
                 return Err(backend::NO_AREA.into());
             }
             if self.background.get() {
-                return Err("element's window is not active; call activate_window first".into());
+                return Err(backend::NOT_ACTIVE.into());
             }
             Ok((0, 0))
         }
@@ -14661,6 +14677,39 @@ mod tests {
                 "{r}"
             );
             assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 53");
+        });
+    }
+
+    #[test]
+    fn a_click_in_a_background_window_names_the_window_to_pass() {
+        local(async {
+            let mut s = session("background");
+            fake_frame(&s, true, &[40]);
+            s.nodes
+                .borrow_mut()
+                .insert(40, fake_node("push button", "Kaydet", &[]));
+            s.background.set(true);
+            let q = json!({"app": "fake", "query": "Kaydet"});
+            // The way up to the window is not known: the plain refusal.
+            let r = call_tool(&mut s, 2, "click", q.clone()).await;
+            assert_eq!(
+                error_text(&r).lines().next().unwrap(),
+                "element's window is not active; call activate_window first; nothing sent"
+            );
+            s.shown.parents.borrow_mut().insert(40, FAKE_FOCUS);
+            let r = call_tool(&mut s, 3, "click", q).await;
+            assert_eq!(
+                error_text(&r).lines().next().unwrap(),
+                "element's window 'notes.txt — Fake' is not active; pass \
+                 window='notes.txt — Fake' or use act; nothing sent"
+            );
+            // By id too, and nothing was clicked.
+            let r = call_tool(&mut s, 4, "click", json!({"id": 1})).await;
+            assert!(
+                error_text(&r).starts_with("element's window 'notes.txt — Fake' is not active"),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
         });
     }
 

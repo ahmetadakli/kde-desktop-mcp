@@ -625,10 +625,11 @@ impl Backend for WindowsBackend {
     async fn element_center(&self, id: &Elem) -> R<(i32, i32)> {
         // Like the Linux backends: a click at a background element's
         // coordinates would land on whatever window covers them.
-        if let Some(h) = self.uia.window_handle(&id.el)
-            && input::root(input::hwnd_from_i32(h)) != input::root(input::foreground())
-        {
-            return Err("element's window is not active; call activate_window first".into());
+        if let Some(h) = self.uia.window_handle(&id.el) {
+            let root = input::root(input::hwnd_from_i32(h));
+            if root != input::root(input::foreground()) {
+                return Err(crate::backend::not_active(&wm::title(root)));
+            }
         }
         self.uia
             .bounds(&id.el)

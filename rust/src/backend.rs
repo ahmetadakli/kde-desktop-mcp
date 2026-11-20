@@ -71,6 +71,25 @@ pub struct Fetch {
 /// elements leaves such ones out.
 pub const NO_AREA: &str = "element has no on-screen area";
 
+/// Levels `Backend::window_title` walks up at most.
+const WINDOW_WALK_MAX: usize = 64;
+
+/// The error `element_center` gives for an element whose window is not in
+/// front (a click there would land on the window covering it). The tool
+/// layer names the window (`not_active`) when the backend does not.
+pub const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
+
+/// NOT_ACTIVE naming the element's window `title` (quoted and cut as
+/// `render::short_title` does): what to pass as `window`, or `act`, which
+/// needs no window in front.
+pub fn not_active(title: &str) -> String {
+    if title.trim().is_empty() {
+        return NOT_ACTIVE.into();
+    }
+    let t = crate::render::short_title(title);
+    format!("element's window {t} is not active; pass window={t} or use act")
+}
+
 /// Window management the desktop does not offer (KDE and Hyprland do).
 pub const NO_WINDOW_CONTROL: &str =
     "window geometry is only available on KDE Plasma, Hyprland and Windows";
@@ -500,6 +519,19 @@ pub trait Backend {
     }
     /// The element holding `id`; None at the top or when unknown.
     async fn parent(&self, _id: &Self::Id) -> Option<Self::Id> {
+        None
+    }
+    /// Title of the window `id` is in (its nearest frame, window or
+    /// dialog), for a NOT_ACTIVE refusal; None when it is not found.
+    async fn window_title(&self, id: &Self::Id) -> Option<String> {
+        let mut cur = id.clone();
+        for _ in 0..WINDOW_WALK_MAX {
+            let (role, name) = self.identity(&cur).await;
+            if matches!(role.as_str(), "frame" | "window" | "dialog") {
+                return Some(name);
+            }
+            cur = self.parent(&cur).await?;
+        }
         None
     }
     /// A mark for `unchanged_since`, taken before a read that may be kept

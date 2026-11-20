@@ -27,7 +27,8 @@ use zbus::zvariant::OwnedObjectPath;
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, Fetch, FileDialog, Focused, Info, Launched,
-    Layout, NO_AREA, R, Screen, Shot, ShotTarget, Toggles, WindowChange, WindowEntry, WindowGeo,
+    Layout, NO_AREA, NOT_ACTIVE, R, Screen, Shot, ShotTarget, Toggles, WindowChange, WindowEntry,
+    WindowGeo,
 };
 use atspi::{A11y, Obj};
 use hyprland::Hypr;
@@ -134,8 +135,6 @@ fn clip_offset(pane: (i32, i32, i32, i32), window: (i32, i32, i32, i32)) -> Opti
         (mid(y0, y1) - mid(py, py + ph)) as i32,
     ))
 }
-
-const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
 
 /// Whether extents (x, y, w, h) have no on-screen area: zero width or
 /// height.
@@ -1296,6 +1295,11 @@ impl Backend for LinuxBackend {
 
     async fn parent(&self, id: &Obj) -> Option<Obj> {
         self.a11y.parent(id).await
+    }
+
+    async fn window_title(&self, id: &Obj) -> Option<String> {
+        let frame = self.a11y.frame_of(id).await?;
+        Some(self.a11y.identity(&frame).await.1)
     }
 
     fn read_mark(&self) -> Option<u64> {
