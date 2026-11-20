@@ -512,6 +512,10 @@ impl Backend for WindowsBackend {
         }
     }
 
+    async fn labels(&self, id: &Elem) -> Vec<String> {
+        self.uia.labels(&id.el)
+    }
+
     async fn actions(&self, id: &Elem) -> Vec<String> {
         self.uia
             .fetch(&id.el)

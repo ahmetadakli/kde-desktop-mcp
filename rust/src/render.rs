@@ -1183,6 +1183,25 @@ fn matches<Id>(info: &Info<Id>, q: &Query, role: &str) -> Option<Hit> {
     (!q.words.is_empty() && q.words.iter().all(|w| hay.contains(w.as_str()))).then_some(Hit::Loose)
 }
 
+/// How well `label` (a field's label, placeholder or description) names
+/// `query`, as `matches` compares a name: 0 equal, 1 containing it, 2 all
+/// its words without accents; None when it does not.
+pub fn label_rank(label: &str, query: &str) -> Option<u8> {
+    let q = Query::new(query);
+    if q.text.is_empty() {
+        return None;
+    }
+    let label = fold(label);
+    if label == q.text {
+        Some(0)
+    } else if label.contains(&q.text) {
+        Some(1)
+    } else {
+        let label = unaccent(&label);
+        (!q.words.is_empty() && q.words.iter().all(|w| label.contains(w.as_str()))).then_some(2)
+    }
+}
+
 /// A window, tab or page title, which ranks below every other element.
 fn is_title<Id>(info: &Info<Id>, role: &str) -> bool {
     role.is_empty() && TITLE_ROLES.contains(&info.role.as_str())

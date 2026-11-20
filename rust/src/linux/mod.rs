@@ -1478,6 +1478,10 @@ impl Backend for LinuxBackend {
         self.a11y.accessible_id(id).await
     }
 
+    async fn labels(&self, id: &Obj) -> Vec<String> {
+        self.a11y.labels(id).await
+    }
+
     async fn actions(&self, id: &Obj) -> Vec<String> {
         self.a11y.actions(id).await
     }

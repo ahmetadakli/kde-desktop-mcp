@@ -376,7 +376,12 @@ tool; `off` turns it off). Not available on Windows yet.
   name or text contains it. Window, tab and page titles (frame, window, page
   tab, and a web page's document) count only when nothing else matches or
   `role` names that role; `wait_for` skips them unless `role` names them.
-  Last come elements holding every word of the query, accents aside.
+  Last come elements holding every word of the query, accents aside. When
+  nothing matches, a visible field (an editable element) whose label (the
+  AT-SPI labelled-by relation, UIA LabeledBy), placeholder text or
+  description the query names is taken, if exactly one fits best; the reply
+  says so (`(labelled 'Red gerekçesi')`). A web form's entry is often named
+  after something other than the label beside it.
 - `role` (in `find`, `wait_for` and the `app` + `query` targets) compares
   without case, spaces, `_` or `-` (`Push_Button`, `pushbutton` and UIA's
   `checkbox` for `check box`). A role that matches nothing is tried again as

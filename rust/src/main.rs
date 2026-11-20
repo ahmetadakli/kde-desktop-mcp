@@ -69,6 +69,10 @@ const MISS_SUGGESTIONS: usize = 5;
 /// its name looked through for them.
 const STALE_SHOWN: usize = 3;
 const STALE_SEARCHED: usize = 20;
+/// Roles of fields whose labels `by_label` reads besides editable ones.
+const FIELD_ROLES: &[&str] = &["entry", "text", "password text", "spin button", "combo box"];
+/// Most fields whose labels one `by_label` reads.
+const LABEL_FIELDS: usize = 60;
 /// Nodes of a web page fetched when looking for matches scrolled out of
 /// view (see `Server::miss_report`).
 const OFFSCREEN_FETCH: usize = 3000;
@@ -3076,23 +3080,36 @@ impl<B: Backend> Server<B> {
         let window = a.get("window").and_then(Json::as_str).unwrap_or("");
         let app_key = app.to_lowercase();
         let mut kept = true;
+        // The label, placeholder or description that named a field.
+        let mut labelled: Option<String> = None;
         let (id, cache, at, ties, synonym, over_chrome) = loop {
             let located = self.locate(app, query, &role, true, kept, window);
             let located = trace::time("locate", located).await?;
             let (mut m, mut cache, cached) = match located {
                 Located::Found(m, cache, cached) => (m, cache, cached),
                 Located::Missed(windows, mut cache) => {
-                    let with_role = if role.is_empty() {
-                        String::new()
+                    if let Some((id, label)) = self.by_label(&cache, query, &role).await {
+                        let window = frame_in(&cache, &id).unwrap_or_else(|| windows[0].clone());
+                        let m = render::Matches {
+                            picked: vec![(id, window)],
+                            by_synonym: false,
+                            over_chrome: 0,
+                        };
+                        labelled = Some(label);
+                        (m, cache, false)
                     } else {
-                        format!(" with role '{role}'")
-                    };
-                    let report = self
-                        .miss_report(&windows, &mut cache, &app_key, query, &role)
-                        .await;
-                    return Err(format!(
-                        "no visible element in '{app}' matches '{query}'{with_role}{report}"
-                    ));
+                        let with_role = if role.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" with role '{role}'")
+                        };
+                        let report = self
+                            .miss_report(&windows, &mut cache, &app_key, query, &role)
+                            .await;
+                        return Err(format!(
+                            "no visible element in '{app}' matches '{query}'{with_role}{report}"
+                        ));
+                    }
                 }
             };
             if input && m.picked.len() > 1 {
@@ -3158,6 +3175,9 @@ impl<B: Backend> Server<B> {
         if !synonym.is_empty() {
             found.push_str(&format!(" ({synonym})"));
         }
+        if let Some(label) = labelled {
+            found.push_str(&format!(" (labelled {})", render::py_repr(&label)));
+        }
         let found = Some(found);
         let role = cache[&id].role.clone();
         self.guard_element(&id).await?;
@@ -3168,6 +3188,61 @@ impl<B: Backend> Server<B> {
             role,
         };
         Ok((t, at))
+    }
+
+    /// The one visible field (an editable element) that its label,
+    /// placeholder or description names `query` best (`render::label_rank`),
+    /// with that text, for a query that matched no element's name or text:
+    /// a web form's label sits outside the entry, which is named after
+    /// something else ("Red gerekçesi" over an entry named "Not ·
+    /// reddederken zorunlu"). None on no match or a tie. Reads the labels
+    /// of at most LABEL_FIELDS fields of `cache`.
+    async fn by_label(
+        &self,
+        cache: &Cache<B::Id>,
+        query: &str,
+        role: &str,
+    ) -> Option<(B::Id, String)> {
+        if query.trim().is_empty() {
+            return None;
+        }
+        let synonyms = render::role_synonyms(role).unwrap_or_default();
+        let fields: Vec<&B::Id> = cache
+            .iter()
+            .filter(|(_, i)| {
+                i.showing
+                    && (i.states.contains(&"editable") || render::role_in(&i.role, FIELD_ROLES))
+                    && (render::role_matches(&i.role, role)
+                        || (!synonyms.is_empty() && render::role_matches(&i.role, &synonyms)))
+            })
+            .map(|(id, _)| id)
+            .take(LABEL_FIELDS)
+            .collect();
+        if fields.is_empty() {
+            return None;
+        }
+        let labels =
+            futures_util::future::join_all(fields.iter().map(|id| self.b.labels(id))).await;
+        let mut best: Option<(u8, &B::Id, String)> = None;
+        let mut tied = false;
+        for (id, texts) in fields.into_iter().zip(labels) {
+            let Some((rank, text)) = texts
+                .into_iter()
+                .filter_map(|t| Some((render::label_rank(&t, query)?, t)))
+                .min_by_key(|(r, _)| *r)
+            else {
+                continue;
+            };
+            match &best {
+                Some((b, _, _)) if *b < rank => {}
+                Some((b, _, _)) if *b == rank => tied = true,
+                _ => {
+                    best = Some((rank, id, text));
+                    tied = false;
+                }
+            }
+        }
+        best.filter(|_| !tied).map(|(_, id, t)| (id.clone(), t))
     }
 
     /// What is on screen, for a reply that found nothing or failed: the
@@ -8192,6 +8267,8 @@ mod tests {
         adds: std::cell::Cell<bool>,
         /// The user types once this many more key presses went out.
         user_after_presses: std::cell::Cell<Option<usize>>,
+        /// `labels` per element.
+        labels: RefCell<HashMap<u32, Vec<String>>>,
         /// What the field keeps of typed text (an input mask), when Some.
         mask: std::cell::Cell<Option<FakeMask>>,
     }
@@ -8687,6 +8764,14 @@ mod tests {
         }
         async fn toolkit_of(&self, _: &u32) -> String {
             self.sem.toolkit.borrow().clone()
+        }
+        async fn labels(&self, id: &u32) -> Vec<String> {
+            self.sem
+                .labels
+                .borrow()
+                .get(id)
+                .cloned()
+                .unwrap_or_default()
         }
         /// "multi line" stands for the state tree and find do not show.
         async fn edit_states(&self, id: &u32) -> Option<(bool, bool)> {
@@ -12688,6 +12773,87 @@ mod tests {
             assert!(
                 reply_text(&r)
                     .contains("written, but the field now holds \"05551234\" (8 chars, 11 asked"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn set_text_finds_a_field_by_its_label_placeholder_or_description() {
+        local(async {
+            let mut s = session("labels");
+            *s.field.borrow_mut() = Some(String::new());
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                let entry = |name: &str| Info {
+                    states: vec!["editable"],
+                    ..fake_node("entry", name, &[])
+                };
+                nodes.insert(30, entry("Not · reddederken zorunlu"));
+                nodes.insert(31, entry("Sicil no"));
+                nodes.insert(32, entry(""));
+                nodes.insert(33, fake_node("label", "Telefon", &[]));
+            }
+            s.focus.borrow_mut().children = vec![30, 31, 32, 33];
+            {
+                let mut labels = s.sem.labels.borrow_mut();
+                labels.insert(30, vec!["Red gerekçesi".into()]);
+                labels.insert(31, vec!["Personelin sicil numarası".into()]);
+                labels.insert(32, vec!["Telefon".into(), "05XX XXX XX XX".into()]);
+            }
+            let r = call_tool(
+                &mut s,
+                2,
+                "set_text",
+                json!({"app": "fake", "query": "Red gerekçesi", "text": "red"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(text.contains("entry \"Not · reddederken zorunlu\""), "{r}");
+            assert!(
+                text.contains("(labelled 'Red gerekçesi'): ok (verified"),
+                "{r}"
+            );
+            // A placeholder, with a role; the label element itself is no
+            // field, and its name does not win over the entry's label.
+            let r = call_tool(
+                &mut s,
+                3,
+                "get_text",
+                json!({"app": "fake", "query": "05xx xxx", "role": "textbox"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("(labelled '05XX XXX XX XX')"),
+                "{r}"
+            );
+            // Words in any order, without accents.
+            let r = call_tool(
+                &mut s,
+                4,
+                "get_text",
+                json!({"app": "fake", "query": "sicil personelin"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("entry \"Sicil no\""), "{r}");
+            // A name match still comes first; a miss still says so.
+            let r = call_tool(
+                &mut s,
+                5,
+                "get_text",
+                json!({"app": "fake", "query": "Telefon"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("label \"Telefon\""), "{r}");
+            let r = call_tool(
+                &mut s,
+                6,
+                "get_text",
+                json!({"app": "fake", "query": "Adres"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("no visible element in 'fake' matches 'Adres'"),
                 "{r}"
             );
         });

@@ -132,7 +132,9 @@ pub const IS_DEFAULT: u32 = 39;
 pub const CHECKABLE: u32 = 41;
 pub const HAS_POPUP: u32 = 42;
 
-// AtspiRelationType: a browser window EMBEDS its current tab's document.
+// AtspiRelationType: a browser window EMBEDS its current tab's document;
+// a field is LABELLED_BY its label.
+pub const RELATION_LABELLED_BY: u32 = 2;
 pub const RELATION_EMBEDS: u32 = 13;
 
 // AtspiCoordType.
@@ -701,6 +703,33 @@ impl A11y {
             .flat_map(|(_, targets)| targets)
             .find(|(_, p)| p.as_str() != NULL_PATH)
             .map(|(b, p)| Obj::new(&b, p))
+    }
+
+    /// The names of the elements `o` is labelled by, its placeholder text
+    /// (Gecko and Chromium: the `placeholder-text` attribute) and its
+    /// description, the empty ones left out.
+    pub async fn labels(&self, o: &Obj) -> Vec<String> {
+        let (set, attrs, description) = tokio::join!(
+            self.call::<Vec<(u32, Vec<(String, OwnedObjectPath)>)>>(o, ACC, "GetRelationSet", &()),
+            self.call::<std::collections::HashMap<String, String>>(o, ACC, "GetAttributes", &()),
+            self.prop(o, ACC, "Description"),
+        );
+        let labels: Vec<Obj> = set
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(k, _)| *k == RELATION_LABELLED_BY)
+            .flat_map(|(_, targets)| targets)
+            .filter(|(_, p)| p.as_str() != NULL_PATH)
+            .take(4)
+            .map(|(b, p)| Obj::new(&b, p))
+            .collect();
+        let mut out = futures_util::future::join_all(labels.iter().map(|l| self.name(l))).await;
+        if let Ok(attrs) = attrs {
+            out.extend(attrs.get("placeholder-text").cloned());
+        }
+        out.extend(description.ok().and_then(|v| String::try_from(v).ok()));
+        out.retain(|t| !t.trim().is_empty());
+        out
     }
 
     pub async fn parent(&self, o: &Obj) -> Option<Obj> {

@@ -652,6 +652,12 @@ pub trait Backend {
     async fn object_id(&self, _id: &Self::Id) -> String {
         String::new()
     }
+    /// What else names a field besides its name: the names of the labels
+    /// it is labelled by, its placeholder text and its description; empty
+    /// when it has none (or the backend reads none).
+    async fn labels(&self, _id: &Self::Id) -> Vec<String> {
+        Vec::new()
+    }
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
     /// The element's states as `act`'s verified actions read them, fresh.
     async fn toggles(&self, id: &Self::Id) -> Toggles {
