@@ -1972,12 +1972,21 @@ impl<B: Backend> Server<B> {
         let left = || limit.saturating_sub(c.at.elapsed());
         let ms = || c.at.elapsed().as_millis();
         if !c.pre.busy && !self.b.wait_change(near, c.pre.mark, left()).await {
+            trace::note(&format!("content: no change in {} ms", ms()));
             return format!("; no page change seen in {} ms", ms());
         }
         let quiet = match c.pre.busy || c.at.elapsed() < CONTENT_EARLY {
             true => CONTENT_QUIET_EARLY,
             false => CONTENT_QUIET,
         };
+        // The first change's delay (the busy app's: none) and the quiet it
+        // chose: what a per-app quiet window would be tuned from.
+        trace::note(&format!(
+            "content: change seen after {} ms (busy={}), quiet {} ms",
+            ms(),
+            c.pre.busy,
+            quiet.as_millis()
+        ));
         let mut cap = Instant::now() + CONTENT_BURST;
         let mut windows: Option<Vec<B::Id>> = None;
         let mut loading = false;
@@ -6647,10 +6656,12 @@ impl<B: Backend> Server<B> {
             ));
         }
         let send = keys.join("+");
-        let app = self.require_input_front().await?;
+        let app = trace::time("require_input_front", self.require_input_front()).await?;
         // Enter submits, alt+left goes back: the page may change.
         let content = match CONTENT_KEYS.contains(&send.as_str()) && self.b.changes_live() {
-            true => self.b.focused().await.map(|f| (f.id, f.info.role)),
+            true => trace::time("focused", self.b.focused())
+                .await
+                .map(|f| (f.id, f.info.role)),
             false => None,
         };
         let pre = self.pre_content(content.as_ref().map(|(id, _)| id));
@@ -6661,13 +6672,13 @@ impl<B: Backend> Server<B> {
                     .await
                     .map_err(|e| format!("{e} after {i} of {times} presses of {send}"))?;
             }
-            self.b.press_combo(&send).await?;
+            trace::time("press", self.b.press_combo(&send)).await?;
         }
         if let Some((id, role)) = &content {
             // Enter in a search field submits it.
-            self.note_content(pre, id, role, true).await;
+            trace::time("note_content", self.note_content(pre, id, role, true)).await;
         }
-        let focus = self.focus_note(false).await;
+        let focus = trace::time("focus_note", self.focus_note(false)).await;
         Ok(format!("sent {combo} x{repeat} to {app}{focus}"))
     }
 
@@ -6877,7 +6888,7 @@ impl<B: Backend> Server<B> {
             Some(t) => self.terminal_window(t).await?,
             None => self.prefer_other(&req_s(a, "query")?).await,
         };
-        let (_, app) = self.activate(&query).await?;
+        let (_, app) = trace::time("activate", self.activate(&query)).await?;
         Ok(format!(
             "active app now: {}",
             if app.is_empty() { "unknown" } else { &app }
@@ -6946,10 +6957,11 @@ impl<B: Backend> Server<B> {
     /// between this and the tool's input.
     async fn ensure_window(&self, query: &str) -> R<Option<String>> {
         let query = self.prefer_other(query).await;
-        if self.window_is_active(&query).await {
+        if trace::time("window_is_active", self.window_is_active(&query)).await {
+            trace::note("window in front already: not activated");
             return Ok(None);
         }
-        let (title, _) = self.activate(&query).await?;
+        let (title, _) = trace::time("activate", self.activate(&query)).await?;
         Ok(Some(title.unwrap_or(query)))
     }
 
@@ -7336,7 +7348,12 @@ impl<B: Backend> Server<B> {
         }
         let (((result, refused), element), wrote) =
             delivery::track(STEP_ELEMENT.scope(std::cell::Cell::new(None), async {
-                let r = with_refusals(self.call_inner(&call.tool, &args, held, settle)).await;
+                let step = format!("step {n} {}", call.tool);
+                let r = with_refusals(trace::time(
+                    &step,
+                    self.call_inner(&call.tool, &args, held, settle),
+                ))
+                .await;
                 (r, STEP_ELEMENT.with(|e| e.get()))
             }))
             .await;
@@ -7602,7 +7619,7 @@ impl<B: Backend> Server<B> {
         // that opened after its reply): said before this input's result.
         let pre_note = match observe {
             None if WINDOW_NOTE_TOOLS.contains(&name) && window.is_none() => {
-                self.window_change_note().await
+                trace::time("window_change_note", self.window_change_note()).await
             }
             _ => String::new(),
         };
@@ -7709,7 +7726,8 @@ impl<B: Backend> Server<B> {
                     o.text
                         .push_str(&format!("; before it, {before} had come to the front"));
                 }
-                o.text.push_str(&self.window_change_note().await);
+                o.text
+                    .push_str(&trace::time("window_change_note", self.window_change_note()).await);
                 o.text.push_str(&opened);
                 Ok(o)
             }

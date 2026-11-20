@@ -1137,6 +1137,7 @@ impl LinuxBackend {
                 });
             }
             if start.elapsed() >= ACTIVATE_WAIT {
+                crate::trace::note("activation: no window of its app reported ACTIVE in time");
                 return None;
             }
             // A round reads only this app's windows: cheap enough to look often.
@@ -1958,19 +1959,22 @@ impl Backend for LinuxBackend {
     async fn activate_window(&self, query: &str, allowed: &[String]) -> R<Option<Activated>> {
         match &self.comp {
             Compositor::Kde(kwin) => {
-                let apps = self.apps_with_pids().await;
+                let apps = crate::trace::time("apps_with_pids", self.apps_with_pids()).await;
                 let allow = Self::allow_of(allowed, &apps);
-                let Some(raised) = kwin.activate(query, &allow).await? else {
+                let raised = crate::trace::time("kwin activate", kwin.activate(query, &allow));
+                let Some(raised) = raised.await? else {
                     return Err(crate::delivery::nothing_sent(format!(
                         "no window of an allowed app matches '{query}'"
                     )));
                 };
                 // KWin switches at once; the toolkit reports ACTIVE a moment later.
                 if apps.iter().any(|(pid, ..)| *pid == Some(raised.pid)) {
-                    return Ok(self.kde_wait_active(&raised, &apps).await);
+                    let waited = self.kde_wait_active(&raised, &apps);
+                    return Ok(crate::trace::time("wait active", waited).await);
                 }
                 // Its process has no AT-SPI app under that pid: by title.
-                poll(ACTIVATE_WAIT, || self.kde_frame_active(&raised.caption)).await;
+                let polled = poll(ACTIVATE_WAIT, || self.kde_frame_active(&raised.caption));
+                crate::trace::time("wait active (by title)", polled).await;
             }
             Compositor::Hyprland(h) => {
                 let q = query.to_lowercase();
