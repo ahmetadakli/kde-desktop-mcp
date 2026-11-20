@@ -592,6 +592,10 @@ struct Gate {
     /// "before it, opened: …" lines for what showed after the previous
     /// input's reply (`Server::opened_before`), said with this call's.
     before: String,
+    /// `act` ran a verified action (check, expand, select, scroll_to): it
+    /// read the state back already, so the effect line does not wait
+    /// PAGE_SETTLE for a page to react on top.
+    verified: bool,
 }
 
 tokio::task_local! {
@@ -1139,6 +1143,49 @@ struct Fingerprint<Id> {
 /// link or a web app's row starts loading the next page only after a
 /// round trip of its own.
 const PAGE_SETTLE: Duration = Duration::from_millis(400);
+
+/// Keys (`chord_keys`, joined) after which the effect line waits
+/// PAGE_SETTLE for a web page to start reacting: they submit a form,
+/// press the focused link or button, go back or forward, or reload.
+/// Other keys (ctrl+l, Escape, Tab, a letter) show their effect at once
+/// or not at all.
+const PAGE_KEYS: [&str; 9] = [
+    "enter",
+    "kpenter",
+    "space",
+    "alt+left",
+    "alt+right",
+    "f5",
+    "ctrl+f5",
+    "ctrl+r",
+    "ctrl+shift+r",
+];
+
+/// Whether the effect line after `tool` (arguments `a`) on a web page
+/// waits PAGE_SETTLE past its settle for the page to start reacting: not
+/// after a verified action (`act` read the state back already), a key
+/// that loads or presses nothing (PAGE_KEYS), text typed without a final
+/// Enter, a field written or an element focused.
+fn waits_for_page(tool: &str, a: &Json, verified: bool) -> bool {
+    match tool {
+        _ if verified => false,
+        "key" => {
+            let sorted = |c: &str| {
+                let mut k = chord_keys(c);
+                k.sort();
+                k
+            };
+            let keys = sorted(a.get("combo").and_then(Json::as_str).unwrap_or_default());
+            PAGE_KEYS.iter().any(|p| sorted(p) == keys)
+        }
+        "type_text" => a
+            .get("text")
+            .and_then(Json::as_str)
+            .is_some_and(|t| t.ends_with('\n')),
+        "set_text" | "focus" => false,
+        _ => true,
+    }
+}
 
 /// How long `page_of` trusts that a browser's window shows no web page (a
 /// dialog, a mail app's window without a web view) before searching it
@@ -3819,6 +3866,17 @@ impl<B: Backend> Server<B> {
             Some(_) => 0,
             None => arg_i(a, "settle_ms", SETTLE_MS).clamp(0, MAX_SETTLE_MS) as u64,
         };
+        let verified = GATE.try_with(|g| g.borrow().verified).unwrap_or(false);
+        // A page answers late: a little longer, after an input that may
+        // load one or press something on it (not when nothing was sent).
+        let page_settle =
+            settle > 0 && sent && before.page.is_some() && waits_for_page(tool, a, verified);
+        if trace::on() && settle > 0 && before.page.is_some() {
+            trace::note(&format!(
+                "page settle {}: {tool} sent={sent} verified={verified}",
+                if page_settle { "on" } else { "skipped" }
+            ));
+        }
         // The focused element's app reacts (its bus, on Linux), the app the
         // input went to (`act` reaches a browser behind the terminal), and
         // the element whose page the content wait watched.
@@ -3837,7 +3895,7 @@ impl<B: Backend> Server<B> {
             self.b.changed_since(&near, mark),
         ) {
             let mut limit = Duration::from_millis(settle);
-            if settle > 0 && sent && before.page.is_some() {
+            if page_settle {
                 limit += PAGE_SETTLE;
             }
             let now = trace::time("content settle", self.content_settle(windows, was, limit)).await;
@@ -3850,9 +3908,7 @@ impl<B: Backend> Server<B> {
                     .await;
             }
             let mut events = self.b.changed_since(&near, mark);
-            // A page answers late: wait a little longer for it to start
-            // (not when nothing was sent).
-            if settle > 0 && sent && before.page.is_some() && events != Some(true) {
+            if page_settle && events != Some(true) {
                 trace::time("page settle", self.b.wait_change(&near, mark, PAGE_SETTLE)).await;
                 events = self.b.changed_since(&near, mark);
             }
@@ -4622,6 +4678,7 @@ impl<B: Backend> Server<B> {
             let done = self.verified(&t, verb, &action, option.as_deref()).await;
             // None: not of the kind, but it has an action of that name.
             if let Some(reply) = done.map_err(|e| t.reply(&e))? {
+                let _ = GATE.try_with(|g| g.borrow_mut().verified = true);
                 return Ok(t.reply(&reply));
             }
         }
@@ -7426,6 +7483,7 @@ impl<B: Backend> Server<B> {
             quiet: false,
             reported: Vec::new(),
             before: String::new(),
+            verified: false,
         };
         Box::pin(GATE.scope(std::cell::RefCell::new(gate), async move {
             let (result, wrote) = delivery::track(self.call_body(name, a, held, settle)).await;
@@ -15176,6 +15234,93 @@ mod tests {
                 reply_text(&r).contains("; page changed, still loading after 4"),
                 "{r}"
             );
+        });
+    }
+
+    #[test]
+    fn only_inputs_that_may_load_a_page_wait_page_settle() {
+        let key = |c: &str| json!({ "combo": c });
+        for c in [
+            "enter",
+            "Return",
+            "space",
+            "alt+left",
+            "F5",
+            "ctrl+r",
+            "shift+ctrl+r",
+        ] {
+            assert!(waits_for_page("key", &key(c), false), "{c}");
+        }
+        for c in ["ctrl+l", "Escape", "tab", "ctrl+a", "a", "ctrl+t", "End"] {
+            assert!(!waits_for_page("key", &key(c), false), "{c}");
+        }
+        let text = |t: &str| json!({ "text": t });
+        assert!(waits_for_page("type_text", &text("query\n"), false));
+        assert!(!waits_for_page("type_text", &text("query"), false));
+        assert!(!waits_for_page("set_text", &text("x"), false));
+        assert!(!waits_for_page("focus", &json!({}), false));
+        // A press or a click may load a page; a verified action read its
+        // state back already.
+        for tool in ["act", "click", "mouse", "menu", "scroll"] {
+            assert!(waits_for_page(tool, &json!({}), false), "{tool}");
+            assert!(!waits_for_page(tool, &json!({}), true), "{tool}");
+        }
+    }
+
+    /// `fake_mail` with a check box and a text field on its page, which
+    /// sends change events but none for the inputs below.
+    fn fake_mail_quiet(s: &Session) {
+        fake_mail(s);
+        s.reads.events.set(true);
+        *s.reads.page.borrow_mut() = Some(page("Inbox (3)", "https://mail/#inbox", false));
+        let mut n = s.nodes.borrow_mut();
+        n.insert(
+            45,
+            with_actions(
+                fake_node("check box", "Remember me", &[]),
+                &["Toggle", "click"],
+            ),
+        );
+        n.get_mut(&40).unwrap().children.push(45);
+    }
+
+    #[test]
+    fn a_verified_action_on_a_page_waits_no_page_settle() {
+        local(async {
+            let mut s = session("verified-page-settle");
+            fake_mail_quiet(&s);
+            let act =
+                |action: &str| json!({"app": "fake", "query": "Remember me", "action": action});
+            // A plain action on the page: the effect line waits for the
+            // page to start reacting on top of its settle.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "act", act("click")).await;
+            assert!(reply_text(&r).contains("click -> ok; effect:"), "{r}");
+            assert!(start.elapsed() >= PAGE_SETTLE, "{:?}", start.elapsed());
+            // A verified one read its state back: the settle only.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "act", act("toggle")).await;
+            assert!(reply_text(&r).contains("(verified); effect:"), "{r}");
+            assert!(start.elapsed() < PAGE_SETTLE, "{:?}", start.elapsed());
+        });
+    }
+
+    #[test]
+    fn a_key_that_loads_nothing_waits_no_page_settle() {
+        local(async {
+            let mut s = session("key-page-settle");
+            fake_mail_quiet(&s);
+            s.focus.borrow_mut().states = vec!["focused", "editable"];
+            let key = |combo: &str| json!({"combo": combo, "observe": "effect"});
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "key", key("ctrl+l")).await;
+            assert!(reply_text(&r).contains("effect: "), "{r}");
+            assert!(start.elapsed() < PAGE_SETTLE, "{:?}", start.elapsed());
+            // Space presses the focused button: it may load a page.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 3, "key", key("space")).await;
+            assert!(reply_text(&r).contains("effect: "), "{r}");
+            assert!(start.elapsed() >= PAGE_SETTLE, "{:?}", start.elapsed());
         });
     }
 
