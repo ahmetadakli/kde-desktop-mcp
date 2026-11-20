@@ -496,6 +496,27 @@ pub trait Backend {
     }
     /// App name owning the foreground window, "" when unknown.
     async fn active_app(&self) -> String;
+    /// The processes of the client running this server (its ancestors and
+    /// their terminals), read once at start for the self-client guard;
+    /// empty where the platform cannot tell.
+    async fn self_client(&self) -> crate::selfguard::SelfClient {
+        crate::selfguard::SelfClient::default()
+    }
+    /// Process id of the app owning the foreground window, after an
+    /// `active_app` call; None when unknown.
+    async fn active_pid(&self) -> Option<u32> {
+        None
+    }
+    /// What the window of process `pid` titled `title` (None: the active
+    /// window) shows of its terminals: those its processes hold and the tab
+    /// in front, as far as the platform tells.
+    async fn term_view(&self, _pid: u32, _title: Option<&str>) -> crate::selfguard::TermView {
+        crate::selfguard::TermView::default()
+    }
+    /// Process id of the app the element belongs to; None when unknown.
+    async fn element_pid(&self, _id: &Self::Id) -> Option<u32> {
+        None
+    }
 
     async fn info(&self, id: &Self::Id, text_limit: usize) -> Info<Self::Id>;
     /// Role and name only, as cheaply as the platform allows (one round

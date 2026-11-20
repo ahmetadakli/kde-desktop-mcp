@@ -14,6 +14,7 @@ mod launch_pick;
 mod linux;
 mod policy;
 mod render;
+mod selfguard;
 mod semantic;
 mod shot;
 mod takeover;
@@ -438,6 +439,8 @@ struct Server<B: Backend> {
     /// NO_PAGE_RECHECK after that look). Never locked across an await.
     #[allow(clippy::type_complexity)]
     page_docs: std::sync::Mutex<HashMap<String, (B::Id, Option<B::Id>, Instant)>>,
+    /// The client running this server (`selfguard`), read on first use.
+    self_client: tokio::sync::OnceCell<selfguard::SelfClient>,
 }
 
 /// A key or mouse button the server pressed and has not released.
@@ -1721,6 +1724,7 @@ impl<B: Backend> Server<B> {
             link: Default::default(),
             reads: std::sync::Mutex::new(Reads::new()),
             page_docs: std::sync::Mutex::new(HashMap::new()),
+            self_client: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -2269,6 +2273,129 @@ impl<B: Backend> Server<B> {
         }
         self.permit(&name).await?;
         Ok(name)
+    }
+
+    /// `require_active_allowed` for a tool about to send input to the
+    /// window in front, which must not be the agent's own client
+    /// (`guard_front`).
+    async fn require_input_front(&self) -> R<String> {
+        let app = self.require_active_allowed().await?;
+        self.guard_front().await?;
+        Ok(app)
+    }
+
+    // ------------------------------------------------------------ self-client guard
+
+    /// The client running this server (`selfguard`), read once; None when
+    /// the guard is off (`self-client: allow`) or no client was found.
+    async fn guarded_client(&self) -> Option<&selfguard::SelfClient> {
+        if self.policy().self_client {
+            return None;
+        }
+        let me = self
+            .self_client
+            .get_or_init(|| async { self.b.self_client().await })
+            .await;
+        (!me.is_empty()).then_some(me)
+    }
+
+    fn allow_file_text(&self) -> String {
+        self.allow_file.display().to_string()
+    }
+
+    /// Refuse input to the window in front when it is the agent's own: its
+    /// terminal tab, or the window of the client running this server.
+    /// Asks the backend for terminals only when the window in front
+    /// belongs to one of the client's processes.
+    async fn guard_front(&self) -> R<()> {
+        let Some(me) = self.guarded_client().await else {
+            return Ok(());
+        };
+        let Some(pid) = self.b.active_pid().await else {
+            return Ok(());
+        };
+        if me.ancestor(pid).is_none() {
+            return Ok(());
+        }
+        let view = self.b.term_view(pid, None).await;
+        match me.front_owner(pid, &view) {
+            None => Ok(()),
+            Some(own) => {
+                let title = self.active_title().await.unwrap_or_default();
+                Err(refusal(selfguard::refusal(
+                    &own,
+                    &title,
+                    &self.allow_file_text(),
+                )))
+            }
+        }
+    }
+
+    /// Refuse a tool that acts on element `id` (click tier and up) when the
+    /// element belongs to the agent's own client (Claude Desktop's own
+    /// buttons). A terminal's own elements (its tabs) stay usable.
+    async fn guard_element(&self, id: &B::Id) -> R<()> {
+        let (tool, args) = GATE
+            .try_with(|g| {
+                let g = g.borrow();
+                (g.tool.clone(), g.args.clone())
+            })
+            .unwrap_or_else(|_| (String::new(), Json::Null));
+        if policy::needed_tier(&tool, &args) < Tier::Click || tool == "move_window" {
+            return Ok(());
+        }
+        let Some(me) = self.guarded_client().await else {
+            return Ok(());
+        };
+        let Some(pid) = self.b.element_pid(id).await else {
+            return Ok(());
+        };
+        if me.ancestor(pid).is_none() {
+            return Ok(());
+        }
+        let view = self.b.term_view(pid, Some("")).await;
+        match me.element_owner(pid, &view) {
+            None => Ok(()),
+            Some(own) => Err(refusal(selfguard::element_refusal(
+                &own,
+                &self.allow_file_text(),
+            ))),
+        }
+    }
+
+    /// Whether `w` is the agent's own window: what input to it in front
+    /// would reach (`SelfClient::front_owner`).
+    async fn is_own_window(&self, me: &selfguard::SelfClient, w: &WindowGeo) -> bool {
+        if me.ancestor(w.pid).is_none() {
+            return false;
+        }
+        let view = self.b.term_view(w.pid, Some(&w.title)).await;
+        me.front_owner(w.pid, &view).is_some()
+    }
+
+    /// Of the windows in `list` that match `query` best (`window_rank`),
+    /// the title of one that is not the agent's own, when one of them is
+    /// (a second Konsole window rather than the agent's tab); None to keep
+    /// the usual pick.
+    async fn other_than_own(&self, query: &str, list: &[WindowGeo]) -> Option<String> {
+        let me = self.guarded_client().await?;
+        if !list.iter().any(|w| me.ancestor(w.pid).is_some()) {
+            return None;
+        }
+        let ranked: Vec<(u8, &WindowGeo)> = list
+            .iter()
+            .filter_map(|w| backend::window_rank(query, &w.title, &[&w.app]).map(|r| (r, w)))
+            .collect();
+        let best = ranked.iter().map(|(r, _)| *r).min()?;
+        let (mut own, mut other) = (false, None);
+        for (_, w) in ranked.iter().filter(|(r, _)| *r == best) {
+            if self.is_own_window(me, w).await {
+                own = true;
+            } else if other.is_none() {
+                other = Some(w.title.clone());
+            }
+        }
+        if own { other } else { None }
     }
 
     // ------------------------------------------------------------ ids
@@ -2839,6 +2966,7 @@ impl<B: Backend> Server<B> {
         if let Some(rid) = a.get("id").and_then(Json::as_i64) {
             let r = trace::time("resolve_ref", self.resolve_ref(rid)).await?;
             trace::time("permit", self.permit(&r.app)).await?;
+            self.guard_element(&r.id).await?;
             note_step_element(rid as u64, true);
             let t = Target {
                 id: r.id,
@@ -2945,6 +3073,7 @@ impl<B: Backend> Server<B> {
         }
         let found = Some(found);
         let role = cache[&id].role.clone();
+        self.guard_element(&id).await?;
         let t = Target {
             id,
             found,
@@ -3766,6 +3895,18 @@ impl<B: Backend> Server<B> {
         // unsaved work may go with it.
         let app = self.window_app(w).await;
         self.permit(&app).await?;
+        if let Some(me) = self.guarded_client().await
+            && me.ancestor(w.pid).is_some()
+        {
+            let view = self.b.term_view(w.pid, Some(&w.title)).await;
+            if let Some(own) = me.close_owner(w.pid, &view) {
+                return Err(refusal(selfguard::close_refusal(
+                    &own,
+                    &w.title,
+                    &self.allow_file_text(),
+                )));
+            }
+        }
         if !GATE.try_with(|g| g.borrow().confirmed).unwrap_or(false) {
             self.confirm("close_window", Some(&app), a).await?;
         }
@@ -3937,6 +4078,29 @@ impl<B: Backend> Server<B> {
                 (false, false) => format!(
                     "never read; filled in only in: {}",
                     policy.passwords.join(", ")
+                ),
+            },
+        );
+        let me = self
+            .self_client
+            .get_or_init(|| async { self.b.self_client().await })
+            .await;
+        row(
+            true,
+            "self-client guard",
+            &match (policy.self_client, me.is_empty()) {
+                (true, _) => format!(
+                    "off ('{}' in the allowlist): input may reach the agent's own client, {}",
+                    selfguard::OPT_OUT,
+                    me.describe()
+                ),
+                (false, true) => {
+                    "no client process found above this server: nothing to guard".into()
+                }
+                (false, false) => format!(
+                    "input never goes to the agent's own terminal tab or client window; \
+                     client: {}",
+                    me.describe()
                 ),
             },
         );
@@ -5017,7 +5181,7 @@ impl<B: Backend> Server<B> {
             ));
         };
         let (active, pane_at, at) = tokio::join!(
-            self.require_active_allowed(),
+            self.require_input_front(),
             self.b.wheel_point(&pane),
             self.b.element_center(id)
         );
@@ -5067,6 +5231,7 @@ impl<B: Backend> Server<B> {
         let app_key = app.to_lowercase();
         let mut cache = Cache::new();
         let bar = self.menu_bar(&app, &windows, &mut cache).await?;
+        self.guard_element(&bar).await?;
         let hidden = !cache[&bar].showing;
         let mut node = bar;
         let mut trail: Vec<String> = Vec::new();
@@ -5535,7 +5700,7 @@ impl<B: Backend> Server<B> {
     /// would not take focus in an allowed active window (nothing typed).
     /// Runs under the input lock `set_text` (an INPUT_TOOLS entry) holds.
     async fn retype(&self, id: &B::Id, text: &str, front_checked: bool) -> bool {
-        if !front_checked && self.require_active_allowed().await.is_err() {
+        if !front_checked && self.require_input_front().await.is_err() {
             return false;
         }
         if !matches!(self.b.try_focus(id).await, Ok(Some(_))) && !self.b.is_focused(id).await {
@@ -5915,8 +6080,7 @@ impl<B: Backend> Server<B> {
     /// to be an allowed app's. Both lookups are reads and independent, so
     /// they run together; the allowlist error still comes first.
     async fn active_center(&self, id: &B::Id) -> R<(i32, i32)> {
-        let (active, center) =
-            tokio::join!(self.require_active_allowed(), self.b.element_center(id));
+        let (active, center) = tokio::join!(self.require_input_front(), self.b.element_center(id));
         active?;
         center
     }
@@ -5928,7 +6092,7 @@ impl<B: Backend> Server<B> {
     /// window, then the centre.
     async fn target_center(&self, a: &Json) -> R<(Target<B::Id>, (i32, i32))> {
         let (active, found) = tokio::join!(
-            trace::time("require_active_allowed", self.require_active_allowed()),
+            trace::time("require_input_front", self.require_input_front()),
             async {
                 let target = self.target_and_center(a, true, true);
                 let (t, center) = trace::time("target", target).await?;
@@ -5950,6 +6114,7 @@ impl<B: Backend> Server<B> {
         if let Some(rid) = a.get(format!("{end}_id")).and_then(Json::as_i64) {
             let (id, app) = self.resolve_with_app(rid).await?;
             self.permit(&app).await?;
+            self.guard_element(&id).await?;
             return Ok(DragEnd::Element(id));
         }
         let (x, y) = (
@@ -5970,7 +6135,7 @@ impl<B: Backend> Server<B> {
     /// order they would come one by one: active window, `from`, `to`.
     async fn drag_points(&self, a: &Json) -> R<(String, (i64, i64), (i64, i64))> {
         let (app, from, to) = tokio::join!(
-            self.require_active_allowed(),
+            self.require_input_front(),
             self.drag_end(a, "from"),
             self.drag_end(a, "to")
         );
@@ -6064,7 +6229,7 @@ impl<B: Backend> Server<B> {
             ));
         }
         let send = keys.join("+");
-        let app = self.require_active_allowed().await?;
+        let app = self.require_input_front().await?;
         // Enter submits, alt+left goes back: the page may change.
         let content = match CONTENT_KEYS.contains(&send.as_str()) && self.b.changes_live() {
             true => self.b.focused().await.map(|f| (f.id, f.info.role)),
@@ -6090,7 +6255,7 @@ impl<B: Backend> Server<B> {
 
     async fn type_text(&self, a: &Json) -> R<String> {
         let text = req_s(a, "text")?;
-        let app = self.require_active_allowed().await?;
+        let app = self.require_input_front().await?;
         if let Some(f) = self.b.focused().await
             && render::is_protected_role(&f.info.role)
             && !self.passwords_allowed(&f.app)
@@ -6206,7 +6371,7 @@ impl<B: Backend> Server<B> {
         if clicks > 0 {
             self.check_button_free(&button)?;
         }
-        let app = self.require_active_allowed().await?;
+        let app = self.require_input_front().await?;
         self.with_modifiers(
             &mods,
             self.b.pointer(x, y, &button, clicks, arg_i(a, "scroll", 0)),
@@ -6260,7 +6425,7 @@ impl<B: Backend> Server<B> {
         };
         let what = items.iter().map(|h| h.name()).collect::<Vec<_>>().join("+");
         if down {
-            let app = self.require_active_allowed().await?;
+            let app = self.require_input_front().await?;
             for h in &items {
                 if !self.is_held(h) {
                     self.press_held(h).await?;
@@ -6292,7 +6457,7 @@ impl<B: Backend> Server<B> {
     async fn activate_window(&self, a: &Json) -> R<String> {
         let query = match a.get("terminal").and_then(Json::as_str) {
             Some(t) => self.terminal_window(t).await?,
-            None => req_s(a, "query")?,
+            None => self.prefer_other(&req_s(a, "query")?).await,
         };
         let (_, app) = self.activate(&query).await?;
         Ok(format!(
@@ -6353,11 +6518,26 @@ impl<B: Backend> Server<B> {
     /// `call`, under the input lock, so nothing else takes the focus
     /// between this and the tool's input.
     async fn ensure_window(&self, query: &str) -> R<Option<String>> {
-        if self.window_is_active(query).await {
+        let query = self.prefer_other(query).await;
+        if self.window_is_active(&query).await {
             return Ok(None);
         }
-        let (title, _) = self.activate(query).await?;
-        Ok(Some(title.unwrap_or_else(|| query.to_string())))
+        let (title, _) = self.activate(&query).await?;
+        Ok(Some(title.unwrap_or(query)))
+    }
+
+    /// `query`, or the title of another window it matches as well when the
+    /// one it would pick is the agent's own (`other_than_own`).
+    async fn prefer_other(&self, query: &str) -> String {
+        if self.guarded_client().await.is_none() {
+            return query.to_string();
+        }
+        let Ok(list) = self.b.windows_quick(query, &self.allowed()).await else {
+            return query.to_string();
+        };
+        self.other_than_own(query, &list)
+            .await
+            .unwrap_or_else(|| query.to_string())
     }
 
     /// Title of the allowed window whose terminal runs a command, or is in a
@@ -6391,6 +6571,7 @@ impl<B: Backend> Server<B> {
         let owner = file_dialog_owner(&d, &allowed)
             .map_err(|e| refusal(format!("{e} (allowlist: {})", self.allow_file.display())))?;
         self.permit(&owner).await?;
+        self.guard_front().await?;
         let mut text = path.display().to_string();
         if cfg!(windows) {
             // `~/x` joined to the profile folder; the dialog's own form.
@@ -7646,6 +7827,21 @@ mod tests {
         shown: Rc<FakeShown>,
         /// What `act`'s verified actions meet: see `FakeSemantic`.
         sem: Rc<FakeSemantic>,
+        /// The client running the server (`selfguard`), and what each
+        /// pid's window shows of its terminals. Window pids: `fake_pid`.
+        client: Rc<RefCell<selfguard::SelfClient>>,
+        views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
+    }
+
+    /// The pid of a fake window's process: Konsole 100, each Fake window a
+    /// process of its own (notes 200, todo 201).
+    fn fake_pid(app: &str, title: &str) -> u32 {
+        match (app, title.starts_with("todo")) {
+            ("konsole", _) => 100,
+            ("fake", false) => 200,
+            ("fake", true) => 201,
+            _ => 0,
+        }
     }
 
     /// How the fake answers `act`'s verified actions. Actions flip a check
@@ -7916,6 +8112,19 @@ mod tests {
         }
         async fn active_app(&self) -> String {
             self.active.borrow().0.clone()
+        }
+        async fn self_client(&self) -> selfguard::SelfClient {
+            self.client.borrow().clone()
+        }
+        async fn active_pid(&self) -> Option<u32> {
+            let (app, title) = self.active.borrow().clone();
+            Some(fake_pid(&app, &title))
+        }
+        async fn term_view(&self, pid: u32, _: Option<&str>) -> selfguard::TermView {
+            self.views.borrow().get(&pid).cloned().unwrap_or_default()
+        }
+        async fn element_pid(&self, _: &u32) -> Option<u32> {
+            Some(fake_pid(&self.focus_app.borrow(), ""))
         }
         async fn info(&self, id: &u32, _: usize) -> Info<u32> {
             match *id {
@@ -8444,6 +8653,7 @@ mod tests {
                     title: title.into(),
                     app: app.into(),
                     active: (app, title) == (active.0.as_str(), active.1.as_str()),
+                    pid: fake_pid(app, title),
                     ..WindowGeo::default()
                 })
                 .collect())
@@ -8504,6 +8714,8 @@ mod tests {
         background: Rc<std::cell::Cell<bool>>,
         shown: Rc<FakeShown>,
         sem: Rc<FakeSemantic>,
+        client: Rc<RefCell<selfguard::SelfClient>>,
+        views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -8540,7 +8752,11 @@ mod tests {
         let background = Rc::new(std::cell::Cell::new(false));
         let shown = Rc::new(FakeShown::default());
         let sem = Rc::new(FakeSemantic::default());
+        let client = Rc::new(RefCell::new(selfguard::SelfClient::default()));
+        let views = Rc::new(RefCell::new(HashMap::new()));
         let server = Rc::new(Server::new(FakeBackend {
+            client: client.clone(),
+            views: views.clone(),
             shown: shown.clone(),
             sem: sem.clone(),
             lag: lag.clone(),
@@ -8580,6 +8796,8 @@ mod tests {
             background,
             shown,
             sem,
+            client,
+            views,
         }
     }
 
@@ -13333,6 +13551,180 @@ mod tests {
                 }
             });
         }
+    }
+
+    /// Claude Code in Konsole's tab pts/0 (the server below it), as in
+    /// the 2026-11-13 incident.
+    fn agent_in_konsole(s: &Session) {
+        *s.client.borrow_mut() = selfguard::SelfClient::walk(60, |pid| match pid {
+            60 => Some((50, "claude".into(), Some("pts/0".into()))),
+            50 => Some((100, "fish".into(), Some("pts/0".into()))),
+            100 => Some((1, "konsole".into(), None)),
+            _ => None,
+        });
+    }
+
+    fn konsole_tab(s: &Session, shown: &str) {
+        s.views.borrow_mut().insert(
+            100,
+            selfguard::TermView {
+                ptys: vec!["pts/0".into(), "pts/5".into()],
+                shown: Some(shown.into()),
+                tabs: Some(vec!["pts/0".into(), "pts/5".into()]),
+            },
+        );
+    }
+
+    #[test]
+    fn input_never_goes_to_the_agents_own_terminal_tab() {
+        local(async {
+            let mut s = session("self-tab");
+            set_allow("self-tab", "fake\nkonsole\n");
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            *s.field.borrow_mut() = Some(String::new());
+            let args =
+                json!({"text": "sudo parted -s /dev/sda mklabel gpt\n", "window": "konsole"});
+            let r = call_tool(&mut s, 2, "type_text", args.clone()).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("is konsole's tab running this agent (pts/0)"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            assert!(text.contains("'self-client: allow'"), "{text}");
+            assert_eq!(
+                s.field.borrow().as_deref(),
+                Some(""),
+                "typed into the agent"
+            );
+            for (id, tool, a) in [
+                (3, "key", json!({"combo": "enter"})),
+                (4, "mouse", json!({"x": 5, "y": 5})),
+                (5, "hold", json!({"key": "ctrl"})),
+            ] {
+                let r = call_tool(&mut s, id, tool, a).await;
+                assert!(reply_text(&r).contains("running this agent"), "{tool}: {r}");
+            }
+            assert!(
+                s.keys.borrow().iter().all(|k| k.starts_with("activate")),
+                "{:?}",
+                s.keys.borrow()
+            );
+            // A batch stops there as at a refusal: its on_fail is not run.
+            let r = call_tool(
+                &mut s,
+                6,
+                "batch",
+                json!({"steps": [{"tool": "key", "args": {"combo": "a"},
+                                  "on_fail": [{"tool": "key", "args": {"combo": "b"}}]}]}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("running this agent"), "{r}");
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("down")), "{r}");
+            // Reads still work in that tab.
+            let r = call_tool(&mut s, 7, "screenshot", json!({})).await;
+            assert!(!reply_text(&r).contains("running this agent"), "{r}");
+            // The user's other tab (pts/5), where they type sudo on purpose.
+            konsole_tab(&s, "pts/5");
+            let r = call_tool(&mut s, 8, "type_text", args).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(
+                s.field.borrow().as_deref(),
+                Some("sudo parted -s /dev/sda mklabel gpt")
+            );
+            // With the tab unknown, refused only when every tab is the agent's.
+            s.views.borrow_mut().insert(
+                100,
+                selfguard::TermView {
+                    ptys: vec!["pts/0".into()],
+                    ..Default::default()
+                },
+            );
+            let r = call_tool(&mut s, 9, "key", json!({"combo": "a"})).await;
+            assert!(
+                reply_text(&r).contains("every terminal in it runs this agent"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_user_can_let_input_reach_the_agents_client() {
+        local(async {
+            let mut s = session("self-allow");
+            set_allow("self-allow", "fake\nkonsole\nself-client: allow\n");
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            *s.active.borrow_mut() = ("konsole".into(), "~ : bash — Konsole".into());
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(s.keys.borrow().contains(&"down a".to_string()));
+            let r = call_tool(&mut s, 3, "doctor", json!({})).await;
+            assert!(
+                reply_text(&r).contains(
+                    "[ok] self-client guard: off ('self-client: allow' in the allowlist): \
+                     input may reach the agent's own client, konsole (100) > fish (50) > \
+                     claude (60) on pts/0"
+                ),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn the_client_window_and_its_elements_get_no_input() {
+        local(async {
+            let mut s = session("self-window");
+            // The server runs under the Fake app of "notes.txt — Fake"
+            // (pid 200), as under Claude Desktop.
+            *s.client.borrow_mut() = selfguard::SelfClient::walk(300, |pid| match pid {
+                300 => Some((200, "disclaimer".into(), None)),
+                200 => Some((1, "fake".into(), None)),
+                _ => None,
+            });
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "a"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("belongs to fake (200), the client running this agent"),
+                "{text}"
+            );
+            // Its approval buttons: act and click refuse, reads work.
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "OK"})).await;
+            assert!(
+                reply_text(&r).contains("that element belongs to fake"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 4, "click", json!({"app": "fake", "query": "OK"})).await;
+            assert!(
+                reply_text(&r).contains("that element belongs to fake"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0);
+            let r = call_tool(&mut s, 5, "find", json!({"app": "fake", "query": "OK"})).await;
+            assert!(reply_text(&r).contains("OK"), "{r}");
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            // window="fake" picks the other Fake window, not the client's.
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "a", "window": "fake"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.active.borrow().1, "todo.txt — Fake");
+            assert!(s.keys.borrow().contains(&"down a".to_string()));
+            // Closing the client is refused before asking anyone.
+            let r = call_tool(&mut s, 7, "close_window", json!({"query": "notes"})).await;
+            assert!(
+                reply_text(&r).contains("closing it would end the agent"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 8, "doctor", json!({})).await;
+            assert!(
+                reply_text(&r).contains(
+                    "[ok] self-client guard: input never goes to the agent's own terminal \
+                     tab or client window; client: fake (200) > disclaimer (300)"
+                ),
+                "{r}"
+            );
+        });
     }
 
     #[test]

@@ -777,6 +777,22 @@ app is on a `passwords:` line (`passwords: all` for every app) or the server
 runs with `DESKTOP_MCP_ALLOW_PASSWORDS=1`. `doctor` shows the tiers, the
 confirm list and the password setting.
 
+Input never goes to the agent's own client. At start the server reads its
+ancestor processes (Claude Code and the terminal it runs in, or Claude
+Desktop) and their terminals; keys, typing and pointer input are refused
+("nothing sent") while the window in front is the client's window or, for a
+terminal, while its tab in front runs the agent. Konsole's tab in front is
+read over D-Bus, so the other tabs of the same window stay usable; for other
+terminals whose tab cannot be read, a window is refused only when every
+terminal in it runs the agent. Element tools refuse the client's own
+elements (Claude Desktop's buttons), `close_window` refuses its window, and
+`window`/`activate_window` prefer another window that matches as well. On
+Windows only the foreground window's process is compared: a console window
+whose shell runs the agent is refused, but Windows Terminal's and editors'
+tabs cannot be told apart, so those windows are not. A
+`self-client: allow` line turns the guard off; `doctor` names the client it
+found.
+
 ## Installation
 
 Each [GitHub release](https://github.com/ahmetadakli/kde-desktop-mcp/releases)

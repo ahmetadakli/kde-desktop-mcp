@@ -335,6 +335,34 @@ pub fn activate(aumid: &str, args: &[String]) -> R<u32> {
     }
 }
 
+/// (process id, parent process id, executable file name) of every
+/// process.
+pub fn processes() -> Vec<(u32, u32, String)> {
+    let mut out = Vec::new();
+    unsafe {
+        let Ok(snap) = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) else {
+            return out;
+        };
+        let mut e = PROCESSENTRY32W {
+            dwSize: size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut more = Process32FirstW(snap, &mut e).is_ok();
+        while more {
+            let len = e
+                .szExeFile
+                .iter()
+                .position(|&c| c == 0)
+                .unwrap_or(e.szExeFile.len());
+            let name = String::from_utf16_lossy(&e.szExeFile[..len]);
+            out.push((e.th32ProcessID, e.th32ParentProcessID, name));
+            more = Process32NextW(snap, &mut e).is_ok();
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+
 /// (process id, parent process id) of every process.
 pub fn parents() -> Vec<(u32, u32)> {
     let mut out = Vec::new();

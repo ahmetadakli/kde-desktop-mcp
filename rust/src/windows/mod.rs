@@ -391,6 +391,51 @@ impl Backend for WindowsBackend {
         input::hwnd_proc_name(input::foreground())
     }
 
+    /// The server's ancestors from a process snapshot. A console window
+    /// reports the shell attached to it as its process; the console hosts
+    /// (conhost) of the client's processes count too. Windows Terminal's
+    /// and editors' tabs cannot be told apart: `selfguard` leaves those
+    /// windows alone unless closing them.
+    async fn self_client(&self) -> crate::selfguard::SelfClient {
+        let procs = tokio::task::spawn_blocking(launch::processes)
+            .await
+            .unwrap_or_default();
+        let me_pid = std::process::id();
+        let by_pid: std::collections::HashMap<u32, (u32, &str)> = procs
+            .iter()
+            .map(|(p, pp, n)| (*p, (*pp, n.as_str())))
+            .collect();
+        let Some((parent, _)) = by_pid.get(&me_pid) else {
+            return crate::selfguard::SelfClient::default();
+        };
+        let mut me = crate::selfguard::SelfClient::walk(*parent, |pid| {
+            by_pid.get(&pid).map(|(pp, n)| (*pp, n.to_string(), None))
+        });
+        let hosts: Vec<(u32, String)> = procs
+            .iter()
+            .filter(|(_, pp, n)| {
+                me.ancestor(*pp).is_some()
+                    && matches!(
+                        crate::selfguard::norm(n).as_str(),
+                        "conhost" | "openconsole"
+                    )
+            })
+            .map(|(p, _, n)| (*p, n.clone()))
+            .collect();
+        for (pid, name) in hosts {
+            me.add(pid, &name, None);
+        }
+        me
+    }
+
+    async fn active_pid(&self) -> Option<u32> {
+        Some(input::hwnd_pid(input::foreground())).filter(|p| *p != 0)
+    }
+
+    async fn element_pid(&self, id: &Elem) -> Option<u32> {
+        self.uia.fetch(&id.el).map(|p| p.pid).filter(|p| *p != 0)
+    }
+
     async fn info(&self, id: &Elem, text_limit: usize) -> Info<Elem> {
         let Some(el) = self.uia.fetch_subtree(&id.el) else {
             return dead();

@@ -8,6 +8,7 @@ mod image;
 pub mod indicator;
 mod indicator_draw;
 mod input;
+mod konsole;
 mod kwin;
 mod launch;
 mod roles;
@@ -547,6 +548,10 @@ fn keep_if_written(path: PathBuf) -> Option<String> {
     }
 }
 
+/// How recent `active_app`'s look at the app in front must be for
+/// `active_pid` to take its answer (it runs right after one).
+const ACTIVE_PID_AGE: Duration = Duration::from_millis(1000);
+
 impl LinuxBackend {
     /// Hyprland when HYPRLAND_INSTANCE_SIGNATURE is set, otherwise KDE;
     /// DESKTOP_MCP_BACKEND=kde|hyprland overrides.
@@ -604,6 +609,18 @@ impl LinuxBackend {
 
     fn app_of(o: &Obj) -> Obj {
         Obj::new(&o.bus, OwnedObjectPath::try_from(APP_ROOT).unwrap())
+    }
+
+    /// The compositor's caption of the active window.
+    async fn active_caption(&self) -> Option<String> {
+        let w = match &self.comp {
+            Compositor::Kde(kwin) => kwin.active_parent().await.ok().flatten()?,
+            Compositor::Hyprland(h) => h.active_window().await.ok().flatten()?,
+        };
+        w.get("caption")
+            .or(w.get("title"))
+            .and_then(Json::as_str)
+            .map(str::to_string)
     }
 
     async fn pid(&self, bus: &str) -> Option<u32> {
@@ -1232,6 +1249,65 @@ impl Backend for LinuxBackend {
                 None => String::new(),
             },
         }
+    }
+
+    async fn self_client(&self) -> crate::selfguard::SelfClient {
+        let mut me = crate::selfguard::SelfClient::walk(
+            std::os::unix::process::parent_id(),
+            terminals::proc_entry,
+        );
+        // The Konsole tab the client was started in, also when the client
+        // outlived the process that started it (a daemon reparented).
+        if let Some((konsole, shell)) = konsole::own_session(&self.session).await {
+            me.add(konsole, "konsole", terminals::tty_of(shell));
+        }
+        me
+    }
+
+    async fn active_pid(&self) -> Option<u32> {
+        match &self.comp {
+            Compositor::Kde(_) => {
+                let bus = match self.a11y.recent_active_bus(ACTIVE_PID_AGE) {
+                    Some(bus) => bus,
+                    None => {
+                        self.a11y.active_app().await;
+                        self.a11y.recent_active_bus(ACTIVE_PID_AGE)?
+                    }
+                };
+                self.pid(&bus).await
+            }
+            Compositor::Hyprland(h) => {
+                let c = h.active_window().await.ok().flatten()?;
+                c["pid"].as_u64().and_then(|p| u32::try_from(p).ok())
+            }
+        }
+    }
+
+    async fn term_view(&self, pid: u32, title: Option<&str>) -> crate::selfguard::TermView {
+        let ptys =
+            tokio::task::spawn_blocking(move || terminals::ptys_of(pid, &terminals::read_stats()))
+                .await
+                .unwrap_or_default();
+        let mut view = crate::selfguard::TermView {
+            ptys,
+            ..Default::default()
+        };
+        if view.ptys.is_empty() {
+            return view;
+        }
+        let caption = async || match title {
+            Some(t) => Some(t.to_string()),
+            None => self.active_caption().await,
+        };
+        if let Some(tabs) = konsole::tabs(&self.session, pid, caption).await {
+            view.shown = terminals::tty_of(tabs.shown);
+            view.tabs = Some(tabs.all.into_iter().filter_map(terminals::tty_of).collect());
+        }
+        view
+    }
+
+    async fn element_pid(&self, id: &Obj) -> Option<u32> {
+        self.pid(&id.bus).await
     }
 
     async fn info(&self, id: &Obj, text_limit: usize) -> Info<Obj> {
