@@ -6906,7 +6906,9 @@ impl<B: Backend> Server<B> {
         if !self.is_allowed(&app) {
             return false;
         }
-        match self.b.windows(query, &self.allowed()).await {
+        // Titles and apps only: the terminals `windows` adds cost a scan
+        // of the processes of each terminal window.
+        match self.b.windows_quick(query, &self.allowed()).await {
             // In front only if it is (one of) the best match: "Claude" with
             // a terminal titled "~ : claude" in front still activates
             // Claude Desktop (backend::window_rank).
