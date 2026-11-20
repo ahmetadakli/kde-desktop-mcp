@@ -569,7 +569,11 @@ tool; `off` turns it off). Not available on Windows yet.
   that state (with `gone`, until it no longer does). `window` instead of
   `query` waits for a window of an allowed app whose title or app name
   contains it to open, or with `gone` to close (KDE and Hyprland window
-  lists, re-read when AT-SPI reports a window change).
+  lists, re-read when AT-SPI reports a window change). A timeout names the
+  app's window title and, waiting for an element to appear, lists up to 3
+  visible elements with the closest names (with ids); when nothing comes
+  close and the query reads as written to time out (`zz-never`,
+  `nonexistent`), it says a fixed wait is `pause`.
 - `wait_idle`: waits until an app's accessibility tree has not changed for
   `quiet_ms` (default 300) and no browser page is still marked busy (loading
   from the network): after opening a URL or a link, use it instead of a fixed

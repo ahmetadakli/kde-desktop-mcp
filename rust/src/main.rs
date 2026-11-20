@@ -69,6 +69,30 @@ const MISS_SUGGESTIONS: usize = 5;
 /// its name looked through for them.
 const STALE_SHOWN: usize = 3;
 const STALE_SEARCHED: usize = 20;
+/// Most elements a `wait_for` timeout offers as the closest.
+const WAIT_CLOSEST: usize = 3;
+
+/// Whether a `wait_for` query names nothing an app would show, but is
+/// written to time out: a sleep ("zz-never", "nonexistent", "dummy").
+fn looks_like_sleep(query: &str) -> bool {
+    const SLEEPY: [&str; 12] = [
+        "never",
+        "nonexist",
+        "non-exist",
+        "not exist",
+        "notexist",
+        "nothing",
+        "dummy",
+        "sleep",
+        "zzz",
+        "zz-",
+        "asdf",
+        "xyzzy",
+    ];
+    let q = query.to_lowercase();
+    q.trim().is_empty() || SLEEPY.iter().any(|w| q.contains(w))
+}
+
 /// Roles of fields whose labels `by_label` reads besides editable ones.
 const FIELD_ROLES: &[&str] = &["entry", "text", "password text", "spin button", "combo box"];
 /// Most fields whose labels one `by_label` reads.
@@ -6129,8 +6153,14 @@ impl<B: Backend> Server<B> {
                     (Some(s), false) => format!("to be {}", s.name()),
                     (Some(s), true) => format!("to stop being {}", s.name()),
                 };
+                let hint = match (state, gone) {
+                    (None, false) => self.wait_miss_hint(&windows, &app, &query).await,
+                    _ => String::new(),
+                };
+                let title = self.app_title(&app).await;
                 return Err(format!(
-                    "timed out after {ms} ms waiting for '{query}' in '{app}' {what}{note}"
+                    "timed out after {ms} ms waiting for '{query}' in '{app}' {what}{note}\
+                     {title}{hint}"
                 ));
             }
             let checked = Instant::now();
@@ -6141,6 +6171,61 @@ impl<B: Backend> Server<B> {
             // Never more often than the old poll, however busy the app.
             tokio::time::sleep(WAIT_MIN_GAP.saturating_sub(checked.elapsed()).min(left)).await;
         }
+    }
+
+    /// "; window 'title'": the title of `app`'s active window, else of its
+    /// first; "" when it has none.
+    async fn app_title(&self, app: &str) -> String {
+        let key = app.to_lowercase();
+        self.b
+            .list_apps()
+            .await
+            .into_iter()
+            .filter(|a| a.name.to_lowercase() == key)
+            .flat_map(|a| a.windows)
+            .min_by_key(|w| !w.active)
+            .map(|w| format!("; window {}", render::py_repr(&w.title)))
+            .unwrap_or_default()
+    }
+
+    /// What a `wait_for` that timed out waiting for `query` to appear in
+    /// `windows` adds: up to WAIT_CLOSEST visible elements with the closest
+    /// names, with ids (a misspelt or reworded query); with none, and a
+    /// query that names nothing an app would show ("zz-never"), that a
+    /// fixed wait is `pause`.
+    async fn wait_miss_hint(&self, windows: &[B::Id], app: &str, query: &str) -> String {
+        if windows.is_empty() {
+            return String::new();
+        }
+        // Read as a search does, every part it needs.
+        let (_, mut cache, _) = self
+            .read_app(
+                None,
+                windows,
+                Cache::new(),
+                search_fetch(render::FIND_TEXT_LIMIT, render::FIND_MAX_SEEN),
+                search_fetch(render::FIND_TEXT_LIMIT, PREFETCH_MORE),
+                |c| render::locate_all(c, windows, query, "", false, "").map(|_| ()),
+            )
+            .await;
+        let near = render::closest(&cache, windows, query, WAIT_CLOSEST);
+        if near.is_empty() {
+            return if looks_like_sleep(query) {
+                "; nothing there comes close: wait_for is no sleep, to wait a fixed time \
+                 use pause"
+                    .into()
+            } else {
+                String::new()
+            };
+        }
+        self.b.fill_actions(&mut cache, &near).await;
+        let key = app.to_lowercase();
+        let mut lines = Vec::new();
+        for id in &near {
+            let rid = self.add_ref(id, &cache[id], &key).await;
+            lines.push(render::describe(&cache[id], rid));
+        }
+        format!("; closest:\n{}", lines.join("\n"))
     }
 
     /// `wait_for` a window of an allowed app (`app`, when given) whose
@@ -6226,19 +6311,8 @@ impl<B: Backend> Server<B> {
             }
             if since.elapsed() >= quiet {
                 let ms = start.elapsed().as_millis();
-                // Which page it settled on, so no find is needed to check:
-                // the app's active window, else its first.
-                let key = app.to_lowercase();
-                let title = self
-                    .b
-                    .list_apps()
-                    .await
-                    .into_iter()
-                    .filter(|a| a.name.to_lowercase() == key)
-                    .flat_map(|a| a.windows)
-                    .min_by_key(|w| !w.active)
-                    .map(|w| format!("; window {}", render::py_repr(&w.title)))
-                    .unwrap_or_default();
+                // Which page it settled on, so no find is needed to check.
+                let title = self.app_title(&app).await;
                 return Ok(format!(
                     "idle after {ms} ms (no change for {} ms){title}{note}",
                     quiet.as_millis()
@@ -12857,6 +12931,71 @@ mod tests {
                 "{r}"
             );
         });
+    }
+
+    #[test]
+    fn a_wait_for_timeout_offers_the_closest_and_says_pause_for_sleeps() {
+        local(async {
+            let mut s = session("wait-hints");
+            s.nodes
+                .borrow_mut()
+                .insert(30, fake_node("push button", "Yayımla", &[]));
+            s.focus.borrow_mut().children = vec![30];
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_for",
+                json!({"app": "fake", "query": "Yayınla", "timeout_ms": 0}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with(
+                    "Error executing tool wait_for: timed out after 0 ms waiting for 'Yayınla' \
+                     in 'fake' to appear; window 'notes.txt — Fake'; closest:\n["
+                ),
+                "{r}"
+            );
+            assert!(text.contains("] push button \"Yayımla\""), "{r}");
+            assert!(!text.contains("pause"), "{r}");
+            // Written to time out: a sleep.
+            let r = call_tool(
+                &mut s,
+                3,
+                "wait_for",
+                json!({"app": "fake", "query": "zz-never", "timeout_ms": 0}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains(
+                    "to appear; window 'notes.txt — Fake'; nothing there comes close: wait_for \
+                     is no sleep, to wait a fixed time use pause"
+                ),
+                "{r}"
+            );
+            // Something not there yet, nothing like it: no advice.
+            let r = call_tool(
+                &mut s,
+                4,
+                "wait_for",
+                json!({"app": "fake", "query": "Download complete", "timeout_ms": 0}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("to appear; window 'notes.txt — Fake'\n"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn sleeps_are_told_from_queries() {
+        assert!(looks_like_sleep("zz-never"));
+        assert!(looks_like_sleep("nonexistent-never"));
+        assert!(looks_like_sleep("Does not exist"));
+        assert!(!looks_like_sleep("Yayın öncesi yapılacaklar"));
+        assert!(!looks_like_sleep("Install"));
+        assert!(!looks_like_sleep("Project Zomboid"));
     }
 
     #[test]
