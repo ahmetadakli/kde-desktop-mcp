@@ -3028,7 +3028,7 @@ impl<B: Backend> Server<B> {
         let window = a.get("window").and_then(Json::as_str).unwrap_or("");
         let app_key = app.to_lowercase();
         let mut kept = true;
-        let (id, cache, at, ties, synonym) = loop {
+        let (id, cache, at, ties, synonym, over_chrome) = loop {
             let located = self.locate(app, query, &role, true, kept, window);
             let located = trace::time("locate", located).await?;
             let (mut m, mut cache, cached) = match located {
@@ -3057,6 +3057,7 @@ impl<B: Backend> Server<B> {
                 self.untie(&mut m, &mut cache, app, query, &role).await?;
             }
             let ties = m.picked.len();
+            let over_chrome = m.over_chrome;
             let roles: Vec<&str> = m
                 .picked
                 .iter()
@@ -3088,7 +3089,7 @@ impl<B: Backend> Server<B> {
                 }
             );
             if there {
-                break (id, cache, at, ties, synonym);
+                break (id, cache, at, ties, synonym, over_chrome);
             }
             // Gone or hidden without an event: read afresh.
             self.forget_reads(&app_key);
@@ -3099,6 +3100,12 @@ impl<B: Backend> Server<B> {
         let mut found = render::describe(&cache[&id], rid);
         if ties > 1 {
             found.push_str(&format!(" (first of {ties} matches)"));
+        }
+        if over_chrome > 0 {
+            let s = if over_chrome == 1 { "" } else { "es" };
+            found.push_str(&format!(
+                " (picked over {over_chrome} browser-chrome match{s})"
+            ));
         }
         if !synonym.is_empty() {
             found.push_str(&format!(" ({synonym})"));
@@ -14630,6 +14637,31 @@ mod tests {
         assert_eq!(r["result"]["isError"], true, "{r}");
         let text = reply_text(r);
         text.split_once(": ").map_or(text, |(_, m)| m)
+    }
+
+    #[test]
+    fn a_browser_page_button_is_picked_over_the_chrome_and_the_reply_says_so() {
+        local(async {
+            let mut s = session("chrome");
+            // A tab's close button in the tab strip, and the page's.
+            fake_frame(&s, true, &[50, 51]);
+            {
+                let mut n = s.nodes.borrow_mut();
+                n.insert(50, fake_node("page tab list", "", &[52]));
+                n.insert(51, fake_node("document web", "Ödeme", &[53]));
+                n.insert(52, fake_node("push button", "Kapat", &[]));
+                n.insert(53, fake_node("push button", "Kapat", &[]));
+            }
+            let q = json!({"app": "fake", "query": "Kapat", "role": "push button"});
+            let r = call_tool(&mut s, 2, "act", q).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r)
+                    .starts_with("[1] push button \"Kapat\" (picked over 1 browser-chrome match):"),
+                "{r}"
+            );
+            assert_eq!(s.keys.borrow().last().unwrap(), "action 0 on 53");
+        });
     }
 
     #[test]

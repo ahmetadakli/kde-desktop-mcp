@@ -363,7 +363,8 @@ tool; `off` turns it off). Not available on Windows yet.
   coordinate, or with `image: true` a pixel of the last screenshot.
 - `act`, `set_text`, `focus`, `click`: act on an element. The element is picked
   by its `tree`/`find` number (`id`) or in one call by `app` + `query`
-  (+ `role`): a visible element whose name equals `query`, else one whose
+  (+ `role`): a visible element whose name or text equals `query` (a
+  button named "Artır" showing "+"), else one whose
   name or text contains it. Window, tab and page titles (frame, window, page
   tab, and a web page's document) count only when nothing else matches or
   `role` names that role; `wait_for` skips them unless `role` names them.
@@ -395,7 +396,12 @@ tool; `off` turns it off). Not available on Windows yet.
   and of stacked dialogs the one opened last (listed last) wins. Then,
   wherever they are: (4) an element one operates (a button, entry, list
   item: an interactive role or state) beats one that only shows the name (a
-  label, a heading, a list named the same); (5) for input tools, an element
+  label, a heading, a list named the same); (5) an enabled element beats a
+  disabled one; (6) in a browser window (one with a tab strip), an element
+  of the web page beats the browser's own tool bars and tabs, and the reply
+  says `(picked over N browser-chrome matches)`; (7) the focused element
+  beats the others; (8) one in a dialog inside the window (a web page's
+  modal) beats the others; (9) for input tools, an element
   with an on-screen area beats one without (zero size), whether its window
   is in front or not (checked for up to 12 candidates). A tie left after
   that is refused by the input tools (`act`, `click`, `focus`, `set_text`,
