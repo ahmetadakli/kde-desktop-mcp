@@ -213,6 +213,39 @@ pub struct Shot {
     pub area: Option<(f64, f64, f64, f64)>,
 }
 
+/// The window a screenshot captures, read once so that the allowlist check
+/// and the capture are of the same window.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ShotTarget {
+    /// Its app as the allowlist names it (the accessibility name of its
+    /// process, else its class); "" when not known.
+    pub app: String,
+    /// `app` is the window's class (its process has no accessibility
+    /// name): an allowlist entry the class contains allows it, as for the
+    /// window tools.
+    pub by_class: bool,
+    pub caption: String,
+    /// The window's class (KWin resource class, Hyprland class, Win32
+    /// class name), for the user to allowlist an unknown app by.
+    pub class: String,
+    /// Its frame, in the coordinates `pointer` takes.
+    pub area: Option<(f64, f64, f64, f64)>,
+    /// The backend's handle of the window (KWin's internal id, Hyprland's
+    /// address, the HWND): the capture must be of this window.
+    pub handle: String,
+}
+
+impl ShotTarget {
+    /// How a refusal names the window: its caption and class.
+    pub fn describe(&self) -> String {
+        let mut out = format!("'{}'", self.caption);
+        if !self.class.is_empty() {
+            out.push_str(&format!(" (class '{}')", self.class));
+        }
+        out
+    }
+}
+
 /// File dialogs the server can fill in (only KDE's so far).
 /// How well a window matches a `window`/`query` argument, lower is better,
 /// None when it does not: 0 its title is the query, 1 its app is (or ends
@@ -792,8 +825,15 @@ pub trait Backend {
     async fn doctor(&self) -> Vec<Check> {
         Vec::new()
     }
-    /// Capture the active window; `path` is a new private file.
-    async fn screenshot(&self) -> Option<Shot>;
+    /// The active window a screenshot would capture, with its app as the
+    /// allowlist names it; Err with the cause when there is none or it
+    /// cannot be read.
+    async fn shot_target(&self) -> R<ShotTarget>;
+    /// Capture `target` (from `shot_target`) and nothing else: a capture
+    /// that could show another window fails instead. `path` is a new
+    /// private file. Err names the real cause (a tool missing or failing,
+    /// the compositor's error, the temporary file).
+    async fn screenshot(&self, target: &ShotTarget) -> R<Shot>;
 }
 
 /// Why `close_window` closed nothing: no window or several match `query`.

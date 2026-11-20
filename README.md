@@ -666,7 +666,15 @@ tool; `off` turns it off). Not available on Windows yet.
   and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
   in pixels of the last screenshot captures again and returns only that part,
   cropped before shrinking, at up to full resolution (`max_size` still
-  applies); `image_x`/`image_y` then refer to the zoomed image.
+  applies); `image_x`/`image_y` then refer to the zoomed image. The
+  allowlist is checked on the window that is captured: KDE reads KWin's
+  active window (its process, caption and class) once and captures it by its
+  handle; `spectacle` (older KWin), `grim` (Hyprland) and the Windows screen
+  copy are only kept when that window was in front before and after. An app
+  without an accessibility name is refused by its caption and class, so the
+  user knows what to allowlist. A failure says why (`grim` or `spectacle`
+  missing or failing with its error, KWin's `ScreenShot2` error, the
+  temporary file).
 - `batch`: runs several tools in order in one call and stops at the first
   error; reduces Claude's number of turns. A step with `"optional": true`
   (typically a `wait_for`) may fail without stopping the batch: it is reported
@@ -846,7 +854,8 @@ claude mcp add --scope user desktop -- "$PWD/target/release/desktop-mcp"
 Requirements:
 - A Hyprland session (the `movecursor` dispatcher)
 - System packages (Arch): `at-spi2-core`, `wl-clipboard`; recommended: `wtype`
-  (typing without touching the clipboard), `grim` (fallback screenshots)
+  (typing without touching the clipboard), `grim` (screenshots; `doctor` warns
+  when it is missing)
 - A working AT-SPI bus in the session. Qt apps may need
   `env = QT_LINUX_ACCESSIBILITY_ALWAYS_ON,1` in the Hyprland configuration.
 - Write access for the user on `/dev/uinput`

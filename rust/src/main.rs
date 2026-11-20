@@ -2258,21 +2258,53 @@ impl<B: Backend> Server<B> {
     async fn require_active_allowed(&self) -> R<String> {
         let name = self.b.active_app().await;
         if !self.is_allowed(&name) {
-            // Name the window this server last brought forward, so the
-            // retry (with `window`) fixes it.
-            let hint = match self.last_active.lock().await.as_deref() {
-                Some(t) if !t.is_empty() => format!(" (last used: '{t}')"),
-                _ => String::new(),
+            // An app without an accessibility name: its window's caption
+            // and class tell the user what to allowlist.
+            let target = match name.is_empty() {
+                true => self.b.shot_target().await.ok(),
+                false => None,
             };
-            return Err(refusal(format!(
-                "active window app '{}' is not in {}; pass window=<title or app> to \
-                 activate an allowed window first{hint}",
-                if name.is_empty() { "unknown" } else { &name },
-                self.allow_file.display()
-            )));
+            return Err(self.active_refusal(&name, target.as_ref()).await);
         }
         self.permit(&name).await?;
         Ok(name)
+    }
+
+    /// The allowlist name of a screenshot's window: its app, or for a
+    /// window named by its class (no accessibility name), the entry the
+    /// class contains ("konsole" for org.kde.konsole), as the window tools
+    /// match it.
+    fn shot_app(&self, t: &backend::ShotTarget) -> String {
+        if !t.by_class || self.is_allowed(&t.app) {
+            return t.app.clone();
+        }
+        let class = t.class.to_lowercase();
+        self.allowed()
+            .into_iter()
+            .find(|a| !a.is_empty() && class.contains(a.as_str()))
+            .unwrap_or_else(|| t.app.clone())
+    }
+
+    /// The refusal for an active window of `app`, not allowed; `target`
+    /// (its window) names its caption and class.
+    async fn active_refusal(&self, app: &str, target: Option<&backend::ShotTarget>) -> String {
+        // Name the window this server last brought forward, so the retry
+        // (with `window`) fixes it.
+        let hint = match self.last_active.lock().await.as_deref() {
+            Some(t) if !t.is_empty() => format!(" (last used: '{t}')"),
+            _ => String::new(),
+        };
+        let what = match (app.is_empty(), target) {
+            (true, Some(t)) => format!("active window {} of an unknown app", t.describe()),
+            (true, None) => "active window app 'unknown'".to_string(),
+            (false, Some(t)) => format!("active window {} of app '{app}'", t.describe()),
+            (false, None) => format!("active window app '{app}'"),
+        };
+        refusal(format!(
+            "{what} is not in {}; pass window=<title or app> to activate an allowed window \
+             first{hint}",
+            self.allow_file.display()
+        ))
     }
 
     /// `require_active_allowed` for a tool about to send input to the
@@ -6657,7 +6689,16 @@ impl<B: Backend> Server<B> {
     /// resolution, mapped so image_x/image_y refer to the zoomed image.
     async fn screenshot(&self, a: &Json) -> R<Out> {
         let region = region_arg(a)?;
-        trace::time("require_active_allowed", self.require_active_allowed()).await?;
+        // The window captured is the one checked: read once, its app by
+        // its process.
+        let target = trace::time("shot_target", self.b.shot_target())
+            .await
+            .map_err(|e| format!("screenshot failed: {e}"))?;
+        let app = self.shot_app(&target);
+        if !self.is_allowed(&app) {
+            return Err(self.active_refusal(&target.app, Some(&target)).await);
+        }
+        self.permit(&app).await?;
         // The zoom's screen area, from the map of the image it was read in.
         let zoom = match region {
             Some(r) => {
@@ -6668,9 +6709,9 @@ impl<B: Backend> Server<B> {
             None => None,
         };
         *self.last_shot.lock().await = None;
-        let Shot { path, pixels, area } = trace::time("capture", self.b.screenshot())
+        let Shot { path, pixels, area } = trace::time("capture", self.b.screenshot(&target))
             .await
-            .ok_or("screenshot failed")?;
+            .map_err(|e| format!("screenshot failed: {e}"))?;
         let frac = match (zoom, area) {
             (None, _) => shot::Frac::ALL,
             (Some((_, want)), Some(area)) => region_frac(area, want).ok_or_else(|| {
@@ -7976,6 +8017,8 @@ mod tests {
         /// expanding entry k shows menu `flyouts[k]` in the pane
         /// FAKE_POPUP_HOST; `open_menus` finds them.
         flyouts: RefCell<HashMap<u32, u32>>,
+        /// `screenshot` fails with this cause.
+        shot_error: RefCell<Option<String>>,
     }
 
     /// Where the fake shows a flyout (`FakeShown::flyouts`).
@@ -8658,11 +8701,37 @@ mod tests {
                 })
                 .collect())
         }
-        async fn screenshot(&self) -> Option<Shot> {
+        async fn shot_target(&self) -> R<backend::ShotTarget> {
+            // "classy": an app without an accessibility name, known by its
+            // window class only.
+            let (app, title) = self.active.borrow().clone();
+            let class = match app.as_str() {
+                "" => "org.example.mystery".to_string(),
+                "classy" => "org.example.Fake".to_string(),
+                _ => app.clone(),
+            };
+            let by_class = app == "classy";
+            Ok(backend::ShotTarget {
+                app: if by_class { class.to_lowercase() } else { app },
+                by_class,
+                class,
+                caption: title.clone(),
+                area: Some((10.0, 20.0, 400.0, 200.0)),
+                handle: title,
+            })
+        }
+        async fn screenshot(&self, target: &backend::ShotTarget) -> R<Shot> {
+            if let Some(e) = self.shown.shot_error.borrow().clone() {
+                return Err(e);
+            }
+            // The capture is of the window checked, or fails.
+            if self.active.borrow().1 != target.handle {
+                return Err("the active window changed".into());
+            }
             // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.
             let path = self.allow_file.with_extension("png");
-            std::fs::write(&path, b"").ok()?;
-            Some(Shot {
+            std::fs::write(&path, b"").map_err(|e| e.to_string())?;
+            Ok(Shot {
                 path: path.display().to_string(),
                 pixels: Some(Box::new(|| {
                     Ok(shot::Pixels {
@@ -8672,7 +8741,7 @@ mod tests {
                         data: vec![128; 200 * 100 * 3],
                     })
                 })),
-                area: Some((10.0, 20.0, 400.0, 200.0)),
+                area: target.area,
             })
         }
     }
@@ -13458,6 +13527,61 @@ mod tests {
             assert_eq!(
                 *s.keys.borrow(),
                 ["down a", "up a", "indicate paused while you use the mouse"]
+            );
+        });
+    }
+
+    #[test]
+    fn a_screenshot_checks_the_window_it_captures() {
+        local(async {
+            let mut s = session("shot-fence");
+            set_active(&s, 0);
+            let r = call_tool(&mut s, 2, "screenshot", json!({})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "active window '~ : bash — Konsole' (class 'konsole') of app 'konsole' \
+                     is not in"
+                ),
+                "{r}"
+            );
+            // An app without an accessibility name: its caption and class
+            // tell the user what to allowlist, for input tools as well.
+            *s.active.borrow_mut() = (String::new(), "Mystery".into());
+            for (id, tool, args) in [
+                (3, "screenshot", json!({})),
+                (4, "key", json!({"combo": "a"})),
+            ] {
+                let r = call_tool(&mut s, id, tool, args).await;
+                assert!(
+                    reply_text(&r).contains(
+                        "active window 'Mystery' (class 'org.example.mystery') of an unknown \
+                         app is not in"
+                    ),
+                    "{tool}: {r}"
+                );
+            }
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // Known by its class only: an allowlist entry the class
+            // contains allows it ("fake" in org.example.Fake).
+            *s.active.borrow_mut() = ("classy".into(), "Notes".into());
+            let r = call_tool(&mut s, 5, "screenshot", json!({})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    #[test]
+    fn a_failed_screenshot_says_why() {
+        local(async {
+            let mut s = session("shot-cause");
+            *s.shown.shot_error.borrow_mut() =
+                Some("grim is not installed; screenshots on Hyprland need it".into());
+            let r = call_tool(&mut s, 2, "screenshot", json!({})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r)
+                    .contains("screenshot failed: grim is not installed; screenshots on Hyprland"),
+                "{r}"
             );
         });
     }

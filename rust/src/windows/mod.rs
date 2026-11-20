@@ -26,7 +26,7 @@ use windows::Win32::UI::HiDpi::{
 
 use crate::backend::{
     Activated, AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_AREA, Page, R,
-    Screen, Shot, WindowChange, WindowEntry, WindowGeo,
+    Screen, Shot, ShotTarget, WindowChange, WindowEntry, WindowGeo,
 };
 use crate::delivery::nothing_sent;
 use crate::launch_pick::{self as pick, Found};
@@ -1038,9 +1038,41 @@ impl Backend for WindowsBackend {
         }]
     }
 
-    async fn screenshot(&self) -> Option<Shot> {
+    async fn shot_target(&self) -> R<ShotTarget> {
+        let h = input::foreground();
+        if h.is_invalid() {
+            return Err("no foreground window".into());
+        }
+        let mut r = windows::Win32::Foundation::RECT::default();
+        let area = unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(h, &mut r) }
+            .ok()
+            .map(|_| {
+                (
+                    r.left as f64,
+                    r.top as f64,
+                    (r.right - r.left) as f64,
+                    (r.bottom - r.top) as f64,
+                )
+            });
+        Ok(ShotTarget {
+            app: input::hwnd_proc_name(h),
+            by_class: false,
+            caption: wm::title(h),
+            class: wm::class_name(h),
+            area,
+            handle: (h.0 as usize).to_string(),
+        })
+    }
+
+    async fn screenshot(&self, target: &ShotTarget) -> R<Shot> {
+        let h = target
+            .handle
+            .parse::<usize>()
+            .map(|v| HWND(v as *mut core::ffi::c_void))
+            .map_err(|_| format!("bad window handle '{}'", target.handle))?;
         // The process is DPI aware: image pixels are screen pixels.
-        input::screenshot().map(|(path, pixels, r)| Shot {
+        let (path, pixels, r) = input::screenshot(h)?;
+        Ok(Shot {
             path,
             pixels: Some(Box::new(move || Ok(pixels))),
             area: Some((

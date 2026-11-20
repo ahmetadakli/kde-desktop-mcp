@@ -284,18 +284,34 @@ fn image_stem(pid: u32) -> String {
     }
 }
 
-/// Grab the screen rectangle of the foreground window as 24-bit RGB rows.
-fn grab_foreground() -> Option<(u32, u32, Vec<u8>, RECT)> {
-    let h = foreground();
-    if h.is_invalid() {
-        return None;
+/// Grab the screen rectangle of window `h` as 24-bit RGB rows. The screen
+/// shows whatever is in front there: `h` must be the foreground window
+/// before and after, or the grab fails.
+fn grab_foreground(h: HWND) -> R<(u32, u32, Vec<u8>, RECT)> {
+    let changed = || {
+        "the foreground window changed during the screenshot; nothing captured, \
+                      take a new one"
+            .to_string()
+    };
+    if h.is_invalid() || foreground() != h {
+        return Err(changed());
     }
     let mut r = RECT::default();
-    unsafe { GetWindowRect(h, &mut r) }.ok()?;
+    unsafe { GetWindowRect(h, &mut r) }
+        .map_err(|_| format!("[Errno {}] GetWindowRect failed", last_error()))?;
     let (w, ht) = (r.right - r.left, r.bottom - r.top);
     if w <= 0 || ht <= 0 {
-        return None;
+        return Err(format!("the window has no area ({w}x{ht})"));
     }
+    let grabbed = grab_rect(w, ht, r).ok_or("the screen could not be copied (BitBlt)")?;
+    if foreground() != h {
+        return Err(changed());
+    }
+    Ok(grabbed)
+}
+
+/// The screen rectangle `r` (`w` x `ht`) as 24-bit RGB rows.
+fn grab_rect(w: i32, ht: i32, r: RECT) -> Option<(u32, u32, Vec<u8>, RECT)> {
     unsafe {
         let screen = GetDC(None);
         let mem = CreateCompatibleDC(Some(screen));
@@ -346,10 +362,11 @@ fn grab_foreground() -> Option<(u32, u32, Vec<u8>, RECT)> {
     }
 }
 
-/// Capture the foreground window: its RGB pixels and screen rectangle,
-/// plus a new private file in %TEMP% for the PNG made from them.
-pub fn screenshot() -> Option<(String, shot::Pixels, RECT)> {
-    let (width, height, data, rect) = grab_foreground()?;
+/// Capture window `h`, which must be the foreground window: its RGB pixels
+/// and screen rectangle, plus a new private file in %TEMP% for the PNG made
+/// from them.
+pub fn screenshot(h: HWND) -> R<(String, shot::Pixels, RECT)> {
+    let (width, height, data, rect) = grab_foreground(h)?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -359,12 +376,12 @@ pub fn screenshot() -> Option<(String, shot::Pixels, RECT)> {
         .write(true)
         .create_new(true)
         .open(&path)
-        .ok()?;
+        .map_err(|e| format!("screenshot: cannot create {}: {e}", path.display()))?;
     let pixels = shot::Pixels {
         width,
         height,
         channels: 3,
         data,
     };
-    Some((path.display().to_string(), pixels, rect))
+    Ok((path.display().to_string(), pixels, rect))
 }
