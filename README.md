@@ -818,10 +818,15 @@ Desktop) and their terminals; keys, typing and pointer input are refused
 ("nothing sent") while the window in front is the client's window or, for a
 terminal, while its tab in front runs the agent. Konsole's tab in front is
 read over D-Bus, so the other tabs of the same window stay usable; for other
-terminals whose tab cannot be read, a window is refused only when every
-terminal in it runs the agent. Element tools refuse the client's own
-elements (Claude Desktop's buttons), `close_window` refuses its window, and
-`window`/`activate_window` prefer another window that matches as well. On
+terminals, whose tab in front cannot be read (kitty, foot's server,
+gnome-terminal), the window is refused while any terminal of its process
+runs the agent. Pointer input at a point outside the window in front is
+refused over the agent's window. Element tools refuse the client's own
+elements (Claude Desktop's buttons) and a terminal's entries that send
+input into it (Paste, Copy Input To), `close_window` refuses its window, and
+`window`/`activate_window` prefer another window that matches as well. Run
+in tmux or screen, the agent's terminal window is not known (the
+multiplexer's server left it), so the guard cannot see it; `doctor` warns. On
 Windows only the foreground window's process is compared: a console window
 whose shell runs the agent is refused, but Windows Terminal's and editors'
 tabs cannot be told apart, so those windows are not. A

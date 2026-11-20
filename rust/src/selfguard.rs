@@ -52,6 +52,9 @@ pub enum Own {
     Tab(Proc, String),
     /// A terminal whose tabs all run the agent (the tab in front unknown).
     AllTabs(Proc),
+    /// A terminal one of whose tabs runs the agent, the tab in front
+    /// unknown (a terminal other than Konsole, or Konsole not answering).
+    SomeTab(Proc),
 }
 
 /// Processes that start everything in a session: an ancestor chain stops
@@ -108,6 +111,31 @@ const TAB_HOSTS: &[&str] = &[
     "tabby",
     "hyper",
 ];
+
+/// Terminal multiplexers, whose server runs apart from the terminal
+/// showing it (name prefixes: "tmux: server", "screen").
+const MULTIPLEXERS: &[&str] = &["tmux", "screen", "zellij", "abduco", "dtach"];
+
+/// Words of terminal menu entries that send input into a terminal
+/// (`fold`ed): Paste, Paste Selection, Copy Input To, in English and
+/// Turkish.
+const INPUT_ENTRIES: &[&str] = &[
+    "paste",
+    "yapıştır",
+    "copy input",
+    "girdiyi kopyala",
+    "send input",
+    "broadcast",
+];
+
+/// Whether a terminal's element named `name` sends input into its
+/// terminals (Konsole's Edit > Paste, Edit > Copy Input To).
+pub fn input_entry(name: &str) -> bool {
+    let n = crate::render::fold(name);
+    INPUT_ENTRIES
+        .iter()
+        .any(|w| n.contains(&crate::render::fold(w)))
+}
 
 /// The `self-client` directive that turns the guard off.
 pub const OPT_OUT: &str = "self-client: allow";
@@ -182,30 +210,43 @@ impl SelfClient {
 
     /// Whether input to the window of `pid` in front, showing `view`,
     /// would reach the agent: an ancestor's window that is no terminal, or
-    /// a terminal whose tab in front (else every tab) runs the agent. A tab
-    /// host whose tabs are unknown (Windows Terminal) does not count.
+    /// a terminal whose tab in front runs the agent. When the tab in front
+    /// cannot be read (kitty, foot's server, gnome-terminal, Konsole not
+    /// answering or with two windows titled the same), any of its
+    /// terminals running the agent counts: one process holds the tabs of
+    /// all its windows, so another tab elsewhere says nothing about this
+    /// one. A tab host whose tabs are unknown (Windows Terminal) does not
+    /// count.
     pub fn front_owner(&self, pid: u32, view: &TermView) -> Option<Own> {
         let p = self.ancestor(pid)?;
         if let Some(t) = &view.shown {
             return self.ours(t).then(|| Own::Tab(p.clone(), t.clone()));
         }
         if !view.ptys.is_empty() {
+            if view.ptys.iter().all(|t| self.ours(t)) {
+                return Some(Own::AllTabs(p.clone()));
+            }
             return view
                 .ptys
                 .iter()
-                .all(|t| self.ours(t))
-                .then(|| Own::AllTabs(p.clone()));
+                .any(|t| self.ours(t))
+                .then(|| Own::SomeTab(p.clone()));
         }
         (!TAB_HOSTS.contains(&p.name.as_str())).then(|| Own::Window(p.clone()))
     }
 
-    /// Whether an element of `pid`'s app is part of the agent's client
-    /// itself (Claude Desktop's own buttons): an ancestor without
-    /// terminals. A terminal's own elements (its tabs, menus) are not.
-    pub fn element_owner(&self, pid: u32, view: &TermView) -> Option<Own> {
+    /// Whether an element of `pid`'s app, named `name`, is part of the
+    /// agent's client itself (Claude Desktop's own buttons): an ancestor
+    /// without terminals. A terminal's own elements (its tabs, menus) are
+    /// not, except the entries that send input into its terminals
+    /// (`input_entry`: Paste, Copy Input To) while one runs the agent.
+    pub fn element_owner(&self, pid: u32, view: &TermView, name: &str) -> Option<Own> {
         let p = self.ancestor(pid)?;
-        (view.ptys.is_empty() && !TAB_HOSTS.contains(&p.name.as_str()))
-            .then(|| Own::Window(p.clone()))
+        if !view.ptys.is_empty() {
+            return (input_entry(name) && view.ptys.iter().any(|t| self.ours(t)))
+                .then(|| Own::SomeTab(p.clone()));
+        }
+        (!TAB_HOSTS.contains(&p.name.as_str())).then(|| Own::Window(p.clone()))
     }
 
     /// Whether closing the window of `pid` would close the agent: an
@@ -219,6 +260,16 @@ impl SelfClient {
                 .then(|| Own::AllTabs(p.clone())),
             None => Some(Own::Window(p.clone())),
         }
+    }
+
+    /// A terminal multiplexer among the client's processes (tmux, screen):
+    /// its server left the terminal that shows it, which is then no
+    /// ancestor, so the guard cannot see that window.
+    pub fn multiplexer(&self) -> Option<&str> {
+        self.chain
+            .iter()
+            .map(|p| p.name.as_str())
+            .find(|n| MULTIPLEXERS.contains(&n.split([':', ' ']).next().unwrap_or("")))
     }
 
     /// The doctor line: the client's processes, outermost first, and their
@@ -237,6 +288,13 @@ impl SelfClient {
         if !self.ttys.is_empty() {
             let _ = write!(s, " on {}", self.ttys.join(", "));
         }
+        if let Some(m) = self.multiplexer() {
+            let _ = write!(
+                s,
+                "; WARNING: the agent runs in {m}, so the terminal window showing it is \
+                 unknown and input to that window is not refused"
+            );
+        }
         s
     }
 }
@@ -254,8 +312,19 @@ pub fn refusal(own: &Own, title: &str, allow_file: &str) -> String {
                 "the window in front{win} is {}'s tab running this agent ({tty})",
                 p.name
             ),
-            "bring another tab to the front first (act on it in the tab bar: find \
-             role='page tab' in that app), or ask the user to switch tabs",
+            "for input meant for another app, pass window=<title or app> to bring it to \
+             the front; for another tab of this terminal, bring it to the front first \
+             (act on it in the tab bar: find role='page tab' in that app), or ask the user \
+             to switch tabs",
+        ),
+        Own::SomeTab(p) => (
+            format!(
+                "the window in front{win} is {}'s, one of whose terminals runs this agent, \
+                 and its tab in front cannot be told",
+                p.name
+            ),
+            "for input meant for another app, pass window=<title or app> to bring it to \
+             the front; else ask the user",
         ),
         Own::AllTabs(p) => (
             format!(
@@ -279,9 +348,32 @@ pub fn refusal(own: &Own, title: &str, allow_file: &str) -> String {
     )
 }
 
+/// The refusal for pointer input at `point`, outside the window in front,
+/// over the agent's own window `title` (`own`, as `refusal` reads it).
+pub fn point_refusal(own: &Own, point: (i64, i64), title: &str, allow_file: &str) -> String {
+    let name = match own {
+        Own::Window(p) | Own::Tab(p, _) | Own::AllTabs(p) | Own::SomeTab(p) => &p.name,
+    };
+    format!(
+        "({},{}) is outside the window in front, over {name}'s window '{title}', which runs \
+         this agent: a press there would reach the agent itself; pick a point inside the \
+         window meant for the input, or bring it to the front (window=<title or app>). Only \
+         the user can turn this off ('{OPT_OUT}' in {allow_file})",
+        point.0, point.1
+    )
+}
+
 /// The refusal for an element of the agent's own client.
 pub fn element_refusal(own: &Own, allow_file: &str) -> String {
     let name = match own {
+        Own::SomeTab(p) => {
+            return format!(
+                "that entry of {} sends input into its terminals, one of which runs this \
+                 agent: the input could reach the agent itself. Only the user can turn this \
+                 off ('{OPT_OUT}' in {allow_file})",
+                p.name
+            );
+        }
         Own::Window(p) | Own::Tab(p, _) | Own::AllTabs(p) => &p.name,
     };
     format!(
@@ -294,7 +386,7 @@ pub fn element_refusal(own: &Own, allow_file: &str) -> String {
 /// The refusal for closing the agent's own window.
 pub fn close_refusal(own: &Own, title: &str, allow_file: &str) -> String {
     let name = match own {
-        Own::Window(p) | Own::Tab(p, _) | Own::AllTabs(p) => &p.name,
+        Own::Window(p) | Own::Tab(p, _) | Own::AllTabs(p) | Own::SomeTab(p) => &p.name,
     };
     format!(
         "'{title}' is {name}'s window, which runs this agent: closing it would end the \
@@ -348,6 +440,7 @@ mod tests {
         assert_eq!(me.chain.len(), 6);
         assert_eq!(me.chain[0], p(60611, "claude"));
         assert_eq!(me.chain[5], p(60338, "konsole"));
+        assert_eq!(me.multiplexer(), None);
         assert_eq!(me.ttys, vec!["pts/2", "pts/0"]);
         assert_eq!(
             me.describe(),
@@ -370,6 +463,14 @@ mod tests {
         });
         assert_eq!(me.chain.len(), 2);
         assert!(SelfClient::walk(5, |_| None).is_empty());
+        // In tmux: its server is a child of systemd, the terminal unknown.
+        let me = SelfClient::walk(10, |pid| match pid {
+            10 => Some((20, "claude".into(), Some("pts/3".into()))),
+            20 => Some((30, "tmux: server".into(), None)),
+            _ => Some((1, "systemd".into(), None)),
+        });
+        assert_eq!(me.multiplexer(), Some("tmux: server"));
+        assert!(me.describe().contains("WARNING: the agent runs in tmux"));
     }
 
     #[test]
@@ -383,8 +484,16 @@ mod tests {
         );
         // The user's own fish tab, for sudo commands, works.
         assert_eq!(me.front_owner(60338, &view(&all, Some("pts/5"))), None);
-        // Tab unknown: refused only when every terminal is the agent's.
-        assert_eq!(me.front_owner(60338, &view(&all, None)), None);
+        // Tab unknown (kitty, foot's server, Konsole not answering): refused
+        // while any of its terminals runs the agent.
+        assert_eq!(
+            me.front_owner(60338, &view(&all, None)),
+            Some(Own::SomeTab(p(60338, "konsole")))
+        );
+        assert_eq!(
+            me.front_owner(60338, &view(&["pts/5", "pts/7"], None)),
+            None
+        );
         assert_eq!(
             me.front_owner(60338, &view(&["pts/0", "pts/2"], None)),
             Some(Own::AllTabs(p(60338, "konsole")))
@@ -392,8 +501,23 @@ mod tests {
         // Another Konsole process, or any other app.
         assert_eq!(me.front_owner(7000, &view(&["pts/0"], Some("pts/0"))), None);
         assert_eq!(me.front_owner(0, &view(&[], None)), None);
-        // Its tabs (elements) stay usable; closing the window does not.
-        assert_eq!(me.element_owner(60338, &view(&all, None)), None);
+        // Its tabs and menus (elements) stay usable, but not the entries
+        // that send input into its terminals; closing the window does not.
+        assert_eq!(
+            me.element_owner(60338, &view(&all, None), "Yeni Sekme"),
+            None
+        );
+        for entry in ["Paste", "Yapıştır", "Copy Input To", "Paste Selection"] {
+            assert_eq!(
+                me.element_owner(60338, &view(&all, None), entry),
+                Some(Own::SomeTab(p(60338, "konsole"))),
+                "{entry}"
+            );
+        }
+        assert_eq!(
+            me.element_owner(60338, &view(&["pts/5"], None), "Paste"),
+            None
+        );
         assert!(me.close_owner(60338, &view(&all, None)).is_some());
         let other_window = TermView {
             tabs: Some(vec!["pts/7".into()]),
@@ -413,7 +537,7 @@ mod tests {
         let none = TermView::default();
         let own = Some(Own::Window(p(10936, "claude-desktop")));
         assert_eq!(desktop.front_owner(10936, &none), own);
-        assert_eq!(desktop.element_owner(10936, &none), own);
+        assert_eq!(desktop.element_owner(10936, &none, "Send"), own);
         assert_eq!(desktop.close_owner(10936, &none), own);
         // Windows Terminal: its tab in front cannot be read.
         let wt = SelfClient::walk(10, |pid| match pid {
@@ -423,7 +547,7 @@ mod tests {
             _ => None,
         });
         assert_eq!(wt.front_owner(30, &none), None);
-        assert_eq!(wt.element_owner(30, &none), None);
+        assert_eq!(wt.element_owner(30, &none, "Paste"), None);
         assert!(
             wt.close_owner(30, &none).is_some(),
             "closing ends the agent"
@@ -439,7 +563,15 @@ mod tests {
         assert!(r.starts_with("the window in front '~ : claude"), "{r}");
         assert!(r.contains("'~ : claude — Konsole' is konsole's tab running this agent (pts/0)"));
         assert!(r.contains("role='page tab'"), "{r}");
+        assert!(r.contains("pass window=<title or app>"), "{r}");
         assert!(r.contains("'self-client: allow' in /a/allow.txt"), "{r}");
+        let r = refusal(&Own::SomeTab(p(9, "kitty")), "claude", "f");
+        assert!(
+            r.contains("is kitty's, one of whose terminals runs this agent"),
+            "{r}"
+        );
+        let r = element_refusal(&Own::SomeTab(p(9, "konsole")), "f");
+        assert!(r.starts_with("that entry of konsole sends input"), "{r}");
         let r = element_refusal(&Own::Window(p(1, "claude-desktop")), "f");
         assert!(
             r.starts_with("that element belongs to claude-desktop"),

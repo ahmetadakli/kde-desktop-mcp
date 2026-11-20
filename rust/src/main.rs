@@ -2453,7 +2453,8 @@ impl<B: Backend> Server<B> {
 
     /// Refuse a tool that acts on element `id` (click tier and up) when the
     /// element belongs to the agent's own client (Claude Desktop's own
-    /// buttons). A terminal's own elements (its tabs) stay usable.
+    /// buttons). A terminal's own elements (its tabs) stay usable, but not
+    /// its entries that send input into the agent's terminal (Paste).
     async fn guard_element(&self, id: &B::Id) -> R<()> {
         let (tool, args) = GATE
             .try_with(|g| {
@@ -2474,13 +2475,62 @@ impl<B: Backend> Server<B> {
             return Ok(());
         }
         let view = self.b.term_view(pid, Some("")).await;
-        match me.element_owner(pid, &view) {
+        let name = if view.ptys.is_empty() {
+            String::new()
+        } else {
+            self.b.identity(id).await.1
+        };
+        match me.element_owner(pid, &view, &name) {
             None => Ok(()),
             Some(own) => Err(refusal(selfguard::element_refusal(
                 &own,
                 &self.allow_file_text(),
             ))),
         }
+    }
+
+    /// Refuse pointer input at screen point (`x`, `y`) outside the window
+    /// in front, over a window of the agent's own (its terminal tab
+    /// beside the browser in front): the press would land there, past
+    /// `guard_front`. Windows are listed with the client's processes
+    /// added to the allowlist, so a terminal not on it is seen too. A
+    /// point inside the window in front, or a list that cannot be read,
+    /// passes.
+    async fn guard_point(&self, x: i64, y: i64) -> R<()> {
+        let Some(me) = self.guarded_client().await else {
+            return Ok(());
+        };
+        let mut names = self.allowed();
+        names.extend(me.chain.iter().map(|p| p.name.clone()));
+        let Ok(list) = self.b.windows_quick("", &names).await else {
+            return Ok(());
+        };
+        let (px, py) = (x as f64, y as f64);
+        let over = |w: &&WindowGeo| {
+            !w.minimized
+                && w.width > 0.0
+                && w.height > 0.0
+                && (w.x..w.x + w.width).contains(&px)
+                && (w.y..w.y + w.height).contains(&py)
+        };
+        if list.iter().filter(over).any(|w| w.active) {
+            return Ok(());
+        }
+        for w in list.iter().filter(over) {
+            if me.ancestor(w.pid).is_none() {
+                continue;
+            }
+            let view = self.b.term_view(w.pid, Some(&w.title)).await;
+            if let Some(own) = me.front_owner(w.pid, &view) {
+                return Err(refusal(selfguard::point_refusal(
+                    &own,
+                    (x, y),
+                    &w.title,
+                    &self.allow_file_text(),
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Whether `w` is the agent's own window: what input to it in front
@@ -4337,7 +4387,7 @@ impl<B: Backend> Server<B> {
             .get_or_init(|| async { self.b.self_client().await })
             .await;
         row(
-            true,
+            policy.self_client || me.multiplexer().is_none(),
             "self-client guard",
             &match (policy.self_client, me.is_empty()) {
                 (true, _) => format!(
@@ -6581,6 +6631,11 @@ impl<B: Backend> Server<B> {
                 named.push(self.name_window(id, c).await);
             }
         }
+        for end in [&from, &to] {
+            if let Ok(DragEnd::Point((x, y))) = end {
+                self.guard_point(*x, *y).await?;
+            }
+        }
         let mut centers = named.into_iter();
         let mut point = |end: R<DragEnd<B::Id>>| -> R<(i64, i64)> {
             match end? {
@@ -6803,6 +6858,7 @@ impl<B: Backend> Server<B> {
             self.check_button_free(&button)?;
         }
         let app = self.require_input_front().await?;
+        self.guard_point(x, y).await?;
         self.with_modifiers(
             &mods,
             self.b.pointer(x, y, &button, clicks, arg_i(a, "scroll", 0)),
@@ -8343,6 +8399,9 @@ mod tests {
     /// push button "OK" unless a test changes it between calls), so finds
     /// for it hit and `wait_for` anything else keeps polling until its
     /// timeout; key presses and actions are logged.
+    /// A window's x, y, width and height.
+    type Frame = (f64, f64, f64, f64);
+
     struct FakeBackend {
         allow_file: PathBuf,
         keys: Rc<RefCell<Vec<String>>>,
@@ -8384,6 +8443,8 @@ mod tests {
         /// The client running the server (`selfguard`), and what each
         /// pid's window shows of its terminals. Window pids: `fake_pid`.
         client: Rc<RefCell<selfguard::SelfClient>>,
+        /// Frames (x, y, width, height) of FAKE_WINDOWS by pid; none: 0x0.
+        frames: Rc<RefCell<HashMap<u32, Frame>>>,
         views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
     }
 
@@ -9232,12 +9293,21 @@ mod tests {
                     allowed.iter().any(|a| a == app)
                         && (title.to_lowercase().contains(&q) || app.contains(&q))
                 })
-                .map(|(app, title)| WindowGeo {
-                    title: title.into(),
-                    app: app.into(),
-                    active: (app, title) == (active.0.as_str(), active.1.as_str()),
-                    pid: fake_pid(app, title),
-                    ..WindowGeo::default()
+                .map(|(app, title)| {
+                    let pid = fake_pid(app, title);
+                    let (x, y, width, height) =
+                        self.frames.borrow().get(&pid).copied().unwrap_or_default();
+                    WindowGeo {
+                        title: title.into(),
+                        app: app.into(),
+                        active: (app, title) == (active.0.as_str(), active.1.as_str()),
+                        pid,
+                        x,
+                        y,
+                        width,
+                        height,
+                        ..WindowGeo::default()
+                    }
                 })
                 .collect())
         }
@@ -9325,6 +9395,7 @@ mod tests {
         sem: Rc<FakeSemantic>,
         client: Rc<RefCell<selfguard::SelfClient>>,
         views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
+        frames: Rc<RefCell<HashMap<u32, Frame>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -9363,7 +9434,9 @@ mod tests {
         let sem = Rc::new(FakeSemantic::default());
         let client = Rc::new(RefCell::new(selfguard::SelfClient::default()));
         let views = Rc::new(RefCell::new(HashMap::new()));
+        let frames = Rc::new(RefCell::new(HashMap::new()));
         let server = Rc::new(Server::new(FakeBackend {
+            frames: frames.clone(),
             client: client.clone(),
             views: views.clone(),
             shown: shown.clone(),
@@ -9407,6 +9480,7 @@ mod tests {
             sem,
             client,
             views,
+            frames,
         }
     }
 
@@ -14015,6 +14089,7 @@ mod tests {
             );
             // The user keeps typing: refused, nothing sent, said once.
             keep_typing(&s.takeover, 4000);
+            s.keys.borrow_mut().clear();
             let r = call_tool(&mut s, 10, "key", json!({"combo": "a"})).await;
             assert_eq!(r["result"]["isError"], true, "{r}");
             assert_eq!(marker(reply_text(&r)), "no", "{r}");
@@ -14691,6 +14766,92 @@ mod tests {
                 reply_text(&r).contains("every terminal in it runs this agent"),
                 "{r}"
             );
+            // Unknown with other tabs too (kitty, Konsole not answering):
+            // still refused, as the agent's tab may be the one in front.
+            s.views.borrow_mut().insert(
+                100,
+                selfguard::TermView {
+                    ptys: vec!["pts/0".into(), "pts/5".into()],
+                    ..Default::default()
+                },
+            );
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 10, "key", json!({"combo": "a"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("one of whose terminals runs this agent"),
+                "{text}"
+            );
+            assert!(text.contains("pass window=<title or app>"), "{text}");
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("down")));
+        });
+    }
+
+    #[test]
+    fn the_pointer_never_lands_on_the_agents_tab_beside_the_window_in_front() {
+        local(async {
+            let mut s = session("self-point");
+            // Konsole is not even on the allowlist: its window is still seen.
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            s.frames.borrow_mut().insert(100, (0.0, 0.0, 500.0, 800.0));
+            s.frames
+                .borrow_mut()
+                .insert(200, (500.0, 0.0, 500.0, 800.0));
+            // A middle click over the agent's tab would paste into it.
+            let r = call_tool(
+                &mut s,
+                2,
+                "mouse",
+                json!({"x": 100, "y": 100, "button": "middle"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("(100,100) is outside the window in front, over konsole's window"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            let r = call_tool(
+                &mut s,
+                3,
+                "drag",
+                json!({"from_x": 600, "from_y": 100, "to_x": 100, "to_y": 100}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("over konsole's window"), "{r}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // Inside the window in front, or with the user's tab shown, it
+            // goes through.
+            let r = call_tool(&mut s, 4, "mouse", json!({"x": 600, "y": 100})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            konsole_tab(&s, "pts/5");
+            let r = call_tool(&mut s, 5, "mouse", json!({"x": 100, "y": 100})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    #[test]
+    fn a_terminals_paste_entry_is_refused_while_it_holds_the_agent() {
+        local(async {
+            let mut s = session("self-paste");
+            set_allow("self-paste", "fake\nkonsole\n");
+            agent_in_konsole(&s);
+            // The user's tab in front: Paste still goes to a session of
+            // the window that runs the agent, Copy Input To to all of them.
+            konsole_tab(&s, "pts/5");
+            *s.focus_app.borrow_mut() = "konsole".into();
+            s.focus.borrow_mut().name = "Paste".into();
+            let r = call_tool(&mut s, 2, "act", json!({"app": "fake", "query": "Paste"})).await;
+            assert!(
+                reply_text(&r).contains("that entry of konsole sends input into its terminals"),
+                "{r}"
+            );
+            assert_eq!(actions_run(&s), 0);
+            // Its other entries stay usable.
+            s.focus.borrow_mut().name = "New Tab".into();
+            let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "New Tab"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
         });
     }
 
