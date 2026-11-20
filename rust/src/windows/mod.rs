@@ -408,8 +408,17 @@ impl Backend for WindowsBackend {
         let Some((parent, _)) = by_pid.get(&me_pid) else {
             return crate::selfguard::SelfClient::default();
         };
+        // Windows keeps a dead parent's pid as the parent of its children,
+        // and the pid may belong to another process by now.
         let mut me = crate::selfguard::SelfClient::walk(*parent, |pid| {
-            by_pid.get(&pid).map(|(pp, n)| (*pp, n.to_string(), None))
+            by_pid.get(&pid).map(|(pp, n)| {
+                let pp = crate::selfguard::live_parent(
+                    *pp,
+                    input::process_created(pid),
+                    input::process_created(*pp),
+                );
+                (pp, n.to_string(), None)
+            })
         });
         let hosts: Vec<(u32, String)> = procs
             .iter()

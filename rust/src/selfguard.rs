@@ -140,6 +140,18 @@ pub fn input_entry(name: &str) -> bool {
 /// The `self-client` directive that turns the guard off.
 pub const OPT_OUT: &str = "self-client: allow";
 
+/// `parent`, the parent pid a process `child` records, unless that pid now
+/// names a process started after the child (Windows: the parent died and
+/// its pid was reused); 0 then, which ends a walk. Start times (any unit)
+/// that cannot be read keep the parent.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn live_parent(parent: u32, child: Option<u64>, parent_started: Option<u64>) -> u32 {
+    match (child, parent_started) {
+        (Some(c), Some(p)) if p > c => 0,
+        _ => parent,
+    }
+}
+
 /// A process name as the guard compares it.
 pub fn norm(name: &str) -> String {
     let n = name.trim().to_lowercase();
@@ -524,6 +536,16 @@ mod tests {
             ..view(&all, Some("pts/7"))
         };
         assert_eq!(me.close_owner(60338, &other_window), None);
+    }
+
+    #[test]
+    fn a_reused_parent_pid_ends_the_walk() {
+        // Claude.exe (started at 50) by an Update.exe since gone, its pid
+        // now Notepad's (started at 90).
+        assert_eq!(live_parent(7, Some(50), Some(90)), 0);
+        assert_eq!(live_parent(7, Some(50), Some(10)), 7);
+        assert_eq!(live_parent(7, None, Some(90)), 7);
+        assert_eq!(live_parent(7, Some(50), None), 7);
     }
 
     #[test]

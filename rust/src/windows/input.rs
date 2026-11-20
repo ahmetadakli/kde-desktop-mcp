@@ -3,14 +3,15 @@
 
 use std::path::PathBuf;
 
-use windows::Win32::Foundation::{CloseHandle, GetLastError, HWND, POINT, RECT};
+use windows::Win32::Foundation::{CloseHandle, FILETIME, GetLastError, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
     CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC,
     SRCCOPY, SelectObject,
 };
 use windows::Win32::System::Threading::{
-    OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+    GetProcessTimes, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
+    QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, MOUSE_EVENT_FLAGS,
@@ -265,6 +266,24 @@ pub fn hosted_apps() -> Vec<String> {
         prev = Some(h);
     }
     out
+}
+
+/// When process `pid` started (100 ns units since 1601); None when it
+/// cannot be opened.
+pub fn process_created(pid: u32) -> Option<u64> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        let ok = GetProcessTimes(h, &mut created, &mut exited, &mut kernel, &mut user);
+        let _ = CloseHandle(h);
+        ok.ok()?;
+        Some(u64::from(created.dwHighDateTime) << 32 | u64::from(created.dwLowDateTime))
+    }
 }
 
 fn image_stem(pid: u32) -> String {
