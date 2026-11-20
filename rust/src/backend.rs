@@ -74,6 +74,48 @@ pub const NO_AREA: &str = "element has no on-screen area";
 /// Levels `Backend::window_title` walks up at most.
 const WINDOW_WALK_MAX: usize = 64;
 
+/// The walk up from an element to its window: the nearest frame, window
+/// or dialog, but not a dialog inside a page (a web page's modal, role
+/// dialog under "document web"), which is no window one can activate.
+/// Feed it each level from the element up (`step`), then `end`.
+pub struct WindowWalk<T> {
+    dialog: Option<T>,
+}
+
+impl<T> Default for WindowWalk<T> {
+    fn default() -> Self {
+        WindowWalk { dialog: None }
+    }
+}
+
+impl<T> WindowWalk<T> {
+    /// The window, when the level `node` of role `role` settles it.
+    pub fn step(&mut self, node: T, role: &str) -> Option<T> {
+        if self.dialog.is_some() {
+            if matches!(role, "document web" | "document frame") {
+                // The dialog sat in a page: keep walking.
+                self.dialog = None;
+            } else if matches!(role, "frame" | "window") {
+                return self.dialog.take();
+            }
+            return None;
+        }
+        match role {
+            "frame" | "window" => Some(node),
+            "dialog" => {
+                self.dialog = Some(node);
+                None
+            }
+            _ => None,
+        }
+    }
+
+    /// At the top: the dialog met on the way, if any.
+    pub fn end(self) -> Option<T> {
+        self.dialog
+    }
+}
+
 /// The error `element_center` gives for an element whose window is not in
 /// front (a click there would land on the window covering it). The tool
 /// layer names the window (`not_active`) when the backend does not.
@@ -521,18 +563,22 @@ pub trait Backend {
     async fn parent(&self, _id: &Self::Id) -> Option<Self::Id> {
         None
     }
-    /// Title of the window `id` is in (its nearest frame, window or
-    /// dialog), for a NOT_ACTIVE refusal; None when it is not found.
+    /// Title of the window `id` is in (`WindowWalk`), for a NOT_ACTIVE
+    /// refusal; None when it is not found.
     async fn window_title(&self, id: &Self::Id) -> Option<String> {
+        let mut walk = WindowWalk::default();
         let mut cur = id.clone();
         for _ in 0..WINDOW_WALK_MAX {
             let (role, name) = self.identity(&cur).await;
-            if matches!(role.as_str(), "frame" | "window" | "dialog") {
+            if let Some(name) = walk.step(name, &role) {
                 return Some(name);
             }
-            cur = self.parent(&cur).await?;
+            match self.parent(&cur).await {
+                Some(p) => cur = p,
+                None => break,
+            }
         }
-        None
+        walk.end()
     }
     /// A mark for `unchanged_since`, taken before a read that may be kept
     /// and reused; None when the backend cannot tell that an app's tree
@@ -895,6 +941,43 @@ pub fn not_one_window(query: &str, matches: &[WindowGeo]) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// What `WindowWalk` picks over these levels, element first.
+    fn window_of(levels: &[(&'static str, &'static str)]) -> Option<&'static str> {
+        let mut walk = super::WindowWalk::default();
+        for (name, role) in levels {
+            if let Some(w) = walk.step(*name, role) {
+                return Some(w);
+            }
+        }
+        walk.end()
+    }
+
+    #[test]
+    fn a_page_modal_is_no_window_but_a_dialog_window_is() {
+        let firefox = ("İzinler — Mozilla Firefox", "frame");
+        // A button in a web page's modal: the browser's frame.
+        let modal = [
+            ("Personel", "combo box"),
+            ("İzin talebi", "dialog"),
+            ("İzinler", "section"),
+            ("İzinler", "document web"),
+            ("", "internal frame"),
+            firefox,
+            ("Firefox", "application"),
+        ];
+        assert_eq!(window_of(&modal), Some(firefox.0));
+        // A dialog window, and a plain element of the frame.
+        let save = [("Kaydet", "push button"), ("Farklı Kaydet", "dialog")];
+        assert_eq!(window_of(&save), Some("Farklı Kaydet"));
+        let save = [("OK", "push button"), ("Ayarlar", "dialog"), firefox];
+        assert_eq!(window_of(&save), Some("Ayarlar"));
+        assert_eq!(
+            window_of(&[("OK", "push button"), firefox]),
+            Some(firefox.0)
+        );
+        assert_eq!(window_of(&[("OK", "push button")]), None);
+    }
+
     #[test]
     fn windows_rank_title_then_app_then_parts() {
         let rank = |q, t, a| super::window_rank(q, t, &[a]);
