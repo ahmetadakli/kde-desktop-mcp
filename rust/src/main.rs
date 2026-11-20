@@ -5883,7 +5883,7 @@ impl<B: Backend> Server<B> {
             match r {
                 Ok(()) => {
                     how = if gecko {
-                        "; typed: accessibility writes have no effect in Firefox"
+                        "; typed: accessibility writes have no effect in Gecko apps"
                     } else {
                         "; typed, the accessibility write had no effect"
                     };
@@ -5975,14 +5975,16 @@ impl<B: Backend> Server<B> {
                     "ok (verified; the field formatted it as {shown}: {counts})"
                 )));
             }
-            Fit::Filtered(dropped) => {
+            // Only when the write changed the field: one that still holds
+            // what it held ignored the write, whatever it would drop.
+            Fit::Filtered(dropped) if before.as_deref() != Some(now.as_str()) => {
                 let shown = shown_value(&now);
                 return Ok(t.reply(&format!(
                     "ok with a warning: the field dropped {dropped:?}, which it does not \
                      accept; it holds {shown} ({counts})"
                 )));
             }
-            Fit::Wrong => {}
+            Fit::Filtered(_) | Fit::Wrong => {}
         }
         if before.as_deref() != Some(now.as_str()) {
             return Err(t.reply(&written_mismatch(&now, text, how)));
@@ -7819,9 +7821,10 @@ enum Fit {
 /// 5). Characters are compared ignoring case. A value holding the asked
 /// characters minus some is a mask only when every one left out is of a
 /// kind (digit, letter, other) the value holds none of, and none is a '.',
-/// ',' or '-', which change a number: a field that dropped "abc" from
-/// "0555abc12" takes digits only, while "abc" for "abcdef" was cut short,
-/// which stays an error.
+/// ',' or '-', which change a number, and not all of them come after the
+/// last one kept: a field that dropped "abc" from "0555abc12" takes digits
+/// only, while "abc" for "abcdef" or "username" for "username2024" was cut
+/// short (a length limit), which stays an error.
 fn text_fit(asked: &str, now: &str) -> Fit {
     fn core(s: &str) -> Vec<char> {
         let chars: Vec<char> = s.chars().collect();
@@ -7866,7 +7869,9 @@ fn text_fit(asked: &str, now: &str) -> Fit {
             _ => dropped.push(c),
         }
     }
+    let cut_short = n.len() < a.len() && n.iter().zip(&a).all(|(k, c)| same(*k, *c));
     let mask = kept.peek().is_none()
+        && !cut_short
         && !dropped.is_empty()
         && !dropped.contains(['.', ',', '-'])
         && !dropped
@@ -10766,6 +10771,9 @@ mod tests {
         // Cut short, a sign or a decimal point lost, other text: wrong.
         assert_eq!(text_fit("abcdef", "abc"), Wrong);
         assert_eq!(text_fit("05551234567", "0555123"), Wrong);
+        // A length limit, though the value holds no digits.
+        assert_eq!(text_fit("username2024", "username"), Wrong);
+        assert_eq!(text_fit("abc123", "abc"), Wrong);
         assert_eq!(text_fit("1.5", "15"), Wrong);
         assert_eq!(text_fit("-5", "5"), Wrong);
         assert_eq!(text_fit("a+b@x.com", "ab@x.com"), Wrong);
@@ -12812,8 +12820,9 @@ mod tests {
             let mut s = session("untyped");
             *s.field.borrow_mut() = Some(String::new());
             let id = focus_id(&mut s, 2).await;
-            // The agent's client in front: the write did nothing and typing
-            // was refused, so the field is as it was and a retry is safe.
+            // A window not on the allowlist in front: the write did nothing
+            // and typing was refused, so the field is as it was and a retry
+            // is safe.
             *s.active.borrow_mut() = (FAKE_WINDOWS[0].0.into(), FAKE_WINDOWS[0].1.into());
             s.keys.borrow_mut().clear();
             let r = call_tool(
@@ -12835,6 +12844,38 @@ mod tests {
             assert!(!text.contains("maybe sent"), "{r}");
             assert_eq!(s.field.borrow().as_deref(), Some(""));
             assert!(!s.keys.borrow().iter().any(|k| k.starts_with("down")));
+            // A field already holding the start of the text: what typing
+            // would have added is no mask the field applied.
+            *s.field.borrow_mut() = Some("Room".into());
+            let r = call_tool(&mut s, 4, "set_text", json!({"id": id, "text": "Room 12"})).await;
+            assert!(
+                reply_text(&r).contains("the field still holds \"Room\": nothing changed"),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn set_text_never_types_into_the_agents_own_tab() {
+        local(async {
+            let mut s = session("untyped-self");
+            set_allow("untyped-self", "fake\nkonsole\n");
+            *s.field.borrow_mut() = Some(String::new());
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            let id = focus_id(&mut s, 2).await;
+            *s.active.borrow_mut() = (FAKE_WINDOWS[0].0.into(), FAKE_WINDOWS[0].1.into());
+            s.keys.borrow_mut().clear();
+            let r = call_tool(&mut s, 3, "set_text", json!({"id": id, "text": "rm -rf x"})).await;
+            let text = reply_text(&r);
+            assert!(text.contains("it could not be typed: "), "{text}");
+            assert!(
+                text.contains("is konsole's tab running this agent (pts/0)"),
+                "{text}"
+            );
+            assert!(text.contains("nothing changed; nothing sent"), "{text}");
+            assert_eq!(s.field.borrow().as_deref(), Some(""));
+            assert!(!s.keys.borrow().iter().any(|k| k.starts_with("down")));
         });
     }
 
@@ -12850,7 +12891,7 @@ mod tests {
             let r = call_tool(&mut s, 3, "set_text", json!({"id": id, "text": "new"})).await;
             assert_eq!(
                 reply_text(&r),
-                "ok (verified; typed: accessibility writes have no effect in Firefox)",
+                "ok (verified; typed: accessibility writes have no effect in Gecko apps)",
                 "{r}"
             );
             assert!(start.elapsed() < SET_TEXT_VERIFY, "{:?}", start.elapsed());
