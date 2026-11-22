@@ -251,8 +251,9 @@ const READ_ONLY_TOOLS: [&str; 12] = [
     "batch",
 ];
 
-/// The nearest frame, window or dialog at or above `id` in `cache` (what
-/// the backend would walk up to); None when the way up is not known for
+/// The window at or above `id` in `cache`, as the backend walks up to it
+/// (`backend::WindowWalk`: the nearest frame, window or dialog, a web
+/// page's modal aside); None when the way up is not known for
 /// sure (a node listed by two parents).
 fn frame_in<Id: Clone + Eq + std::hash::Hash>(cache: &Cache<Id>, id: &Id) -> Option<Id> {
     let mut parents: HashMap<&Id, Option<&Id>> = HashMap::new();
@@ -268,15 +269,23 @@ fn frame_in<Id: Clone + Eq + std::hash::Hash>(cache: &Cache<Id>, id: &Id) -> Opt
                 .or_insert(Some(p));
         }
     }
+    // A web page's modal (a dialog under "document web") is no window:
+    // its ACTIVE state is never set, so the frame above it counts.
+    let mut walk = backend::WindowWalk::default();
     let mut cur = id;
     for _ in 0..=cache.len() {
         let info = cache.get(cur)?;
-        if matches!(info.role.as_str(), "frame" | "window" | "dialog") {
-            return Some(cur.clone());
+        if let Some(w) = walk.step(cur, &info.role) {
+            return Some(w.clone());
         }
-        cur = (*parents.get(cur)?)?;
+        match parents.get(cur) {
+            Some(Some(p)) => cur = p,
+            // Listed by two parents: not known for sure.
+            Some(None) => return None,
+            None => break,
+        }
     }
-    None
+    walk.end().cloned()
 }
 
 struct Refs<Id> {
@@ -16167,6 +16176,16 @@ mod tests {
         cache.insert(7, node("panel", &[8]));
         cache.insert(8, node("panel", &[7]));
         assert_eq!(frame_in(&cache, &8), None);
+        // A button in a web page's modal (role dialog under the page): the
+        // browser's frame, whose ACTIVE state counts, not the modal's.
+        cache.insert(10, node("frame", &[11]));
+        cache.insert(11, node("internal frame", &[12]));
+        cache.insert(12, node("document web", &[13]));
+        cache.insert(13, node("section", &[14]));
+        cache.insert(14, node("dialog", &[15]));
+        cache.insert(15, node("push button", &[]));
+        assert_eq!(frame_in(&cache, &15), Some(10));
+        assert_eq!(frame_in(&cache, &14), Some(10));
     }
 
     /// A web mail page in the fake: a table of rows and cells.
