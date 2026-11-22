@@ -81,6 +81,85 @@ fn held_ttys(root: u32, stats: &HashMap<u32, Stat>) -> BTreeMap<u32, i32> {
     ttys
 }
 
+/// The ptys ("pts/N") on which `root` or a descendant `is_client` runs.
+pub fn client_ptys(
+    root: u32,
+    stats: &HashMap<u32, Stat>,
+    is_client: impl Fn(u32) -> bool,
+) -> Vec<String> {
+    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+    for (&pid, s) in stats {
+        children.entry(s.ppid).or_default().push(pid);
+    }
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(pid) = stack.pop() {
+        if !seen.insert(pid) {
+            continue;
+        }
+        if let Some(t) = stats.get(&pid).and_then(|s| pts_name(s.tty_nr))
+            && !out.contains(&t)
+            && is_client(pid)
+        {
+            out.push(t);
+        }
+        stack.extend(children.get(&pid).into_iter().flatten());
+    }
+    out.sort();
+    out
+}
+
+/// Every process on a pty that `is_client`, with the pty and the process
+/// holding it (the nearest ancestor on no pty: the terminal emulator),
+/// once per pty.
+pub fn client_holders(
+    stats: &HashMap<u32, Stat>,
+    is_client: impl Fn(u32) -> bool,
+) -> Vec<(String, u32)> {
+    let mut out: Vec<(String, u32)> = Vec::new();
+    let mut pids: Vec<u32> = stats.keys().copied().collect();
+    pids.sort_unstable();
+    for pid in pids {
+        let Some(tty) = pts_name(stats[&pid].tty_nr) else {
+            continue;
+        };
+        if out.iter().any(|(t, _)| *t == tty) || !is_client(pid) {
+            continue;
+        }
+        let mut cur = pid;
+        let mut holder = None;
+        for _ in 0..64 {
+            let Some(s) = stats.get(&cur) else { break };
+            if pts_name(s.tty_nr).is_none() {
+                holder = Some(cur);
+                break;
+            }
+            cur = s.ppid;
+        }
+        if let Some(h) = holder.filter(|&h| h > 1) {
+            out.push((tty, h));
+        }
+    }
+    out
+}
+
+/// The executable and command line of a process, for
+/// `SelfClient::is_client`.
+pub fn exe_and_argv(pid: u32) -> Option<(String, Vec<String>)> {
+    let base = std::path::PathBuf::from(format!("/proc/{pid}"));
+    let exe = std::fs::read_link(base.join("exe"))
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let raw = std::fs::read(base.join("cmdline")).ok()?;
+    let argv = raw
+        .split(|&b| b == 0)
+        .filter(|a| !a.is_empty())
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect();
+    Some((exe, argv))
+}
+
 /// The ptys ("pts/N") `root` and its descendants hold.
 pub fn ptys_of(root: u32, stats: &HashMap<u32, Stat>) -> Vec<String> {
     held_ttys(root, stats)
@@ -235,6 +314,30 @@ mod tests {
         assert!(terminals_of(900_000, &stats, |_| unreachable!()).is_empty());
         assert_eq!(ptys_of(100, &stats), vec!["pts/1", "pts/2"]);
         assert!(ptys_of(400, &stats) == vec!["pts/2"]);
+    }
+
+    #[test]
+    fn client_terminals_are_found_with_the_terminal_holding_them() {
+        let (pts0, pts5, pts6) = (136 << 8, 136 << 8 | 5, 136 << 8 | 6);
+        let stats = HashMap::from([
+            (2409, st(1, 0, -1)),          // konsole
+            (202881, st(2409, pts0, 0)),   // fish on pts/0
+            (202969, st(202881, pts0, 0)), // claude, the client
+            (300, st(2409, pts5, 300)),    // fish on pts/5
+            (94198, st(3504, 0, -1)),      // claude daemon
+            (95355, st(94198, pts6, 0)),   // bg-spare on pts/6
+            (3504, st(1, 0, -1)),          // systemd --user
+        ]);
+        let client = |pid| pid == 202969;
+        assert_eq!(client_ptys(2409, &stats, client), vec!["pts/0"]);
+        assert!(client_ptys(300, &stats, client).is_empty());
+        assert_eq!(
+            client_holders(&stats, client),
+            vec![("pts/0".to_string(), 2409)]
+        );
+        // This process' own command line can be read.
+        let (_, argv) = exe_and_argv(std::process::id()).unwrap();
+        assert!(!argv.is_empty());
     }
 
     #[test]

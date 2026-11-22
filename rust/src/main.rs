@@ -95,6 +95,10 @@ fn looks_like_sleep(query: &str) -> bool {
 
 /// Roles of fields whose labels `by_label` reads besides editable ones.
 const FIELD_ROLES: &[&str] = &["entry", "text", "password text", "spin button", "combo box"];
+/// How long a focus request (or a click) may take to show before
+/// `take_focus` tries the next way: Gecko reports focus from the page's
+/// process, at times well after the backend's own short wait.
+const FOCUS_LATE: Duration = Duration::from_millis(300);
 /// Most fields whose labels one `by_label` reads.
 const LABEL_FIELDS: usize = 60;
 /// Nodes of a web page fetched when looking for matches scrolled out of
@@ -251,8 +255,32 @@ const READ_ONLY_TOOLS: [&str; 12] = [
     "batch",
 ];
 
-/// The nearest frame, window or dialog at or above `id` in `cache` (what
-/// the backend would walk up to); None when the way up is not known for
+/// Whether the tool being run (`GATE`) with `args`, its target a label
+/// `info`, needs the field the label is for instead: set_text and focus
+/// always, act for a verified action (check, select…) or when the label
+/// has no action of its own. A click on a label is left alone (it reaches
+/// its field as the user's would), as are reads.
+fn label_needs_field<Id>(args: &Json, info: &Info<Id>) -> bool {
+    let tool = GATE
+        .try_with(|g| g.borrow().tool.clone())
+        .unwrap_or_default();
+    match tool.as_str() {
+        "set_text" | "focus" => true,
+        "act" => {
+            semantic::Verb::parse(&arg_s(args, "action", "")).is_some()
+                || args
+                    .get("option")
+                    .and_then(Json::as_str)
+                    .is_some_and(|o| !o.trim().is_empty())
+                || info.actions.is_empty()
+        }
+        _ => false,
+    }
+}
+
+/// The window at or above `id` in `cache`, as the backend walks up to it
+/// (`backend::WindowWalk`: the nearest frame, window or dialog, a web
+/// page's modal aside); None when the way up is not known for
 /// sure (a node listed by two parents).
 fn frame_in<Id: Clone + Eq + std::hash::Hash>(cache: &Cache<Id>, id: &Id) -> Option<Id> {
     let mut parents: HashMap<&Id, Option<&Id>> = HashMap::new();
@@ -268,15 +296,23 @@ fn frame_in<Id: Clone + Eq + std::hash::Hash>(cache: &Cache<Id>, id: &Id) -> Opt
                 .or_insert(Some(p));
         }
     }
+    // A web page's modal (a dialog under "document web") is no window:
+    // its ACTIVE state is never set, so the frame above it counts.
+    let mut walk = backend::WindowWalk::default();
     let mut cur = id;
     for _ in 0..=cache.len() {
         let info = cache.get(cur)?;
-        if matches!(info.role.as_str(), "frame" | "window" | "dialog") {
-            return Some(cur.clone());
+        if let Some(w) = walk.step(cur, &info.role) {
+            return Some(w.clone());
         }
-        cur = (*parents.get(cur)?)?;
+        match parents.get(cur) {
+            Some(Some(p)) => cur = p,
+            // Listed by two parents: not known for sure.
+            Some(None) => return None,
+            None => break,
+        }
     }
-    None
+    walk.end().cloned()
 }
 
 struct Refs<Id> {
@@ -2434,10 +2470,10 @@ impl<B: Backend> Server<B> {
         let Some(pid) = self.b.active_pid().await else {
             return Ok(());
         };
-        if me.ancestor(pid).is_none() {
+        if !me.may_own(pid) {
             return Ok(());
         }
-        let view = self.b.term_view(pid, None).await;
+        let view = self.b.term_view(pid, None, me).await;
         match me.front_owner(pid, &view) {
             None => Ok(()),
             Some(own) => {
@@ -2471,10 +2507,10 @@ impl<B: Backend> Server<B> {
         let Some(pid) = self.b.element_pid(id).await else {
             return Ok(());
         };
-        if me.ancestor(pid).is_none() {
+        if !me.may_own(pid) {
             return Ok(());
         }
-        let view = self.b.term_view(pid, Some("")).await;
+        let view = self.b.term_view(pid, Some(""), me).await;
         let name = if view.ptys.is_empty() {
             String::new()
         } else {
@@ -2502,6 +2538,10 @@ impl<B: Backend> Server<B> {
         };
         let mut names = self.allowed();
         names.extend(me.chain.iter().map(|p| p.name.clone()));
+        // Under a daemon, the terminals showing its clients too.
+        for t in self.b.client_tabs(me).await {
+            names.push(t.terminal.name);
+        }
         let Ok(list) = self.b.windows_quick("", &names).await else {
             return Ok(());
         };
@@ -2517,10 +2557,10 @@ impl<B: Backend> Server<B> {
             return Ok(());
         }
         for w in list.iter().filter(over) {
-            if me.ancestor(w.pid).is_none() {
+            if !me.may_own(w.pid) {
                 continue;
             }
-            let view = self.b.term_view(w.pid, Some(&w.title)).await;
+            let view = self.b.term_view(w.pid, Some(&w.title), me).await;
             if let Some(own) = me.front_owner(w.pid, &view) {
                 return Err(refusal(selfguard::point_refusal(
                     &own,
@@ -2536,10 +2576,10 @@ impl<B: Backend> Server<B> {
     /// Whether `w` is the agent's own window: what input to it in front
     /// would reach (`SelfClient::front_owner`).
     async fn is_own_window(&self, me: &selfguard::SelfClient, w: &WindowGeo) -> bool {
-        if me.ancestor(w.pid).is_none() {
+        if !me.may_own(w.pid) {
             return false;
         }
-        let view = self.b.term_view(w.pid, Some(&w.title)).await;
+        let view = self.b.term_view(w.pid, Some(&w.title), me).await;
         me.front_owner(w.pid, &view).is_some()
     }
 
@@ -2549,7 +2589,7 @@ impl<B: Backend> Server<B> {
     /// the usual pick.
     async fn other_than_own(&self, query: &str, list: &[WindowGeo]) -> Option<String> {
         let me = self.guarded_client().await?;
-        if !list.iter().any(|w| me.ancestor(w.pid).is_some()) {
+        if !list.iter().any(|w| me.may_own(w.pid)) {
             return None;
         }
         let ranked: Vec<(u8, &WindowGeo)> = list
@@ -3212,7 +3252,7 @@ impl<B: Backend> Server<B> {
         let mut kept = true;
         // The label, placeholder or description that named a field.
         let mut labelled: Option<String> = None;
-        let (id, cache, at, ties, synonym, over_chrome) = loop {
+        let (mut id, mut cache, mut at, ties, synonym, over_chrome) = loop {
             let located = self.locate(app, query, &role, true, kept, window);
             let located = trace::time("locate", located).await?;
             let (mut m, mut cache, cached) = match located {
@@ -3290,6 +3330,17 @@ impl<B: Backend> Server<B> {
             self.forget_reads(&app_key);
             kept = false;
         };
+        // A label named, where the tool needs the field it labels.
+        if labelled.is_none()
+            && role.trim().is_empty()
+            && cache[&id].role == "label"
+            && label_needs_field(a, &cache[&id])
+            && let Some(field) = self.labelled_field(&id, &mut cache).await
+        {
+            labelled = Some(cache[&id].name.clone());
+            id = field;
+            at = None;
+        }
         let rid = trace::time("add_ref", self.add_ref(&id, &cache[&id], &app_key)).await;
         note_step_element(rid, true);
         let mut found = render::describe(&cache[&id], rid);
@@ -3318,6 +3369,24 @@ impl<B: Backend> Server<B> {
             role,
         };
         Ok((t, at))
+    }
+
+    /// The field label `label` is for: its LABEL_FOR relation (the
+    /// backend's `label_target`), else the one visible field `by_label`
+    /// finds labelled by its name. Read into `cache` when it was not.
+    async fn labelled_field(&self, label: &B::Id, cache: &mut Cache<B::Id>) -> Option<B::Id> {
+        if let Some(f) = self.b.label_target(label).await {
+            if !cache.contains_key(&f) {
+                let info = self.b.info(&f, 0).await;
+                if info.role.is_empty() || !info.showing {
+                    return None;
+                }
+                cache.insert(f.clone(), info);
+            }
+            return Some(f);
+        }
+        let name = cache.get(label)?.name.clone();
+        self.by_label(cache, &name, "").await.map(|(f, _)| f)
     }
 
     /// The one visible field (an editable element) that its label,
@@ -4199,7 +4268,7 @@ impl<B: Backend> Server<B> {
         if let Some(me) = self.guarded_client().await
             && me.ancestor(w.pid).is_some()
         {
-            let view = self.b.term_view(w.pid, Some(&w.title)).await;
+            let view = self.b.term_view(w.pid, Some(&w.title), me).await;
             if let Some(own) = me.close_owner(w.pid, &view) {
                 return Err(refusal(selfguard::close_refusal(
                     &own,
@@ -4400,8 +4469,17 @@ impl<B: Backend> Server<B> {
                 }
                 (false, false) => format!(
                     "input never goes to the agent's own terminal tab or client window; \
-                     client: {}",
-                    me.describe()
+                     client: {}{}",
+                    me.describe(),
+                    if me.daemon {
+                        let name = me.client_names.first().map_or("client", String::as_str);
+                        format!(
+                            "; client tabs: {}",
+                            selfguard::describe_tabs(name, &self.b.client_tabs(me).await)
+                        )
+                    } else {
+                        String::new()
+                    }
                 ),
             },
         );
@@ -6106,7 +6184,7 @@ impl<B: Backend> Server<B> {
         if !front_checked && let Err(e) = self.require_input_front().await {
             return Err(e);
         }
-        if !matches!(self.b.try_focus(id).await, Ok(Some(_))) && !self.b.is_focused(id).await {
+        if !self.take_focus(id).await {
             return Err(
                 "it would not take the keyboard focus (not the field itself? find it \
                  by role, e.g. role \"text\")"
@@ -6120,6 +6198,44 @@ impl<B: Backend> Server<B> {
         } else {
             self.b.type_text(text).await.map(|_| ())
         }
+    }
+
+    /// Give `id` the keyboard focus for typing into it: the backend's
+    /// focus request (`try_focus`); then, as Gecko moves focus in the page's
+    /// own process and may report it later than the backend waits (or a
+    /// request lands while the document takes focus back), a while for it
+    /// to show and a second request; last, for an editable element, a
+    /// click on its centre, when its window is in front and the point is
+    /// not the agent's own. Whether it holds the focus in the end.
+    async fn take_focus(&self, id: &B::Id) -> bool {
+        if matches!(self.b.try_focus(id).await, Ok(Some(_))) || self.b.is_focused(id).await {
+            return true;
+        }
+        if wait_for(FOCUS_LATE, || self.b.is_focused(id)).await {
+            return true;
+        }
+        if matches!(self.b.try_focus(id).await, Ok(Some(_)))
+            || wait_for(FOCUS_LATE, || self.b.is_focused(id)).await
+        {
+            return true;
+        }
+        // Only a field is clicked: a click on a button would press it.
+        if !self.b.info(id, 0).await.states.contains(&"editable") {
+            return false;
+        }
+        let Ok((x, y)) = self.b.element_center(id).await else {
+            return false;
+        };
+        if self.guard_point(x as i64, y as i64).await.is_err()
+            || self
+                .b
+                .pointer(x as i64, y as i64, "left", 1, 0)
+                .await
+                .is_err()
+        {
+            return false;
+        }
+        wait_for(FOCUS_LATE, || self.b.is_focused(id)).await
     }
 
     /// Why a password field is not filled in, and how the user can allow it.
@@ -8476,6 +8592,11 @@ mod tests {
         wheel: std::cell::Cell<Option<(u32, u32)>>,
         /// `try_focus` works.
         focusable: std::cell::Cell<bool>,
+        /// The field (`field` None) takes focus once this many more
+        /// `is_focused` reads went by (a late grab), when not 0.
+        focus_late: std::cell::Cell<u32>,
+        /// A click gives the field (`field` None) the focus.
+        click_focuses: std::cell::Cell<bool>,
         /// `may_open_menu` says no (Firefox).
         no_menu_open: std::cell::Cell<bool>,
         /// `toolkit_of` for every element ("" by default).
@@ -8744,8 +8865,29 @@ mod tests {
             let (app, title) = self.active.borrow().clone();
             Some(fake_pid(&app, &title))
         }
-        async fn term_view(&self, pid: u32, _: Option<&str>) -> selfguard::TermView {
+        async fn term_view(
+            &self,
+            pid: u32,
+            _: Option<&str>,
+            _: &selfguard::SelfClient,
+        ) -> selfguard::TermView {
             self.views.borrow().get(&pid).cloned().unwrap_or_default()
+        }
+        async fn client_tabs(&self, me: &selfguard::SelfClient) -> Vec<selfguard::ClientTab> {
+            let mut tabs: Vec<selfguard::ClientTab> = Vec::new();
+            for (&pid, v) in self.views.borrow().iter() {
+                for tty in v.clients.iter().filter(|_| me.daemon) {
+                    tabs.push(selfguard::ClientTab {
+                        tty: tty.clone(),
+                        terminal: selfguard::Proc {
+                            pid,
+                            name: v.name.clone(),
+                        },
+                    });
+                }
+            }
+            tabs.sort_by(|a, b| a.tty.cmp(&b.tty));
+            tabs
         }
         async fn element_pid(&self, _: &u32) -> Option<u32> {
             Some(fake_pid(&self.focus_app.borrow(), ""))
@@ -9089,6 +9231,14 @@ mod tests {
             }
         }
         async fn is_focused(&self, _: &u32) -> bool {
+            match self.sem.focus_late.get() {
+                0 => {}
+                1 => {
+                    self.sem.focus_late.set(0);
+                    *self.field.borrow_mut() = Some(String::new());
+                }
+                n => self.sem.focus_late.set(n - 1),
+            }
             self.field.borrow().is_some()
         }
         async fn try_focus(&self, _: &u32) -> R<Option<String>> {
@@ -9215,6 +9365,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             if clicks > 0 {
+                if self.sem.click_focuses.get() && self.field.borrow().is_none() {
+                    *self.field.borrow_mut() = Some(String::new());
+                }
                 self.keys
                     .borrow_mut()
                     .push(format!("click {button} x{clicks}"));
@@ -13046,6 +13199,110 @@ mod tests {
     }
 
     #[test]
+    fn set_text_waits_for_a_late_focus_then_clicks_the_field() {
+        local(async {
+            let mut s = session("late-focus");
+            *s.sem.toolkit.borrow_mut() = "gecko".into();
+            s.nodes.borrow_mut().insert(
+                30,
+                Info {
+                    states: vec!["editable"],
+                    ..fake_node("entry", "Telefon alanı", &[])
+                },
+            );
+            s.focus.borrow_mut().children = vec![30];
+            // The grab lands a few reads late: no click.
+            s.sem.focus_late.set(3);
+            let r = call_tool(
+                &mut s,
+                2,
+                "set_text",
+                json!({"app": "fake", "query": "Telefon alanı", "text": "0555"}),
+            )
+            .await;
+            if cfg!(target_os = "linux") {
+                assert!(reply_text(&r).contains("ok (verified"), "{r}");
+                assert_eq!(s.field.borrow().as_deref(), Some("0555"));
+                assert!(!s.keys.borrow().iter().any(|k| k.starts_with("click")));
+            }
+            // It never lands: a click on the field gives it the focus.
+            *s.field.borrow_mut() = None;
+            s.sem.click_focuses.set(true);
+            let r = call_tool(
+                &mut s,
+                3,
+                "set_text",
+                json!({"app": "fake", "query": "Telefon alanı", "text": "0555 1"}),
+            )
+            .await;
+            if cfg!(target_os = "linux") {
+                assert!(reply_text(&r).contains("ok (verified"), "{r}");
+                assert_eq!(s.field.borrow().as_deref(), Some("0555 1"));
+                assert!(s.keys.borrow().iter().any(|k| k == "click left x1"));
+            }
+        });
+    }
+
+    #[test]
+    fn a_label_named_stands_for_its_field_where_a_field_is_needed() {
+        local(async {
+            let mut s = session("label-for");
+            *s.field.borrow_mut() = Some(String::new());
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                // <label for="red">Red gerekçesi</label> beside the entry.
+                nodes.insert(33, fake_node("label", "Red gerekçesi", &[]));
+                nodes.insert(
+                    30,
+                    Info {
+                        states: vec!["editable"],
+                        ..fake_node("entry", "Not · reddederken zorunlu", &[])
+                    },
+                );
+            }
+            s.focus.borrow_mut().children = vec![33, 30];
+            s.sem
+                .labels
+                .borrow_mut()
+                .insert(30, vec!["Red gerekçesi".into()]);
+            let r = call_tool(
+                &mut s,
+                2,
+                "set_text",
+                json!({"app": "fake", "query": "Red gerekçesi", "text": "red"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with("[1] entry \"Not · reddederken zorunlu\""),
+                "{r}"
+            );
+            assert!(
+                text.contains("(labelled 'Red gerekçesi'): ok (verified"),
+                "{r}"
+            );
+            assert_eq!(s.field.borrow().as_deref(), Some("red"));
+            // Reads, and a role naming the label, keep the label.
+            let r = call_tool(
+                &mut s,
+                3,
+                "get_text",
+                json!({"app": "fake", "query": "Red gerekçesi"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("label \"Red gerekçesi\""), "{r}");
+            let r = call_tool(
+                &mut s,
+                4,
+                "focus",
+                json!({"app": "fake", "query": "Red gerekçesi", "role": "label"}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("(labelled"), "{r}");
+        });
+    }
+
+    #[test]
     fn set_text_finds_a_field_by_its_label_placeholder_or_description() {
         local(async {
             let mut s = session("labels");
@@ -14690,6 +14947,7 @@ mod tests {
                 ptys: vec!["pts/0".into(), "pts/5".into()],
                 shown: Some(shown.into()),
                 tabs: Some(vec!["pts/0".into(), "pts/5".into()]),
+                ..Default::default()
             },
         );
     }
@@ -14851,6 +15109,79 @@ mod tests {
             // Its other entries stay usable.
             s.focus.borrow_mut().name = "New Tab".into();
             let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "New Tab"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    /// Claude Code as a background job (2026-11-22): the server below
+    /// `claude daemon run` > bg-pty-host > bg-spare (pts/6); the user's
+    /// `claude` client, no ancestor, in Konsole's (pid 100) tab pts/0.
+    fn agent_under_daemon(s: &Session, shown: &str) {
+        let mut me = selfguard::SelfClient::walk(60, |pid| match pid {
+            60 => Some((61, "claude".into(), Some("pts/6".into()))),
+            61 => Some((62, "claude".into(), None)),
+            62 => Some((1, "claude".into(), None)),
+            _ => None,
+        });
+        me.mark_daemon(true, |pid| {
+            let line = match pid {
+                60 => "claude bg-spare --bg-spare /tmp/a.claim.sock",
+                61 => "claude bg-pty-host --bg-pty-host /tmp/a.pty.sock",
+                _ => "claude daemon run",
+            };
+            Some(("/v/claude/versions/2.1.330".into(), vec![line.into()]))
+        });
+        *s.client.borrow_mut() = me;
+        s.views.borrow_mut().insert(
+            100,
+            selfguard::TermView {
+                ptys: vec!["pts/0".into(), "pts/5".into()],
+                shown: Some(shown.into()),
+                tabs: Some(vec!["pts/0".into(), "pts/5".into()]),
+                clients: vec!["pts/0".into()],
+                name: "konsole".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn under_a_daemon_no_tab_running_its_client_gets_input() {
+        local(async {
+            let mut s = session("self-daemon");
+            set_allow("self-daemon", "fake\nkonsole\n");
+            agent_under_daemon(&s, "pts/0");
+            *s.active.borrow_mut() = ("konsole".into(), "~ : claude — Konsole".into());
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "shift"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("is konsole's tab running an interactive client (pts/0)"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("down")));
+            let r = call_tool(&mut s, 3, "doctor", json!({})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "client: claude (62) > claude (61) > claude (60) on pts/6; it runs under \
+                     a background daemon"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains("client tabs: claude UI on pts/0 in konsole (100)"),
+                "{text}"
+            );
+            // Reads work; the user's other tab takes input.
+            let r = call_tool(&mut s, 4, "screenshot", json!({})).await;
+            assert!(!reply_text(&r).contains("interactive client"), "{r}");
+            agent_under_daemon(&s, "pts/5");
+            let r = call_tool(&mut s, 5, "key", json!({"combo": "shift"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            // The opt-out lets it through.
+            agent_under_daemon(&s, "pts/0");
+            set_allow("self-daemon", "fake\nkonsole\nself-client: allow\n");
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "a"})).await;
             assert_ne!(r["result"]["isError"], true, "{r}");
         });
     }
@@ -16059,6 +16390,16 @@ mod tests {
         cache.insert(7, node("panel", &[8]));
         cache.insert(8, node("panel", &[7]));
         assert_eq!(frame_in(&cache, &8), None);
+        // A button in a web page's modal (role dialog under the page): the
+        // browser's frame, whose ACTIVE state counts, not the modal's.
+        cache.insert(10, node("frame", &[11]));
+        cache.insert(11, node("internal frame", &[12]));
+        cache.insert(12, node("document web", &[13]));
+        cache.insert(13, node("section", &[14]));
+        cache.insert(14, node("dialog", &[15]));
+        cache.insert(15, node("push button", &[]));
+        assert_eq!(frame_in(&cache, &15), Some(10));
+        assert_eq!(frame_in(&cache, &14), Some(10));
     }
 
     /// A web mail page in the fake: a table of rows and cells.

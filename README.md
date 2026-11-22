@@ -381,7 +381,9 @@ tool; `off` turns it off). Not available on Windows yet.
   AT-SPI labelled-by relation, UIA LabeledBy), placeholder text or
   description the query names is taken, if exactly one fits best; the reply
   says so (`(labelled 'Red gerekçesi')`). A web form's entry is often named
-  after something other than the label beside it.
+  after something other than the label beside it. The other way round, a
+  query that names a label (an HTML `<label for>`) stands for the field it
+  labels in `set_text`, `focus` and `act` (unless `role` names the label).
 - `role` (in `find`, `wait_for` and the `app` + `query` targets) compares
   without case, spaces, `_` or `-` (`Push_Button`, `pushbutton` and UIA's
   `checkbox` for `check box`). A role that matches nothing is tried again as
@@ -631,8 +633,9 @@ tool; `off` turns it off). Not available on Windows yet.
   list (no shell; its `.desktop` file first, else the program on `PATH`) and
   waits until its window opens (`wait_ms`, default 15 s, at most 60 s; 0 does
   not wait). Prints the window as `windows` does; also finds launches handed
-  to an already running instance (firefox, kate). Works on KDE, Hyprland and
-  Windows (see the Windows limitations).
+  to an already running instance (firefox, kate), also when it opened them as
+  a tab in a window left behind others ("opened in the running instance's
+  window"). Works on KDE, Hyprland and Windows (see the Windows limitations).
 - Terminal windows: `windows` also lists each terminal tab's pts device,
   foreground command and directory; `activate_window` with
   `terminal: "pytest"` brings forward the terminal running that command (or in

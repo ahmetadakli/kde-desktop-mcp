@@ -621,8 +621,23 @@ pub trait Backend {
     /// What the window of process `pid` titled `title` (None: the active
     /// window) shows of its terminals: those its processes hold and the tab
     /// in front, as far as the platform tells.
-    async fn term_view(&self, _pid: u32, _title: Option<&str>) -> crate::selfguard::TermView {
+    /// `me` is the client (`self_client`), whose daemon's interactive
+    /// clients the view lists.
+    async fn term_view(
+        &self,
+        _pid: u32,
+        _title: Option<&str>,
+        _me: &crate::selfguard::SelfClient,
+    ) -> crate::selfguard::TermView {
         crate::selfguard::TermView::default()
+    }
+    /// The terminal tabs running an interactive client of the daemon the
+    /// server runs under (`SelfClient::daemon`), for doctor.
+    async fn client_tabs(
+        &self,
+        _me: &crate::selfguard::SelfClient,
+    ) -> Vec<crate::selfguard::ClientTab> {
+        Vec::new()
     }
     /// Process id of the app the element belongs to; None when unknown.
     async fn element_pid(&self, _id: &Self::Id) -> Option<u32> {
@@ -703,6 +718,11 @@ pub trait Backend {
     /// when it has none (or the backend reads none).
     async fn labels(&self, _id: &Self::Id) -> Vec<String> {
         Vec::new()
+    }
+    /// The element label `id` is the label for (AT-SPI relation
+    /// LABEL_FOR); None without one, or where the backend cannot tell.
+    async fn label_target(&self, _id: &Self::Id) -> Option<Self::Id> {
+        None
     }
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
     /// The element's states as `act`'s verified actions read them, fresh.

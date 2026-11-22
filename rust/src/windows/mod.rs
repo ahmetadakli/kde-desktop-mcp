@@ -1009,7 +1009,7 @@ impl Backend for WindowsBackend {
                 out.note = match how {
                     Found::Own => "",
                     Found::New => "opened by the running instance",
-                    Found::Existing => "handed to the running instance",
+                    Found::Existing => "opened in the running instance's window",
                 }
                 .into();
                 return Ok(out);

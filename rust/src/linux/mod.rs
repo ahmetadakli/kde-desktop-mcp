@@ -174,6 +174,9 @@ const PASTE_READ_WAIT: Duration = Duration::from_secs(1);
 /// How long a focus request may take to show in the element's state.
 /// Qt reports focus about 3 ms after a GrabFocus that works.
 const FOCUS_POLL: Duration = Duration::from_millis(20);
+/// The same for Gecko, which applies focus in the page's own process: a
+/// grab that works may show only after tens of ms there.
+const FOCUS_POLL_GECKO: Duration = Duration::from_millis(150);
 const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
 const NOT_A_FILE_DIALOG: &str = "the active window is not a KDE file dialog";
 /// Roles holding rows of data (files, places) or tool buttons, never the
@@ -1401,7 +1404,44 @@ impl Backend for LinuxBackend {
         if let Some((konsole, shell)) = konsole::own_session(&self.session).await {
             me.add(konsole, "konsole", terminals::tty_of(shell));
         }
+        // Under Claude Code's daemon the client the user sees is no
+        // ancestor: remember what the daemon runs to tell its clients.
+        let env_bg = std::env::var("CLAUDE_CODE_SESSION_KIND").is_ok_and(|v| v == "bg")
+            || std::env::var("CLAUDE_BG_BACKEND").is_ok_and(|v| v == "daemon");
+        me.mark_daemon(env_bg, terminals::exe_and_argv);
         me
+    }
+
+    async fn client_tabs(
+        &self,
+        me: &crate::selfguard::SelfClient,
+    ) -> Vec<crate::selfguard::ClientTab> {
+        if !me.daemon {
+            return Vec::new();
+        }
+        let me = me.clone();
+        tokio::task::spawn_blocking(move || {
+            let stats = terminals::read_stats();
+            terminals::client_holders(&stats, |pid| is_client(&me, pid))
+                .into_iter()
+                // The daemon's own sessions, on the ptys its hosts hold.
+                .filter(|(_, holder)| {
+                    !terminals::exe_and_argv(*holder)
+                        .is_some_and(|(_, argv)| crate::selfguard::background_cmd(&argv))
+                })
+                .map(|(tty, pid)| crate::selfguard::ClientTab {
+                    tty,
+                    terminal: crate::selfguard::Proc {
+                        pid,
+                        name: terminals::proc_entry(pid)
+                            .map(|e| crate::selfguard::norm(&e.1))
+                            .unwrap_or_default(),
+                    },
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn active_pid(&self) -> Option<u32> {
@@ -1423,18 +1463,34 @@ impl Backend for LinuxBackend {
         }
     }
 
-    async fn term_view(&self, pid: u32, title: Option<&str>) -> crate::selfguard::TermView {
-        let ptys =
-            tokio::task::spawn_blocking(move || terminals::ptys_of(pid, &terminals::read_stats()))
-                .await
-                .unwrap_or_default();
+    async fn term_view(
+        &self,
+        pid: u32,
+        title: Option<&str>,
+        me: &crate::selfguard::SelfClient,
+    ) -> crate::selfguard::TermView {
+        let me = me.clone();
+        let (ptys, clients) = tokio::task::spawn_blocking(move || {
+            let stats = terminals::read_stats();
+            let ptys = terminals::ptys_of(pid, &stats);
+            let clients = if me.daemon && !ptys.is_empty() {
+                terminals::client_ptys(pid, &stats, |p| is_client(&me, p))
+            } else {
+                Vec::new()
+            };
+            (ptys, clients)
+        })
+        .await
+        .unwrap_or_default();
         let mut view = crate::selfguard::TermView {
             ptys,
+            clients,
             ..Default::default()
         };
         if view.ptys.is_empty() {
             return view;
         }
+        view.name = terminals::proc_entry(pid).map(|e| e.1).unwrap_or_default();
         let caption = async || match title {
             Some(t) => Some(t.to_string()),
             None => self.active_caption().await,
@@ -1521,6 +1577,10 @@ impl Backend for LinuxBackend {
 
     async fn object_id(&self, id: &Obj) -> String {
         self.a11y.accessible_id(id).await
+    }
+
+    async fn label_target(&self, id: &Obj) -> Option<Obj> {
+        self.a11y.relation(id, atspi::RELATION_LABEL_FOR).await
     }
 
     async fn labels(&self, id: &Obj) -> Vec<String> {
@@ -1764,15 +1824,21 @@ impl Backend for LinuxBackend {
     async fn try_focus(&self, id: &Obj) -> R<Option<String>> {
         // Qt only honours GrabFocus when the element exposes a "Set Focus"
         // action, so try both before the caller falls back to a click.
-        let (ifaces, actions, role) = tokio::join!(
+        let (ifaces, actions, role, toolkit) = tokio::join!(
             self.a11y.interfaces(id),
             self.a11y.actions(id),
-            self.a11y.role(id)
+            self.a11y.role(id),
+            self.toolkit(&id.bus)
         );
         if !ifaces.iter().any(|i| i == "org.a11y.atspi.Component") {
             return Err("element cannot take focus".into());
         }
-        let wait = FOCUS_POLL;
+        // Gecko moves focus in the page's process: it shows later.
+        let wait = if toolkit.eq_ignore_ascii_case("gecko") {
+            FOCUS_POLL_GECKO
+        } else {
+            FOCUS_POLL
+        };
         if self.focus_should_try(id, &role, FocusMethod::GrabFocus) {
             let ok = self.a11y.grab_focus(id).await && poll(wait, || self.is_focused(id)).await;
             self.focus_note(id, &role, FocusMethod::GrabFocus, ok);
@@ -2297,7 +2363,7 @@ impl Backend for LinuxBackend {
                 out.note = match how {
                     launch::Found::Own => "",
                     launch::Found::New => "opened by the running instance",
-                    launch::Found::Existing => "handed to the running instance",
+                    launch::Found::Existing => "opened in the running instance's window",
                 }
                 .into();
                 return Ok(out);
@@ -2606,6 +2672,12 @@ impl Backend for LinuxBackend {
             }
         }
     }
+}
+
+/// Whether process `pid` is an interactive client of the daemon the server
+/// runs under (`SelfClient::is_client`).
+fn is_client(me: &crate::selfguard::SelfClient, pid: u32) -> bool {
+    terminals::exe_and_argv(pid).is_some_and(|(exe, argv)| me.is_client(&exe, &argv))
 }
 
 #[cfg(test)]
