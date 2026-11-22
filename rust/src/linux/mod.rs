@@ -174,6 +174,9 @@ const PASTE_READ_WAIT: Duration = Duration::from_secs(1);
 /// How long a focus request may take to show in the element's state.
 /// Qt reports focus about 3 ms after a GrabFocus that works.
 const FOCUS_POLL: Duration = Duration::from_millis(20);
+/// The same for Gecko, which applies focus in the page's own process: a
+/// grab that works may show only after tens of ms there.
+const FOCUS_POLL_GECKO: Duration = Duration::from_millis(150);
 const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
 const NOT_A_FILE_DIALOG: &str = "the active window is not a KDE file dialog";
 /// Roles holding rows of data (files, places) or tool buttons, never the
@@ -1816,15 +1819,21 @@ impl Backend for LinuxBackend {
     async fn try_focus(&self, id: &Obj) -> R<Option<String>> {
         // Qt only honours GrabFocus when the element exposes a "Set Focus"
         // action, so try both before the caller falls back to a click.
-        let (ifaces, actions, role) = tokio::join!(
+        let (ifaces, actions, role, toolkit) = tokio::join!(
             self.a11y.interfaces(id),
             self.a11y.actions(id),
-            self.a11y.role(id)
+            self.a11y.role(id),
+            self.toolkit(&id.bus)
         );
         if !ifaces.iter().any(|i| i == "org.a11y.atspi.Component") {
             return Err("element cannot take focus".into());
         }
-        let wait = FOCUS_POLL;
+        // Gecko moves focus in the page's process: it shows later.
+        let wait = if toolkit.eq_ignore_ascii_case("gecko") {
+            FOCUS_POLL_GECKO
+        } else {
+            FOCUS_POLL
+        };
         if self.focus_should_try(id, &role, FocusMethod::GrabFocus) {
             let ok = self.a11y.grab_focus(id).await && poll(wait, || self.is_focused(id)).await;
             self.focus_note(id, &role, FocusMethod::GrabFocus, ok);

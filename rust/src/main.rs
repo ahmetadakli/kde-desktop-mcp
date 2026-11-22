@@ -95,6 +95,10 @@ fn looks_like_sleep(query: &str) -> bool {
 
 /// Roles of fields whose labels `by_label` reads besides editable ones.
 const FIELD_ROLES: &[&str] = &["entry", "text", "password text", "spin button", "combo box"];
+/// How long a focus request (or a click) may take to show before
+/// `take_focus` tries the next way: Gecko reports focus from the page's
+/// process, at times well after the backend's own short wait.
+const FOCUS_LATE: Duration = Duration::from_millis(300);
 /// Most fields whose labels one `by_label` reads.
 const LABEL_FIELDS: usize = 60;
 /// Nodes of a web page fetched when looking for matches scrolled out of
@@ -6180,7 +6184,7 @@ impl<B: Backend> Server<B> {
         if !front_checked && let Err(e) = self.require_input_front().await {
             return Err(e);
         }
-        if !matches!(self.b.try_focus(id).await, Ok(Some(_))) && !self.b.is_focused(id).await {
+        if !self.take_focus(id).await {
             return Err(
                 "it would not take the keyboard focus (not the field itself? find it \
                  by role, e.g. role \"text\")"
@@ -6194,6 +6198,44 @@ impl<B: Backend> Server<B> {
         } else {
             self.b.type_text(text).await.map(|_| ())
         }
+    }
+
+    /// Give `id` the keyboard focus for typing into it: the backend's
+    /// focus request (`try_focus`); then, as Gecko moves focus in the page's
+    /// own process and may report it later than the backend waits (or a
+    /// request lands while the document takes focus back), a while for it
+    /// to show and a second request; last, for an editable element, a
+    /// click on its centre, when its window is in front and the point is
+    /// not the agent's own. Whether it holds the focus in the end.
+    async fn take_focus(&self, id: &B::Id) -> bool {
+        if matches!(self.b.try_focus(id).await, Ok(Some(_))) || self.b.is_focused(id).await {
+            return true;
+        }
+        if wait_for(FOCUS_LATE, || self.b.is_focused(id)).await {
+            return true;
+        }
+        if matches!(self.b.try_focus(id).await, Ok(Some(_)))
+            || wait_for(FOCUS_LATE, || self.b.is_focused(id)).await
+        {
+            return true;
+        }
+        // Only a field is clicked: a click on a button would press it.
+        if !self.b.info(id, 0).await.states.contains(&"editable") {
+            return false;
+        }
+        let Ok((x, y)) = self.b.element_center(id).await else {
+            return false;
+        };
+        if self.guard_point(x as i64, y as i64).await.is_err()
+            || self
+                .b
+                .pointer(x as i64, y as i64, "left", 1, 0)
+                .await
+                .is_err()
+        {
+            return false;
+        }
+        wait_for(FOCUS_LATE, || self.b.is_focused(id)).await
     }
 
     /// Why a password field is not filled in, and how the user can allow it.
@@ -8550,6 +8592,11 @@ mod tests {
         wheel: std::cell::Cell<Option<(u32, u32)>>,
         /// `try_focus` works.
         focusable: std::cell::Cell<bool>,
+        /// The field (`field` None) takes focus once this many more
+        /// `is_focused` reads went by (a late grab), when not 0.
+        focus_late: std::cell::Cell<u32>,
+        /// A click gives the field (`field` None) the focus.
+        click_focuses: std::cell::Cell<bool>,
         /// `may_open_menu` says no (Firefox).
         no_menu_open: std::cell::Cell<bool>,
         /// `toolkit_of` for every element ("" by default).
@@ -9184,6 +9231,14 @@ mod tests {
             }
         }
         async fn is_focused(&self, _: &u32) -> bool {
+            match self.sem.focus_late.get() {
+                0 => {}
+                1 => {
+                    self.sem.focus_late.set(0);
+                    *self.field.borrow_mut() = Some(String::new());
+                }
+                n => self.sem.focus_late.set(n - 1),
+            }
             self.field.borrow().is_some()
         }
         async fn try_focus(&self, _: &u32) -> R<Option<String>> {
@@ -9310,6 +9365,9 @@ mod tests {
                 tokio::time::sleep(Duration::from_secs(5)).await;
             }
             if clicks > 0 {
+                if self.sem.click_focuses.get() && self.field.borrow().is_none() {
+                    *self.field.borrow_mut() = Some(String::new());
+                }
                 self.keys
                     .borrow_mut()
                     .push(format!("click {button} x{clicks}"));
@@ -13137,6 +13195,51 @@ mod tests {
                     .contains("written, but the field now holds \"05551234\" (8 chars, 11 asked"),
                 "{r}"
             );
+        });
+    }
+
+    #[test]
+    fn set_text_waits_for_a_late_focus_then_clicks_the_field() {
+        local(async {
+            let mut s = session("late-focus");
+            *s.sem.toolkit.borrow_mut() = "gecko".into();
+            s.nodes.borrow_mut().insert(
+                30,
+                Info {
+                    states: vec!["editable"],
+                    ..fake_node("entry", "Telefon alanı", &[])
+                },
+            );
+            s.focus.borrow_mut().children = vec![30];
+            // The grab lands a few reads late: no click.
+            s.sem.focus_late.set(3);
+            let r = call_tool(
+                &mut s,
+                2,
+                "set_text",
+                json!({"app": "fake", "query": "Telefon alanı", "text": "0555"}),
+            )
+            .await;
+            if cfg!(target_os = "linux") {
+                assert!(reply_text(&r).contains("ok (verified"), "{r}");
+                assert_eq!(s.field.borrow().as_deref(), Some("0555"));
+                assert!(!s.keys.borrow().iter().any(|k| k.starts_with("click")));
+            }
+            // It never lands: a click on the field gives it the focus.
+            *s.field.borrow_mut() = None;
+            s.sem.click_focuses.set(true);
+            let r = call_tool(
+                &mut s,
+                3,
+                "set_text",
+                json!({"app": "fake", "query": "Telefon alanı", "text": "0555 1"}),
+            )
+            .await;
+            if cfg!(target_os = "linux") {
+                assert!(reply_text(&r).contains("ok (verified"), "{r}");
+                assert_eq!(s.field.borrow().as_deref(), Some("0555 1"));
+                assert!(s.keys.borrow().iter().any(|k| k == "click left x1"));
+            }
         });
     }
 
