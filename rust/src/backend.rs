@@ -621,8 +621,23 @@ pub trait Backend {
     /// What the window of process `pid` titled `title` (None: the active
     /// window) shows of its terminals: those its processes hold and the tab
     /// in front, as far as the platform tells.
-    async fn term_view(&self, _pid: u32, _title: Option<&str>) -> crate::selfguard::TermView {
+    /// `me` is the client (`self_client`), whose daemon's interactive
+    /// clients the view lists.
+    async fn term_view(
+        &self,
+        _pid: u32,
+        _title: Option<&str>,
+        _me: &crate::selfguard::SelfClient,
+    ) -> crate::selfguard::TermView {
         crate::selfguard::TermView::default()
+    }
+    /// The terminal tabs running an interactive client of the daemon the
+    /// server runs under (`SelfClient::daemon`), for doctor.
+    async fn client_tabs(
+        &self,
+        _me: &crate::selfguard::SelfClient,
+    ) -> Vec<crate::selfguard::ClientTab> {
+        Vec::new()
     }
     /// Process id of the app the element belongs to; None when unknown.
     async fn element_pid(&self, _id: &Self::Id) -> Option<u32> {

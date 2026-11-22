@@ -2434,10 +2434,10 @@ impl<B: Backend> Server<B> {
         let Some(pid) = self.b.active_pid().await else {
             return Ok(());
         };
-        if me.ancestor(pid).is_none() {
+        if !me.may_own(pid) {
             return Ok(());
         }
-        let view = self.b.term_view(pid, None).await;
+        let view = self.b.term_view(pid, None, me).await;
         match me.front_owner(pid, &view) {
             None => Ok(()),
             Some(own) => {
@@ -2471,10 +2471,10 @@ impl<B: Backend> Server<B> {
         let Some(pid) = self.b.element_pid(id).await else {
             return Ok(());
         };
-        if me.ancestor(pid).is_none() {
+        if !me.may_own(pid) {
             return Ok(());
         }
-        let view = self.b.term_view(pid, Some("")).await;
+        let view = self.b.term_view(pid, Some(""), me).await;
         let name = if view.ptys.is_empty() {
             String::new()
         } else {
@@ -2502,6 +2502,10 @@ impl<B: Backend> Server<B> {
         };
         let mut names = self.allowed();
         names.extend(me.chain.iter().map(|p| p.name.clone()));
+        // Under a daemon, the terminals showing its clients too.
+        for t in self.b.client_tabs(me).await {
+            names.push(t.terminal.name);
+        }
         let Ok(list) = self.b.windows_quick("", &names).await else {
             return Ok(());
         };
@@ -2517,10 +2521,10 @@ impl<B: Backend> Server<B> {
             return Ok(());
         }
         for w in list.iter().filter(over) {
-            if me.ancestor(w.pid).is_none() {
+            if !me.may_own(w.pid) {
                 continue;
             }
-            let view = self.b.term_view(w.pid, Some(&w.title)).await;
+            let view = self.b.term_view(w.pid, Some(&w.title), me).await;
             if let Some(own) = me.front_owner(w.pid, &view) {
                 return Err(refusal(selfguard::point_refusal(
                     &own,
@@ -2536,10 +2540,10 @@ impl<B: Backend> Server<B> {
     /// Whether `w` is the agent's own window: what input to it in front
     /// would reach (`SelfClient::front_owner`).
     async fn is_own_window(&self, me: &selfguard::SelfClient, w: &WindowGeo) -> bool {
-        if me.ancestor(w.pid).is_none() {
+        if !me.may_own(w.pid) {
             return false;
         }
-        let view = self.b.term_view(w.pid, Some(&w.title)).await;
+        let view = self.b.term_view(w.pid, Some(&w.title), me).await;
         me.front_owner(w.pid, &view).is_some()
     }
 
@@ -2549,7 +2553,7 @@ impl<B: Backend> Server<B> {
     /// the usual pick.
     async fn other_than_own(&self, query: &str, list: &[WindowGeo]) -> Option<String> {
         let me = self.guarded_client().await?;
-        if !list.iter().any(|w| me.ancestor(w.pid).is_some()) {
+        if !list.iter().any(|w| me.may_own(w.pid)) {
             return None;
         }
         let ranked: Vec<(u8, &WindowGeo)> = list
@@ -4199,7 +4203,7 @@ impl<B: Backend> Server<B> {
         if let Some(me) = self.guarded_client().await
             && me.ancestor(w.pid).is_some()
         {
-            let view = self.b.term_view(w.pid, Some(&w.title)).await;
+            let view = self.b.term_view(w.pid, Some(&w.title), me).await;
             if let Some(own) = me.close_owner(w.pid, &view) {
                 return Err(refusal(selfguard::close_refusal(
                     &own,
@@ -4400,8 +4404,17 @@ impl<B: Backend> Server<B> {
                 }
                 (false, false) => format!(
                     "input never goes to the agent's own terminal tab or client window; \
-                     client: {}",
-                    me.describe()
+                     client: {}{}",
+                    me.describe(),
+                    if me.daemon {
+                        let name = me.client_names.first().map_or("client", String::as_str);
+                        format!(
+                            "; client tabs: {}",
+                            selfguard::describe_tabs(name, &self.b.client_tabs(me).await)
+                        )
+                    } else {
+                        String::new()
+                    }
                 ),
             },
         );
@@ -8744,8 +8757,29 @@ mod tests {
             let (app, title) = self.active.borrow().clone();
             Some(fake_pid(&app, &title))
         }
-        async fn term_view(&self, pid: u32, _: Option<&str>) -> selfguard::TermView {
+        async fn term_view(
+            &self,
+            pid: u32,
+            _: Option<&str>,
+            _: &selfguard::SelfClient,
+        ) -> selfguard::TermView {
             self.views.borrow().get(&pid).cloned().unwrap_or_default()
+        }
+        async fn client_tabs(&self, me: &selfguard::SelfClient) -> Vec<selfguard::ClientTab> {
+            let mut tabs: Vec<selfguard::ClientTab> = Vec::new();
+            for (&pid, v) in self.views.borrow().iter() {
+                for tty in v.clients.iter().filter(|_| me.daemon) {
+                    tabs.push(selfguard::ClientTab {
+                        tty: tty.clone(),
+                        terminal: selfguard::Proc {
+                            pid,
+                            name: v.name.clone(),
+                        },
+                    });
+                }
+            }
+            tabs.sort_by(|a, b| a.tty.cmp(&b.tty));
+            tabs
         }
         async fn element_pid(&self, _: &u32) -> Option<u32> {
             Some(fake_pid(&self.focus_app.borrow(), ""))
@@ -14690,6 +14724,7 @@ mod tests {
                 ptys: vec!["pts/0".into(), "pts/5".into()],
                 shown: Some(shown.into()),
                 tabs: Some(vec!["pts/0".into(), "pts/5".into()]),
+                ..Default::default()
             },
         );
     }
@@ -14851,6 +14886,79 @@ mod tests {
             // Its other entries stay usable.
             s.focus.borrow_mut().name = "New Tab".into();
             let r = call_tool(&mut s, 3, "act", json!({"app": "fake", "query": "New Tab"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    /// Claude Code as a background job (2026-11-22): the server below
+    /// `claude daemon run` > bg-pty-host > bg-spare (pts/6); the user's
+    /// `claude` client, no ancestor, in Konsole's (pid 100) tab pts/0.
+    fn agent_under_daemon(s: &Session, shown: &str) {
+        let mut me = selfguard::SelfClient::walk(60, |pid| match pid {
+            60 => Some((61, "claude".into(), Some("pts/6".into()))),
+            61 => Some((62, "claude".into(), None)),
+            62 => Some((1, "claude".into(), None)),
+            _ => None,
+        });
+        me.mark_daemon(true, |pid| {
+            let line = match pid {
+                60 => "claude bg-spare --bg-spare /tmp/a.claim.sock",
+                61 => "claude bg-pty-host --bg-pty-host /tmp/a.pty.sock",
+                _ => "claude daemon run",
+            };
+            Some(("/v/claude/versions/2.1.330".into(), vec![line.into()]))
+        });
+        *s.client.borrow_mut() = me;
+        s.views.borrow_mut().insert(
+            100,
+            selfguard::TermView {
+                ptys: vec!["pts/0".into(), "pts/5".into()],
+                shown: Some(shown.into()),
+                tabs: Some(vec!["pts/0".into(), "pts/5".into()]),
+                clients: vec!["pts/0".into()],
+                name: "konsole".into(),
+            },
+        );
+    }
+
+    #[test]
+    fn under_a_daemon_no_tab_running_its_client_gets_input() {
+        local(async {
+            let mut s = session("self-daemon");
+            set_allow("self-daemon", "fake\nkonsole\n");
+            agent_under_daemon(&s, "pts/0");
+            *s.active.borrow_mut() = ("konsole".into(), "~ : claude — Konsole".into());
+            let r = call_tool(&mut s, 2, "key", json!({"combo": "shift"})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("is konsole's tab running an interactive client (pts/0)"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            assert!(!s.keys.borrow().iter().any(|k| k.contains("down")));
+            let r = call_tool(&mut s, 3, "doctor", json!({})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains(
+                    "client: claude (62) > claude (61) > claude (60) on pts/6; it runs under \
+                     a background daemon"
+                ),
+                "{text}"
+            );
+            assert!(
+                text.contains("client tabs: claude UI on pts/0 in konsole (100)"),
+                "{text}"
+            );
+            // Reads work; the user's other tab takes input.
+            let r = call_tool(&mut s, 4, "screenshot", json!({})).await;
+            assert!(!reply_text(&r).contains("interactive client"), "{r}");
+            agent_under_daemon(&s, "pts/5");
+            let r = call_tool(&mut s, 5, "key", json!({"combo": "shift"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            // The opt-out lets it through.
+            agent_under_daemon(&s, "pts/0");
+            set_allow("self-daemon", "fake\nkonsole\nself-client: allow\n");
+            let r = call_tool(&mut s, 6, "key", json!({"combo": "a"})).await;
             assert_ne!(r["result"]["isError"], true, "{r}");
         });
     }

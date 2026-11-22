@@ -1401,7 +1401,39 @@ impl Backend for LinuxBackend {
         if let Some((konsole, shell)) = konsole::own_session(&self.session).await {
             me.add(konsole, "konsole", terminals::tty_of(shell));
         }
+        // Under Claude Code's daemon the client the user sees is no
+        // ancestor: remember what the daemon runs to tell its clients.
+        let env_bg = std::env::var("CLAUDE_CODE_SESSION_KIND").is_ok_and(|v| v == "bg")
+            || std::env::var("CLAUDE_BG_BACKEND").is_ok_and(|v| v == "daemon");
+        me.mark_daemon(env_bg, terminals::exe_and_argv);
         me
+    }
+
+    async fn client_tabs(
+        &self,
+        me: &crate::selfguard::SelfClient,
+    ) -> Vec<crate::selfguard::ClientTab> {
+        if !me.daemon {
+            return Vec::new();
+        }
+        let me = me.clone();
+        tokio::task::spawn_blocking(move || {
+            let stats = terminals::read_stats();
+            terminals::client_holders(&stats, |pid| is_client(&me, pid))
+                .into_iter()
+                .map(|(tty, pid)| crate::selfguard::ClientTab {
+                    tty,
+                    terminal: crate::selfguard::Proc {
+                        pid,
+                        name: terminals::proc_entry(pid)
+                            .map(|e| crate::selfguard::norm(&e.1))
+                            .unwrap_or_default(),
+                    },
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn active_pid(&self) -> Option<u32> {
@@ -1423,18 +1455,34 @@ impl Backend for LinuxBackend {
         }
     }
 
-    async fn term_view(&self, pid: u32, title: Option<&str>) -> crate::selfguard::TermView {
-        let ptys =
-            tokio::task::spawn_blocking(move || terminals::ptys_of(pid, &terminals::read_stats()))
-                .await
-                .unwrap_or_default();
+    async fn term_view(
+        &self,
+        pid: u32,
+        title: Option<&str>,
+        me: &crate::selfguard::SelfClient,
+    ) -> crate::selfguard::TermView {
+        let me = me.clone();
+        let (ptys, clients) = tokio::task::spawn_blocking(move || {
+            let stats = terminals::read_stats();
+            let ptys = terminals::ptys_of(pid, &stats);
+            let clients = if me.daemon && !ptys.is_empty() {
+                terminals::client_ptys(pid, &stats, |p| is_client(&me, p))
+            } else {
+                Vec::new()
+            };
+            (ptys, clients)
+        })
+        .await
+        .unwrap_or_default();
         let mut view = crate::selfguard::TermView {
             ptys,
+            clients,
             ..Default::default()
         };
         if view.ptys.is_empty() {
             return view;
         }
+        view.name = terminals::proc_entry(pid).map(|e| e.1).unwrap_or_default();
         let caption = async || match title {
             Some(t) => Some(t.to_string()),
             None => self.active_caption().await,
@@ -2606,6 +2654,12 @@ impl Backend for LinuxBackend {
             }
         }
     }
+}
+
+/// Whether process `pid` is an interactive client of the daemon the server
+/// runs under (`SelfClient::is_client`).
+fn is_client(me: &crate::selfguard::SelfClient, pid: u32) -> bool {
+    terminals::exe_and_argv(pid).is_some_and(|(exe, argv)| me.is_client(&exe, &argv))
 }
 
 #[cfg(test)]
