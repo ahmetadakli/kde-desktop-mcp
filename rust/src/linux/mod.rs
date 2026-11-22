@@ -1424,6 +1424,11 @@ impl Backend for LinuxBackend {
             let stats = terminals::read_stats();
             terminals::client_holders(&stats, |pid| is_client(&me, pid))
                 .into_iter()
+                // The daemon's own sessions, on the ptys its hosts hold.
+                .filter(|(_, holder)| {
+                    !terminals::exe_and_argv(*holder)
+                        .is_some_and(|(_, argv)| crate::selfguard::background_cmd(&argv))
+                })
                 .map(|(tty, pid)| crate::selfguard::ClientTab {
                     tty,
                     terminal: crate::selfguard::Proc {
