@@ -2358,7 +2358,7 @@ impl Backend for LinuxBackend {
                 out.note = match how {
                     launch::Found::Own => "",
                     launch::Found::New => "opened by the running instance",
-                    launch::Found::Existing => "handed to the running instance",
+                    launch::Found::Existing => "opened in the running instance's window",
                 }
                 .into();
                 return Ok(out);

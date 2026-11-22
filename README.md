@@ -633,8 +633,9 @@ tool; `off` turns it off). Not available on Windows yet.
   list (no shell; its `.desktop` file first, else the program on `PATH`) and
   waits until its window opens (`wait_ms`, default 15 s, at most 60 s; 0 does
   not wait). Prints the window as `windows` does; also finds launches handed
-  to an already running instance (firefox, kate). Works on KDE, Hyprland and
-  Windows (see the Windows limitations).
+  to an already running instance (firefox, kate), also when it opened them as
+  a tab in a window left behind others ("opened in the running instance's
+  window"). Works on KDE, Hyprland and Windows (see the Windows limitations).
 - Terminal windows: `windows` also lists each terminal tab's pts device,
   foreground command and directory; `activate_window` with
   `terminal: "pytest"` brings forward the terminal running that command (or in

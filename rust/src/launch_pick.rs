@@ -107,8 +107,9 @@ pub enum Found {
     Own,
     /// A new window of the app from another process (a running instance).
     New,
-    /// No new window, but the app's window in front is new or changed: a
-    /// running instance took the request (e.g. `kate -b file` opens a tab).
+    /// No new window, but the app's window in front is new or changed, or
+    /// another of its windows was renamed: a running instance took the
+    /// request (e.g. `kate -b file` or `firefox URL` opens a tab).
     Existing,
 }
 
@@ -161,16 +162,47 @@ pub fn pick_window<'a>(
             return Some((w, Found::New));
         }
     }
-    let active = of_app.into_iter().find(|w| w.active)?;
-    let changed = !was_active.contains(&key(active));
-    let title = active.title.to_lowercase();
-    let named = hints.iter().any(|h| title.contains(h.as_str()));
-    let ok = match stage {
-        Stage::Starting => changed && named,
-        Stage::Settled => changed || named,
-        Stage::Ended => true,
+    let named = |w: &WindowGeo| {
+        let title = w.title.to_lowercase();
+        hints.iter().any(|h| title.contains(h.as_str()))
     };
-    ok.then_some((active, Found::Existing))
+    if let Some(active) = of_app.iter().copied().find(|w| w.active) {
+        let changed = !was_active.contains(&key(active));
+        let ok = match stage {
+            Stage::Starting => changed && named(active),
+            Stage::Settled => changed || named(active),
+            Stage::Ended => true,
+        };
+        if ok {
+            return Some((active, Found::Existing));
+        }
+    }
+    // The instance opened it in a window it did not bring to the front
+    // (a browser's new tab, the compositor keeping focus where it was):
+    // a window of the app renamed since, of a process that had one.
+    let pids: HashSet<u32> = before
+        .iter()
+        .filter(|w| class_matches(w, app))
+        .map(|w| w.pid)
+        .collect();
+    let renamed: Vec<&WindowGeo> = of_app
+        .iter()
+        .copied()
+        .filter(|w| !old.contains(&key(w)) && pids.contains(&w.pid))
+        .collect();
+    let pick = match stage {
+        Stage::Starting => renamed.into_iter().find(|w| named(w)),
+        Stage::Settled | Stage::Ended => first(renamed),
+    };
+    if let Some(w) = pick {
+        return Some((w, Found::Existing));
+    }
+    // Ended cleanly with nothing renamed (the page's title was already
+    // shown): the app's only window took it.
+    match (stage, of_app.as_slice()) {
+        (Stage::Ended, [only]) => Some((only, Found::Existing)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +325,61 @@ mod tests {
         assert_eq!(
             pick_window("kate", &before, &now, &tree, Stage::Starting, &hints),
             Some((&own, Found::Own))
+        );
+    }
+
+    #[test]
+    fn a_tab_opened_in_a_window_left_behind_counts() {
+        // `firefox file:///…/live.html` with Firefox running: its window
+        // gets the page as a new tab but stays behind the terminal.
+        let tree = HashSet::from([50]);
+        let hints = arg_hints(&s(&["file:///tmp/smoke/live.html"]));
+        assert!(hints.is_empty());
+        let term = win("konsole", "~ : claude — Konsole", 7, true);
+        let before = [
+            term.clone(),
+            win("firefox", "Gelen kutusu — Mozilla Firefox", 10, false),
+        ];
+        let now = [
+            term.clone(),
+            win(
+                "firefox",
+                "desktop-mcp canli test — Mozilla Firefox",
+                10,
+                false,
+            ),
+        ];
+        let pick = |stage| pick_window("firefox", &before, &now, &tree, stage, &hints);
+        assert_eq!(pick(Stage::Starting), None);
+        assert_eq!(pick(Stage::Settled), Some((&now[1], Found::Existing)));
+        assert_eq!(pick(Stage::Ended), Some((&now[1], Found::Existing)));
+        // Already showing that title: its only window, once it ended.
+        let pick = |stage| pick_window("firefox", &now, &now, &tree, stage, &hints);
+        assert_eq!(pick(Stage::Settled), None);
+        assert_eq!(pick(Stage::Ended), Some((&now[1], Found::Existing)));
+        // With two windows left as they were, none can be told.
+        let two = [
+            now[1].clone(),
+            win("firefox", "Mail — Mozilla Firefox", 10, false),
+        ];
+        assert_eq!(
+            pick_window("firefox", &two, &two, &tree, Stage::Ended, &hints),
+            None
+        );
+        // A renamed window counts while just started only when its title
+        // names the file asked for.
+        let before = [win("org.kde.kate", "a.txt — Kate", 10, false)];
+        let now = [win("org.kde.kate", "notes.txt — Kate", 10, false)];
+        let hints = s(&["notes.txt"]);
+        assert_eq!(
+            pick_window("kate", &before, &now, &tree, Stage::Starting, &hints),
+            Some((&now[0], Found::Existing))
+        );
+        // Another process' window is no rename.
+        let now = [win("org.kde.kate", "notes.txt — Kate", 11, false)];
+        assert_eq!(
+            pick_window("kate", &before, &now, &tree, Stage::Settled, &hints),
+            None
         );
     }
 
