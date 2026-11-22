@@ -1571,6 +1571,10 @@ impl Backend for LinuxBackend {
         self.a11y.accessible_id(id).await
     }
 
+    async fn label_target(&self, id: &Obj) -> Option<Obj> {
+        self.a11y.relation(id, atspi::RELATION_LABEL_FOR).await
+    }
+
     async fn labels(&self, id: &Obj) -> Vec<String> {
         self.a11y.labels(id).await
     }

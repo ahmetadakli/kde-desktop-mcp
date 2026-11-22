@@ -719,6 +719,11 @@ pub trait Backend {
     async fn labels(&self, _id: &Self::Id) -> Vec<String> {
         Vec::new()
     }
+    /// The element label `id` is the label for (AT-SPI relation
+    /// LABEL_FOR); None without one, or where the backend cannot tell.
+    async fn label_target(&self, _id: &Self::Id) -> Option<Self::Id> {
+        None
+    }
     async fn do_action(&self, id: &Self::Id, index: usize) -> R<bool>;
     /// The element's states as `act`'s verified actions read them, fresh.
     async fn toggles(&self, id: &Self::Id) -> Toggles {

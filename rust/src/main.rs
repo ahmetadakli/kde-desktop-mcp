@@ -251,6 +251,29 @@ const READ_ONLY_TOOLS: [&str; 12] = [
     "batch",
 ];
 
+/// Whether the tool being run (`GATE`) with `args`, its target a label
+/// `info`, needs the field the label is for instead: set_text and focus
+/// always, act for a verified action (check, select…) or when the label
+/// has no action of its own. A click on a label is left alone (it reaches
+/// its field as the user's would), as are reads.
+fn label_needs_field<Id>(args: &Json, info: &Info<Id>) -> bool {
+    let tool = GATE
+        .try_with(|g| g.borrow().tool.clone())
+        .unwrap_or_default();
+    match tool.as_str() {
+        "set_text" | "focus" => true,
+        "act" => {
+            semantic::Verb::parse(&arg_s(args, "action", "")).is_some()
+                || args
+                    .get("option")
+                    .and_then(Json::as_str)
+                    .is_some_and(|o| !o.trim().is_empty())
+                || info.actions.is_empty()
+        }
+        _ => false,
+    }
+}
+
 /// The window at or above `id` in `cache`, as the backend walks up to it
 /// (`backend::WindowWalk`: the nearest frame, window or dialog, a web
 /// page's modal aside); None when the way up is not known for
@@ -3225,7 +3248,7 @@ impl<B: Backend> Server<B> {
         let mut kept = true;
         // The label, placeholder or description that named a field.
         let mut labelled: Option<String> = None;
-        let (id, cache, at, ties, synonym, over_chrome) = loop {
+        let (mut id, mut cache, mut at, ties, synonym, over_chrome) = loop {
             let located = self.locate(app, query, &role, true, kept, window);
             let located = trace::time("locate", located).await?;
             let (mut m, mut cache, cached) = match located {
@@ -3303,6 +3326,17 @@ impl<B: Backend> Server<B> {
             self.forget_reads(&app_key);
             kept = false;
         };
+        // A label named, where the tool needs the field it labels.
+        if labelled.is_none()
+            && role.trim().is_empty()
+            && cache[&id].role == "label"
+            && label_needs_field(a, &cache[&id])
+            && let Some(field) = self.labelled_field(&id, &mut cache).await
+        {
+            labelled = Some(cache[&id].name.clone());
+            id = field;
+            at = None;
+        }
         let rid = trace::time("add_ref", self.add_ref(&id, &cache[&id], &app_key)).await;
         note_step_element(rid, true);
         let mut found = render::describe(&cache[&id], rid);
@@ -3331,6 +3365,24 @@ impl<B: Backend> Server<B> {
             role,
         };
         Ok((t, at))
+    }
+
+    /// The field label `label` is for: its LABEL_FOR relation (the
+    /// backend's `label_target`), else the one visible field `by_label`
+    /// finds labelled by its name. Read into `cache` when it was not.
+    async fn labelled_field(&self, label: &B::Id, cache: &mut Cache<B::Id>) -> Option<B::Id> {
+        if let Some(f) = self.b.label_target(label).await {
+            if !cache.contains_key(&f) {
+                let info = self.b.info(&f, 0).await;
+                if info.role.is_empty() || !info.showing {
+                    return None;
+                }
+                cache.insert(f.clone(), info);
+            }
+            return Some(f);
+        }
+        let name = cache.get(label)?.name.clone();
+        self.by_label(cache, &name, "").await.map(|(f, _)| f)
     }
 
     /// The one visible field (an editable element) that its label,
@@ -13085,6 +13137,65 @@ mod tests {
                     .contains("written, but the field now holds \"05551234\" (8 chars, 11 asked"),
                 "{r}"
             );
+        });
+    }
+
+    #[test]
+    fn a_label_named_stands_for_its_field_where_a_field_is_needed() {
+        local(async {
+            let mut s = session("label-for");
+            *s.field.borrow_mut() = Some(String::new());
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                // <label for="red">Red gerekçesi</label> beside the entry.
+                nodes.insert(33, fake_node("label", "Red gerekçesi", &[]));
+                nodes.insert(
+                    30,
+                    Info {
+                        states: vec!["editable"],
+                        ..fake_node("entry", "Not · reddederken zorunlu", &[])
+                    },
+                );
+            }
+            s.focus.borrow_mut().children = vec![33, 30];
+            s.sem
+                .labels
+                .borrow_mut()
+                .insert(30, vec!["Red gerekçesi".into()]);
+            let r = call_tool(
+                &mut s,
+                2,
+                "set_text",
+                json!({"app": "fake", "query": "Red gerekçesi", "text": "red"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with("[1] entry \"Not · reddederken zorunlu\""),
+                "{r}"
+            );
+            assert!(
+                text.contains("(labelled 'Red gerekçesi'): ok (verified"),
+                "{r}"
+            );
+            assert_eq!(s.field.borrow().as_deref(), Some("red"));
+            // Reads, and a role naming the label, keep the label.
+            let r = call_tool(
+                &mut s,
+                3,
+                "get_text",
+                json!({"app": "fake", "query": "Red gerekçesi"}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("label \"Red gerekçesi\""), "{r}");
+            let r = call_tool(
+                &mut s,
+                4,
+                "focus",
+                json!({"app": "fake", "query": "Red gerekçesi", "role": "label"}),
+            )
+            .await;
+            assert!(!reply_text(&r).contains("(labelled"), "{r}");
         });
     }
 

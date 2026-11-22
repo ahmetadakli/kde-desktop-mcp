@@ -133,7 +133,8 @@ pub const CHECKABLE: u32 = 41;
 pub const HAS_POPUP: u32 = 42;
 
 // AtspiRelationType: a browser window EMBEDS its current tab's document;
-// a field is LABELLED_BY its label.
+// a label is the LABEL_FOR its field, which is LABELLED_BY it.
+pub const RELATION_LABEL_FOR: u32 = 1;
 pub const RELATION_LABELLED_BY: u32 = 2;
 pub const RELATION_EMBEDS: u32 = 13;
 
