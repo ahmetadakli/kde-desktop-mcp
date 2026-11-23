@@ -521,23 +521,15 @@ async fn wl_copy(text: &str) -> R<()> {
     Ok(())
 }
 
-/// A new, empty file only this user can read, for a screenshot. Creating it
-/// exclusively means a planted file or symlink in /tmp makes this fail
-/// instead of being written through.
+/// A new, empty file only this user can read, for a screenshot, in the
+/// private screenshot directory (`spill`). Creating it exclusively means a
+/// planted file or symlink makes this fail instead of being written
+/// through.
 fn temp_png() -> R<(PathBuf, std::fs::File)> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("desktop-mcp-{}-{nanos}.png", std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| format!("screenshot: cannot create {}: {e}", path.display()))?;
-    Ok((path, file))
+    let dir = crate::spill::dir(&crate::spill::SHOTS)
+        .ok_or("screenshot: no directory for the image (HOME is not set)")?;
+    crate::spill::create(&dir, &crate::spill::SHOTS)
+        .map_err(|e| format!("screenshot: cannot create a file in {}: {e}", dir.display()))
 }
 
 /// Whether an external capture tool (`tool`) wrote the image: Err with

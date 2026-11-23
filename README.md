@@ -700,7 +700,15 @@ tool; `off` turns it off). Not available on Windows yet.
   only (about width x height / 750: 786 at 1024x576), so the default size
   stays: at 896 px a 1080p window's 13 px text shrinks to 6 px. An inline
   screenshot leaves no file behind and names none; `inline: false` saves a
-  PNG and returns only its path; given `image_x`/`image_y`,
+  PNG and returns only its path. Captures go to a new file only the user
+  can read, never through an existing file or symlink: Linux
+  `$XDG_RUNTIME_DIR/desktop-mcp/shots` (else `~/.cache/desktop-mcp/shots`,
+  directories 0700, files 0600), Windows
+  `%LOCALAPPDATA%\desktop-mcp\shots`; the newest 20 are kept. `save_to`
+  (an absolute or `~/` path to a new `.png`) saves the image there instead,
+  only in an existing folder under the home folder that the user owns and
+  no one else can write to; an existing file is refused, never replaced.
+  Given `image_x`/`image_y`,
   `mouse` converts a pixel of the image to a screen coordinate (window position
   and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
   in pixels of the last screenshot captures again and returns only that part,

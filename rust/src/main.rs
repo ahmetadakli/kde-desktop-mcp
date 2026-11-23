@@ -1700,7 +1700,7 @@ impl<Id> Target<Id> {
 /// Write a tree's text to a new private file; the reply names it, with
 /// its size and first lines.
 async fn tree_to_file(text: String) -> R<String> {
-    let dir = spill::dir().ok_or("no directory for tree files (HOME is not set)")?;
+    let dir = spill::dir(&spill::TREES).ok_or("no directory for tree files (HOME is not set)")?;
     let head: Vec<&str> = text.lines().take(TREE_FILE_HEAD).collect();
     let head = head.join("\n");
     let shown = dir.display().to_string();
@@ -7424,6 +7424,16 @@ impl<B: Backend> Server<B> {
     /// resolution, mapped so image_x/image_y refer to the zoomed image.
     async fn screenshot(&self, a: &Json) -> R<Out> {
         let region = region_arg(a)?;
+        // A path to save at is checked before anything is captured.
+        let save_to = match a.get("save_to").and_then(Json::as_str) {
+            Some(raw) => {
+                let home = home_dir();
+                let path =
+                    expand_path(raw, home.as_deref()).map_err(|e| format!("save_to: {e}"))?;
+                Some(spill::check_save_path(&path, home.as_deref())?)
+            }
+            None => None,
+        };
         // The window captured is the one checked: read once, its app by
         // its process.
         let target = trace::time("shot_target", self.b.shot_target())
@@ -7459,7 +7469,7 @@ impl<B: Backend> Server<B> {
             }
         };
         let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, 8192) as u32;
-        let inline = arg_b(a, "inline", true);
+        let inline = arg_b(a, "inline", true) && save_to.is_none();
         // Converting, shrinking and encoding take milliseconds: keep other
         // calls moving.
         let file = path.clone();
@@ -7483,6 +7493,16 @@ impl<B: Backend> Server<B> {
         let mut text = if inline {
             let _ = std::fs::remove_file(&path);
             format!("{iw}x{ih} px")
+        } else if let Some(dest) = save_to {
+            // The caller's copy is all that is left: the private file goes.
+            let _ = std::fs::remove_file(&path);
+            let shown = dest.display().to_string();
+            let png = done.png.clone();
+            tokio::task::spawn_blocking(move || spill::save(&dest, &png))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("save_to: cannot write {shown}: {e}"))?;
+            format!("{shown}\n{iw}x{ih} px")
         } else {
             format!("{path}\n{iw}x{ih} px")
         };
@@ -10817,6 +10837,58 @@ mod tests {
             for name in common.trim_end_matches('.').split(", ") {
                 assert!(names.contains(&json!(name)), "{name}");
             }
+        });
+    }
+
+    #[test]
+    fn screenshot_save_to_writes_a_new_png_and_refuses_bad_paths() {
+        local(async {
+            let mut s = session("saveto");
+            // Refused before anything is captured.
+            for (path, want) in [
+                ("shot.png", "not absolute"),
+                ("/etc/shot.png", "inside the home folder"),
+                ("~/shot.jpg", ".png"),
+            ] {
+                let r = call_tool(&mut s, 2, "screenshot", json!({"save_to": path})).await;
+                assert!(reply_text(&r).contains(want), "{path}: {r}");
+            }
+            let Some(home) = home_dir() else { return };
+            let dir = home
+                .join(".cache")
+                .join(format!("desktop-mcp-test-saveto-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let file = dir.join("a.png");
+            let a = json!({"save_to": file.display().to_string(), "max_size": 100});
+            let r = call_tool(&mut s, 3, "screenshot", a.clone()).await;
+            // No image: the reply names the file, which holds the PNG.
+            assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1, "{r}");
+            let text = reply_text(&r);
+            let saved = std::fs::canonicalize(&file).unwrap();
+            assert!(
+                text.starts_with(&format!("{}\n100x50 px", saved.display())),
+                "{text}"
+            );
+            assert_eq!(
+                shot::read_png(&saved.display().to_string()).unwrap().width,
+                100
+            );
+            // The capture's own file is gone.
+            let own = std::env::temp_dir().join(format!(
+                "desktop-mcp-test-{}-saveto.png",
+                std::process::id()
+            ));
+            assert!(!own.exists());
+            // Never over an existing file.
+            let r = call_tool(&mut s, 4, "screenshot", a).await;
+            assert!(reply_text(&r).contains("already exists"), "{r}");
+            std::fs::remove_dir_all(&dir).unwrap();
         });
     }
 

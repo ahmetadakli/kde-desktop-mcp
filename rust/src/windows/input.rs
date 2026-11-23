@@ -1,8 +1,6 @@
 //! Win32 side of input and windows: SendInput, the cursor, the foreground
 //! window, process names and window screenshots.
 
-use std::path::PathBuf;
-
 use windows::Win32::Foundation::{CloseHandle, FILETIME, GetLastError, HWND, POINT, RECT};
 use windows::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, BitBlt, CAPTUREBLT, CreateCompatibleBitmap,
@@ -382,20 +380,13 @@ fn grab_rect(w: i32, ht: i32, r: RECT) -> Option<(u32, u32, Vec<u8>, RECT)> {
 }
 
 /// Capture window `h`, which must be the foreground window: its RGB pixels
-/// and screen rectangle, plus a new private file in %TEMP% for the PNG made
+/// and screen rectangle, plus a new private file (`spill::SHOTS`) for the PNG made
 /// from them.
 pub fn screenshot(h: HWND) -> R<(String, shot::Pixels, RECT)> {
     let (width, height, data, rect) = grab_foreground(h)?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path: PathBuf = std::env::temp_dir().join(format!("desktop-mcp-{nanos}.png"));
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&path)
-        .map_err(|e| format!("screenshot: cannot create {}: {e}", path.display()))?;
+    let dir = crate::spill::dir(&crate::spill::SHOTS).ok_or("screenshot: no image directory")?;
+    let (path, _) = crate::spill::create(&dir, &crate::spill::SHOTS)
+        .map_err(|e| format!("screenshot: cannot create a file in {}: {e}", dir.display()))?;
     let pixels = shot::Pixels {
         width,
         height,
