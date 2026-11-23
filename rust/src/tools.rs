@@ -81,6 +81,30 @@ pub const OBSERVE_TOOLS: [&str; 10] = [
 /// Values of `observe`.
 pub const OBSERVE_KINDS: [&str; 5] = ["none", "effect", "focus", "tree", "screenshot"];
 
+/// Mouse buttons click, drag, mouse and hold take.
+pub const BUTTONS: [&str; 3] = ["left", "right", "middle"];
+
+/// Values of move_window's `state`.
+pub const WINDOW_STATES: [&str; 3] = ["maximize", "minimize", "restore"];
+
+/// Values of wait_for's `state`.
+pub const WAIT_STATES: [&str; 4] = ["enabled", "focused", "checked", "selected"];
+
+/// Values of file_dialog's `action`.
+pub const DIALOG_ACTIONS: [&str; 2] = ["open", "save"];
+
+/// Arguments that take one of a closed set of values, sent as an `enum`
+/// (tool, argument, values). `observe` is added with OBSERVE_TOOLS.
+const ENUMS: [(&str, &str, &[&str]); 7] = [
+    ("click", "button", &BUTTONS),
+    ("drag", "button", &BUTTONS),
+    ("mouse", "button", &BUTTONS),
+    ("hold", "button", &BUTTONS),
+    ("move_window", "state", &WINDOW_STATES),
+    ("wait_for", "state", &WAIT_STATES),
+    ("file_dialog", "action", &DIALOG_ACTIONS),
+];
+
 /// Sent as `instructions` in the initialize result. Clients that load tool
 /// schemas lazily show only this and the tool names at session start, so it
 /// carries the workflow and the targeting rules that every tool shares. It
@@ -313,7 +337,7 @@ pub fn tools() -> Json {
         t(
             "click",
             &d(
-                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. `button`: left, right or middle;\n`clicks`: 2 = double, 3 = triple (select a line). `modifiers` are held\nduring the click, e.g. [\"ctrl\"] to add to a selection, [\"shift\"] for a\nrange. A menu, combo box list or dialog the click opened is listed with its\nentries' ids (opened: …; Linux; Windows: menus); a right click, or one on a combo box or menu\nentry, waits up to 150 ms for one to show."
+                "Real pointer click on an element's centre, for elements without actions.\nThe element's window must be active. `clicks`: 2 = double,\n3 = triple (select a line). `modifiers` are held\nduring the click, e.g. [\"ctrl\"] to add to a selection, [\"shift\"] for a\nrange. A menu, combo box list or dialog the click opened is listed with its\nentries' ids (opened: …; Linux; Windows: menus); a right click, or one on a combo box or menu\nentry, waits up to 150 ms for one to show."
             ),
             target(&[
                 ("button", "string", Some(json!("left"))),
@@ -347,7 +371,7 @@ pub fn tools() -> Json {
         ),
         t(
             "wait_for",
-            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). Matches like act's `query`, except that window, tab\nand page titles (frame, window, page tab, document web), which name a page\nbefore it has loaded, match only when `role` names that role. `state` (enabled, focused, checked,\nselected): the element must also have it (with `gone`: until it no longer\ndoes). `window` instead of `query`: wait for a window of an allowed app\n(`app`, if given) whose title or app name contains it to open, or with\n`gone` to close. To just wait a fixed time, use pause, not a query that\nnever matches.",
+            "Wait until an element matching `query` (+ `role`) is visible in `app`, or with\n`gone`=true until none is; checks every 50 ms up to `timeout_ms` (at most\n600000 = 10 minutes; a larger value is cut and the reply says so). Use instead\nof polling with tree/find after an action that takes time (a dialog, a load, a\nlong build or download). Matches like act's `query`, except that window, tab\nand page titles (frame, window, page tab, document web), which name a page\nbefore it has loaded, match only when `role` names that role. `state`: the element must\nalso have it (with `gone`: until it no longer\ndoes). `window` instead of `query`: wait for a window of an allowed app\n(`app`, if given) whose title or app name contains it to open, or with\n`gone` to close. To just wait a fixed time, use pause, not a query that\nnever matches.",
             schema(&[
                 ("app", "string", Some(Json::Null)),
                 ("query", "string", Some(Json::Null)),
@@ -397,7 +421,7 @@ pub fn tools() -> Json {
         ),
         t(
             "mouse",
-            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple; `button` left, right or middle) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. A right click lists the menu it opened with ids (opened: …; Linux; Windows: menus).",
+            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. A right click lists the menu it opened with ids (opened: …; Linux; Windows: menus).",
             schema(&[
                 ("x", "integer", Some(Json::Null)),
                 ("y", "integer", Some(Json::Null)),
@@ -548,6 +572,9 @@ pub fn tools() -> Json {
         }
         let name = tool["name"].as_str().unwrap().to_string();
         let name = name.as_str();
+        for (_, arg, values) in ENUMS.iter().filter(|(t, ..)| *t == name) {
+            tool["inputSchema"]["properties"][arg]["enum"] = json!(values);
+        }
         if READ_ONLY.contains(&name) {
             tool["annotations"] = json!({ "readOnlyHint": true });
         } else {
@@ -654,5 +681,153 @@ mod tests {
             .find(|t| t["name"] == "close_window")
             .unwrap();
         assert_eq!(close["annotations"]["destructiveHint"], json!(true));
+    }
+
+    /// JSON Schema types a property may name.
+    const TYPES: [&str; 6] = ["string", "integer", "number", "boolean", "array", "object"];
+
+    /// Whether `v` has JSON Schema type `kind`.
+    fn has_type(v: &Json, kind: &str) -> bool {
+        match kind {
+            "string" => v.is_string(),
+            "integer" => v.is_i64() || v.is_u64(),
+            "number" => v.is_number(),
+            "boolean" => v.is_boolean(),
+            "array" => v.is_array(),
+            "object" => v.is_object(),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn every_tool_has_a_description_annotations_and_a_sound_schema() {
+        let list = tools();
+        let mut names = std::collections::HashSet::new();
+        for tool in list.as_array().unwrap() {
+            let name = tool["name"].as_str().unwrap();
+            assert!(names.insert(name), "{name} twice");
+            assert!(
+                !name.is_empty() && name.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                "{name}"
+            );
+            let desc = tool["description"].as_str().unwrap_or("");
+            assert!(desc.trim().len() > 20, "{name}: no description");
+            let ann = &tool["annotations"];
+            assert!(ann["readOnlyHint"].is_boolean(), "{name}: readOnlyHint");
+            if ann["readOnlyHint"] == json!(false) {
+                assert!(
+                    ann["destructiveHint"].is_boolean(),
+                    "{name}: destructiveHint"
+                );
+            }
+            let schema = &tool["inputSchema"];
+            assert_eq!(schema["type"], "object", "{name}");
+            let props = schema["properties"].as_object().unwrap();
+            for req in schema["required"].as_array().into_iter().flatten() {
+                let req = req.as_str().unwrap();
+                assert!(
+                    props.contains_key(req),
+                    "{name}: required {req} not a property"
+                );
+                assert!(
+                    props[req].get("default").is_none(),
+                    "{name}.{req}: required with a default"
+                );
+            }
+            for (arg, p) in props {
+                let kinds: Vec<&str> = match &p["type"] {
+                    Json::String(k) => vec![k.as_str()],
+                    Json::Array(ks) => ks.iter().map(|k| k.as_str().unwrap()).collect(),
+                    other => panic!("{name}.{arg}: type {other}"),
+                };
+                assert!(
+                    kinds.iter().all(|k| TYPES.contains(k)),
+                    "{name}.{arg}: {kinds:?}"
+                );
+                if kinds.contains(&"array") {
+                    assert!(p["items"].is_object(), "{name}.{arg}: array without items");
+                }
+                if let Some(d) = p.get("default") {
+                    assert!(
+                        kinds.iter().any(|k| has_type(d, k)),
+                        "{name}.{arg}: default {d}"
+                    );
+                }
+                if let Some(values) = p.get("enum") {
+                    let values = values.as_array().unwrap();
+                    assert!(!values.is_empty(), "{name}.{arg}: empty enum");
+                    for v in values {
+                        assert!(kinds.iter().any(|k| has_type(v, k)), "{name}.{arg}: {v}");
+                    }
+                    if let Some(d) = p.get("default") {
+                        assert!(values.contains(d), "{name}.{arg}: default {d} not in enum");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn closed_sets_of_values_are_enums() {
+        let list = tools();
+        let by_name = |n: &str| {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .find(|t| t["name"] == n)
+                .unwrap_or_else(|| panic!("{n} is no tool"))
+        };
+        for (tool, arg, values) in ENUMS {
+            let p = &by_name(tool)["inputSchema"]["properties"][arg];
+            assert_eq!(p["enum"], json!(values), "{tool}.{arg}");
+        }
+        for tool in OBSERVE_TOOLS {
+            let p = &by_name(tool)["inputSchema"]["properties"]["observe"];
+            assert_eq!(p["enum"], json!(OBSERVE_KINDS), "{tool}.observe");
+        }
+    }
+
+    #[test]
+    fn the_tool_list_is_the_same_every_time() {
+        // Clients cache it, and a prompt cache breaks on any change: the
+        // order of tools and of their properties must not vary.
+        let a = serde_json::to_string(&tools()).unwrap();
+        for _ in 0..5 {
+            assert_eq!(serde_json::to_string(&tools()).unwrap(), a);
+        }
+        let names: Vec<_> = tools()
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(names.first().map(String::as_str), Some("apps"));
+        assert_eq!(names.last().map(String::as_str), Some("batch"));
+    }
+
+    /// What every session pays for up front: the instructions and the
+    /// always-loaded tools as tools/list sends them. Raise it on purpose
+    /// only, with the reason in the commit.
+    const ALWAYS_LOADED_BUDGET: usize = 19_500;
+
+    #[test]
+    fn the_always_loaded_context_stays_in_budget() {
+        let list = tools();
+        let tools_bytes: usize = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|t| ALWAYS_LOAD.contains(&t["name"].as_str().unwrap()))
+            .map(|t| serde_json::to_string(t).unwrap().len())
+            .sum();
+        let total = INSTRUCTIONS.len() + tools_bytes;
+        eprintln!(
+            "always loaded: {total} bytes (instructions {}, tools {tools_bytes})",
+            INSTRUCTIONS.len()
+        );
+        assert!(
+            total <= ALWAYS_LOADED_BUDGET,
+            "always-loaded context is {total} bytes, over the budget of {ALWAYS_LOADED_BUDGET}"
+        );
     }
 }

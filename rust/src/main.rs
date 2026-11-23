@@ -529,7 +529,6 @@ impl Held {
 
 /// Modifiers click, mouse and scroll take.
 const MODIFIERS: [&str; 4] = ["ctrl", "shift", "alt", "meta"];
-const BUTTONS: [&str; 3] = ["left", "right", "middle"];
 
 /// One name per key, so "control" held and "ctrl" asked are the same key.
 fn canon_key(name: &str) -> String {
@@ -4206,7 +4205,7 @@ impl<B: Backend> Server<B> {
             desktop: desktop_arg(a)?,
         };
         if let Some(st) = &change.state
-            && !["maximize", "minimize", "restore"].contains(&st.as_str())
+            && !tools::WINDOW_STATES.contains(&st.as_str())
         {
             return Err(format!(
                 "state must be maximize, minimize or restore, not '{st}'"
@@ -7020,7 +7019,7 @@ impl<B: Backend> Server<B> {
                 keys.into_iter().map(Held::Key).collect()
             }
             (None, Some(b)) => {
-                if !BUTTONS.contains(&b) {
+                if !tools::BUTTONS.contains(&b) {
                     return Err(format!("unknown button '{b}' (left, right, middle)"));
                 }
                 vec![Held::Button(b.to_string())]
@@ -11385,6 +11384,24 @@ mod tests {
         assert!(check_dialog_path(&dir.join("no/such.txt"), "save").is_err());
         assert!(check_dialog_path(&file, "delete").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_enum_value_in_the_schemas_is_taken() {
+        // The schemas offer these values; the handlers must take each one.
+        for s in tools::WAIT_STATES {
+            assert_eq!(WaitState::parse(s).unwrap().name(), s);
+        }
+        let file = std::env::temp_dir().join(format!("desktop-mcp-en-{}", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        for a in tools::DIALOG_ACTIONS {
+            assert!(check_dialog_path(&file, a).is_ok(), "{a}");
+        }
+        std::fs::remove_file(&file).unwrap();
+        for k in tools::OBSERVE_KINDS {
+            let a = json!({ "observe": k });
+            assert!(observe_arg("click", &a).is_ok(), "{k}");
+        }
     }
 
     #[test]

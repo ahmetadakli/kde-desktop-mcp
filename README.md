@@ -969,6 +969,12 @@ Linux too):
 cd rust && cargo test --release
 ```
 
+They also check the tool list itself: every tool's annotations, description
+and schema (required arguments, defaults, enums), its stable order, and a byte
+budget for what every session loads up front (the instructions and the
+always-loaded tools). CI also runs `cargo audit` on `rust/Cargo.lock`, weekly
+too; accepted advisories and why are in `rust/.cargo/audit.toml`.
+
 `tools/mcp_smoke_test.py` tests end to end on the real desktop over the real
 MCP protocol (Linux, Kate): it opens the editor with a temporary file, finds the
 element, refocuses it after focus moved elsewhere, types text with Turkish
