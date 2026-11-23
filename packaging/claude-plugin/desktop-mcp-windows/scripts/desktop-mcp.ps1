@@ -11,7 +11,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # Kept equal to rust/Cargo.toml by rust/tests/plugin_package.rs.
-$version = '0.17.1'
+$version = '0.18.0'
 $releases = $env:DESKTOP_MCP_RELEASES_URL
 if (-not $releases) { $releases = 'https://github.com/ahmetadakli/kde-desktop-mcp/releases' }
 

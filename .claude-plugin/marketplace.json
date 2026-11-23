@@ -12,14 +12,14 @@
       "name": "desktop-mcp",
       "source": "./packaging/claude-plugin/desktop-mcp",
       "description": "The desktop MCP server on Linux (KDE Plasma Wayland, Hyprland): accessibility-tree targeting with real keyboard and mouse input.",
-      "version": "0.17.1",
+      "version": "0.18.0",
       "category": "productivity"
     },
     {
       "name": "desktop-mcp-windows",
       "source": "./packaging/claude-plugin/desktop-mcp-windows",
       "description": "The desktop MCP server on Windows 10 and 11: UI Automation targeting with real keyboard and mouse input.",
-      "version": "0.17.1",
+      "version": "0.18.0",
       "category": "productivity"
     }
   ]
