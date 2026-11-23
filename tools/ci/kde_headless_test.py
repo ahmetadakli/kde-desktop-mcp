@@ -1,0 +1,260 @@
+"""Integration test of the server in a headless KWin session (CI only).
+
+    tools/ci/kde_headless.sh rust/target/release/desktop-mcp
+
+Run by kde_headless.sh inside the CI container, after it started its own
+KWin and D-Bus session; it refuses to run anywhere else (it starts a window
+and sends it keys). Starts tools/ci/qt_app.py and the server with an
+allowlist holding only that app, then speaks MCP over stdio: apps, tree,
+find, set_text, get_text, act, activate_window, focus, type_text, key and
+the allowlist's refusals, each checked against what the window shows.
+
+type_text into the multi-line editor inserts through AT-SPI and needs no
+input device. key, and type_text into a line edit (a paste with ctrl+v),
+need /dev/uinput and a compositor that reads it; KWin's virtual backend
+reads no input devices. --input auto (the default) runs them when
+/dev/uinput is writable and reports them skipped, with the reason, when the
+first key does not arrive; --input require fails instead, --input skip
+skips them.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+APP = "desktop-mcp-ci"
+TITLE = "desktop-mcp CI window"
+HERE = Path(__file__).resolve().parent
+results: list[tuple[str, str, str]] = []
+
+
+class Client:
+    def __init__(self, cmd: list[str], env: dict, log: Path):
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=log.open("w"), text=True, encoding="utf-8", env=env)
+        self.n = 0
+        self.rpc("initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                "clientInfo": {"name": "kde-headless-ci", "version": "0"}})
+        self.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
+
+    def send(self, msg: dict) -> None:
+        self.proc.stdin.write(json.dumps(msg) + "\n")
+        self.proc.stdin.flush()
+
+    def rpc(self, method: str, params: dict) -> dict:
+        self.n += 1
+        self.send({"jsonrpc": "2.0", "id": self.n, "method": method, "params": params})
+        while True:
+            line = self.proc.stdout.readline()
+            if not line:
+                raise RuntimeError("server exited")
+            msg = json.loads(line)
+            if msg.get("id") == self.n:
+                return msg
+
+    def call(self, name: str, **args) -> tuple[bool, str]:
+        """(ok, text) of a tool call."""
+        res = self.rpc("tools/call", {"name": name, "arguments": args})["result"]
+        text = "".join(c.get("text", "") for c in res.get("content", []))
+        return not res.get("isError", False), text
+
+    def text(self, name: str, **args) -> str:
+        ok, text = self.call(name, **args)
+        if not ok:
+            raise RuntimeError(f"{name}: {text}")
+        return text
+
+    def close(self) -> None:
+        self.proc.terminate()
+        try:
+            self.proc.wait(5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+
+
+def record(name: str, verdict: str, detail: str = "") -> bool:
+    results.append((name, verdict, detail))
+    print(f"[{verdict}] {name}" + (f": {detail}" if detail else ""), flush=True)
+    return verdict == "PASS"
+
+
+def step(name: str, ok: bool, detail: str = "") -> bool:
+    return record(name, "PASS" if ok else "FAIL", detail)
+
+
+def wait_for(fn, timeout: float = 10.0):
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            value = fn()
+            if value:
+                return value
+        except RuntimeError:
+            pass
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.3)
+
+
+def one_line(s: str) -> str:
+    return s.replace("\n", " | ")[:300]
+
+
+def find_id(c: Client, query: str, role: str = "") -> int | None:
+    """Id of the first element `find` lists whose line has `query`."""
+    out = c.text("find", app=APP, query=query, role=role)
+    for line in out.splitlines():
+        m = re.match(r"\s*\[(\d+)\]", line)
+        if m and query.lower() in line.lower():
+            return int(m.group(1))
+    return None
+
+
+def status(c: Client) -> str:
+    sid = find_id(c, "Status:")
+    return c.text("get_text", id=sid) if sid is not None else ""
+
+
+def status_has(c: Client, want: str, timeout: float = 5.0) -> str | None:
+    return wait_for(lambda: (s := status(c)) and want in s and s, timeout)
+
+
+def input_tests(c: Client, ids: dict, mode: str) -> None:
+    """key and type_text through the virtual keyboard."""
+    if mode == "skip":
+        record("input (uinput)", "SKIP", "--input skip")
+        return
+    if mode == "auto" and not os.access("/dev/uinput", os.W_OK):
+        record("input (uinput)", "SKIP", "/dev/uinput is missing or not writable here")
+        return
+    hard = "FAIL" if mode == "require" else "SKIP"
+
+    c.call("activate_window", query=TITLE)
+    ok, out = c.call("key", combo="ctrl+k", window=TITLE)
+    if not ok:
+        record("key ctrl+k fires the window's shortcut", hard, one_line(out))
+        return
+    seen = status_has(c, "shortcut")
+    if not seen:
+        record("key ctrl+k fires the window's shortcut", hard,
+               "the key event did not arrive (KWin's virtual backend reads no input "
+               f"devices); key reply: {one_line(out)}; {status(c)!r}")
+        return
+    step("key ctrl+k fires the window's shortcut", True)
+
+    c.call("focus", id=ids["name"])
+    c.text("key", combo="ctrl+a")
+    ok, out = c.call("type_text", text="Grace Hopper")
+    got = wait_for(lambda: "Grace Hopper" in (t := c.text("get_text", id=ids["name"])) and t)
+    step("type_text into a line edit (paste)", ok and bool(got), one_line(out))
+
+
+def run(c: Client, input_mode: str) -> None:
+    ok, out = c.call("doctor")
+    print(f"--- doctor ---\n{out}\n---", flush=True)
+
+    apps = wait_for(lambda: (a := c.text("apps")) and APP in a and TITLE in a and a, 30)
+    if not step("apps lists the test window", bool(apps), one_line(apps or c.text("apps"))):
+        return
+
+    tree = c.text("tree", app=APP)
+    step("tree shows the window's controls",
+         all(w in tree for w in ("Greet", "Name", "Notes", "Agree", "Status:")), one_line(tree))
+
+    ids = {
+        "greet": find_id(c, "Greet", "button"),
+        "agree": find_id(c, "Agree", "check box"),
+        "name": find_id(c, "Name", "text"),
+        "notes": find_id(c, "Notes", "text"),
+    }
+    if not step("find locates every control", all(v is not None for v in ids.values()), str(ids)):
+        return
+
+    ok, out = c.call("set_text", id=ids["name"], text="Ada Lovelace")
+    step("set_text writes the line edit", ok, one_line(out))
+    step("get_text reads it back", "Ada Lovelace" in c.text("get_text", id=ids["name"]))
+
+    ok, out = c.call("act", id=ids["greet"])
+    seen = status_has(c, "hello Ada Lovelace")
+    step("act presses the button", ok and bool(seen), f"{one_line(out)}; {seen or status(c)!r}")
+
+    ok, out = c.call("act", id=ids["agree"], action="check")
+    seen = status_has(c, "agree on")
+    step("act check ticks the check box", ok and bool(seen),
+         f"{one_line(out)}; {seen or status(c)!r}")
+    ok, out = c.call("act", id=ids["agree"], action="check")
+    step("act check on a ticked box sends nothing", ok and "nothing sent" in out, one_line(out))
+
+    ok, out = c.call("activate_window", query=TITLE)
+    step("activate_window raises the test window", ok, one_line(out))
+
+    ok, out = c.call("focus", id=ids["notes"])
+    step("focus moves to the editor", ok, one_line(out))
+    typed = "Zeile çğışöü İ\nzweite"
+    ok, out = c.call("type_text", text=typed, window=TITLE)
+    got = wait_for(lambda: typed in c.text("get_text", id=ids["notes"]), 5)
+    step("type_text into the editor (accessibility insert)", ok and bool(got), one_line(out))
+
+    input_tests(c, ids, input_mode)
+
+    ok, out = c.call("find", app="definitely-not-allowed-app", query="x")
+    step("allowlist refuses another app", not ok and "not in" in out, one_line(out))
+    ok, out = c.call("get_text", id=999999999)
+    step("an unknown id is an error", not ok and "unknown id" in out, one_line(out))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    ap.add_argument("server", nargs="+", help="server command")
+    ap.add_argument("--input", choices=("auto", "require", "skip"), default="auto")
+    ap.add_argument("--logs", default=os.environ.get("CI_LOG_DIR", "."))
+    args = ap.parse_args()
+    if os.environ.get("DESKTOP_MCP_HEADLESS") != "1" or os.environ.get("GITHUB_ACTIONS") != "true":
+        print("refusing to run: only for the headless session kde_headless.sh starts "
+              "(it opens a window and sends it keys)", file=sys.stderr)
+        return 2
+    logs = Path(args.logs)
+    logs.mkdir(parents=True, exist_ok=True)
+
+    home = Path(tempfile.mkdtemp(prefix="desktop-mcp-ci-home-"))
+    (home / ".config/desktop-mcp").mkdir(parents=True)
+    (home / ".config/desktop-mcp/allow.txt").write_text(f"{APP}\n", encoding="utf-8")
+    env = dict(os.environ, HOME=str(home), DESKTOP_MCP_INDICATOR="0",
+               DESKTOP_MCP_NO_UPDATE_CHECK="1", DESKTOP_MCP_STOP_KEY="off")
+
+    app = subprocess.Popen([sys.executable, str(HERE / "qt_app.py")], env=os.environ,
+                           stdin=subprocess.DEVNULL, stdout=(logs / "qt_app.log").open("w"),
+                           stderr=subprocess.STDOUT)
+    c = Client(args.server, env, logs / "server.log")
+    try:
+        run(c, args.input)
+    except (RuntimeError, OSError) as e:
+        step("no unexpected error", False, str(e))
+    finally:
+        if any(v == "FAIL" for _, v, _ in results):
+            for name, a in (("apps", {}), ("tree", {"app": APP})):
+                try:
+                    print(f"--- {name} ---\n{c.call(name, **a)[1]}\n---")
+                except (RuntimeError, OSError) as e:
+                    print(f"--- {name}: {e}")
+        c.close()
+        app.terminate()
+
+    count = {v: sum(1 for _, r, _ in results if r == v) for v in ("PASS", "FAIL", "SKIP")}
+    print(f"\n{count['PASS']} passed, {count['FAIL']} failed, {count['SKIP']} skipped")
+    for name, v, detail in results:
+        if v == "SKIP":
+            print(f"skipped: {name}: {detail}")
+    return 1 if count["FAIL"] or not count["PASS"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

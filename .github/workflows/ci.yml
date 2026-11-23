@@ -1,5 +1,6 @@
-# Checks that need no desktop. The end-to-end test (tools/mcp_smoke_test.py)
-# drives a real KDE session and stays a local step.
+# Checks that need no desktop. kde-headless.yml tests against a headless
+# KWin; the end-to-end test on a real desktop (tools/mcp_smoke_test.py)
+# stays a local step.
 name: CI
 
 on:
@@ -59,8 +60,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 -m py_compile tools/*.py
-      - run: bash -n tools/install.sh
+      - run: python3 -m py_compile tools/*.py tools/ci/*.py
+      - run: bash -n tools/install.sh tools/ci/kde_headless.sh
       - run: sh -n packaging/claude-plugin/desktop-mcp/scripts/desktop-mcp.sh
       - name: PowerShell launcher parses
         shell: pwsh

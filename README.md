@@ -1029,6 +1029,16 @@ budget for what every session loads up front (the instructions and the
 always-loaded tools). CI also runs `cargo audit` on `rust/Cargo.lock`, weekly
 too; accepted advisories and why are in `rust/.cargo/audit.toml`.
 
+The "KDE (headless)" CI job tests against a real KWin 6 and AT-SPI without a
+screen: in an Arch Linux container it starts `kwin_wayland --virtual` in its
+own D-Bus session, opens a small Qt window (`tools/ci/qt_app.py`) and drives it
+over MCP (`tools/ci/kde_headless_test.py`): apps, tree, find, set_text,
+get_text, act, activate_window, focus, type_text, key and the allowlist's
+refusals. KWin's virtual backend reads no input devices, so `key` and pasting
+are reported skipped there, with the reason. The scripts refuse to run outside
+CI: a second session bus and compositor next to a running desktop can break
+its accessibility bus.
+
 `tools/mcp_smoke_test.py` tests end to end on the real desktop over the real
 MCP protocol (Linux, Kate): it opens the editor with a temporary file, finds the
 element, refocuses it after focus moved elsewhere, types text with Turkish
