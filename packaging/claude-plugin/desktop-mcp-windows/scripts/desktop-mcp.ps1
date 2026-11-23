@@ -57,9 +57,14 @@ function Install-Release([string]$root, [string]$dir, [string]$exe) {
             throw "$name.zip has no desktop-mcp.exe"
         }
         # One rename: a second server starting at the same time never runs a
-        # half-written file.
+        # half-written file. A launcher that got there first may already run
+        # its copy, which Windows will not replace: that copy is the same.
         New-Item -ItemType Directory -Force -Path $dir | Out-Null
-        Move-Item -Force -LiteralPath $new -Destination $exe
+        try {
+            Move-Item -Force -LiteralPath $new -Destination $exe
+        } catch {
+            if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw }
+        }
     } finally {
         Remove-Item -Recurse -Force -LiteralPath $tmp -ErrorAction SilentlyContinue
     }
@@ -85,6 +90,9 @@ try {
 }
 
 # Run last in the script and not piped, the server gets this process's stdin
-# and stdout directly, which are Claude Code's pipes.
+# and stdout directly, which are Claude Code's pipes. Windows PowerShell 5.1
+# turns each line the server writes to a redirected stderr into an error
+# record: under 'Stop' the first one would end the script and the server.
+$ErrorActionPreference = 'Continue'
 & $exe @args
 exit $LASTEXITCODE
