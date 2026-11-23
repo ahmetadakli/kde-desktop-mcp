@@ -17,6 +17,7 @@ mod render;
 mod selfguard;
 mod semantic;
 mod shot;
+mod spill;
 mod takeover;
 mod tools;
 mod trace;
@@ -55,6 +56,10 @@ const TREE_TEXT_LIMIT: usize = render::PREVIEW_CHARS + 1;
 const TREE_MAX_CHARS: i64 = 20_000;
 /// Characters kept free in a capped tree for the line saying how to go on.
 const CONTINUATION_CHARS: usize = 150;
+/// Default `max_nodes` of a tree written to a file.
+const TREE_FILE_MAX_NODES: i64 = 3000;
+/// Lines of a tree file the reply shows.
+const TREE_FILE_HEAD: usize = 15;
 /// Nodes fetched ahead when rendering reaches an unfetched part of the tree.
 const PREFETCH_MORE: usize = 500;
 /// Candidates an ambiguous target lists (`Server::untie`).
@@ -1692,6 +1697,32 @@ impl<Id> Target<Id> {
     }
 }
 
+/// Write a tree's text to a new private file; the reply names it, with
+/// its size and first lines.
+async fn tree_to_file(text: String) -> R<String> {
+    let dir = spill::dir().ok_or("no directory for tree files (HOME is not set)")?;
+    let head: Vec<&str> = text.lines().take(TREE_FILE_HEAD).collect();
+    let head = head.join("\n");
+    let shown = dir.display().to_string();
+    let spilled = tokio::task::spawn_blocking(move || spill::write(&dir, &text))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("cannot write the tree to {shown}: {e}"))?;
+    let more = spilled.lines.saturating_sub(TREE_FILE_HEAD);
+    Ok(format!(
+        "tree written to {} ({} bytes, {} lines; its ids work as usual){}\n{head}{}",
+        spilled.path.display(),
+        spilled.bytes,
+        spilled.lines,
+        if more > 0 { "; first lines:" } else { ":" },
+        if more > 0 {
+            format!("\n… {more} more lines in the file")
+        } else {
+            String::new()
+        },
+    ))
+}
+
 /// The last line of a cut tree: how much is left and the call that lists
 /// it, `after` the last element printed. Ids are stable, so the next page
 /// starts right after that element while it is still there.
@@ -1714,12 +1745,12 @@ fn continuation(a: &Json, app: &str, last: Option<u64>, left: usize, truncated: 
         }
         root => call.push(format!("root_id={root}")),
     }
-    for flag in ["interactive", "include_hidden"] {
+    for flag in ["interactive", "include_hidden", "to_file"] {
         if arg_b(a, flag, false) {
             call.push(format!("{flag}=true"));
         }
     }
-    for (k, d) in [("max_depth", 12), ("max_nodes", 300)] {
+    for (k, d) in [("max_depth", 12), ("max_nodes", tree_max_nodes(a))] {
         let v = arg_i(a, k, d);
         if v != d {
             call.push(format!("{k}={v}"));
@@ -1733,6 +1764,15 @@ fn continuation(a: &Json, app: &str, last: Option<u64>, left: usize, truncated: 
     }
     call.push(format!("after={last}"));
     format!("… {left}; continue with tree({})", call.join(", "))
+}
+
+/// Default `max_nodes` of a tree call: larger when it goes to a file.
+fn tree_max_nodes(a: &Json) -> i64 {
+    if arg_b(a, "to_file", false) {
+        TREE_FILE_MAX_NODES
+    } else {
+        300
+    }
 }
 
 fn arg_s(a: &Json, k: &str, d: &str) -> String {
@@ -4541,7 +4581,7 @@ impl<B: Backend> Server<B> {
         let interactive = arg_b(a, "interactive", false);
         let opts = WalkOpts {
             max_depth: arg_i(a, "max_depth", 12).max(0) as usize,
-            budget: arg_i(a, "max_nodes", 300).max(0) as usize,
+            budget: arg_i(a, "max_nodes", tree_max_nodes(a)).max(0) as usize,
             only_showing: !arg_b(a, "include_hidden", false),
             boring_roles: self.b.boring_roles(),
             interactive,
@@ -4616,8 +4656,11 @@ impl<B: Backend> Server<B> {
             ));
         }
         let printed = self.printed(lines, &cache, &app).await;
+        // To a file: the whole text, `max_chars` aside.
+        let to_file = arg_b(a, "to_file", false);
         // Room for the continuation line.
         let room = match max_chars {
+            _ if to_file => 0,
             0 => 0,
             n => n.saturating_sub(CONTINUATION_CHARS).max(1),
         };
@@ -4632,6 +4675,9 @@ impl<B: Backend> Server<B> {
                 capped.left,
                 walked.truncated,
             ));
+        }
+        if to_file {
+            text = tree_to_file(text).await?;
         }
         if !arg_b(a, "screenshot", false) {
             return Ok(Out::from(text));
@@ -10066,6 +10112,49 @@ mod tests {
             "… more nodes; continue with tree(root_id=9, max_chars=5000, after=12)"
         );
         assert_eq!(continuation(&a, "kate", None, 0, true), render::TRUNCATED);
+        // To a file, max_nodes=300 is no longer the default.
+        let a = json!({"app": "kate", "to_file": true, "max_nodes": 300});
+        assert_eq!(
+            continuation(&a, "kate", Some(5), 0, true),
+            "… more nodes; continue with tree(app=\"kate\", to_file=true, max_nodes=300, after=5)"
+        );
+    }
+
+    #[test]
+    fn tree_to_file_writes_the_same_lines_and_ids() {
+        local(async {
+            let mut s = session("tree-file");
+            let r = call_tool(&mut s, 2, "tree", json!({"app": "fake"})).await;
+            let inline = reply_text(&r);
+            let r = call_tool(&mut s, 3, "tree", json!({"app": "fake", "to_file": true})).await;
+            let text = reply_text(&r);
+            let rest = text.strip_prefix("tree written to ").expect(text);
+            let path = rest.split(" (").next().unwrap();
+            let written = std::fs::read_to_string(path).unwrap();
+            let _ = std::fs::remove_file(path);
+            // The same text as inline, so the same ids.
+            assert_eq!(written, inline);
+            assert!(
+                text.contains(&format!(
+                    "({} bytes, {} lines; ",
+                    written.len(),
+                    written.lines().count()
+                )),
+                "{text}"
+            );
+            let head = written
+                .lines()
+                .take(TREE_FILE_HEAD)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(&head), "{text}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::metadata(std::path::Path::new(path).parent().unwrap()).unwrap();
+                assert_eq!(meta.permissions().mode() & 0o077, 0);
+            }
+        });
     }
 
     #[test]

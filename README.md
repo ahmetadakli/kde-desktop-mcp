@@ -266,6 +266,13 @@ tool; `off` turns it off). Not available on Windows yet.
   reply is capped at `max_chars` (default 20,000) and `max_nodes`; a cut one
   ends with `… N more nodes; continue with tree(…, after=ID)`, which lists the
   rest after that element (ids are stable, so pages join up exactly).
+  `to_file: true` writes the whole tree (`max_nodes` default 3,000) to a new
+  file only the user can read and replies with its path, size and first
+  lines; the ids in it work like any other. Linux:
+  `$XDG_RUNTIME_DIR/desktop-mcp/trees` (else `~/.cache/desktop-mcp/trees`),
+  directories 0700, files 0600, never written through an existing file or
+  symlink. Windows: `%LOCALAPPDATA%\desktop-mcp\trees`, which keeps the
+  profile's ACL (the user, SYSTEM, Administrators). The newest 10 are kept.
   `screenshot: true` adds the image of the app's window when it is in front.
 - `set_text` reads back what it wrote: the reply says "verified", or it fails
   saying what the field holds (a length limit, other text). A field that only
