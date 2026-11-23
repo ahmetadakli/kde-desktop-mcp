@@ -22,7 +22,6 @@ jobs:
     name: KWin + AT-SPI integration
     runs-on: ubuntu-24.04
     # New: reported, not yet required, until it has proved stable.
-    continue-on-error: true
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
