@@ -83,15 +83,14 @@ pub fn summary(version: &str, platform: &str, session: &str, rows: &[Row]) -> Js
 }
 
 /// The last line of the text report: `summary` without the checks' details
-/// (only the names of the failed ones).
+/// (only the names of the failed ones, each once).
 pub fn line(summary: &Json) -> String {
-    let failed: Vec<&Json> = summary["checks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter(|c| c["ok"] == json!(false))
-        .map(|c| &c["name"])
-        .collect();
+    let mut failed: Vec<&Json> = Vec::new();
+    for c in summary["checks"].as_array().into_iter().flatten() {
+        if c["ok"] == json!(false) && !failed.contains(&&c["name"]) {
+            failed.push(&c["name"]);
+        }
+    }
     json!({
         "version": summary["version"],
         "platform": summary["platform"],
@@ -232,6 +231,8 @@ mod tests {
             s["next_step"],
             "ready; to use all of it, fix: allowlist line, screenshot"
         );
+        let line: Json = serde_json::from_str(&line(&s)).unwrap();
+        assert_eq!(line["failed"], json!(["allowlist line", "screenshot"]));
     }
 
     #[test]
