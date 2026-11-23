@@ -1703,7 +1703,7 @@ impl<Id> Target<Id> {
 
 /// Write a tree's text to a new private file; the reply names it, with
 /// its size and first lines.
-async fn tree_to_file(text: String) -> R<String> {
+async fn tree_to_file(text: String, cut: Option<String>) -> R<String> {
     let dir = spill::dir(&spill::TREES).ok_or("no directory for tree files (HOME is not set)")?;
     let head: Vec<&str> = text.lines().take(TREE_FILE_HEAD).collect();
     let head = head.join("\n");
@@ -1713,18 +1713,21 @@ async fn tree_to_file(text: String) -> R<String> {
         .map_err(|e| e.to_string())?
         .map_err(|e| format!("cannot write the tree to {shown}: {e}"))?;
     let more = spilled.lines.saturating_sub(TREE_FILE_HEAD);
-    Ok(format!(
-        "tree written to {} ({} bytes, {} lines; its ids work as usual){}\n{head}{}",
+    let mut reply = format!(
+        "tree written to {} ({} bytes, {} lines; its ids work as usual){}\n{head}",
         spilled.path.display(),
         spilled.bytes,
         spilled.lines,
         if more > 0 { "; first lines:" } else { ":" },
-        if more > 0 {
-            format!("\n… {more} more lines in the file")
-        } else {
-            String::new()
-        },
-    ))
+    );
+    if more > 0 {
+        reply.push_str(&format!("\n… {more} more lines in the file"));
+    }
+    // A cut tree says so here too, not only in the file's last line.
+    if let Some(cut) = cut.filter(|_| more > 0) {
+        reply.push_str(&format!("; the file is cut:\n{cut}"));
+    }
+    Ok(reply)
 }
 
 /// The last line of a cut tree: how much is left and the call that lists
@@ -4691,18 +4694,14 @@ impl<B: Backend> Server<B> {
         };
         let capped = render::format_capped(&printed, room);
         let mut text = capped.text;
-        if capped.left > 0 || walked.truncated {
+        let cut = (capped.left > 0 || walked.truncated)
+            .then(|| continuation(a, &app, capped.last, capped.left, walked.truncated));
+        if let Some(cut) = &cut {
             text.push('\n');
-            text.push_str(&continuation(
-                a,
-                &app,
-                capped.last,
-                capped.left,
-                walked.truncated,
-            ));
+            text.push_str(cut);
         }
         if to_file {
-            text = tree_to_file(text).await?;
+            text = tree_to_file(text, cut).await?;
         }
         if !arg_b(a, "screenshot", false) {
             return Ok(Out::from(text));
@@ -10225,6 +10224,27 @@ mod tests {
                 let meta = std::fs::metadata(std::path::Path::new(path).parent().unwrap()).unwrap();
                 assert_eq!(meta.permissions().mode() & 0o077, 0);
             }
+        });
+    }
+
+    #[test]
+    fn a_cut_tree_file_says_so_in_the_reply() {
+        local(async {
+            let cut = "… 9+ more nodes; continue with tree(app=\"fake\", to_file=true, after=40)";
+            let lines: Vec<String> = (0..40).map(|i| format!("[{i}] label \"x\"")).collect();
+            let text = format!("{}\n{cut}", lines.join("\n"));
+            let reply = tree_to_file(text.clone(), Some(cut.into())).await.unwrap();
+            let path = reply.strip_prefix("tree written to ").unwrap();
+            let _ = std::fs::remove_file(path.split(" (").next().unwrap());
+            assert!(
+                reply.ends_with(&format!("in the file; the file is cut:\n{cut}")),
+                "{reply}"
+            );
+            // Whole: nothing more to say.
+            let reply = tree_to_file(text, None).await.unwrap();
+            let path = reply.strip_prefix("tree written to ").unwrap();
+            let _ = std::fs::remove_file(path.split(" (").next().unwrap());
+            assert!(reply.ends_with("more lines in the file"), "{reply}");
         });
     }
 
