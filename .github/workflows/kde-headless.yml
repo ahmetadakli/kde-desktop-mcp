@@ -44,7 +44,7 @@ jobs:
           mkdir -p "$RUNNER_TEMP/kde-logs"
           dev=()
           [ -e /dev/uinput ] && dev=(--device /dev/uinput)
-          docker run --rm "${dev[@]}" -e GITHUB_ACTIONS -e CI_LOG_DIR=/logs \
+          docker run --rm --cap-add SYS_NICE "${dev[@]}" -e GITHUB_ACTIONS -e CI_LOG_DIR=/logs \
             -v "$PWD:/src:ro" -v "$RUNNER_TEMP/kde-logs:/logs" archlinux:latest \
             bash /src/tools/ci/kde_headless.sh /src/rust/target/release/desktop-mcp --input auto
       - if: always()
