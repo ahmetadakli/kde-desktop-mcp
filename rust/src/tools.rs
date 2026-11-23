@@ -507,7 +507,7 @@ pub fn tools() -> Json {
         ),
         t(
             "doctor",
-            "Check the setup in one report: version, allowlist (each app's tier, the\nconfirm list, password fields), which running apps are allowed or blocked, the session, AT-SPI, the virtual keyboard and\npointer, KWin scripting, screens and the screenshot path. Run it first\nwhen tools fail in ways that look like a broken installation.",
+            "Check the setup in one report: version, allowlist (each app's tier, the\nconfirm list, password fields), which running apps are allowed or blocked, the session, AT-SPI, the virtual keyboard and\npointer, KWin scripting, screens and the screenshot path. Run it first\nwhen tools fail in ways that look like a broken installation. Its last line\nis JSON: failed, blockers, next_step.",
             schema(&[])
         ),
         t(
@@ -551,6 +551,9 @@ pub fn tools() -> Json {
                 "type": "string",
                 "description": "Title or app-name substring: activate that window first unless it is already in front."
             });
+        }
+        if tool["name"] == "doctor" {
+            tool["outputSchema"] = crate::doctor::output_schema();
         }
         if tool["name"] == "screenshot" {
             tool["inputSchema"]["properties"]["region"]["items"] = json!({ "type": "number" });

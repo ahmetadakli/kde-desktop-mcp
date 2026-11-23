@@ -8,6 +8,7 @@
 
 mod backend;
 mod delivery;
+mod doctor;
 mod flow;
 mod launch_pick;
 #[cfg(target_os = "linux")]
@@ -1348,6 +1349,8 @@ struct Out {
     text: String,
     /// Inline images: base64 data and media type.
     images: Vec<(String, &'static str)>,
+    /// MCP `structuredContent`, for a tool with an `outputSchema`.
+    structured: Option<Json>,
 }
 
 impl From<String> for Out {
@@ -1355,6 +1358,7 @@ impl From<String> for Out {
         Out {
             text,
             images: Vec::new(),
+            structured: None,
         }
     }
 }
@@ -4133,7 +4137,11 @@ impl<B: Backend> Server<B> {
                 Err(e) => text.push_str(&format!("\nobserve screenshot failed: {e}")),
             },
         }
-        Out { text, images }
+        Out {
+            text,
+            images,
+            structured: None,
+        }
     }
 
     /// A compact tree of the active window of `app` (else of the app in
@@ -4424,7 +4432,7 @@ impl<B: Backend> Server<B> {
         }
     }
 
-    async fn doctor(&self) -> R<String> {
+    async fn doctor(&self) -> R<Out> {
         self.b.enable().await;
         let policy = self.policy();
         let allow = policy.names();
@@ -4435,11 +4443,17 @@ impl<B: Backend> Server<B> {
             std::env::consts::ARCH
         )];
         let update = update::line(env!("CARGO_PKG_VERSION")).await;
+        let mut rows = Vec::new();
         let mut row = |ok: bool, name: &str, detail: &str| {
             lines.push(format!(
                 "[{}] {name}: {detail}",
                 if ok { "ok" } else { "FAIL" }
             ));
+            rows.push(doctor::Row {
+                name: name.into(),
+                ok,
+                detail: detail.into(),
+            });
         };
         row(true, "update", &update);
         let listed = self.policy_file();
@@ -4572,7 +4586,18 @@ impl<B: Backend> Server<B> {
         if !self.b.apps_note().is_empty() {
             lines.push(format!("note: {}", self.b.apps_note()));
         }
-        Ok(lines.join("\n"))
+        let summary = doctor::summary(
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            self.b.session(),
+            &rows,
+        );
+        lines.push(doctor::line(&summary));
+        Ok(Out {
+            text: lines.join("\n"),
+            images: Vec::new(),
+            structured: Some(summary),
+        })
     }
 
     async fn tree(&self, a: &Json) -> R<Out> {
@@ -4696,6 +4721,7 @@ impl<B: Backend> Server<B> {
             Ok(shot) => Ok(Out {
                 text: format!("{text}\nscreenshot: {}", shot.text),
                 images: shot.images,
+                structured: None,
             }),
             Err(e) => Ok(Out::from(format!("{text}\nno screenshot: {e}"))),
         }
@@ -7531,6 +7557,7 @@ impl<B: Backend> Server<B> {
             } else {
                 Vec::new()
             },
+            structured: None,
         })
     }
 
@@ -7671,6 +7698,7 @@ impl<B: Backend> Server<B> {
         Ok(Out {
             text,
             images: run.images,
+            structured: None,
         })
     }
 
@@ -7998,7 +8026,7 @@ impl<B: Backend> Server<B> {
             "close_window" => self.close_window(a).await.map(Out::from),
             "menu" => self.menu(a).await.map(Out::from),
             "launch" => self.launch(a).await.map(Out::from),
-            "doctor" => self.doctor().await.map(Out::from),
+            "doctor" => self.doctor().await,
             "scroll" => self.scroll(a).await.map(Out::from),
             "key" => self.key(a).await.map(Out::from),
             "type_text" => self.type_text(a).await.map(Out::from),
@@ -8411,7 +8439,11 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
                 content.extend(out.images.into_iter().map(
                     |(data, mime)| json!({ "type": "image", "data": data, "mimeType": mime }),
                 ));
-                json!({ "content": content, "isError": is_error })
+                let mut result = json!({ "content": content, "isError": is_error });
+                if let Some(s) = out.structured {
+                    result["structuredContent"] = s;
+                }
+                result
             }
             _ => {
                 return Some(json!({ "jsonrpc": "2.0", "id": id,
@@ -10516,6 +10548,56 @@ mod tests {
                 "{text}"
             );
             assert!(!text.contains("konsole"), "{text}");
+        });
+    }
+
+    #[test]
+    fn doctor_ends_with_a_summary_line_and_sends_it_structured() {
+        local(async {
+            let mut s = session("doctor-summary");
+            let r = call_tool(&mut s, 2, "doctor", json!({})).await;
+            let text = reply_text(&r);
+            let last: Json = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            let structured = &r["result"]["structuredContent"];
+            assert_eq!(structured["version"], env!("CARGO_PKG_VERSION"), "{r}");
+            assert_eq!(structured["platform"], std::env::consts::OS);
+            assert_eq!(structured["blockers"], json!([]));
+            let checks = structured["checks"].as_array().unwrap();
+            let failed: Vec<&Json> = checks
+                .iter()
+                .filter(|c| c["ok"] == false)
+                .map(|c| &c["name"])
+                .collect();
+            assert!(
+                structured["next_step"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("ready"),
+                "{r}"
+            );
+            let allowlist = checks.iter().find(|c| c["name"] == "allowlist").unwrap();
+            assert_eq!(allowlist["ok"], true);
+            // Each check's detail is in the text once, as its report line.
+            let detail = allowlist["detail"].as_str().unwrap();
+            assert_eq!(text.matches(detail).count(), 1, "{text}");
+            assert_eq!(last["failed"], json!(failed));
+            assert_eq!(last["next_step"], structured["next_step"]);
+            assert!(last.get("checks").is_none(), "{last}");
+            // An empty allowlist blocks everything.
+            set_allow("doctor-summary", "");
+            let r = call_tool(&mut s, 3, "doctor", json!({})).await;
+            let structured = &r["result"]["structuredContent"];
+            assert_eq!(structured["blockers"], json!(["allowlist"]), "{r}");
+            assert!(
+                structured["next_step"]
+                    .as_str()
+                    .unwrap()
+                    .contains("allowlist file"),
+                "{r}"
+            );
+            // Other tools send no structured content.
+            let r = call_tool(&mut s, 4, "apps", json!({})).await;
+            assert!(r["result"].get("structuredContent").is_none(), "{r}");
         });
     }
 

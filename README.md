@@ -667,7 +667,11 @@ tool; `off` turns it off). Not available on Windows yet.
   fails saying the dialog is still open.
 - `doctor`: checks the setup in one report: version, allowlist, which running
   apps are allowed, the session, AT-SPI, the virtual keyboard and mouse, KWin
-  scripting, screens and the screenshot path.
+  scripting, screens and the screenshot path. Its last line is a JSON
+  summary for programs: version, platform, session, the failed checks, the
+  `blockers` (failed checks nothing works without) and a `next_step`. The
+  same summary, each check with its detail, comes as MCP
+  `structuredContent` (the tool has an `outputSchema`).
 - `key`, `type_text`: keyboard. The reply names the element that has focus
   afterwards; `type_text` warns when focus is not on an editable field (KDE).
   In a `batch`, a step whose focus is the one the previous report described

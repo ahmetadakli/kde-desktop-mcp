@@ -1213,6 +1213,13 @@ impl Backend for LinuxBackend {
         DEFAULT_ALLOW
     }
 
+    fn session(&self) -> &'static str {
+        match self.comp {
+            Compositor::Kde(_) => "kde-plasma",
+            Compositor::Hyprland(_) => "hyprland",
+        }
+    }
+
     fn apps_note(&self) -> &'static str {
         match self.comp {
             Compositor::Kde(_) => APPS_NOTE,

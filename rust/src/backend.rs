@@ -950,6 +950,11 @@ pub trait Backend {
     async fn doctor(&self) -> Vec<Check> {
         Vec::new()
     }
+    /// The desktop session, as doctor's summary names it ("kde-plasma",
+    /// "hyprland", "windows").
+    fn session(&self) -> &'static str {
+        ""
+    }
     /// The active window a screenshot would capture, with its app as the
     /// allowlist names it; Err with the cause when there is none or it
     /// cannot be read.
