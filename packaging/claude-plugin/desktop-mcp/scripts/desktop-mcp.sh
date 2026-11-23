@@ -11,7 +11,7 @@
 set -eu
 
 # Kept equal to rust/Cargo.toml by rust/tests/plugin_package.rs.
-version=0.17.1
+version=0.18.0
 releases=${DESKTOP_MCP_RELEASES_URL:-https://github.com/ahmetadakli/kde-desktop-mcp/releases}
 
 say() {
