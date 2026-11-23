@@ -1,0 +1,27 @@
+{
+  "name": "desktop-mcp-windows",
+  "version": "0.17.1",
+  "description": "The desktop MCP server on Windows 10 and 11: UI Automation targeting with real keyboard and mouse input.",
+  "author": {
+    "name": "Ahmet Adaklı",
+    "url": "https://github.com/ahmetadakli"
+  },
+  "homepage": "https://github.com/ahmetadakli/kde-desktop-mcp",
+  "repository": "https://github.com/ahmetadakli/kde-desktop-mcp",
+  "license": "MIT",
+  "keywords": ["desktop", "accessibility", "ui-automation", "windows"],
+  "mcpServers": {
+    "desktop": {
+      "command": "powershell",
+      "args": [
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-File",
+        "${CLAUDE_PLUGIN_ROOT}/scripts/desktop-mcp.ps1"
+      ]
+    }
+  }
+}

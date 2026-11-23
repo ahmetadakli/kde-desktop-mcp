@@ -888,6 +888,37 @@ The Windows build is cross-compiled and has not been run on real Windows yet.
 
 The sections below build from source.
 
+### Claude Code plugin
+
+The repository is also a Claude Code plugin marketplace. In Claude Code:
+
+```
+/plugin marketplace add ahmetadakli/kde-desktop-mcp
+/plugin install desktop-mcp
+```
+
+On Windows install `desktop-mcp-windows` instead. The plugin adds the
+`desktop` server; the system packages listed per desktop below are still
+needed. Its launcher
+([`packaging/claude-plugin`](packaging/claude-plugin)) runs a `desktop-mcp`
+found on `PATH` (installed with `install.sh`, an AUR package or cargo).
+Otherwise it downloads the release build of the plugin's version once into
+the plugin's data directory (`~/.claude/plugins/data/…`), checks it against
+the release's `SHA256SUMS` and runs it; an archive that does not match is
+deleted, never run. Linux needs `curl` (or `wget`), `sha256sum` and `tar`;
+the Windows launcher uses PowerShell and has not been run on real Windows yet.
+
+- Updating: `/plugin update desktop-mcp` (or the marketplace's auto-update)
+  moves to the next version, whose launcher downloads that release. A
+  `desktop-mcp` on `PATH` is updated the way it was installed.
+- Plugin servers have their own tool names: `mcp__plugin_desktop-mcp_desktop__find`
+  instead of `mcp__desktop__find`, so the permission rule under "Speed:
+  skipping the permission prompt" is `mcp__plugin_desktop-mcp_desktop`
+  (Windows: `mcp__plugin_desktop-mcp-windows_desktop`).
+- A `desktop` server already added with `claude mcp add` keeps running next
+  to the plugin's; remove one of them (`claude mcp remove --scope user
+  desktop`).
+
 ### KDE Plasma (Wayland)
 
 Requirements:
