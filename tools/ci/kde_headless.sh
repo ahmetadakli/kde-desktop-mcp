@@ -56,7 +56,13 @@ session() {
         KWIN_COMPOSE=Q
     unset DISPLAY WAYLAND_DISPLAY
 
-    kwin_wayland --virtual --width 1280 --height 800 --socket "$socket" \
+    # Arch ships kwin_wayland with file capabilities (cap_sys_nice); a
+    # container without that capability refuses to exec it ("Operation not
+    # permitted"). A plain copy has none.
+    kwin_bin=$(mktemp)
+    cp "$(command -v kwin_wayland)" "$kwin_bin"
+    chmod 0755 "$kwin_bin"
+    "$kwin_bin" --virtual --width 1280 --height 800 --socket "$socket" \
         --no-lockscreen --no-global-shortcuts >"$logs/kwin.log" 2>&1 &
     kwin=$!
     trap 'kill "$kwin" 2>/dev/null || true' EXIT
