@@ -98,6 +98,22 @@ fn private(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Close an existing directory of ours that others may read but not write
+/// to them (a plain `mkdir` under umask 022 makes "desktop-mcp" so).
+/// One others may write to, or someone else's, stays as it is: refused.
+fn tighten(path: &Path, meta: &fs::Metadata) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = meta.mode();
+        if meta.is_dir() && meta.uid() == me() && mode & 0o022 == 0 && mode & 0o077 != 0 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(mode & 0o700));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (path, meta);
+}
+
 /// Create `dir` and its parent as private directories, or check existing
 /// ones.
 fn ensure_private(dir: &Path) -> io::Result<()> {
@@ -121,7 +137,7 @@ fn ensure_private(dir: &Path) -> io::Result<()> {
                 }
             }
             Err(e) => return Err(e),
-            Ok(_) => {}
+            Ok(meta) => tighten(path, &meta),
         }
         private(path)?;
     }
@@ -341,6 +357,21 @@ mod tests {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(write(&link, "x").is_err());
         assert_eq!(fs::read_dir(&dir).unwrap().count(), 0);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_own_directory_others_may_only_read_is_closed() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = scratch("readable");
+        let dir = base.join("shots");
+        fs::create_dir_all(&dir).unwrap();
+        // As the plugin launcher's `mkdir -p` under umask 022 left it.
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o755)).unwrap();
+        write(&dir, "x").unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!((mode(&base), mode(&dir)), (0o700, 0o700));
         fs::remove_dir_all(&base).unwrap();
     }
 

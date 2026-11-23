@@ -53,7 +53,9 @@ sha256() {
 install_release() {
     name=desktop-mcp-v$version-x86_64-linux
     url=$releases/download/v$version
-    mkdir -p "$root"
+    # Private, as the server wants its desktop-mcp directory under ~/.cache
+    # for screenshots and tree files when XDG_RUNTIME_DIR is not usable.
+    (umask 077 && mkdir -p "$root")
     tmp=$(mktemp -d "$root/.download.XXXXXX")
     trap 'rm -rf "$tmp"' EXIT
     say "downloading $name.tar.gz"
