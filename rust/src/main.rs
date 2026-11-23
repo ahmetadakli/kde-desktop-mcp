@@ -732,8 +732,6 @@ const DELIVERY_TOOLS: [&str; 17] = [
     "clipboard_set",
 ];
 
-/// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
-/// when absent, empty, or the tool takes none.
 /// The command or directory of an input tool's `window` of the form
 /// "terminal:<what>": the terminal tab running or in it.
 fn terminal_query(window: &str) -> Option<&str> {
@@ -743,6 +741,8 @@ fn terminal_query(window: &str) -> Option<&str> {
         .then(|| rest.trim())
 }
 
+/// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
+/// when absent, empty, or the tool takes none.
 fn window_arg(tool: &str, a: &Json) -> R<Option<String>> {
     if !tools::WINDOW_TOOLS.contains(&tool) {
         return Ok(None);
