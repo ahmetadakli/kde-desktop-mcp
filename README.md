@@ -639,8 +639,12 @@ tool; `off` turns it off). Not available on Windows yet.
 - Terminal windows: `windows` also lists each terminal tab's pts device,
   foreground command and directory; `activate_window` with
   `terminal: "pytest"` brings forward the terminal running that command (or in
-  that directory). A terminal with several tabs comes forward on whichever tab
-  it shows. The terminal must be in the allowlist (e.g. `konsole`).
+  that directory), and Konsole switches to that tab over D-Bus (other
+  terminals come forward on whichever tab they show). Input tools take the
+  same as `window: "terminal:pytest"`; they never pick the agent's own tab,
+  and refuse a tab that cannot be brought forward in a window with others.
+  The reply names the tab (pts, command, directory). The terminal must be in
+  the allowlist (e.g. `konsole`).
 - `file_dialog`: fills in the file Open/Save dialog in front: `path` (absolute
   or `~/…`) is written into its file name field, the default button (Open,
   Save) is pressed and the dialog's closing is awaited (Qt 5's name field and

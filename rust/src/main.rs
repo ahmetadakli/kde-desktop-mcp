@@ -728,6 +728,15 @@ const DELIVERY_TOOLS: [&str; 17] = [
 
 /// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
 /// when absent, empty, or the tool takes none.
+/// The command or directory of an input tool's `window` of the form
+/// "terminal:<what>": the terminal tab running or in it.
+fn terminal_query(window: &str) -> Option<&str> {
+    let (head, rest) = window.split_once(':')?;
+    head.trim()
+        .eq_ignore_ascii_case("terminal")
+        .then(|| rest.trim())
+}
+
 fn window_arg(tool: &str, a: &Json) -> R<Option<String>> {
     if !tools::WINDOW_TOOLS.contains(&tool) {
         return Ok(None);
@@ -7057,13 +7066,19 @@ impl<B: Backend> Server<B> {
     }
 
     async fn activate_window(&self, a: &Json) -> R<String> {
-        let query = match a.get("terminal").and_then(Json::as_str) {
-            Some(t) => self.terminal_window(t).await?,
-            None => self.prefer_other(&req_s(a, "query")?).await,
+        let (app, tab) = match a.get("terminal").and_then(Json::as_str) {
+            Some(t) => {
+                let (_, app, tab) = self.show_terminal(t, false).await?;
+                (app, format!("; {tab}"))
+            }
+            None => {
+                let query = self.prefer_other(&req_s(a, "query")?).await;
+                let (_, app) = trace::time("activate", self.activate(&query)).await?;
+                (app, String::new())
+            }
         };
-        let (_, app) = trace::time("activate", self.activate(&query)).await?;
         Ok(format!(
-            "active app now: {}",
+            "active app now: {}{tab}",
             if app.is_empty() { "unknown" } else { &app }
         ))
     }
@@ -7120,22 +7135,36 @@ impl<B: Backend> Server<B> {
     /// Whether `window` (an argument) needs no activation: the window
     /// `ensure_window` would bring forward is already in front.
     async fn window_in_front(&self, query: &str) -> bool {
+        if terminal_query(query).is_some() {
+            return false;
+        }
         let query = self.prefer_other(query).await;
         self.window_is_active(&query).await
     }
 
     /// An input tool's `window`: activate the matching window unless it is
-    /// already in front. Some(title) when it activated one. Runs inside
-    /// `call`, under the input lock, so nothing else takes the focus
-    /// between this and the tool's input.
+    /// already in front; "terminal:<what>" brings that terminal tab to the
+    /// front (`show_terminal`). Some("activated <title>...") when it
+    /// activated one. Runs inside `call`, under the input lock, so nothing
+    /// else takes the focus between this and the tool's input.
     async fn ensure_window(&self, query: &str) -> R<Option<String>> {
+        if let Some(what) = terminal_query(query) {
+            let (title, _, tab) = self.show_terminal(what, true).await?;
+            return Ok(Some(format!(
+                "activated {}, {tab}",
+                render::short_title(&title)
+            )));
+        }
         let query = self.prefer_other(query).await;
         if trace::time("window_is_active", self.window_is_active(&query)).await {
             trace::note("window in front already: not activated");
             return Ok(None);
         }
         let (title, _) = trace::time("activate", self.activate(&query)).await?;
-        Ok(Some(title.unwrap_or(query)))
+        Ok(Some(format!(
+            "activated {}",
+            render::short_title(&title.unwrap_or(query))
+        )))
     }
 
     /// `query`, or the title of another window it matches as well when the
@@ -7152,21 +7181,101 @@ impl<B: Backend> Server<B> {
             .unwrap_or_else(|| query.to_string())
     }
 
-    /// Title of the allowed window whose terminal runs a command, or is in a
-    /// directory, containing `what` (case-insensitive).
-    async fn terminal_window(&self, what: &str) -> R<String> {
-        let q = what.to_lowercase();
+    /// Bring the terminal tab of an allowed app whose foreground command,
+    /// or its directory, contains `what` (case-insensitive) to the front:
+    /// activate its window, then show the tab (Konsole). Tabs of the agent's
+    /// own client (`selfguard`) are only picked when no other matches, and
+    /// never `for_input`; nor is a tab that cannot be brought forward in a
+    /// window with several. Returns the window's title (after the switch),
+    /// the active app and the tab as "tab pts/N: <command> in <dir>".
+    async fn show_terminal(&self, what: &str, for_input: bool) -> R<(String, String, String)> {
+        let q = what.trim().to_lowercase();
+        if q.is_empty() {
+            return Err("terminal: name a command or directory".into());
+        }
         let list = self.b.windows("", &self.allowed()).await?;
-        list.into_iter()
-            .find(|w| {
-                w.terminals.iter().any(|t| {
-                    t.command.to_lowercase().contains(&q) || t.cwd.to_lowercase().contains(&q)
-                })
-            })
-            .map(|w| w.title)
-            .ok_or_else(|| {
-                format!("no terminal of an allowed app runs or is in '{what}' (see windows)")
-            })
+        let me = self.guarded_client().await;
+        // (window, terminal) per tab: one Konsole process lists every tab
+        // under each of its windows.
+        let (mut hits, mut own) = (Vec::new(), Vec::new());
+        for w in &list {
+            let view = match me {
+                Some(me) if me.daemon && me.may_own(w.pid) => {
+                    Some(self.b.term_view(w.pid, Some(&w.title), me).await)
+                }
+                _ => None,
+            };
+            for t in &w.terminals {
+                let matches =
+                    t.command.to_lowercase().contains(&q) || t.cwd.to_lowercase().contains(&q);
+                let seen = |v: &Vec<(&WindowGeo, &backend::Terminal)>| {
+                    v.iter().any(|(h, ht)| h.pid == w.pid && ht.tty == t.tty)
+                };
+                if !matches || seen(&hits) || seen(&own) {
+                    continue;
+                }
+                let ours = me.is_some_and(|me| {
+                    me.owns_tty(view.as_ref().unwrap_or(&Default::default()), &t.tty)
+                });
+                if ours { &mut own } else { &mut hits }.push((w, t));
+            }
+        }
+        let others = hits.len().saturating_sub(1);
+        let (w, t) = match (hits.first(), own.first()) {
+            (Some(hit), _) => *hit,
+            (None, Some(_)) if for_input => {
+                let ttys: Vec<&str> = own.iter().map(|(_, t)| t.tty.as_str()).collect();
+                return Err(refusal(delivery::nothing_sent(format!(
+                    "only the agent's own terminal tab ({}) runs or is in '{what}': input \
+                     never goes there",
+                    ttys.join(", ")
+                ))));
+            }
+            (None, Some(hit)) => *hit,
+            (None, None) => {
+                return Err(delivery::nothing_sent(format!(
+                    "no terminal of an allowed app runs or is in '{what}' (see windows)"
+                )));
+            }
+        };
+        let tab = self.b.term_tab(w.pid, &t.tty).await;
+        let several = w.terminals.iter().filter(|x| x.tty != t.tty).count() > 0;
+        if for_input && several && tab.is_none() {
+            return Err(delivery::nothing_sent(format!(
+                "{} cannot bring tab {} to the front, and its window has others: \
+                 activate it and switch tabs first",
+                w.app, t.tty
+            )));
+        }
+        // The window showing the tab, among the terminal's windows: the
+        // one whose tab in front has the title Konsole gives.
+        let front = tab.as_ref().map(|t| t.front.trim()).unwrap_or_default();
+        let same: Vec<&WindowGeo> = list
+            .iter()
+            .filter(|x| x.pid == w.pid && !front.is_empty() && x.title.starts_with(front))
+            .collect();
+        let title = match same.as_slice() {
+            [one] => one.title.clone(),
+            _ => w.title.clone(),
+        };
+        let (_, app) = trace::time("activate", self.activate(&title)).await?;
+        if let Some(tab) = tab.as_ref().filter(|t| !t.shown) {
+            trace::time("show_tab", self.b.show_tab(tab)).await?;
+            let now = self.active_title().await;
+            *self.last_active.lock().await = now;
+        }
+        let title = self.active_title().await.unwrap_or(title);
+        let mut about = format!("tab {}: {}", t.tty, t.command);
+        if !t.cwd.is_empty() {
+            about.push_str(&format!(" in {}", t.cwd));
+        }
+        if tab.is_none() && several {
+            about.push_str(" (another tab may show: this terminal cannot switch tabs)");
+        }
+        if others > 0 {
+            about.push_str(&format!("; {others} more tabs match"));
+        }
+        Ok((title, app, about))
     }
 
     /// Fill in the active file Open/Save dialog of an allowed app: write the
@@ -7919,7 +8028,7 @@ impl<B: Backend> Server<B> {
         });
         let result = match activated {
             Some(title) => {
-                let done = format!("activated {}; ", render::short_title(&title));
+                let done = format!("{title}; ");
                 result
                     .map(|mut o| {
                         o.text.insert_str(0, &done);
@@ -8561,6 +8670,9 @@ mod tests {
         /// Frames (x, y, width, height) of FAKE_WINDOWS by pid; none: 0x0.
         frames: Rc<RefCell<HashMap<u32, Frame>>>,
         views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
+        /// The Konsole window's terminals, as `windows` lists them. Its
+        /// tabs switch (`show_tab`) when its view lists `tabs`.
+        terms: Rc<RefCell<Vec<backend::Terminal>>>,
     }
 
     /// The pid of a fake window's process: Konsole 100, each Fake window a
@@ -8871,6 +8983,26 @@ mod tests {
             _: &selfguard::SelfClient,
         ) -> selfguard::TermView {
             self.views.borrow().get(&pid).cloned().unwrap_or_default()
+        }
+        async fn term_tab(&self, pid: u32, tty: &str) -> Option<backend::TermTab> {
+            let views = self.views.borrow();
+            let v = views.get(&pid)?;
+            v.tabs
+                .as_ref()?
+                .iter()
+                .any(|t| t == tty)
+                .then(|| backend::TermTab {
+                    front: String::new(),
+                    shown: v.shown.as_deref() == Some(tty),
+                    handle: tty.into(),
+                })
+        }
+        async fn show_tab(&self, tab: &backend::TermTab) -> R<()> {
+            self.keys.borrow_mut().push(format!("tab {}", tab.handle));
+            if let Some(v) = self.views.borrow_mut().get_mut(&100) {
+                v.shown = Some(tab.handle.clone());
+            }
+            Ok(())
         }
         async fn client_tabs(&self, me: &selfguard::SelfClient) -> Vec<selfguard::ClientTab> {
             let mut tabs: Vec<selfguard::ClientTab> = Vec::new();
@@ -9449,10 +9581,15 @@ mod tests {
                     let pid = fake_pid(app, title);
                     let (x, y, width, height) =
                         self.frames.borrow().get(&pid).copied().unwrap_or_default();
+                    let terminals = match app {
+                        "konsole" => self.terms.borrow().clone(),
+                        _ => Vec::new(),
+                    };
                     WindowGeo {
                         title: title.into(),
                         app: app.into(),
                         active: (app, title) == (active.0.as_str(), active.1.as_str()),
+                        terminals,
                         pid,
                         x,
                         y,
@@ -9548,6 +9685,7 @@ mod tests {
         client: Rc<RefCell<selfguard::SelfClient>>,
         views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
         frames: Rc<RefCell<HashMap<u32, Frame>>>,
+        terms: Rc<RefCell<Vec<backend::Terminal>>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -9587,7 +9725,9 @@ mod tests {
         let client = Rc::new(RefCell::new(selfguard::SelfClient::default()));
         let views = Rc::new(RefCell::new(HashMap::new()));
         let frames = Rc::new(RefCell::new(HashMap::new()));
+        let terms = Rc::new(RefCell::new(Vec::new()));
         let server = Rc::new(Server::new(FakeBackend {
+            terms: terms.clone(),
             frames: frames.clone(),
             client: client.clone(),
             views: views.clone(),
@@ -9633,6 +9773,7 @@ mod tests {
             client,
             views,
             frames,
+            terms,
         }
     }
 
@@ -14967,6 +15108,107 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    #[test]
+    fn a_terminal_tab_comes_to_the_front_by_its_command_or_directory() {
+        local(async {
+            let mut s = session("term-tab");
+            set_allow("term-tab", "fake\nkonsole\n");
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            let term = |tty: &str, command: &str| backend::Terminal {
+                tty: tty.into(),
+                command: command.into(),
+                cwd: "~/kde-desktop-mcp".into(),
+            };
+            *s.terms.borrow_mut() = vec![term("pts/0", "claude"), term("pts/5", "cargo test")];
+            let tabs = |s: &Session| -> Vec<String> {
+                s.keys
+                    .borrow()
+                    .iter()
+                    .filter(|k| k.starts_with("tab "))
+                    .cloned()
+                    .collect()
+            };
+            // activate_window switches Konsole to that tab.
+            let r = call_tool(&mut s, 2, "activate_window", json!({"terminal": "CARGO"})).await;
+            assert_eq!(
+                reply_text(&r),
+                "active app now: konsole; tab pts/5: cargo test in ~/kde-desktop-mcp",
+                "{r}"
+            );
+            assert_eq!(tabs(&s), vec!["tab pts/5"]);
+            assert!(
+                s.keys
+                    .borrow()
+                    .contains(&"activate ~ : bash — Konsole".to_string())
+            );
+            // A tab shown already is not switched to again.
+            call_tool(&mut s, 3, "activate_window", json!({"terminal": "cargo"})).await;
+            assert_eq!(tabs(&s).len(), 1);
+            // An input tool's window "terminal:<what>": both tabs are in the
+            // directory, the agent's own is passed over.
+            konsole_tab(&s, "pts/0");
+            *s.field.borrow_mut() = Some(String::new());
+            let args = json!({"text": "make\n", "window": "terminal:kde-desktop-mcp"});
+            let r = call_tool(&mut s, 4, "type_text", args).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).starts_with(
+                    "activated '~ : bash — Konsole', tab pts/5: cargo test in ~/kde-desktop-mcp; typed"
+                ),
+                "{r}"
+            );
+            assert_eq!(s.field.borrow().as_deref(), Some("make"));
+            assert_eq!(tabs(&s), vec!["tab pts/5", "tab pts/5"]);
+            // Input never switches to the agent's own tab.
+            konsole_tab(&s, "pts/5");
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                5,
+                "key",
+                json!({"combo": "a", "window": "terminal:claude"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("only the agent's own terminal tab (pts/0) runs or is in 'claude'"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // activate_window alone may show it: no input goes there.
+            let r = call_tool(&mut s, 6, "activate_window", json!({"terminal": "claude"})).await;
+            assert!(
+                reply_text(&r).ends_with("tab pts/0: claude in ~/kde-desktop-mcp"),
+                "{r}"
+            );
+            // A terminal that cannot switch tabs: no input to whichever tab
+            // shows when the window has others.
+            s.views.borrow_mut().get_mut(&100).unwrap().tabs = None;
+            let r = call_tool(
+                &mut s,
+                7,
+                "key",
+                json!({"combo": "a", "window": "terminal:cargo"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("konsole cannot bring tab pts/5 to the front"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 8, "activate_window", json!({"terminal": "cargo"})).await;
+            assert!(reply_text(&r).contains("another tab may show"), "{r}");
+            let r = call_tool(&mut s, 9, "activate_window", json!({"terminal": "zzz"})).await;
+            assert!(
+                reply_text(&r).contains("no terminal of an allowed app runs or is in 'zzz'"),
+                "{r}"
+            );
+            assert_eq!(terminal_query("Terminal: pytest"), Some("pytest"));
+            assert_eq!(terminal_query("notes.txt — Fake"), None);
+        })
     }
 
     #[test]

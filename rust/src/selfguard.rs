@@ -398,6 +398,12 @@ impl SelfClient {
         })
     }
 
+    /// Whether terminal `tty` runs the agent or, in `view`, a client of
+    /// the daemon it runs under.
+    pub fn owns_tty(&self, view: &TermView, tty: &str) -> bool {
+        self.ours(tty) || self.client_tty(view, tty)
+    }
+
     /// Whether terminal `tty` of `view` runs a client of the daemon.
     fn client_tty(&self, view: &TermView, tty: &str) -> bool {
         self.daemon && view.clients.iter().any(|t| t == tty)

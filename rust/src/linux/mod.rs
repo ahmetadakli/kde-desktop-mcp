@@ -1502,6 +1502,32 @@ impl Backend for LinuxBackend {
         view
     }
 
+    async fn term_tab(&self, pid: u32, tty: &str) -> Option<crate::backend::TermTab> {
+        let t = konsole::tab(&self.session, pid, tty, terminals::tty_of).await?;
+        Some(crate::backend::TermTab {
+            front: t.front,
+            shown: t.shown,
+            handle: format!("{}\n{}\n{}", t.service, t.window, t.session),
+        })
+    }
+
+    async fn show_tab(&self, tab: &crate::backend::TermTab) -> R<()> {
+        let mut parts = tab.handle.split('\n');
+        let (Some(service), Some(window), Some(session)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err("not a Konsole tab".into());
+        };
+        let tab = konsole::Tab {
+            service: service.into(),
+            window: window.into(),
+            session: session.parse().map_err(|_| "not a Konsole tab")?,
+            front: tab.front.clone(),
+            shown: tab.shown,
+        };
+        konsole::show(&self.session, &tab).await
+    }
+
     async fn element_pid(&self, id: &Obj) -> Option<u32> {
         self.pid(&id.bus).await
     }

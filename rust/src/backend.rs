@@ -212,6 +212,18 @@ pub struct Terminal {
     pub cwd: String,
 }
 
+/// A terminal tab that `show_tab` can bring to the front of its window.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct TermTab {
+    /// Title of the tab its window shows now, to tell that window among
+    /// the terminal's windows ("" when it has one).
+    pub front: String,
+    /// The tab is the one its window shows.
+    pub shown: bool,
+    /// The backend's handle of the tab.
+    pub handle: String,
+}
+
 /// An app `launch` started: the command, its pid, and the window it opened
 /// (None after the wait ran out, or when windows cannot be tracked).
 #[derive(Clone, Debug, Default)]
@@ -630,6 +642,15 @@ pub trait Backend {
         _me: &crate::selfguard::SelfClient,
     ) -> crate::selfguard::TermView {
         crate::selfguard::TermView::default()
+    }
+    /// The tab of terminal process `pid` on pty `tty` ("pts/3"), when the
+    /// terminal can switch tabs (Konsole); None otherwise.
+    async fn term_tab(&self, _pid: u32, _tty: &str) -> Option<TermTab> {
+        None
+    }
+    /// Bring `tab` (`term_tab`) to the front of its window.
+    async fn show_tab(&self, _tab: &TermTab) -> R<()> {
+        Err("this terminal cannot switch tabs".into())
     }
     /// The terminal tabs running an interactive client of the daemon the
     /// server runs under (`SelfClient::daemon`), for doctor.

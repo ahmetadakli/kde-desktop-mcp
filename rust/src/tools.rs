@@ -449,7 +449,7 @@ pub fn tools() -> Json {
         ),
         t(
             "activate_window",
-            "Bring an allowed app's window to the front by title or app-name substring\n(`query`), or with `terminal` the window whose terminal runs a command or\nis in a directory containing it (as listed by windows; KDE). A terminal\nwith several tabs comes to the front on whichever tab was shown.\nAfter the user pressed the stop shortcut, this call (not as a batch step)\nresumes input: only do it once the user agreed.",
+            "Bring an allowed app's window to the front by title or app-name substring\n(`query`), or with `terminal` the window whose terminal runs a command or\nis in a directory containing it (as listed by windows; KDE). Konsole shows\nthat tab. Input tools' `window` takes \"terminal:<what>\" too.\nAfter the user pressed the stop shortcut, this call (not as a batch step)\nresumes input: only do it once the user agreed.",
             schema(&[
                 ("query", "string", Some(Json::Null)),
                 ("terminal", "string", Some(Json::Null)),
