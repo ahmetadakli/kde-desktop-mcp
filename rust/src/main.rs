@@ -8,6 +8,7 @@
 
 mod backend;
 mod delivery;
+mod doctor;
 mod flow;
 mod launch_pick;
 #[cfg(target_os = "linux")]
@@ -17,6 +18,7 @@ mod render;
 mod selfguard;
 mod semantic;
 mod shot;
+mod spill;
 mod takeover;
 mod tools;
 mod trace;
@@ -55,6 +57,10 @@ const TREE_TEXT_LIMIT: usize = render::PREVIEW_CHARS + 1;
 const TREE_MAX_CHARS: i64 = 20_000;
 /// Characters kept free in a capped tree for the line saying how to go on.
 const CONTINUATION_CHARS: usize = 150;
+/// Default `max_nodes` of a tree written to a file.
+const TREE_FILE_MAX_NODES: i64 = 3000;
+/// Lines of a tree file the reply shows.
+const TREE_FILE_HEAD: usize = 15;
 /// Nodes fetched ahead when rendering reaches an unfetched part of the tree.
 const PREFETCH_MORE: usize = 500;
 /// Candidates an ambiguous target lists (`Server::untie`).
@@ -529,7 +535,6 @@ impl Held {
 
 /// Modifiers click, mouse and scroll take.
 const MODIFIERS: [&str; 4] = ["ctrl", "shift", "alt", "meta"];
-const BUTTONS: [&str; 3] = ["left", "right", "middle"];
 
 /// One name per key, so "control" held and "ctrl" asked are the same key.
 fn canon_key(name: &str) -> String {
@@ -726,6 +731,15 @@ const DELIVERY_TOOLS: [&str; 17] = [
     "launch",
     "clipboard_set",
 ];
+
+/// The command or directory of an input tool's `window` of the form
+/// "terminal:<what>": the terminal tab running or in it.
+fn terminal_query(window: &str) -> Option<&str> {
+    let (head, rest) = window.split_once(':')?;
+    head.trim()
+        .eq_ignore_ascii_case("terminal")
+        .then(|| rest.trim())
+}
 
 /// An input tool's `window` argument (tools::WINDOW_TOOLS), trimmed; None
 /// when absent, empty, or the tool takes none.
@@ -1335,6 +1349,8 @@ struct Out {
     text: String,
     /// Inline images: base64 data and media type.
     images: Vec<(String, &'static str)>,
+    /// MCP `structuredContent`, for a tool with an `outputSchema`.
+    structured: Option<Json>,
 }
 
 impl From<String> for Out {
@@ -1342,6 +1358,7 @@ impl From<String> for Out {
         Out {
             text,
             images: Vec::new(),
+            structured: None,
         }
     }
 }
@@ -1684,6 +1701,35 @@ impl<Id> Target<Id> {
     }
 }
 
+/// Write a tree's text to a new private file; the reply names it, with
+/// its size and first lines.
+async fn tree_to_file(text: String, cut: Option<String>) -> R<String> {
+    let dir = spill::dir(&spill::TREES).ok_or("no directory for tree files (HOME is not set)")?;
+    let head: Vec<&str> = text.lines().take(TREE_FILE_HEAD).collect();
+    let head = head.join("\n");
+    let shown = dir.display().to_string();
+    let spilled = tokio::task::spawn_blocking(move || spill::write(&dir, &text))
+        .await
+        .map_err(|e| e.to_string())?
+        .map_err(|e| format!("cannot write the tree to {shown}: {e}"))?;
+    let more = spilled.lines.saturating_sub(TREE_FILE_HEAD);
+    let mut reply = format!(
+        "tree written to {} ({} bytes, {} lines; its ids work as usual){}\n{head}",
+        spilled.path.display(),
+        spilled.bytes,
+        spilled.lines,
+        if more > 0 { "; first lines:" } else { ":" },
+    );
+    if more > 0 {
+        reply.push_str(&format!("\n… {more} more lines in the file"));
+    }
+    // A cut tree says so here too, not only in the file's last line.
+    if let Some(cut) = cut.filter(|_| more > 0) {
+        reply.push_str(&format!("; the file is cut:\n{cut}"));
+    }
+    Ok(reply)
+}
+
 /// The last line of a cut tree: how much is left and the call that lists
 /// it, `after` the last element printed. Ids are stable, so the next page
 /// starts right after that element while it is still there.
@@ -1706,12 +1752,12 @@ fn continuation(a: &Json, app: &str, last: Option<u64>, left: usize, truncated: 
         }
         root => call.push(format!("root_id={root}")),
     }
-    for flag in ["interactive", "include_hidden"] {
+    for flag in ["interactive", "include_hidden", "to_file"] {
         if arg_b(a, flag, false) {
             call.push(format!("{flag}=true"));
         }
     }
-    for (k, d) in [("max_depth", 12), ("max_nodes", 300)] {
+    for (k, d) in [("max_depth", 12), ("max_nodes", tree_max_nodes(a))] {
         let v = arg_i(a, k, d);
         if v != d {
             call.push(format!("{k}={v}"));
@@ -1725,6 +1771,15 @@ fn continuation(a: &Json, app: &str, last: Option<u64>, left: usize, truncated: 
     }
     call.push(format!("after={last}"));
     format!("… {left}; continue with tree({})", call.join(", "))
+}
+
+/// Default `max_nodes` of a tree call: larger when it goes to a file.
+fn tree_max_nodes(a: &Json) -> i64 {
+    if arg_b(a, "to_file", false) {
+        TREE_FILE_MAX_NODES
+    } else {
+        300
+    }
 }
 
 fn arg_s(a: &Json, k: &str, d: &str) -> String {
@@ -4085,7 +4140,11 @@ impl<B: Backend> Server<B> {
                 Err(e) => text.push_str(&format!("\nobserve screenshot failed: {e}")),
             },
         }
-        Out { text, images }
+        Out {
+            text,
+            images,
+            structured: None,
+        }
     }
 
     /// A compact tree of the active window of `app` (else of the app in
@@ -4206,7 +4265,7 @@ impl<B: Backend> Server<B> {
             desktop: desktop_arg(a)?,
         };
         if let Some(st) = &change.state
-            && !["maximize", "minimize", "restore"].contains(&st.as_str())
+            && !tools::WINDOW_STATES.contains(&st.as_str())
         {
             return Err(format!(
                 "state must be maximize, minimize or restore, not '{st}'"
@@ -4376,7 +4435,7 @@ impl<B: Backend> Server<B> {
         }
     }
 
-    async fn doctor(&self) -> R<String> {
+    async fn doctor(&self) -> R<Out> {
         self.b.enable().await;
         let policy = self.policy();
         let allow = policy.names();
@@ -4387,11 +4446,17 @@ impl<B: Backend> Server<B> {
             std::env::consts::ARCH
         )];
         let update = update::line(env!("CARGO_PKG_VERSION")).await;
+        let mut rows = Vec::new();
         let mut row = |ok: bool, name: &str, detail: &str| {
             lines.push(format!(
                 "[{}] {name}: {detail}",
                 if ok { "ok" } else { "FAIL" }
             ));
+            rows.push(doctor::Row {
+                name: name.into(),
+                ok,
+                detail: detail.into(),
+            });
         };
         row(true, "update", &update);
         let listed = self.policy_file();
@@ -4524,7 +4589,18 @@ impl<B: Backend> Server<B> {
         if !self.b.apps_note().is_empty() {
             lines.push(format!("note: {}", self.b.apps_note()));
         }
-        Ok(lines.join("\n"))
+        let summary = doctor::summary(
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::OS,
+            self.b.session(),
+            &rows,
+        );
+        lines.push(doctor::line(&summary));
+        Ok(Out {
+            text: lines.join("\n"),
+            images: Vec::new(),
+            structured: Some(summary),
+        })
     }
 
     async fn tree(&self, a: &Json) -> R<Out> {
@@ -4533,7 +4609,7 @@ impl<B: Backend> Server<B> {
         let interactive = arg_b(a, "interactive", false);
         let opts = WalkOpts {
             max_depth: arg_i(a, "max_depth", 12).max(0) as usize,
-            budget: arg_i(a, "max_nodes", 300).max(0) as usize,
+            budget: arg_i(a, "max_nodes", tree_max_nodes(a)).max(0) as usize,
             only_showing: !arg_b(a, "include_hidden", false),
             boring_roles: self.b.boring_roles(),
             interactive,
@@ -4608,22 +4684,24 @@ impl<B: Backend> Server<B> {
             ));
         }
         let printed = self.printed(lines, &cache, &app).await;
+        // To a file: the whole text, `max_chars` aside.
+        let to_file = arg_b(a, "to_file", false);
         // Room for the continuation line.
         let room = match max_chars {
+            _ if to_file => 0,
             0 => 0,
             n => n.saturating_sub(CONTINUATION_CHARS).max(1),
         };
         let capped = render::format_capped(&printed, room);
         let mut text = capped.text;
-        if capped.left > 0 || walked.truncated {
+        let cut = (capped.left > 0 || walked.truncated)
+            .then(|| continuation(a, &app, capped.last, capped.left, walked.truncated));
+        if let Some(cut) = &cut {
             text.push('\n');
-            text.push_str(&continuation(
-                a,
-                &app,
-                capped.last,
-                capped.left,
-                walked.truncated,
-            ));
+            text.push_str(cut);
+        }
+        if to_file {
+            text = tree_to_file(text, cut).await?;
         }
         if !arg_b(a, "screenshot", false) {
             return Ok(Out::from(text));
@@ -4642,6 +4720,7 @@ impl<B: Backend> Server<B> {
             Ok(shot) => Ok(Out {
                 text: format!("{text}\nscreenshot: {}", shot.text),
                 images: shot.images,
+                structured: None,
             }),
             Err(e) => Ok(Out::from(format!("{text}\nno screenshot: {e}"))),
         }
@@ -7020,7 +7099,7 @@ impl<B: Backend> Server<B> {
                 keys.into_iter().map(Held::Key).collect()
             }
             (None, Some(b)) => {
-                if !BUTTONS.contains(&b) {
+                if !tools::BUTTONS.contains(&b) {
                     return Err(format!("unknown button '{b}' (left, right, middle)"));
                 }
                 vec![Held::Button(b.to_string())]
@@ -7058,13 +7137,19 @@ impl<B: Backend> Server<B> {
     }
 
     async fn activate_window(&self, a: &Json) -> R<String> {
-        let query = match a.get("terminal").and_then(Json::as_str) {
-            Some(t) => self.terminal_window(t).await?,
-            None => self.prefer_other(&req_s(a, "query")?).await,
+        let (app, tab) = match a.get("terminal").and_then(Json::as_str) {
+            Some(t) => {
+                let (_, app, tab) = self.show_terminal(t, false).await?;
+                (app, format!("; {tab}"))
+            }
+            None => {
+                let query = self.prefer_other(&req_s(a, "query")?).await;
+                let (_, app) = trace::time("activate", self.activate(&query)).await?;
+                (app, String::new())
+            }
         };
-        let (_, app) = trace::time("activate", self.activate(&query)).await?;
         Ok(format!(
-            "active app now: {}",
+            "active app now: {}{tab}",
             if app.is_empty() { "unknown" } else { &app }
         ))
     }
@@ -7121,22 +7206,36 @@ impl<B: Backend> Server<B> {
     /// Whether `window` (an argument) needs no activation: the window
     /// `ensure_window` would bring forward is already in front.
     async fn window_in_front(&self, query: &str) -> bool {
+        if terminal_query(query).is_some() {
+            return false;
+        }
         let query = self.prefer_other(query).await;
         self.window_is_active(&query).await
     }
 
     /// An input tool's `window`: activate the matching window unless it is
-    /// already in front. Some(title) when it activated one. Runs inside
-    /// `call`, under the input lock, so nothing else takes the focus
-    /// between this and the tool's input.
+    /// already in front; "terminal:<what>" brings that terminal tab to the
+    /// front (`show_terminal`). Some("activated <title>...") when it
+    /// activated one. Runs inside `call`, under the input lock, so nothing
+    /// else takes the focus between this and the tool's input.
     async fn ensure_window(&self, query: &str) -> R<Option<String>> {
+        if let Some(what) = terminal_query(query) {
+            let (title, _, tab) = self.show_terminal(what, true).await?;
+            return Ok(Some(format!(
+                "activated {}, {tab}",
+                render::short_title(&title)
+            )));
+        }
         let query = self.prefer_other(query).await;
         if trace::time("window_is_active", self.window_is_active(&query)).await {
             trace::note("window in front already: not activated");
             return Ok(None);
         }
         let (title, _) = trace::time("activate", self.activate(&query)).await?;
-        Ok(Some(title.unwrap_or(query)))
+        Ok(Some(format!(
+            "activated {}",
+            render::short_title(&title.unwrap_or(query))
+        )))
     }
 
     /// `query`, or the title of another window it matches as well when the
@@ -7153,21 +7252,114 @@ impl<B: Backend> Server<B> {
             .unwrap_or_else(|| query.to_string())
     }
 
-    /// Title of the allowed window whose terminal runs a command, or is in a
-    /// directory, containing `what` (case-insensitive).
-    async fn terminal_window(&self, what: &str) -> R<String> {
-        let q = what.to_lowercase();
+    /// Bring the terminal tab of an allowed app whose foreground command,
+    /// or its directory, contains `what` (case-insensitive) to the front:
+    /// activate its window, then show the tab (Konsole). Tabs of the agent's
+    /// own client (`selfguard`) are only picked when no other matches, and
+    /// never `for_input`; nor is a tab that cannot be brought forward in a
+    /// window with several. Returns the window's title (after the switch),
+    /// the active app and the tab as "tab pts/N: <command> in <dir>".
+    async fn show_terminal(&self, what: &str, for_input: bool) -> R<(String, String, String)> {
+        let q = what.trim().to_lowercase();
+        if q.is_empty() {
+            return Err("terminal: name a command or directory".into());
+        }
         let list = self.b.windows("", &self.allowed()).await?;
-        list.into_iter()
-            .find(|w| {
-                w.terminals.iter().any(|t| {
-                    t.command.to_lowercase().contains(&q) || t.cwd.to_lowercase().contains(&q)
-                })
-            })
-            .map(|w| w.title)
-            .ok_or_else(|| {
-                format!("no terminal of an allowed app runs or is in '{what}' (see windows)")
-            })
+        let me = self.guarded_client().await;
+        // (window, terminal) per tab: one Konsole process lists every tab
+        // under each of its windows.
+        let (mut hits, mut own) = (Vec::new(), Vec::new());
+        for w in &list {
+            let view = match me {
+                Some(me) if me.daemon && me.may_own(w.pid) => {
+                    Some(self.b.term_view(w.pid, Some(&w.title), me).await)
+                }
+                _ => None,
+            };
+            for t in &w.terminals {
+                let matches =
+                    t.command.to_lowercase().contains(&q) || t.cwd.to_lowercase().contains(&q);
+                let seen = |v: &Vec<(&WindowGeo, &backend::Terminal)>| {
+                    v.iter().any(|(h, ht)| h.pid == w.pid && ht.tty == t.tty)
+                };
+                if !matches || seen(&hits) || seen(&own) {
+                    continue;
+                }
+                let ours = me.is_some_and(|me| {
+                    me.owns_tty(view.as_ref().unwrap_or(&Default::default()), &t.tty)
+                });
+                if ours { &mut own } else { &mut hits }.push((w, t));
+            }
+        }
+        let others = hits.len().saturating_sub(1);
+        let (w, t) = match (hits.first(), own.first()) {
+            (Some(hit), _) => *hit,
+            (None, Some(_)) if for_input => {
+                let ttys: Vec<&str> = own.iter().map(|(_, t)| t.tty.as_str()).collect();
+                return Err(refusal(delivery::nothing_sent(format!(
+                    "only the agent's own terminal tab ({}) runs or is in '{what}': input \
+                     never goes there",
+                    ttys.join(", ")
+                ))));
+            }
+            (None, Some(hit)) => *hit,
+            (None, None) => {
+                return Err(delivery::nothing_sent(format!(
+                    "no terminal of an allowed app runs or is in '{what}' (see windows)"
+                )));
+            }
+        };
+        let tab = self.b.term_tab(w.pid, &t.tty).await;
+        let several = w.terminals.iter().filter(|x| x.tty != t.tty).count() > 0;
+        if for_input && several && tab.is_none() {
+            return Err(delivery::nothing_sent(format!(
+                "{} cannot bring tab {} to the front, and its window has others: \
+                 activate it and switch tabs first",
+                w.app, t.tty
+            )));
+        }
+        // The window holding the tab, among the terminal's windows (each
+        // lists all its tabs): the one whose tab in front has the title
+        // Konsole gives. Unclear when none or several have it; input then
+        // could go to the tab another window shows.
+        let front = tab.as_ref().map(|t| t.front.trim()).unwrap_or_default();
+        let same: Vec<&WindowGeo> = list
+            .iter()
+            .filter(|x| x.pid == w.pid && x.title.starts_with(front))
+            .collect();
+        let (title, unclear) = match same.as_slice() {
+            _ if front.is_empty() => (w.title.clone(), false),
+            [one] => (one.title.clone(), false),
+            _ if for_input => {
+                return Err(delivery::nothing_sent(format!(
+                    "{} has several windows and which one holds tab {} cannot be told \
+                     (their tabs in front share a title): activate it and switch tabs first",
+                    w.app, t.tty
+                )));
+            }
+            _ => (w.title.clone(), true),
+        };
+        let (_, app) = trace::time("activate", self.activate(&title)).await?;
+        if let Some(tab) = tab.as_ref().filter(|t| !t.shown) {
+            trace::time("show_tab", self.b.show_tab(tab)).await?;
+            let now = self.active_title().await;
+            *self.last_active.lock().await = now;
+        }
+        let title = self.active_title().await.unwrap_or(title);
+        let mut about = format!("tab {}: {}", t.tty, t.command);
+        if !t.cwd.is_empty() {
+            about.push_str(&format!(" in {}", t.cwd));
+        }
+        if tab.is_none() && several {
+            about.push_str(" (another tab may show: this terminal cannot switch tabs)");
+        }
+        if unclear {
+            about.push_str(" (in another window of it, which may not be the one in front)");
+        }
+        if others > 0 {
+            about.push_str(&format!("; {others} more tabs match"));
+        }
+        Ok((title, app, about))
     }
 
     /// Fill in the active file Open/Save dialog of an allowed app: write the
@@ -7270,6 +7462,16 @@ impl<B: Backend> Server<B> {
     /// resolution, mapped so image_x/image_y refer to the zoomed image.
     async fn screenshot(&self, a: &Json) -> R<Out> {
         let region = region_arg(a)?;
+        // A path to save at is checked before anything is captured.
+        let save_to = match a.get("save_to").and_then(Json::as_str) {
+            Some(raw) => {
+                let home = home_dir();
+                let path =
+                    expand_path(raw, home.as_deref()).map_err(|e| format!("save_to: {e}"))?;
+                Some(spill::check_save_path(&path, home.as_deref())?)
+            }
+            None => None,
+        };
         // The window captured is the one checked: read once, its app by
         // its process.
         let target = trace::time("shot_target", self.b.shot_target())
@@ -7305,7 +7507,7 @@ impl<B: Backend> Server<B> {
             }
         };
         let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, 8192) as u32;
-        let inline = arg_b(a, "inline", true);
+        let inline = arg_b(a, "inline", true) && save_to.is_none();
         // Converting, shrinking and encoding take milliseconds: keep other
         // calls moving.
         let file = path.clone();
@@ -7329,6 +7531,16 @@ impl<B: Backend> Server<B> {
         let mut text = if inline {
             let _ = std::fs::remove_file(&path);
             format!("{iw}x{ih} px")
+        } else if let Some(dest) = save_to {
+            // The caller's copy is all that is left: the private file goes.
+            let _ = std::fs::remove_file(&path);
+            let shown = dest.display().to_string();
+            let png = done.png.clone();
+            tokio::task::spawn_blocking(move || spill::save(&dest, &png))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| format!("save_to: cannot write {shown}: {e}"))?;
+            format!("{shown}\n{iw}x{ih} px")
         } else {
             format!("{path}\n{iw}x{ih} px")
         };
@@ -7357,6 +7569,7 @@ impl<B: Backend> Server<B> {
             } else {
                 Vec::new()
             },
+            structured: None,
         })
     }
 
@@ -7497,6 +7710,7 @@ impl<B: Backend> Server<B> {
         Ok(Out {
             text,
             images: run.images,
+            structured: None,
         })
     }
 
@@ -7824,7 +8038,7 @@ impl<B: Backend> Server<B> {
             "close_window" => self.close_window(a).await.map(Out::from),
             "menu" => self.menu(a).await.map(Out::from),
             "launch" => self.launch(a).await.map(Out::from),
-            "doctor" => self.doctor().await.map(Out::from),
+            "doctor" => self.doctor().await,
             "scroll" => self.scroll(a).await.map(Out::from),
             "key" => self.key(a).await.map(Out::from),
             "type_text" => self.type_text(a).await.map(Out::from),
@@ -7920,7 +8134,7 @@ impl<B: Backend> Server<B> {
         });
         let result = match activated {
             Some(title) => {
-                let done = format!("activated {}; ", render::short_title(&title));
+                let done = format!("{title}; ");
                 result
                     .map(|mut o| {
                         o.text.insert_str(0, &done);
@@ -8237,7 +8451,11 @@ async fn handle<B: Backend>(server: &Server<B>, msg: &Json) -> Option<Json> {
                 content.extend(out.images.into_iter().map(
                     |(data, mime)| json!({ "type": "image", "data": data, "mimeType": mime }),
                 ));
-                json!({ "content": content, "isError": is_error })
+                let mut result = json!({ "content": content, "isError": is_error });
+                if let Some(s) = out.structured {
+                    result["structuredContent"] = s;
+                }
+                result
             }
             _ => {
                 return Some(json!({ "jsonrpc": "2.0", "id": id,
@@ -8562,6 +8780,11 @@ mod tests {
         /// Frames (x, y, width, height) of FAKE_WINDOWS by pid; none: 0x0.
         frames: Rc<RefCell<HashMap<u32, Frame>>>,
         views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
+        /// The Konsole window's terminals, as `windows` lists them. Its
+        /// tabs switch (`show_tab`) when its view lists `tabs`.
+        terms: Rc<RefCell<Vec<backend::Terminal>>>,
+        /// `TermTab::front` of its tabs: "" as with one Konsole window.
+        tab_front: Rc<RefCell<String>>,
     }
 
     /// The pid of a fake window's process: Konsole 100, each Fake window a
@@ -8872,6 +9095,26 @@ mod tests {
             _: &selfguard::SelfClient,
         ) -> selfguard::TermView {
             self.views.borrow().get(&pid).cloned().unwrap_or_default()
+        }
+        async fn term_tab(&self, pid: u32, tty: &str) -> Option<backend::TermTab> {
+            let views = self.views.borrow();
+            let v = views.get(&pid)?;
+            v.tabs
+                .as_ref()?
+                .iter()
+                .any(|t| t == tty)
+                .then(|| backend::TermTab {
+                    front: self.tab_front.borrow().clone(),
+                    shown: v.shown.as_deref() == Some(tty),
+                    handle: tty.into(),
+                })
+        }
+        async fn show_tab(&self, tab: &backend::TermTab) -> R<()> {
+            self.keys.borrow_mut().push(format!("tab {}", tab.handle));
+            if let Some(v) = self.views.borrow_mut().get_mut(&100) {
+                v.shown = Some(tab.handle.clone());
+            }
+            Ok(())
         }
         async fn client_tabs(&self, me: &selfguard::SelfClient) -> Vec<selfguard::ClientTab> {
             let mut tabs: Vec<selfguard::ClientTab> = Vec::new();
@@ -9450,10 +9693,15 @@ mod tests {
                     let pid = fake_pid(app, title);
                     let (x, y, width, height) =
                         self.frames.borrow().get(&pid).copied().unwrap_or_default();
+                    let terminals = match app {
+                        "konsole" => self.terms.borrow().clone(),
+                        _ => Vec::new(),
+                    };
                     WindowGeo {
                         title: title.into(),
                         app: app.into(),
                         active: (app, title) == (active.0.as_str(), active.1.as_str()),
+                        terminals,
                         pid,
                         x,
                         y,
@@ -9549,6 +9797,8 @@ mod tests {
         client: Rc<RefCell<selfguard::SelfClient>>,
         views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
         frames: Rc<RefCell<HashMap<u32, Frame>>>,
+        terms: Rc<RefCell<Vec<backend::Terminal>>>,
+        tab_front: Rc<RefCell<String>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -9588,7 +9838,11 @@ mod tests {
         let client = Rc::new(RefCell::new(selfguard::SelfClient::default()));
         let views = Rc::new(RefCell::new(HashMap::new()));
         let frames = Rc::new(RefCell::new(HashMap::new()));
+        let terms = Rc::new(RefCell::new(Vec::new()));
+        let tab_front = Rc::new(RefCell::new(String::new()));
         let server = Rc::new(Server::new(FakeBackend {
+            tab_front: tab_front.clone(),
+            terms: terms.clone(),
             frames: frames.clone(),
             client: client.clone(),
             views: views.clone(),
@@ -9634,6 +9888,8 @@ mod tests {
             client,
             views,
             frames,
+            terms,
+            tab_front,
         }
     }
 
@@ -9926,6 +10182,70 @@ mod tests {
             "… more nodes; continue with tree(root_id=9, max_chars=5000, after=12)"
         );
         assert_eq!(continuation(&a, "kate", None, 0, true), render::TRUNCATED);
+        // To a file, max_nodes=300 is no longer the default.
+        let a = json!({"app": "kate", "to_file": true, "max_nodes": 300});
+        assert_eq!(
+            continuation(&a, "kate", Some(5), 0, true),
+            "… more nodes; continue with tree(app=\"kate\", to_file=true, max_nodes=300, after=5)"
+        );
+    }
+
+    #[test]
+    fn tree_to_file_writes_the_same_lines_and_ids() {
+        local(async {
+            let mut s = session("tree-file");
+            let r = call_tool(&mut s, 2, "tree", json!({"app": "fake"})).await;
+            let inline = reply_text(&r);
+            let r = call_tool(&mut s, 3, "tree", json!({"app": "fake", "to_file": true})).await;
+            let text = reply_text(&r);
+            let rest = text.strip_prefix("tree written to ").expect(text);
+            let path = rest.split(" (").next().unwrap();
+            let written = std::fs::read_to_string(path).unwrap();
+            let _ = std::fs::remove_file(path);
+            // The same text as inline, so the same ids.
+            assert_eq!(written, inline);
+            assert!(
+                text.contains(&format!(
+                    "({} bytes, {} lines; ",
+                    written.len(),
+                    written.lines().count()
+                )),
+                "{text}"
+            );
+            let head = written
+                .lines()
+                .take(TREE_FILE_HEAD)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains(&head), "{text}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let meta = std::fs::metadata(std::path::Path::new(path).parent().unwrap()).unwrap();
+                assert_eq!(meta.permissions().mode() & 0o077, 0);
+            }
+        });
+    }
+
+    #[test]
+    fn a_cut_tree_file_says_so_in_the_reply() {
+        local(async {
+            let cut = "… 9+ more nodes; continue with tree(app=\"fake\", to_file=true, after=40)";
+            let lines: Vec<String> = (0..40).map(|i| format!("[{i}] label \"x\"")).collect();
+            let text = format!("{}\n{cut}", lines.join("\n"));
+            let reply = tree_to_file(text.clone(), Some(cut.into())).await.unwrap();
+            let path = reply.strip_prefix("tree written to ").unwrap();
+            let _ = std::fs::remove_file(path.split(" (").next().unwrap());
+            assert!(
+                reply.ends_with(&format!("in the file; the file is cut:\n{cut}")),
+                "{reply}"
+            );
+            // Whole: nothing more to say.
+            let reply = tree_to_file(text, None).await.unwrap();
+            let path = reply.strip_prefix("tree written to ").unwrap();
+            let _ = std::fs::remove_file(path.split(" (").next().unwrap());
+            assert!(reply.ends_with("more lines in the file"), "{reply}");
+        });
     }
 
     #[test]
@@ -10271,6 +10591,56 @@ mod tests {
     }
 
     #[test]
+    fn doctor_ends_with_a_summary_line_and_sends_it_structured() {
+        local(async {
+            let mut s = session("doctor-summary");
+            let r = call_tool(&mut s, 2, "doctor", json!({})).await;
+            let text = reply_text(&r);
+            let last: Json = serde_json::from_str(text.lines().last().unwrap()).unwrap();
+            let structured = &r["result"]["structuredContent"];
+            assert_eq!(structured["version"], env!("CARGO_PKG_VERSION"), "{r}");
+            assert_eq!(structured["platform"], std::env::consts::OS);
+            assert_eq!(structured["blockers"], json!([]));
+            let checks = structured["checks"].as_array().unwrap();
+            let failed: Vec<&Json> = checks
+                .iter()
+                .filter(|c| c["ok"] == false)
+                .map(|c| &c["name"])
+                .collect();
+            assert!(
+                structured["next_step"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("ready"),
+                "{r}"
+            );
+            let allowlist = checks.iter().find(|c| c["name"] == "allowlist").unwrap();
+            assert_eq!(allowlist["ok"], true);
+            // Each check's detail is in the text once, as its report line.
+            let detail = allowlist["detail"].as_str().unwrap();
+            assert_eq!(text.matches(detail).count(), 1, "{text}");
+            assert_eq!(last["failed"], json!(failed));
+            assert_eq!(last["next_step"], structured["next_step"]);
+            assert!(last.get("checks").is_none(), "{last}");
+            // An empty allowlist blocks everything.
+            set_allow("doctor-summary", "");
+            let r = call_tool(&mut s, 3, "doctor", json!({})).await;
+            let structured = &r["result"]["structuredContent"];
+            assert_eq!(structured["blockers"], json!(["allowlist"]), "{r}");
+            assert!(
+                structured["next_step"]
+                    .as_str()
+                    .unwrap()
+                    .contains("allowlist file"),
+                "{r}"
+            );
+            // Other tools send no structured content.
+            let r = call_tool(&mut s, 4, "apps", json!({})).await;
+            assert!(r["result"].get("structuredContent").is_none(), "{r}");
+        });
+    }
+
+    #[test]
     fn doctor_lists_the_file_and_names_apps_allowed_through_an_alias() {
         local(async {
             let mut s = session("doctor-alias");
@@ -10588,6 +10958,58 @@ mod tests {
             for name in common.trim_end_matches('.').split(", ") {
                 assert!(names.contains(&json!(name)), "{name}");
             }
+        });
+    }
+
+    #[test]
+    fn screenshot_save_to_writes_a_new_png_and_refuses_bad_paths() {
+        local(async {
+            let mut s = session("saveto");
+            // Refused before anything is captured.
+            for (path, want) in [
+                ("shot.png", "not absolute"),
+                ("/etc/shot.png", "inside the home folder"),
+                ("~/shot.jpg", ".png"),
+            ] {
+                let r = call_tool(&mut s, 2, "screenshot", json!({"save_to": path})).await;
+                assert!(reply_text(&r).contains(want), "{path}: {r}");
+            }
+            let Some(home) = home_dir() else { return };
+            let dir = home
+                .join(".cache")
+                .join(format!("desktop-mcp-test-saveto-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let file = dir.join("a.png");
+            let a = json!({"save_to": file.display().to_string(), "max_size": 100});
+            let r = call_tool(&mut s, 3, "screenshot", a.clone()).await;
+            // No image: the reply names the file, which holds the PNG.
+            assert_eq!(r["result"]["content"].as_array().unwrap().len(), 1, "{r}");
+            let text = reply_text(&r);
+            let saved = std::fs::canonicalize(&file).unwrap();
+            assert!(
+                text.starts_with(&format!("{}\n100x50 px", saved.display())),
+                "{text}"
+            );
+            assert_eq!(
+                shot::read_png(&saved.display().to_string()).unwrap().width,
+                100
+            );
+            // The capture's own file is gone.
+            let own = std::env::temp_dir().join(format!(
+                "desktop-mcp-test-{}-saveto.png",
+                std::process::id()
+            ));
+            assert!(!own.exists());
+            // Never over an existing file.
+            let r = call_tool(&mut s, 4, "screenshot", a).await;
+            assert!(reply_text(&r).contains("already exists"), "{r}");
+            std::fs::remove_dir_all(&dir).unwrap();
         });
     }
 
@@ -11385,6 +11807,24 @@ mod tests {
         assert!(check_dialog_path(&dir.join("no/such.txt"), "save").is_err());
         assert!(check_dialog_path(&file, "delete").is_err());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn every_enum_value_in_the_schemas_is_taken() {
+        // The schemas offer these values; the handlers must take each one.
+        for s in tools::WAIT_STATES {
+            assert_eq!(WaitState::parse(s).unwrap().name(), s);
+        }
+        let file = std::env::temp_dir().join(format!("desktop-mcp-en-{}", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        for a in tools::DIALOG_ACTIONS {
+            assert!(check_dialog_path(&file, a).is_ok(), "{a}");
+        }
+        std::fs::remove_file(&file).unwrap();
+        for k in tools::OBSERVE_KINDS {
+            let a = json!({ "observe": k });
+            assert!(observe_arg("click", &a).is_ok(), "{k}");
+        }
     }
 
     #[test]
@@ -14950,6 +15390,145 @@ mod tests {
                 ..Default::default()
             },
         );
+    }
+
+    #[test]
+    fn a_terminal_tab_comes_to_the_front_by_its_command_or_directory() {
+        local(async {
+            let mut s = session("term-tab");
+            set_allow("term-tab", "fake\nkonsole\n");
+            agent_in_konsole(&s);
+            konsole_tab(&s, "pts/0");
+            let term = |tty: &str, command: &str| backend::Terminal {
+                tty: tty.into(),
+                command: command.into(),
+                cwd: "~/kde-desktop-mcp".into(),
+            };
+            *s.terms.borrow_mut() = vec![term("pts/0", "claude"), term("pts/5", "cargo test")];
+            let tabs = |s: &Session| -> Vec<String> {
+                s.keys
+                    .borrow()
+                    .iter()
+                    .filter(|k| k.starts_with("tab "))
+                    .cloned()
+                    .collect()
+            };
+            // activate_window switches Konsole to that tab.
+            let r = call_tool(&mut s, 2, "activate_window", json!({"terminal": "CARGO"})).await;
+            assert_eq!(
+                reply_text(&r),
+                "active app now: konsole; tab pts/5: cargo test in ~/kde-desktop-mcp",
+                "{r}"
+            );
+            assert_eq!(tabs(&s), vec!["tab pts/5"]);
+            assert!(
+                s.keys
+                    .borrow()
+                    .contains(&"activate ~ : bash — Konsole".to_string())
+            );
+            // A tab shown already is not switched to again.
+            call_tool(&mut s, 3, "activate_window", json!({"terminal": "cargo"})).await;
+            assert_eq!(tabs(&s).len(), 1);
+            // An input tool's window "terminal:<what>": both tabs are in the
+            // directory, the agent's own is passed over.
+            konsole_tab(&s, "pts/0");
+            *s.field.borrow_mut() = Some(String::new());
+            let args = json!({"text": "make\n", "window": "terminal:kde-desktop-mcp"});
+            let r = call_tool(&mut s, 4, "type_text", args).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).starts_with(
+                    "activated '~ : bash — Konsole', tab pts/5: cargo test in ~/kde-desktop-mcp; typed"
+                ),
+                "{r}"
+            );
+            assert_eq!(s.field.borrow().as_deref(), Some("make"));
+            assert_eq!(tabs(&s), vec!["tab pts/5", "tab pts/5"]);
+            // Input never switches to the agent's own tab.
+            konsole_tab(&s, "pts/5");
+            s.keys.borrow_mut().clear();
+            let r = call_tool(
+                &mut s,
+                5,
+                "key",
+                json!({"combo": "a", "window": "terminal:claude"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("only the agent's own terminal tab (pts/0) runs or is in 'claude'"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // activate_window alone may show it: no input goes there.
+            let r = call_tool(&mut s, 6, "activate_window", json!({"terminal": "claude"})).await;
+            assert!(
+                reply_text(&r).ends_with("tab pts/0: claude in ~/kde-desktop-mcp"),
+                "{r}"
+            );
+            // A terminal that cannot switch tabs: no input to whichever tab
+            // shows when the window has others.
+            s.views.borrow_mut().get_mut(&100).unwrap().tabs = None;
+            let r = call_tool(
+                &mut s,
+                7,
+                "key",
+                json!({"combo": "a", "window": "terminal:cargo"}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("konsole cannot bring tab pts/5 to the front"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 8, "activate_window", json!({"terminal": "cargo"})).await;
+            assert!(reply_text(&r).contains("another tab may show"), "{r}");
+            // Several Konsole windows: the one holding the tab is the one
+            // whose tab in front has that title; input only when that is
+            // clear.
+            konsole_tab(&s, "pts/0");
+            s.keys.borrow_mut().clear();
+            *s.tab_front.borrow_mut() = "~ : bash".into();
+            let r = call_tool(
+                &mut s,
+                10,
+                "key",
+                json!({"combo": "a", "window": "terminal:cargo"}),
+            )
+            .await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(tabs(&s), vec!["tab pts/5"]);
+            konsole_tab(&s, "pts/0");
+            s.keys.borrow_mut().clear();
+            *s.tab_front.borrow_mut() = "~ : fish".into();
+            let r = call_tool(
+                &mut s,
+                11,
+                "key",
+                json!({"combo": "a", "window": "terminal:cargo"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("konsole has several windows and which one holds tab pts/5"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            let r = call_tool(&mut s, 12, "activate_window", json!({"terminal": "cargo"})).await;
+            assert!(
+                reply_text(&r).contains("may not be the one in front"),
+                "{r}"
+            );
+            *s.tab_front.borrow_mut() = String::new();
+            let r = call_tool(&mut s, 9, "activate_window", json!({"terminal": "zzz"})).await;
+            assert!(
+                reply_text(&r).contains("no terminal of an allowed app runs or is in 'zzz'"),
+                "{r}"
+            );
+            assert_eq!(terminal_query("Terminal: pytest"), Some("pytest"));
+            assert_eq!(terminal_query("notes.txt — Fake"), None);
+        })
     }
 
     #[test]

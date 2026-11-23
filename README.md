@@ -266,6 +266,13 @@ tool; `off` turns it off). Not available on Windows yet.
   reply is capped at `max_chars` (default 20,000) and `max_nodes`; a cut one
   ends with `… N more nodes; continue with tree(…, after=ID)`, which lists the
   rest after that element (ids are stable, so pages join up exactly).
+  `to_file: true` writes the whole tree (`max_nodes` default 3,000) to a new
+  file only the user can read and replies with its path, size and first
+  lines; the ids in it work like any other. Linux:
+  `$XDG_RUNTIME_DIR/desktop-mcp/trees` (else `~/.cache/desktop-mcp/trees`),
+  directories 0700, files 0600, never written through an existing file or
+  symlink. Windows: `%LOCALAPPDATA%\desktop-mcp\trees`, which keeps the
+  profile's ACL (the user, SYSTEM, Administrators). The newest 10 are kept.
   `screenshot: true` adds the image of the app's window when it is in front.
 - `set_text` reads back what it wrote: the reply says "verified", or it fails
   saying what the field holds (a length limit, other text). A field that only
@@ -639,8 +646,12 @@ tool; `off` turns it off). Not available on Windows yet.
 - Terminal windows: `windows` also lists each terminal tab's pts device,
   foreground command and directory; `activate_window` with
   `terminal: "pytest"` brings forward the terminal running that command (or in
-  that directory). A terminal with several tabs comes forward on whichever tab
-  it shows. The terminal must be in the allowlist (e.g. `konsole`).
+  that directory), and Konsole switches to that tab over D-Bus (other
+  terminals come forward on whichever tab they show). Input tools take the
+  same as `window: "terminal:pytest"`; they never pick the agent's own tab,
+  and refuse a tab that cannot be brought forward in a window with others.
+  The reply names the tab (pts, command, directory). The terminal must be in
+  the allowlist (e.g. `konsole`).
 - `file_dialog`: fills in the file Open/Save dialog in front: `path` (absolute
   or `~/…`) is written into its file name field, the default button (Open,
   Save) is pressed and the dialog's closing is awaited (Qt 5's name field and
@@ -656,7 +667,11 @@ tool; `off` turns it off). Not available on Windows yet.
   fails saying the dialog is still open.
 - `doctor`: checks the setup in one report: version, allowlist, which running
   apps are allowed, the session, AT-SPI, the virtual keyboard and mouse, KWin
-  scripting, screens and the screenshot path.
+  scripting, screens and the screenshot path. Its last line is a JSON
+  summary for programs: version, platform, session, the failed checks, the
+  `blockers` (failed checks nothing works without) and a `next_step`. The
+  same summary, each check with its detail, comes as MCP
+  `structuredContent` (the tool has an `outputSchema`).
 - `key`, `type_text`: keyboard. The reply names the element that has focus
   afterwards; `type_text` warns when focus is not on an editable field (KDE).
   In a `batch`, a step whose focus is the one the previous report described
@@ -689,7 +704,15 @@ tool; `off` turns it off). Not available on Windows yet.
   only (about width x height / 750: 786 at 1024x576), so the default size
   stays: at 896 px a 1080p window's 13 px text shrinks to 6 px. An inline
   screenshot leaves no file behind and names none; `inline: false` saves a
-  PNG and returns only its path; given `image_x`/`image_y`,
+  PNG and returns only its path. Captures go to a new file only the user
+  can read, never through an existing file or symlink: Linux
+  `$XDG_RUNTIME_DIR/desktop-mcp/shots` (else `~/.cache/desktop-mcp/shots`,
+  directories 0700, files 0600), Windows
+  `%LOCALAPPDATA%\desktop-mcp\shots`; the newest 20 are kept. `save_to`
+  (an absolute or `~/` path to a new `.png`) saves the image there instead,
+  only in an existing folder under the home folder that the user owns and
+  no one else can write to; an existing file is refused, never replaced.
+  Given `image_x`/`image_y`,
   `mouse` converts a pixel of the image to a screen coordinate (window position
   and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
   in pixels of the last screenshot captures again and returns only that part,
@@ -865,6 +888,37 @@ The Windows build is cross-compiled and has not been run on real Windows yet.
 
 The sections below build from source.
 
+### Claude Code plugin
+
+The repository is also a Claude Code plugin marketplace. In Claude Code:
+
+```
+/plugin marketplace add ahmetadakli/kde-desktop-mcp
+/plugin install desktop-mcp
+```
+
+On Windows install `desktop-mcp-windows` instead. The plugin adds the
+`desktop` server; the system packages listed per desktop below are still
+needed. Its launcher
+([`packaging/claude-plugin`](packaging/claude-plugin)) runs a `desktop-mcp`
+found on `PATH` (installed with `install.sh`, an AUR package or cargo).
+Otherwise it downloads the release build of the plugin's version once into
+the plugin's data directory (`~/.claude/plugins/data/…`), checks it against
+the release's `SHA256SUMS` and runs it; an archive that does not match is
+deleted, never run. Linux needs `curl` (or `wget`), `sha256sum` and `tar`;
+the Windows launcher uses PowerShell and has not been run on real Windows yet.
+
+- Updating: `/plugin update desktop-mcp` (or the marketplace's auto-update)
+  moves to the next version, whose launcher downloads that release. A
+  `desktop-mcp` on `PATH` is updated the way it was installed.
+- Plugin servers have their own tool names: `mcp__plugin_desktop-mcp_desktop__find`
+  instead of `mcp__desktop__find`, so the permission rule under "Speed:
+  skipping the permission prompt" is `mcp__plugin_desktop-mcp_desktop`
+  (Windows: `mcp__plugin_desktop-mcp-windows_desktop`).
+- A `desktop` server already added with `claude mcp add` keeps running next
+  to the plugin's; remove one of them (`claude mcp remove --scope user
+  desktop`).
+
 ### KDE Plasma (Wayland)
 
 Requirements:
@@ -968,6 +1022,22 @@ Linux too):
 ```bash
 cd rust && cargo test --release
 ```
+
+They also check the tool list itself: every tool's annotations, description
+and schema (required arguments, defaults, enums), its stable order, and a byte
+budget for what every session loads up front (the instructions and the
+always-loaded tools). CI also runs `cargo audit` on `rust/Cargo.lock`, weekly
+too; accepted advisories and why are in `rust/.cargo/audit.toml`.
+
+The "KDE (headless)" CI job tests against a real KWin 6 and AT-SPI without a
+screen: in an Arch Linux container it starts `kwin_wayland --virtual` in its
+own D-Bus session, opens a small Qt window (`tools/ci/qt_app.py`) and drives it
+over MCP (`tools/ci/kde_headless_test.py`): apps, tree, find, set_text,
+get_text, act, activate_window, focus, type_text, key and the allowlist's
+refusals. KWin's virtual backend reads no input devices, so `key` and pasting
+are reported skipped there, with the reason. The scripts refuse to run outside
+CI: a second session bus and compositor next to a running desktop can break
+its accessibility bus.
 
 `tools/mcp_smoke_test.py` tests end to end on the real desktop over the real
 MCP protocol (Linux, Kate): it opens the editor with a temporary file, finds the

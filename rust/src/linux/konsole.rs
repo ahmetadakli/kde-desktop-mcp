@@ -1,6 +1,8 @@
-//! Konsole's tabs over D-Bus, read only: which session a window shows and
-//! the shell behind each, so the self-client guard can tell the agent's
-//! own tab from the others in one Konsole window.
+//! Konsole's tabs over D-Bus: which session a window shows and the shell
+//! behind each, so the self-client guard can tell the agent's own tab from
+//! the others in one Konsole window, and `show` to bring a tab to the
+//! front of its window (activate_window's `terminal`). Only services that
+//! have an owner are called, so D-Bus never starts a Konsole.
 
 use std::time::Duration;
 
@@ -188,6 +190,136 @@ pub async fn tabs(
         .flatten()
 }
 
+/// A tab of a Konsole window: what `show` needs to bring it to the front.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Tab {
+    pub service: String,
+    /// The window's object path ("/Windows/1").
+    pub window: String,
+    pub session: i32,
+    /// Title of the tab the window shows now, to tell its window among
+    /// several ("" when Konsole has one window).
+    pub front: String,
+    /// The tab is the one shown.
+    pub shown: bool,
+}
+
+/// One Konsole window as read for `locate`: object path, title of the
+/// tab in front, that tab's session, and every session with its pty.
+type WindowTabs = (String, String, i32, Vec<(i32, Option<String>)>);
+
+/// The tab of `windows` whose shell is on pty `tty`.
+fn locate(service: &str, windows: &[WindowTabs], tty: &str) -> Option<Tab> {
+    let one = windows.len() == 1;
+    windows.iter().find_map(|(path, title, cur, sessions)| {
+        let (session, _) = sessions.iter().find(|(_, t)| t.as_deref() == Some(tty))?;
+        Some(Tab {
+            service: service.to_string(),
+            window: path.clone(),
+            session: *session,
+            front: if one { String::new() } else { title.clone() },
+            shown: session == cur,
+        })
+    })
+}
+
+async fn read_tab(
+    conn: &Connection,
+    pid: u32,
+    tty: &str,
+    tty_of: impl Fn(u32) -> Option<String>,
+) -> Option<Tab> {
+    let svc = service(conn, pid).await?;
+    let xml: String = call(
+        conn,
+        &svc,
+        "/Windows",
+        "org.freedesktop.DBus.Introspectable",
+        "Introspect",
+        &(),
+    )
+    .await?;
+    let mut windows: Vec<WindowTabs> = Vec::new();
+    for n in child_nodes(&xml) {
+        let path = format!("/Windows/{n}");
+        let Some(cur) = call::<_, i32>(conn, &svc, &path, WINDOW, "currentSession", &()).await
+        else {
+            continue;
+        };
+        let title: String = call(
+            conn,
+            &svc,
+            &format!("/Sessions/{cur}"),
+            SESSION,
+            "title",
+            &(1i32,),
+        )
+        .await
+        .unwrap_or_default();
+        let list: Vec<String> = call(conn, &svc, &path, WINDOW, "sessionList", &())
+            .await
+            .unwrap_or_default();
+        let mut sessions = Vec::new();
+        for s in list {
+            let Ok(id) = s.parse::<i32>() else { continue };
+            let tty = shell_pid(conn, &svc, &s).await.and_then(&tty_of);
+            sessions.push((id, tty));
+        }
+        windows.push((path, title, cur, sessions));
+    }
+    locate(&svc, &windows, tty)
+}
+
+/// The tab of Konsole process `pid` whose shell is on pty `tty` ("pts/3"),
+/// `tty_of` giving a process' pty. None when `pid` is no Konsole or no
+/// tab of it is on `tty`.
+pub async fn tab(
+    conn: &Connection,
+    pid: u32,
+    tty: &str,
+    tty_of: impl Fn(u32) -> Option<String>,
+) -> Option<Tab> {
+    tokio::time::timeout(WAIT, read_tab(conn, pid, tty, tty_of))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Bring `tab` to the front of its window and check that it is.
+pub async fn show(conn: &Connection, tab: &Tab) -> Result<(), String> {
+    let run = async {
+        // The service must still be there: never start one.
+        owner_pid(conn, &tab.service)
+            .await
+            .ok_or("Konsole is gone")?;
+        conn.call_method(
+            Some(tab.service.as_str()),
+            tab.window.as_str(),
+            Some(WINDOW),
+            "setCurrentSession",
+            &(tab.session,),
+        )
+        .await
+        .map_err(|e| format!("Konsole did not switch tabs: {e}"))?;
+        let cur: Option<i32> = call(
+            conn,
+            &tab.service,
+            &tab.window,
+            WINDOW,
+            "currentSession",
+            &(),
+        )
+        .await;
+        match cur {
+            Some(c) if c == tab.session => Ok(()),
+            _ => Err("Konsole did not switch tabs".to_string()),
+        }
+    };
+    tokio::time::timeout(WAIT, run)
+        .await
+        .unwrap_or_else(|_| Err("Konsole did not answer".into()))
+}
+
 /// The Konsole process and shell of the session this server was started
 /// in, from the variables Konsole sets in each tab
 /// (KONSOLE_DBUS_SERVICE, KONSOLE_DBUS_SESSION).
@@ -212,6 +344,67 @@ mod tests {
         let xml = r#"<node><interface name="x"/><node name="1"/><node name="12"/></node>"#;
         assert_eq!(child_nodes(xml), vec!["1", "12"]);
         assert!(child_nodes("<node/>").is_empty());
+    }
+
+    /// Read only, against the live session bus: the tab of Konsole
+    /// DESKTOP_MCP_KONSOLE_PID on pty DESKTOP_MCP_TTY ("pts/3").
+    #[test]
+    #[ignore]
+    fn tab_live() {
+        let var = |n: &str| std::env::var(n).unwrap_or_default();
+        let (Ok(pid), tty) = (
+            var("DESKTOP_MCP_KONSOLE_PID").parse::<u32>(),
+            var("DESKTOP_MCP_TTY"),
+        ) else {
+            eprintln!("skipped: set DESKTOP_MCP_KONSOLE_PID and DESKTOP_MCP_TTY");
+            return;
+        };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let conn = Connection::session().await.unwrap();
+            let tab = tab(&conn, pid, &tty, super::super::terminals::tty_of).await;
+            println!("{tty}: {tab:?}");
+            assert!(tab.is_some());
+        });
+    }
+
+    #[test]
+    fn a_tab_is_found_by_its_pty_in_any_window() {
+        let pts = |n: u32| Some(format!("pts/{n}"));
+        let windows: Vec<WindowTabs> = vec![
+            (
+                "/Windows/1".into(),
+                "~ : claude".into(),
+                1,
+                vec![(1, pts(0)), (3, pts(5))],
+            ),
+            (
+                "/Windows/2".into(),
+                "~/src : fish".into(),
+                4,
+                vec![(4, pts(7)), (6, None)],
+            ),
+        ];
+        let tab = locate("org.kde.konsole-9", &windows, "pts/5").unwrap();
+        assert_eq!(
+            tab,
+            Tab {
+                service: "org.kde.konsole-9".into(),
+                window: "/Windows/1".into(),
+                session: 3,
+                front: "~ : claude".into(),
+                shown: false,
+            }
+        );
+        let shown = locate("k", &windows, "pts/7").unwrap();
+        assert_eq!((shown.window.as_str(), shown.shown), ("/Windows/2", true));
+        assert_eq!(locate("k", &windows, "pts/9"), None);
+        // With one window, which one it is needs no title.
+        let one = locate("k", &windows[..1], "pts/0").unwrap();
+        assert_eq!((one.front.as_str(), one.shown), ("", true));
     }
 
     #[test]

@@ -310,6 +310,10 @@ impl Backend for WindowsBackend {
         DEFAULT_ALLOW
     }
 
+    fn session(&self) -> &'static str {
+        "windows"
+    }
+
     fn apps_note(&self) -> &'static str {
         APPS_NOTE
     }

@@ -1,0 +1,53 @@
+# The server against a real KWin 6 and AT-SPI: a headless KWin session in an
+# Arch Linux container, a small Qt window (tools/ci/qt_app.py) and MCP calls
+# over stdio (tools/ci/kde_headless_test.py). Runs on every branch, since
+# a desktop-only regression is what the other jobs cannot see.
+name: KDE (headless)
+
+on:
+  push:
+    paths: ['rust/**', 'tools/ci/**', '.github/workflows/kde-headless.yml']
+  pull_request:
+    paths: ['rust/**', 'tools/ci/**', '.github/workflows/kde-headless.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  kde:
+    name: KWin + AT-SPI integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      # wl-clipboard-rs links libwayland-client.
+      - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libwayland-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+      # Built here (older glibc than the container's), run in the container.
+      - run: cargo build --release --locked
+        working-directory: rust
+      - name: Virtual input device
+        run: |
+          sudo modprobe uinput && ls -l /dev/uinput \
+            || echo "::notice::no uinput on this runner; key and paste tests will be skipped"
+      - name: Headless KWin session
+        run: |
+          mkdir -p "$RUNNER_TEMP/kde-logs"
+          dev=()
+          [ -e /dev/uinput ] && dev=(--device /dev/uinput)
+          docker run --rm --cap-add SYS_NICE "${dev[@]}" -e GITHUB_ACTIONS -e CI_LOG_DIR=/logs \
+            -v "$PWD:/src:ro" -v "$RUNNER_TEMP/kde-logs:/logs" archlinux:latest \
+            bash /src/tools/ci/kde_headless.sh /src/rust/target/release/desktop-mcp --input auto
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kde-headless-logs
+          path: ${{ runner.temp }}/kde-logs
+          if-no-files-found: ignore

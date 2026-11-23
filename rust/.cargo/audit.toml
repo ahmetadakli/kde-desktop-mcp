@@ -1,0 +1,17 @@
+# cargo audit (CI job "cargo audit") fails on any advisory, warnings
+# included, except the ones below. Each says why it is accepted; drop an
+# entry once the dependency moves on.
+
+[advisories]
+ignore = [
+    # ttf-parser (via fontdue, which draws the input indicator's text) is
+    # unmaintained, not vulnerable. It parses only the system's own
+    # sans-serif font that fc-match names; fontdue has no release without it.
+    "RUSTSEC-2026-0192",
+    # zvariant, zvariant_derive and zbus_names are unmaintained as separate
+    # crates: zbus 6 merged them in. zbus 5 still uses them; moving to zbus 6
+    # touches every D-Bus call and is a change of its own.
+    "RUSTSEC-2026-0370",
+    "RUSTSEC-2026-0371",
+    "RUSTSEC-2026-0372",
+]

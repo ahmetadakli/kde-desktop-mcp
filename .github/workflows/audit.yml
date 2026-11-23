@@ -1,0 +1,39 @@
+# Checks rust/Cargo.lock against the RustSec advisory database. Weekly too,
+# since a new advisory turns up without any change here. Accepted advisories
+# and why are in rust/.cargo/audit.toml.
+name: Audit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '17 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_AUDIT_VERSION: 0.23.0
+
+jobs:
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # The binary only; the advisory database is fetched fresh every run.
+      - uses: actions/cache@v4
+        id: cache
+        with:
+          path: ~/.cargo/bin/cargo-audit
+          key: cargo-audit-${{ env.CARGO_AUDIT_VERSION }}-${{ runner.os }}
+      - if: steps.cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-audit --locked --version "$CARGO_AUDIT_VERSION"
+      - run: cargo audit --deny warnings

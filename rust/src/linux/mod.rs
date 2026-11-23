@@ -521,23 +521,15 @@ async fn wl_copy(text: &str) -> R<()> {
     Ok(())
 }
 
-/// A new, empty file only this user can read, for a screenshot. Creating it
-/// exclusively means a planted file or symlink in /tmp makes this fail
-/// instead of being written through.
+/// A new, empty file only this user can read, for a screenshot, in the
+/// private screenshot directory (`spill`). Creating it exclusively means a
+/// planted file or symlink makes this fail instead of being written
+/// through.
 fn temp_png() -> R<(PathBuf, std::fs::File)> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let path = std::env::temp_dir().join(format!("desktop-mcp-{}-{nanos}.png", std::process::id()));
-    let file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| format!("screenshot: cannot create {}: {e}", path.display()))?;
-    Ok((path, file))
+    let dir = crate::spill::dir(&crate::spill::SHOTS)
+        .ok_or("screenshot: no directory for the image (HOME is not set)")?;
+    crate::spill::create(&dir, &crate::spill::SHOTS)
+        .map_err(|e| format!("screenshot: cannot create a file in {}: {e}", dir.display()))
 }
 
 /// Whether an external capture tool (`tool`) wrote the image: Err with
@@ -1221,6 +1213,13 @@ impl Backend for LinuxBackend {
         DEFAULT_ALLOW
     }
 
+    fn session(&self) -> &'static str {
+        match self.comp {
+            Compositor::Kde(_) => "kde-plasma",
+            Compositor::Hyprland(_) => "hyprland",
+        }
+    }
+
     fn apps_note(&self) -> &'static str {
         match self.comp {
             Compositor::Kde(_) => APPS_NOTE,
@@ -1500,6 +1499,32 @@ impl Backend for LinuxBackend {
             view.tabs = Some(tabs.all.into_iter().filter_map(terminals::tty_of).collect());
         }
         view
+    }
+
+    async fn term_tab(&self, pid: u32, tty: &str) -> Option<crate::backend::TermTab> {
+        let t = konsole::tab(&self.session, pid, tty, terminals::tty_of).await?;
+        Some(crate::backend::TermTab {
+            front: t.front,
+            shown: t.shown,
+            handle: format!("{}\n{}\n{}", t.service, t.window, t.session),
+        })
+    }
+
+    async fn show_tab(&self, tab: &crate::backend::TermTab) -> R<()> {
+        let mut parts = tab.handle.split('\n');
+        let (Some(service), Some(window), Some(session)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            return Err("not a Konsole tab".into());
+        };
+        let tab = konsole::Tab {
+            service: service.into(),
+            window: window.into(),
+            session: session.parse().map_err(|_| "not a Konsole tab")?,
+            front: tab.front.clone(),
+            shown: tab.shown,
+        };
+        konsole::show(&self.session, &tab).await
     }
 
     async fn element_pid(&self, id: &Obj) -> Option<u32> {
