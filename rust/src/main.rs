@@ -7319,16 +7319,26 @@ impl<B: Backend> Server<B> {
                 w.app, t.tty
             )));
         }
-        // The window showing the tab, among the terminal's windows: the
-        // one whose tab in front has the title Konsole gives.
+        // The window holding the tab, among the terminal's windows (each
+        // lists all its tabs): the one whose tab in front has the title
+        // Konsole gives. Unclear when none or several have it; input then
+        // could go to the tab another window shows.
         let front = tab.as_ref().map(|t| t.front.trim()).unwrap_or_default();
         let same: Vec<&WindowGeo> = list
             .iter()
-            .filter(|x| x.pid == w.pid && !front.is_empty() && x.title.starts_with(front))
+            .filter(|x| x.pid == w.pid && x.title.starts_with(front))
             .collect();
-        let title = match same.as_slice() {
-            [one] => one.title.clone(),
-            _ => w.title.clone(),
+        let (title, unclear) = match same.as_slice() {
+            _ if front.is_empty() => (w.title.clone(), false),
+            [one] => (one.title.clone(), false),
+            _ if for_input => {
+                return Err(delivery::nothing_sent(format!(
+                    "{} has several windows and which one holds tab {} cannot be told \
+                     (their tabs in front share a title): activate it and switch tabs first",
+                    w.app, t.tty
+                )));
+            }
+            _ => (w.title.clone(), true),
         };
         let (_, app) = trace::time("activate", self.activate(&title)).await?;
         if let Some(tab) = tab.as_ref().filter(|t| !t.shown) {
@@ -7343,6 +7353,9 @@ impl<B: Backend> Server<B> {
         }
         if tab.is_none() && several {
             about.push_str(" (another tab may show: this terminal cannot switch tabs)");
+        }
+        if unclear {
+            about.push_str(" (in another window of it, which may not be the one in front)");
         }
         if others > 0 {
             about.push_str(&format!("; {others} more tabs match"));
@@ -8771,6 +8784,8 @@ mod tests {
         /// The Konsole window's terminals, as `windows` lists them. Its
         /// tabs switch (`show_tab`) when its view lists `tabs`.
         terms: Rc<RefCell<Vec<backend::Terminal>>>,
+        /// `TermTab::front` of its tabs: "" as with one Konsole window.
+        tab_front: Rc<RefCell<String>>,
     }
 
     /// The pid of a fake window's process: Konsole 100, each Fake window a
@@ -9090,7 +9105,7 @@ mod tests {
                 .iter()
                 .any(|t| t == tty)
                 .then(|| backend::TermTab {
-                    front: String::new(),
+                    front: self.tab_front.borrow().clone(),
                     shown: v.shown.as_deref() == Some(tty),
                     handle: tty.into(),
                 })
@@ -9784,6 +9799,7 @@ mod tests {
         views: Rc<RefCell<HashMap<u32, selfguard::TermView>>>,
         frames: Rc<RefCell<HashMap<u32, Frame>>>,
         terms: Rc<RefCell<Vec<backend::Terminal>>>,
+        tab_front: Rc<RefCell<String>>,
     }
 
     /// `run_loop` over in-memory pipes, on the current LocalSet.
@@ -9824,7 +9840,9 @@ mod tests {
         let views = Rc::new(RefCell::new(HashMap::new()));
         let frames = Rc::new(RefCell::new(HashMap::new()));
         let terms = Rc::new(RefCell::new(Vec::new()));
+        let tab_front = Rc::new(RefCell::new(String::new()));
         let server = Rc::new(Server::new(FakeBackend {
+            tab_front: tab_front.clone(),
             terms: terms.clone(),
             frames: frames.clone(),
             client: client.clone(),
@@ -9872,6 +9890,7 @@ mod tests {
             views,
             frames,
             terms,
+            tab_front,
         }
     }
 
@@ -15444,6 +15463,44 @@ mod tests {
             );
             let r = call_tool(&mut s, 8, "activate_window", json!({"terminal": "cargo"})).await;
             assert!(reply_text(&r).contains("another tab may show"), "{r}");
+            // Several Konsole windows: the one holding the tab is the one
+            // whose tab in front has that title; input only when that is
+            // clear.
+            konsole_tab(&s, "pts/0");
+            s.keys.borrow_mut().clear();
+            *s.tab_front.borrow_mut() = "~ : bash".into();
+            let r = call_tool(
+                &mut s,
+                10,
+                "key",
+                json!({"combo": "a", "window": "terminal:cargo"}),
+            )
+            .await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(tabs(&s), vec!["tab pts/5"]);
+            konsole_tab(&s, "pts/0");
+            s.keys.borrow_mut().clear();
+            *s.tab_front.borrow_mut() = "~ : fish".into();
+            let r = call_tool(
+                &mut s,
+                11,
+                "key",
+                json!({"combo": "a", "window": "terminal:cargo"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("konsole has several windows and which one holds tab pts/5"),
+                "{text}"
+            );
+            assert!(text.contains("nothing sent"), "{text}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            let r = call_tool(&mut s, 12, "activate_window", json!({"terminal": "cargo"})).await;
+            assert!(
+                reply_text(&r).contains("may not be the one in front"),
+                "{r}"
+            );
+            *s.tab_front.borrow_mut() = String::new();
             let r = call_tool(&mut s, 9, "activate_window", json!({"terminal": "zzz"})).await;
             assert!(
                 reply_text(&r).contains("no terminal of an allowed app runs or is in 'zzz'"),
