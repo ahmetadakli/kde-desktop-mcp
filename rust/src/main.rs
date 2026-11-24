@@ -4248,6 +4248,14 @@ impl<B: Backend> Server<B> {
         for line in lines {
             out.push(match line {
                 Line::Raw(s) => Printed::Raw(s),
+                Line::Chrome { depth, bars } => {
+                    let mut named = Vec::with_capacity(bars.len());
+                    for (id, counts) in &bars {
+                        let rid = self.add_ref(id, &cache[id], app).await;
+                        named.push((rid, &cache[id], counts.as_str()));
+                    }
+                    Printed::Raw(render::chrome_line(depth, &named))
+                }
                 Line::Node { depth, id } => {
                     let rid = self.add_ref(&id, &cache[&id], app).await;
                     Printed::Node {
@@ -17805,6 +17813,52 @@ mod tests {
         cache.insert(15, node("push button", &[]));
         assert_eq!(frame_in(&cache, &15), Some(10));
         assert_eq!(frame_in(&cache, &14), Some(10));
+    }
+
+    #[test]
+    fn a_browsers_tool_bars_print_on_one_line_with_ids_to_expand() {
+        local(async {
+            let mut s = session("browser-chrome");
+            *s.focus.borrow_mut() = Info {
+                role: "frame".into(),
+                name: "Page — Firefox".into(),
+                showing: true,
+                children: vec![30, 33],
+                ..Info::default()
+            };
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.insert(30, fake_node("tool bar", "Tabs", &[31, 32]));
+                let mut tab = fake_node("page tab", "Page", &[]);
+                tab.states = vec!["selected"];
+                nodes.insert(31, tab);
+                nodes.insert(32, fake_node("page tab", "Other", &[]));
+                nodes.insert(33, fake_node("internal frame", "", &[34]));
+                nodes.insert(34, fake_node("document web", "Page", &[35]));
+                nodes.insert(35, fake_node("push button", "OK", &[]));
+            }
+            let r = call_tool(&mut s, 2, "tree", json!({"app": "fake"})).await;
+            let text = reply_text(&r);
+            let line = text
+                .lines()
+                .find(|l| l.contains("browser tool bars"))
+                .unwrap_or_else(|| panic!("{text}"));
+            assert!(line.ends_with("\"Tabs\": page tab ×2"), "{text}");
+            assert!(text.contains("page tab \"Page\" {selected}"), "{text}");
+            assert!(!text.contains("Other"), "{text}");
+            assert!(text.contains("button \"OK\""), "{text}");
+            // The bar's id lists it in full.
+            let rid: u64 = line
+                .split('[')
+                .nth(1)
+                .and_then(|r| r.split(']').next())
+                .and_then(|r| r.parse().ok())
+                .unwrap_or_else(|| panic!("{line}"));
+            let r = call_tool(&mut s, 3, "tree", json!({"root_id": rid})).await;
+            let text = reply_text(&r);
+            assert!(text.contains("\"Other\""), "{text}");
+            assert!(!text.contains("browser tool bars"), "{text}");
+        });
     }
 
     /// A web mail page in the fake: a table of rows and cells.

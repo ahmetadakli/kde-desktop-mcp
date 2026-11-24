@@ -283,6 +283,8 @@ def run(c: Client, input_mode: str) -> None:
     tree = c.text("tree", app=APP)
     step("tree shows the window's controls",
          all(w in tree for w in ("Greet", "Name", "Notes", "Agree", "Status:")), one_line(tree))
+    # Tool bars are summed up only next to a browser's page.
+    step("tree keeps a plain app's lines", "browser tool bars" not in tree, one_line(tree))
 
     ids = {
         "greet": find_id(c, "Greet", "button"),
