@@ -904,6 +904,9 @@ const WAIT_MIN_GAP: Duration = Duration::from_millis(50);
 
 /// How often `wait_idle` reads the tree where no change events come.
 const IDLE_POLL: Duration = Duration::from_millis(100);
+/// Least time `wait_idle` counts change events before it looks at the
+/// page's content instead (with twice `quiet_ms`, whichever is longer).
+const IDLE_NOISE: Duration = Duration::from_secs(2);
 
 /// How often the effect line reads an app's content again while it waits
 /// for a change, where the backend gets no change events.
@@ -6606,7 +6609,9 @@ impl<B: Backend> Server<B> {
     /// Wait until `app` stopped changing for `quiet_ms`: no accessibility
     /// change events from it (children added or removed, names, text), or,
     /// where the backend hears none, the same fingerprint of its visible
-    /// tree.
+    /// tree. A page that never stops sending events (a clock, a video, a
+    /// live region) counts as settled once nothing loads and its own
+    /// content holds still (`steady_idle`).
     async fn wait_idle(&self, a: &Json) -> R<String> {
         let app = req_s(a, "app")?;
         let quiet = Duration::from_millis(arg_i(a, "quiet_ms", 300).clamp(10, MAX_WAIT_MS) as u64);
@@ -6615,12 +6620,16 @@ impl<B: Backend> Server<B> {
         self.b.enable().await;
         let windows = self.app_windows(&app).await?;
         let start = Instant::now();
+        // After this much noise, the content decides instead of the events.
+        let noisy = (quiet * 2).max(IDLE_NOISE);
         let mut since = Instant::now();
         let mut print = None;
         let mut loading = false;
+        let mut load_checked: Option<Instant> = None;
         loop {
             if since.elapsed() >= quiet {
                 loading = self.b.loading(&windows).await;
+                load_checked = Some(Instant::now());
                 if loading {
                     // Quiet only because the page waits for the network.
                     since = Instant::now();
@@ -6646,6 +6655,15 @@ impl<B: Backend> Server<B> {
                     "'{app}' still changing after {ms} ms ({why}){note}"
                 ));
             }
+            if start.elapsed() >= noisy && load_checked.is_none_or(|t| t.elapsed() >= IDLE_POLL) {
+                loading = self.b.loading(&windows).await;
+                load_checked = Some(Instant::now());
+                if !loading {
+                    return self
+                        .steady_idle(&app, &windows, quiet, start, limit, note)
+                        .await;
+                }
+            }
             let left = limit
                 .saturating_sub(start.elapsed())
                 .min(quiet.saturating_sub(since.elapsed()));
@@ -6662,6 +6680,110 @@ impl<B: Backend> Server<B> {
                 tokio::time::sleep(left.min(IDLE_POLL)).await;
             }
         }
+    }
+
+    /// The rest of a `wait_idle` whose app kept changing with nothing
+    /// loading: settled once the content of its active page (else its
+    /// windows), without the browser around it, live regions, media,
+    /// progress and clocks (`render::steady_fingerprint`), reads the same
+    /// for `quiet` and nothing loads.
+    async fn steady_idle(
+        &self,
+        app: &str,
+        windows: &[B::Id],
+        quiet: Duration,
+        start: Instant,
+        limit: Duration,
+        note: String,
+    ) -> R<String> {
+        let (mut roots, mut page) = self.steady_roots(app, windows).await;
+        let mut print = None;
+        let mut since = Instant::now();
+        let mut loading;
+        loop {
+            let (read, busy) = tokio::join!(self.steady_hash(&roots), self.b.loading(windows));
+            loading = busy;
+            match read {
+                // The page went (another tab, a new document): find it again.
+                None => {
+                    (roots, page) = self.steady_roots(app, windows).await;
+                    print = None;
+                    since = Instant::now();
+                }
+                Some(now) => {
+                    if loading || print.replace(now) != Some(now) {
+                        since = Instant::now();
+                    }
+                }
+            }
+            let ms = start.elapsed().as_millis();
+            if print.is_some() && since.elapsed() >= quiet {
+                let title = self.app_title(app).await;
+                let what = if page { "the page's" } else { "its" };
+                return Ok(format!(
+                    "idle after {ms} ms (change events never stopped; {what} content, \
+                     live regions, media and clocks aside, held still for {} ms){title}{note}",
+                    quiet.as_millis()
+                ));
+            }
+            if start.elapsed() >= limit {
+                let why = if loading {
+                    "a page is still loading".to_string()
+                } else {
+                    format!("its content never held still for {} ms", quiet.as_millis())
+                };
+                return Err(format!(
+                    "'{app}' still changing after {ms} ms ({why}){note}"
+                ));
+            }
+            let left = limit
+                .saturating_sub(start.elapsed())
+                .min(quiet.saturating_sub(since.elapsed()));
+            tokio::time::sleep(left.min(IDLE_POLL)).await;
+        }
+    }
+
+    /// What `steady_idle` reads: the active window's document (true),
+    /// else the app's windows.
+    async fn steady_roots(&self, app: &str, windows: &[B::Id]) -> (Vec<B::Id>, bool) {
+        let mut cache = Cache::new();
+        match self
+            .active_document(app, windows.to_vec(), &mut cache)
+            .await
+        {
+            Ok(doc) => (vec![doc], true),
+            Err(_) => (windows.to_vec(), false),
+        }
+    }
+
+    /// `render::steady_fingerprint` of `roots` read afresh; None when none
+    /// of them shows any more.
+    async fn steady_hash(&self, roots: &[B::Id]) -> Option<u64> {
+        let mut cache = Cache::new();
+        let mut read = roots.to_vec();
+        let hash = loop {
+            // A read that adds nothing (elements gone meanwhile) ends it.
+            let had = cache.len();
+            self.b
+                .prefetch_with(
+                    &mut cache,
+                    read,
+                    &search_fetch(TREE_TEXT_LIMIT, render::FIND_MAX_SEEN),
+                )
+                .await;
+            match render::steady_fingerprint(&cache, roots) {
+                Ok(h) => break h,
+                // Read as far as a page's content is read for a search.
+                Err((h, _)) if cache.len() >= render::FIND_MAX_SEEN || cache.len() == had => {
+                    break h;
+                }
+                Err((_, missing)) => read = missing,
+            }
+        };
+        roots
+            .iter()
+            .any(|r| cache.get(r).is_some_and(|i| i.showing))
+            .then_some(hash)
     }
 
     /// `content_hash` of `windows` read until it differs from `was` or
@@ -10305,6 +10427,106 @@ mod tests {
             assert!(reply_text(&r).contains("still changing after "), "{r}");
             let r = call_tool(&mut s, 4, "wait_idle", json!({"app": "konsole"})).await;
             assert!(reply_text(&r).contains("is not in"), "{r}");
+        });
+    }
+
+    /// A fake browser window: tool bar 94 around page 90, which holds
+    /// heading 91, clock 92 and live log 93. Returns a task that sends a
+    /// change event every 20 ms and on each ticks the clock, renames the
+    /// tool bar, adds to the log and, with `restless_heading`, renames the
+    /// heading too.
+    fn noisy_page(s: &Session, restless_heading: bool) -> tokio::task::JoinHandle<()> {
+        fake_page(s);
+        s.focus.borrow_mut().children = vec![94, 90];
+        {
+            let mut n = s.nodes.borrow_mut();
+            n.insert(94, fake_node("tool bar", "Navigation", &[]));
+            n.insert(90, fake_node("document web", "News", &[91, 92, 93]));
+            n.insert(91, fake_node("heading", "Top", &[]));
+            n.insert(92, fake_node("label", "12:00:00", &[]));
+            n.insert(93, fake_node("log", "Chat", &[]));
+        }
+        let (nodes, shown) = (s.nodes.clone(), s.shown.clone());
+        tokio::task::spawn_local(async move {
+            for k in 0..=u32::MAX {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                {
+                    let mut n = nodes.borrow_mut();
+                    n.get_mut(&92).unwrap().name = format!("12:00:{k:02}");
+                    n.get_mut(&94).unwrap().name = ["Stop", "Reload"][k as usize % 2].into();
+                    let id = 1000 + k;
+                    n.insert(id, fake_node("paragraph", &format!("line {k}"), &[]));
+                    n.get_mut(&93).unwrap().children.push(id);
+                    if restless_heading {
+                        n.get_mut(&91).unwrap().name =
+                            format!("Top {}", char::from(b'a' + (k % 26) as u8));
+                    }
+                }
+                shown.seq.set(shown.seq.get() + 1);
+            }
+        })
+    }
+
+    #[test]
+    fn wait_idle_settles_on_a_page_that_never_stops_sending_events() {
+        local(async {
+            let mut s = session("wait-idle-steady");
+            let noise = noisy_page(&s, false);
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 100, "timeout_ms": 6000}),
+            )
+            .await;
+            let took = start.elapsed();
+            noise.abort();
+            let text = reply_text(&r);
+            assert!(text.starts_with("idle after "), "{r}");
+            assert!(
+                text.contains("(change events never stopped; the page's content")
+                    && text.contains("held still for 100 ms"),
+                "{text}"
+            );
+            // Events counted for 2 s first, then a few content reads.
+            assert!(took >= Duration::from_secs(2), "{took:?}");
+            assert!(took < Duration::from_millis(3500), "{took:?}");
+        });
+    }
+
+    #[test]
+    fn wait_idle_still_fails_while_the_page_itself_changes_or_loads() {
+        local(async {
+            let mut s = session("wait-idle-restless");
+            let noise = noisy_page(&s, true);
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 100, "timeout_ms": 2600}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            assert!(
+                reply_text(&r).contains("still changing after ")
+                    && reply_text(&r).contains("(its content never held still for 100 ms)"),
+                "{r}"
+            );
+            noise.abort();
+            // Only a clock ticks, but the page still loads: no content read.
+            let noise = noisy_page(&s, false);
+            s.reads.loading.set(true);
+            let r = call_tool(
+                &mut s,
+                3,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 100, "timeout_ms": 2600}),
+            )
+            .await;
+            noise.abort();
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            assert!(reply_text(&r).contains("(a page is still loading)"), "{r}");
         });
     }
 

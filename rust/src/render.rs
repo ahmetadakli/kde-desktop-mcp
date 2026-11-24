@@ -1696,25 +1696,91 @@ pub fn closest<Id: Clone + Eq + Hash>(
 /// text), in document order, for telling whether a window changed. Nodes
 /// not fetched are left out.
 pub fn fingerprint<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id]) -> u64 {
+    hash_showing(cache, roots, false).0
+}
+
+/// Roles whose content changes on its own, not because a page is still
+/// building: live regions (a log, a ticker, a status line), media,
+/// progress and clocks.
+pub const RESTLESS_ROLES: [&str; 8] = [
+    "log",
+    "marquee",
+    "timer",
+    "status bar",
+    "progress bar",
+    "animation",
+    "video",
+    "audio",
+];
+
+/// `fingerprint` without what changes on its own: the subtrees of
+/// `RESTLESS_ROLES` are left out, and each run of digits in names and text
+/// counts as one digit (a clock, a counter, "3 s ago"), so a page whose
+/// only changes are those hashes the same. Err: the hash, and the elements
+/// it would read that `cache` lacks.
+pub fn steady_fingerprint<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+) -> Result<u64, (u64, Vec<Id>)> {
+    match hash_showing(cache, roots, true) {
+        (h, missing) if missing.is_empty() => Ok(h),
+        out => Err(out),
+    }
+}
+
+/// `s` with each run of digits as a single "0".
+fn digits_folded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut digit = false;
+    for c in s.chars() {
+        let d = c.is_ascii_digit();
+        if !(d && digit) {
+            out.push(if d { '0' } else { c });
+        }
+        digit = d;
+    }
+    out
+}
+
+/// The hash, and the elements it would have read that `cache` lacks.
+fn hash_showing<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+    steady: bool,
+) -> (u64, Vec<Id>) {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let mut stack: Vec<&Id> = roots.iter().rev().collect();
     let mut seen = 0;
+    let mut missing = Vec::new();
     while let Some(id) = stack.pop() {
         seen += 1;
         if seen > FIND_MAX_SEEN {
             break;
         }
-        let Some(info) = cache.get(id) else { continue };
+        let Some(info) = cache.get(id) else {
+            missing.push(id.clone());
+            continue;
+        };
         if !info.showing {
             continue;
         }
-        (&info.role, &info.name, &info.states, &info.text).hash(&mut h);
+        if steady {
+            if RESTLESS_ROLES.contains(&info.role.as_str()) {
+                // Where it is still counts: one coming or going changes the page.
+                info.role.hash(&mut h);
+                continue;
+            }
+            let text = info.text.as_deref().map(digits_folded);
+            (&info.role, digits_folded(&info.name), &info.states, text).hash(&mut h);
+        } else {
+            (&info.role, &info.name, &info.states, &info.text).hash(&mut h);
+        }
         // Where a subtree ends, so moving a node changes the hash.
         info.children.len().hash(&mut h);
         stack.extend(info.children.iter().rev());
     }
-    h.finish()
+    (h.finish(), missing)
 }
 
 /// Roles of the page or document inside an app window: a browser tab's web
@@ -4338,6 +4404,53 @@ mod tests {
         let mut hidden = sample();
         hidden.get_mut("/h").unwrap().name = "other".into();
         assert_eq!(fp, fingerprint(&hidden, &["/w"]));
+    }
+
+    #[test]
+    fn steady_fingerprint_ignores_clocks_media_and_live_regions() {
+        let page = |clock: &str, log: &str, heading: &str| {
+            let mut c = Cache::new();
+            c.insert(
+                "/d",
+                node(
+                    "document web",
+                    "News",
+                    true,
+                    &[],
+                    &["/h", "/t", "/log", "/v"],
+                ),
+            );
+            c.insert("/h", node("heading", heading, true, &[], &[]));
+            let mut t = node("label", "", true, &[], &[]);
+            t.text = Some(clock.into());
+            c.insert("/t", t);
+            c.insert("/log", node("log", "", true, &[], &["/e"]));
+            c.insert("/e", node("paragraph", log, true, &[], &[]));
+            c.insert("/v", node("video", "", true, &[], &[]));
+            c
+        };
+        let sfp = |c: &Cache<&'static str>, r: &[&'static str]| steady_fingerprint(c, r).unwrap();
+        let fp = sfp(&page("12:04:59", "a", "Top"), &["/d"]);
+        // The clock ticked and the log grew: the same page.
+        assert_eq!(fp, sfp(&page("12:05:00", "b", "Top"), &["/d"]));
+        assert_ne!(
+            fingerprint(&page("12:04:59", "a", "Top"), &["/d"]),
+            fingerprint(&page("12:05:00", "b", "Top"), &["/d"])
+        );
+        // Its real content changed.
+        assert_ne!(fp, sfp(&page("12:04:59", "a", "Bottom"), &["/d"]));
+        // A live region going away changes it too.
+        let mut gone = page("12:04:59", "a", "Top");
+        gone.get_mut("/d").unwrap().children.pop();
+        assert_ne!(fp, sfp(&gone, &["/d"]));
+        // Elements not read yet are named, for reading them.
+        let mut short = page("12:04:59", "a", "Top");
+        short.remove("/h");
+        assert_eq!(
+            steady_fingerprint(&short, &["/d"]).unwrap_err().1,
+            vec!["/h"]
+        );
+        assert_eq!(digits_folded("3 of 120, 4.5 s"), "0 of 0, 0.0 s");
     }
 
     #[test]

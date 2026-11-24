@@ -205,6 +205,28 @@ def background_screenshot(c: Client) -> None:
          not ok and "in the background" in out and "nothing sent" in out, one_line(out))
 
 
+def wait_idle_while_ticking(c: Client) -> None:
+    """wait_idle settles on a window whose clock never stops changing: after
+    2 s of change events it compares the content, digits aside."""
+    c.call("activate_window", query=TITLE)
+    tick = find_id(c, "Tick", "check box")
+    ok, out = c.call("act", id=tick, action="check") if tick is not None else (False, "no Tick")
+    if not step("act check starts the ticking clock", ok, one_line(out)):
+        return
+    try:
+        ok, out = c.call("wait_idle", app=APP, quiet_ms=200, timeout_ms=8000)
+        step("wait_idle settles while a clock ticks", ok and "idle after" in out, one_line(out))
+        if ok and "change events never stopped" not in out:
+            record("wait_idle settles on the content past the clock's events", "SKIP",
+                   f"the clock's changes sent no events here: {one_line(out)}")
+        else:
+            step("wait_idle settles on the content past the clock's events",
+                 ok and "held still for 200 ms" in out, one_line(out))
+    finally:
+        ok, out = c.call("act", id=tick, action="uncheck")
+        step("act uncheck stops the clock", ok, one_line(out))
+
+
 def run(c: Client, input_mode: str) -> None:
     ok, out = c.call("doctor")
     print(f"--- doctor ---\n{out}\n---", flush=True)
@@ -257,6 +279,8 @@ def run(c: Client, input_mode: str) -> None:
     input_tests(c, ids, input_mode)
 
     background_screenshot(c)
+
+    wait_idle_while_ticking(c)
 
     ok, out = c.call("find", app="definitely-not-allowed-app", query="x")
     step("allowlist refuses another app", not ok and "not in" in out, one_line(out))
