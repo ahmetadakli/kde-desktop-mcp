@@ -7,8 +7,8 @@ KWin and D-Bus session; it refuses to run anywhere else (it starts a window
 and sends it keys). Starts tools/ci/qt_app.py and the server with an
 allowlist holding only that app, then speaks MCP over stdio: apps, tree,
 find, set_text, get_text, act, activate_window, click, mouse (its hit
-test), focus, type_text, key, a screenshot of a window in the background and
-the allowlist's refusals, each checked against what the window shows.
+test), focus, type_text, key, a screenshot of a window in the background (and
+one with element marks) and the allowlist's refusals, each checked against what the window shows.
 
 type_text into the multi-line editor inserts through AT-SPI and needs no
 input device. key, and type_text into a line edit (a paste with ctrl+v),
@@ -206,6 +206,30 @@ def background_screenshot(c: Client) -> None:
          not ok and "in the background" in out and "nothing sent" in out, one_line(out))
 
 
+def marked_screenshot(c: Client, ids: dict) -> None:
+    """screenshot marks=true numbers the window's controls (here the window
+    behind, captured in place) and the ids it lists act like find's."""
+    ok, out = c.call("screenshot", window=TITLE, marks=True, inline=False)
+    if not ok and "KWin refused" in out:
+        record("screenshot marks=true lists the window's controls", "SKIP",
+               f"KWin refuses ScreenShot2 here: {one_line(out)}")
+        return
+    path = out.splitlines()[0] if ok else ""
+    if path.endswith(".png"):
+        Path(path).unlink(missing_ok=True)
+    legend = next((line for line in out.splitlines() if line.startswith("marks: ")), "")
+    m = re.search(r"\[(\d+)\] [^,]*'Greet'", legend)
+    if not step("screenshot marks=true lists the window's controls",
+                ok and bool(m) and "'Agree'" in legend, one_line(out)):
+        return
+    c.call("activate_window", query=TITLE)
+    c.call("act", id=ids["agree"], action="uncheck")
+    ok, out = c.call("act", id=int(m.group(1)))
+    seen = status_has(c, "hello")
+    step("a mark's id acts on its control", ok and bool(seen),
+         f"{one_line(out)}; {seen or status(c)!r}")
+
+
 def wait_idle_while_ticking(c: Client) -> None:
     """wait_idle settles on a window whose clock never stops changing: after
     2 s of change events it compares the content, digits aside."""
@@ -299,6 +323,8 @@ def run(c: Client, input_mode: str) -> None:
     input_tests(c, ids, input_mode)
 
     background_screenshot(c)
+
+    marked_screenshot(c, ids)
 
     wait_idle_while_ticking(c)
 

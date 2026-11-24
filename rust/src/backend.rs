@@ -303,6 +303,9 @@ pub struct ShotTarget {
     pub class: String,
     /// Its frame, in the coordinates `pointer` takes.
     pub area: Option<(f64, f64, f64, f64)>,
+    /// Origin of its client area in the same coordinates, where its
+    /// elements' window coordinates start; None when not known.
+    pub client: Option<(f64, f64)>,
     /// The backend's handle of the window (KWin's internal id, Hyprland's
     /// address, the HWND): the capture must be of this window.
     pub handle: String,
@@ -849,6 +852,17 @@ pub trait Backend {
                 Err(_) => None,
             })
             .collect()
+    }
+
+    /// Boxes (x, y, width, height, in the coordinates `pointer` takes) of
+    /// elements of the window `target` names, in front or not, to mark
+    /// them on its capture; None for one without an area or when unknown.
+    async fn element_boxes(
+        &self,
+        _target: &ShotTarget,
+        ids: &[Self::Id],
+    ) -> Vec<Option<(f64, f64, f64, f64)>> {
+        vec![None; ids.len()]
     }
 
     /// Check a chord such as "ctrl+s" without pressing it.

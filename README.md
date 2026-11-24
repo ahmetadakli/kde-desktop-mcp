@@ -734,7 +734,14 @@ tool; `off` turns it off). Not available on Windows yet.
   background: '<title>' is not in front`. `image_x`/`image_y` of such an
   image are refused until that window is in front (`window` on `mouse`).
   A minimized window, one on another virtual desktop, and Hyprland and
-  Windows are activated first, as before.
+  Windows are activated first, as before. `marks: true` draws the ids of
+  the captured window's visible interactive elements on the image (a thin
+  frame around each, its id on a label beside it; the web page's or
+  document's first, at most 40) and adds a legend line `marks: [12] link
+  'Home', …`; the ids are registered as find's, so the next call is `act`
+  or `click` by id rather than `mouse` by pixel. It costs one tree read of
+  the window, done while it is captured, and one box read per element (KDE
+  and Windows; Hyprland draws none yet).
 - `batch`: runs several tools in order in one call and stops at the first
   error; reduces Claude's number of turns. A step with `"optional": true`
   (typically a `wait_for`) may fail without stopping the batch: it is reported

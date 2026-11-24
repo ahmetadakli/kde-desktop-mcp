@@ -271,6 +271,183 @@ pub fn crop(img: &Pixels, (x, y, w, h): (u32, u32, u32, u32)) -> Pixels {
     }
 }
 
+/// An element to mark on a capture: the id it is drawn with and its box,
+/// as fractions of the whole capture.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mark {
+    pub id: u64,
+    pub rect: Frac,
+}
+
+/// Overlap (intersection over union) at which two boxes are one element
+/// to the eye: a list entry and the link filling it, a label and its field.
+const SAME_BOX: f64 = 0.7;
+
+fn overlap(a: Frac, b: Frac) -> f64 {
+    let w = (a.x + a.w).min(b.x + b.w) - a.x.max(b.x);
+    let h = (a.y + a.h).min(b.y + b.h) - a.y.max(b.y);
+    if w <= 0.0 || h <= 0.0 {
+        return 0.0;
+    }
+    let both = w * h;
+    both / (a.w * a.h + b.w * b.h - both)
+}
+
+/// Which of `boxes` (fractions of a capture) to mark on its part `kept`, in
+/// order, at most `max`: those whose centre lies in it, each but the first
+/// of nearly the same box left out.
+pub fn choose_marks(boxes: &[Frac], kept: Frac, max: usize) -> Vec<usize> {
+    let mut out: Vec<usize> = Vec::new();
+    for (i, b) in boxes.iter().enumerate() {
+        if out.len() >= max {
+            break;
+        }
+        let (cx, cy) = (b.x + b.w / 2.0, b.y + b.h / 2.0);
+        let inside =
+            (kept.x..kept.x + kept.w).contains(&cx) && (kept.y..kept.y + kept.h).contains(&cy);
+        if b.w > 0.0 && b.h > 0.0 && inside && out.iter().all(|&o| overlap(boxes[o], *b) < SAME_BOX)
+        {
+            out.push(i);
+        }
+    }
+    out
+}
+
+/// 5x7 digits, one row per byte, the high of 5 bits leftmost.
+const DIGITS: [[u8; 7]; 10] = [
+    [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+    [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+    [0x0E, 0x11, 0x01, 0x02, 0x04, 0x08, 0x1F],
+    [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+    [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+    [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+    [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+    [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+    [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+    [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+];
+
+/// Dark, saturated colours that white digits read on, taken in turn so
+/// neighbouring marks differ.
+const MARK_COLORS: [[u8; 3]; 6] = [
+    [200, 20, 60],
+    [0, 100, 190],
+    [0, 125, 60],
+    [130, 30, 170],
+    [190, 80, 0],
+    [0, 115, 125],
+];
+
+/// Pixel rectangle: x, y, width, height.
+type PxRect = (i64, i64, i64, i64);
+
+/// Size of the label of `id` at `scale` px per font pixel.
+fn label_size(id: u64, scale: i64) -> (i64, i64) {
+    let n = id.to_string().len() as i64;
+    let pad = scale + 1;
+    ((n * 6 - 1) * scale + 2 * pad, 7 * scale + 2 * pad)
+}
+
+fn hits(a: PxRect, b: PxRect) -> bool {
+    a.0 < b.0 + b.2 && b.0 < a.0 + a.2 && a.1 < b.1 + b.3 && b.1 < a.1 + a.3
+}
+
+/// Where each label goes on a `w` x `h` image: by its box (`rects`), above
+/// its top left corner, else inside it, below it, left or right of it,
+/// whichever first stays clear of the labels placed before; shifted into
+/// the image. Labels that fit nowhere clear go above (or inside).
+fn place_labels(rects: &[PxRect], sizes: &[(i64, i64)], (w, h): (i64, i64)) -> Vec<PxRect> {
+    let mut placed: Vec<PxRect> = Vec::with_capacity(rects.len());
+    for (&(x, y, rw, rh), &(lw, lh)) in rects.iter().zip(sizes) {
+        let within = |(px, py): (i64, i64)| {
+            (
+                px.clamp(0, (w - lw).max(0)),
+                py.clamp(0, (h - lh).max(0)),
+                lw,
+                lh,
+            )
+        };
+        let spots = [(x, y - lh), (x, y), (x, y + rh), (x - lw, y), (x + rw, y)].map(within);
+        let free = spots
+            .iter()
+            .find(|s| placed.iter().all(|p| !hits(**s, *p)))
+            .copied();
+        placed.push(free.unwrap_or(spots[0]));
+    }
+    placed
+}
+
+/// Paint pixel (x, y) of `img`, if inside, opaque `rgb`.
+fn paint(img: &mut Pixels, x: i64, y: i64, [r, g, b]: [u8; 3]) {
+    if x < 0 || y < 0 || x >= i64::from(img.width) || y >= i64::from(img.height) {
+        return;
+    }
+    let c = img.channels;
+    let i = (y as usize * img.width as usize + x as usize) * c;
+    let px = &mut img.data[i..i + c];
+    let luma = ((u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114) / 1000) as u8;
+    match c {
+        1 => px[0] = luma,
+        2 => px.copy_from_slice(&[luma, 255]),
+        3 => px.copy_from_slice(&[r, g, b]),
+        _ => px[..4].copy_from_slice(&[r, g, b, 255]),
+    }
+}
+
+fn fill(img: &mut Pixels, (x, y, w, h): PxRect, rgb: [u8; 3]) {
+    for py in y..y + h {
+        for px in x..x + w {
+            paint(img, px, py, rgb);
+        }
+    }
+}
+
+/// Draw `marks` on `img`, the image of the part `kept` of a capture: a
+/// thin frame in the mark's colour around each box and its id in white on
+/// a label of that colour next to it.
+pub fn draw_marks(img: &mut Pixels, kept: Frac, marks: &[Mark]) {
+    let (w, h) = (i64::from(img.width), i64::from(img.height));
+    let scale = if w.max(h) >= 600 { 2 } else { 1 };
+    let rects: Vec<PxRect> = marks
+        .iter()
+        .map(|m| {
+            let x0 = ((m.rect.x - kept.x) / kept.w * w as f64).round() as i64;
+            let y0 = ((m.rect.y - kept.y) / kept.h * h as f64).round() as i64;
+            let x1 = ((m.rect.x + m.rect.w - kept.x) / kept.w * w as f64).round() as i64;
+            let y1 = ((m.rect.y + m.rect.h - kept.y) / kept.h * h as f64).round() as i64;
+            (x0, y0, (x1 - x0).max(1), (y1 - y0).max(1))
+        })
+        .collect();
+    let sizes: Vec<(i64, i64)> = marks.iter().map(|m| label_size(m.id, scale)).collect();
+    let labels = place_labels(&rects, &sizes, (w, h));
+    // Frames first, so no frame crosses a label.
+    for (k, &(x, y, rw, rh)) in rects.iter().enumerate() {
+        let color = MARK_COLORS[k % MARK_COLORS.len()];
+        let t = 1;
+        fill(img, (x, y, rw, t), color);
+        fill(img, (x, y + rh - t, rw, t), color);
+        fill(img, (x, y, t, rh), color);
+        fill(img, (x + rw - t, y, t, rh), color);
+    }
+    let pad = scale + 1;
+    for (k, (m, &label)) in marks.iter().zip(&labels).enumerate() {
+        fill(img, label, MARK_COLORS[k % MARK_COLORS.len()]);
+        let mut pen = label.0 + pad;
+        for d in m.id.to_string().bytes() {
+            let glyph = DIGITS[usize::from(d - b'0')];
+            for (gy, row) in glyph.iter().enumerate() {
+                for gx in 0..5 {
+                    if row >> (4 - gx) & 1 == 1 {
+                        let (px, py) = (pen + gx * scale, label.1 + pad + gy as i64 * scale);
+                        fill(img, (px, py, scale, scale), [255, 255, 255]);
+                    }
+                }
+            }
+            pen += 6 * scale;
+        }
+    }
+}
+
 /// What `finish` sent: the image size, the PNG, and the part of the
 /// capture it shows (exactly, after rounding `region` to whole pixels).
 pub struct Finished {
@@ -297,13 +474,14 @@ impl Finished {
 /// ends up holding exactly that PNG, the image the screenshot's
 /// coordinates refer to; it is removed on failure. With `jpeg`, the same
 /// pixels are also encoded as a JPEG, kept when it is at most JPEG_SHARE of
-/// the PNG's size.
+/// the PNG's size. `marks` are drawn on it (`draw_marks`).
 pub fn finish(
     path: &str,
     pixels: Option<Convert>,
     max: u32,
     region: Frac,
     jpeg: bool,
+    marks: &[Mark],
 ) -> R<Finished> {
     let whole = region == Frac::ALL;
     let done = (|| {
@@ -311,7 +489,10 @@ pub fn finish(
             Some(convert) => convert()?,
             None => {
                 let img = read_png(path)?;
-                if whole && fit((img.width, img.height), max, max) == (img.width, img.height) {
+                if whole
+                    && marks.is_empty()
+                    && fit((img.width, img.height), max, max) == (img.width, img.height)
+                {
                     let png = std::fs::read(path).map_err(|e| e.to_string())?;
                     return Ok(Finished {
                         size: (img.width, img.height),
@@ -347,6 +528,8 @@ pub fn finish(
         } else {
             shrink(&img, w, h)
         };
+        let mut img = img;
+        draw_marks(&mut img, kept, marks);
         let img = drop_opaque_alpha(img);
         let png = write_png(&img)?;
         std::fs::write(path, &png).map_err(|e| format!("{path}: {e}"))?;
@@ -545,22 +728,22 @@ mod tests {
         let path = temp("pixels");
         std::fs::write(&path, b"").unwrap();
         let convert: Convert = Box::new(|| Ok(noise(300, 100, 4)));
-        let done = finish(&path, Some(convert), 150, Frac::ALL, false).unwrap();
+        let done = finish(&path, Some(convert), 150, Frac::ALL, false, &[]).unwrap();
         assert_eq!(done.size, (150, 50));
         assert_eq!(done.kept, Frac::ALL);
         assert_eq!(std::fs::read(&path).unwrap(), done.png);
         // Another tool's PNG (the spectacle/grim fallback) is decoded.
-        let small = finish(&path, None, 60, Frac::ALL, false).unwrap();
+        let small = finish(&path, None, 60, Frac::ALL, false, &[]).unwrap();
         assert_eq!(small.size, (60, 20));
         let back = read_png(&path).unwrap();
         assert_eq!((back.width, back.height, back.channels), (60, 20, 4));
         // Small enough already: sent as the tool wrote it.
-        let same = finish(&path, None, 100, Frac::ALL, false).unwrap();
+        let same = finish(&path, None, 100, Frac::ALL, false, &[]).unwrap();
         assert_eq!((same.size, same.png), ((60, 20), small.png));
         std::fs::remove_file(&path).unwrap();
         // A failed capture leaves no file behind.
         let convert: Convert = Box::new(|| Err("gone".into()));
-        assert!(finish(&path, Some(convert), 100, Frac::ALL, false).is_err());
+        assert!(finish(&path, Some(convert), 100, Frac::ALL, false, &[]).is_err());
         assert!(std::fs::metadata(&path).is_err());
     }
 
@@ -616,12 +799,12 @@ mod tests {
             w: 0.25,
             h: 0.5,
         };
-        let done = finish(&path, Some(Box::new(half)), 1024, region, false).unwrap();
+        let done = finish(&path, Some(Box::new(half)), 1024, region, false, &[]).unwrap();
         assert_eq!((done.size, done.kept), ((100, 50), region));
         let back = read_png(&path).unwrap();
         assert!(back.data.iter().all(|&p| p == 200));
         // Still shrunk to max_size after the crop.
-        let done = finish(&path, Some(Box::new(half)), 50, region, false).unwrap();
+        let done = finish(&path, Some(Box::new(half)), 50, region, false, &[]).unwrap();
         assert_eq!(done.size, (50, 25));
         // The PNG another tool wrote is cropped too.
         let done = finish(
@@ -635,6 +818,7 @@ mod tests {
                 h: 1.0,
             },
             false,
+            &[],
         )
         .unwrap();
         assert_eq!(done.size, (25, 25));
@@ -664,7 +848,7 @@ mod tests {
         // Noise, as busy as a photo: the JPEG is far smaller; the file
         // stays a PNG.
         let convert: Convert = Box::new(|| Ok(noise(320, 200, 3)));
-        let done = finish(&path, Some(convert), 1024, Frac::ALL, true).unwrap();
+        let done = finish(&path, Some(convert), 1024, Frac::ALL, true, &[]).unwrap();
         let (bytes, mime) = done.inline();
         assert_eq!(mime, "image/jpeg");
         assert!(bytes.starts_with(&[0xFF, 0xD8]) && bytes.ends_with(&[0xFF, 0xD9]));
@@ -672,7 +856,7 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), done.png);
         // Not asked for (inline=false): no JPEG is made.
         let convert: Convert = Box::new(|| Ok(noise(320, 200, 3)));
-        let done = finish(&path, Some(convert), 1024, Frac::ALL, false).unwrap();
+        let done = finish(&path, Some(convert), 1024, Frac::ALL, false, &[]).unwrap();
         assert!(done.jpeg.is_none());
         // A flat window compresses better losslessly: PNG.
         let flat: Convert = Box::new(|| {
@@ -683,13 +867,159 @@ mod tests {
                 data: vec![240; 320 * 200 * 3],
             })
         });
-        let done = finish(&path, Some(flat), 1024, Frac::ALL, true).unwrap();
+        let done = finish(&path, Some(flat), 1024, Frac::ALL, true, &[]).unwrap();
         assert_eq!(done.inline().1, "image/png");
         std::fs::remove_file(&path).unwrap();
         // Translucent pixels have no JPEG form.
         let mut img = noise(8, 8, 4);
         img.data[3] = 0;
         assert!(write_jpeg(&img).is_none());
+    }
+
+    fn frac(x: f64, y: f64, w: f64, h: f64) -> Frac {
+        Frac { x, y, w, h }
+    }
+
+    #[test]
+    fn marks_are_those_in_view_once_per_box_and_capped() {
+        let boxes = [
+            frac(0.1, 0.1, 0.2, 0.1),
+            // Nearly the same box (a list entry around its link): left out.
+            frac(0.1, 0.1, 0.21, 0.1),
+            // Centre outside the image.
+            frac(0.9, 0.5, 0.2, 0.1),
+            frac(0.5, 0.5, 0.1, 0.1),
+            // No area.
+            frac(0.4, 0.4, 0.0, 0.1),
+            // Inside a bigger one, but a box of its own.
+            frac(0.12, 0.12, 0.05, 0.05),
+        ];
+        assert_eq!(choose_marks(&boxes, Frac::ALL, 40), vec![0, 3, 5]);
+        assert_eq!(choose_marks(&boxes, Frac::ALL, 2), vec![0, 3]);
+        // A zoom keeps the marks whose centre it shows.
+        let right = frac(0.5, 0.0, 0.5, 1.0);
+        assert_eq!(choose_marks(&boxes, right, 40), vec![3]);
+    }
+
+    #[test]
+    fn labels_go_above_their_box_and_clear_of_each_other() {
+        let size = (12, 11);
+        // Room above: there.
+        assert_eq!(
+            place_labels(&[(20, 30, 50, 10)], &[size], (200, 100)),
+            vec![(20, 19, 12, 11)]
+        );
+        // At the top edge: inside the box.
+        assert_eq!(
+            place_labels(&[(20, 0, 50, 10)], &[size], (200, 100)),
+            vec![(20, 0, 12, 11)]
+        );
+        // Two boxes in a row at the same spot: the second goes below its
+        // own box, then left of it, then right.
+        let rects = [(20, 30, 50, 20); 5];
+        let placed = place_labels(&rects, &[size; 5], (200, 100));
+        assert_eq!(placed[0], (20, 19, 12, 11));
+        assert_eq!(placed[1], (20, 30, 12, 11));
+        assert_eq!(placed[2], (20, 50, 12, 11));
+        assert_eq!(placed[3], (8, 30, 12, 11));
+        assert_eq!(placed[4], (70, 30, 12, 11));
+        for (i, a) in placed.iter().enumerate() {
+            for b in &placed[i + 1..] {
+                assert!(!hits(*a, *b), "{a:?} {b:?}");
+            }
+        }
+        // Past the right edge: shifted into the image.
+        assert_eq!(
+            place_labels(&[(195, 50, 5, 5)], &[size], (200, 100)),
+            vec![(188, 39, 12, 11)]
+        );
+    }
+
+    #[test]
+    fn a_label_fits_its_digits() {
+        assert_eq!(label_size(7, 1), (9, 11));
+        assert_eq!(label_size(123, 2), (40, 20));
+    }
+
+    #[test]
+    fn marks_are_drawn_as_frames_and_labelled_ids() {
+        for channels in 1..=4 {
+            let mut img = Pixels {
+                width: 200,
+                height: 100,
+                channels,
+                data: vec![128; 200 * 100 * channels],
+            };
+            // Box (40, 40)-(80, 60) of the image.
+            let m = Mark {
+                id: 8,
+                rect: frac(0.2, 0.4, 0.2, 0.2),
+            };
+            draw_marks(&mut img, Frac::ALL, &[m]);
+            let px = |x: usize, y: usize| {
+                let i = (y * 200 + x) * channels;
+                img.data[i..i + channels].to_vec()
+            };
+            let red = match channels {
+                1 => vec![78],
+                2 => vec![78, 255],
+                3 => vec![200, 20, 60],
+                _ => vec![200, 20, 60, 255],
+            };
+            // The frame, inside untouched.
+            assert_eq!(px(60, 59), red, "{channels}");
+            assert_eq!(px(40, 50), red, "{channels}");
+            assert_eq!(px(60, 50), vec![128; channels]);
+            // The label above the box (9x11 at (40, 29)): its padding in
+            // the colour, the 8's top bar in white.
+            assert_eq!(px(40, 29), red);
+            let white = match channels {
+                2 => vec![255, 255],
+                c => vec![255; c],
+            };
+            assert_eq!(px(43, 31), white, "{channels}");
+            assert_eq!(px(42, 31), red);
+        }
+        // Through a zoom on the right half: the same box, twice as wide.
+        let mut img = Pixels {
+            width: 100,
+            height: 100,
+            channels: 3,
+            data: vec![128; 100 * 100 * 3],
+        };
+        let m = Mark {
+            id: 1,
+            rect: frac(0.6, 0.4, 0.2, 0.2),
+        };
+        draw_marks(&mut img, frac(0.5, 0.0, 0.5, 1.0), &[m]);
+        let at = |x: usize, y: usize| img.data[(y * 100 + x) * 3];
+        assert_eq!((at(20, 50), at(59, 50), at(40, 50)), (200, 200, 128));
+    }
+
+    #[test]
+    fn finish_draws_the_marks_on_the_image_it_sends() {
+        let path = temp("marks");
+        std::fs::write(&path, b"").unwrap();
+        let flat: Convert = Box::new(|| {
+            Ok(Pixels {
+                width: 400,
+                height: 200,
+                channels: 3,
+                data: vec![128; 400 * 200 * 3],
+            })
+        });
+        let m = Mark {
+            id: 3,
+            rect: frac(0.25, 0.5, 0.25, 0.25),
+        };
+        // Shrunk to 200x100 first: the frame is at (50, 50) of it.
+        let done = finish(&path, Some(flat), 200, Frac::ALL, false, &[m]).unwrap();
+        assert_eq!(done.size, (200, 100));
+        let back = read_png(&path).unwrap();
+        let at = |x: usize, y: usize| &back.data[(y * 200 + x) * 3..(y * 200 + x) * 3 + 3];
+        assert_eq!(at(50, 60), [200, 20, 60]);
+        assert_eq!(at(60, 60), [128, 128, 128]);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]

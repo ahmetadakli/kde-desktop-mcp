@@ -1377,6 +1377,37 @@ impl From<String> for Out {
 /// Image tokens grow with the area: 1024 costs about 0.64 of 1280 and
 /// still shows a 1536 px wide window's text legibly.
 const SHOT_MAX_SIZE: i64 = 1024;
+/// Elements `screenshot(marks=true)` marks at most: enough for a page's
+/// controls in view, few enough to keep the image and legend readable.
+const MARKS_MAX: usize = 40;
+/// Nodes the marks' tree read looks through at most.
+const MARKS_SEEN: usize = 4000;
+/// Interactive elements whose boxes are read at most (one call each).
+const MARKS_BOXES: usize = 300;
+/// Characters of an element's name the marks' legend shows.
+const MARKS_NAME_CHARS: usize = 40;
+
+/// An element `screenshot(marks=true)` may mark: what it is, its app (lower
+/// case) and its screen box.
+struct MarkCandidate<Id> {
+    id: Id,
+    info: Info<Id>,
+    app: String,
+    area: (f64, f64, f64, f64),
+}
+
+/// One entry of the marks' legend: `[id] role 'name'`.
+fn mark_legend<Id>(rid: u64, info: &Info<Id>) -> String {
+    let name = info.name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut short: String = name.chars().take(MARKS_NAME_CHARS).collect();
+    if short.len() < name.len() {
+        short.push('…');
+    }
+    match short.is_empty() {
+        true => format!("[{rid}] {}", info.role),
+        false => format!("[{rid}] {} {}", info.role, render::py_repr(&short)),
+    }
+}
 
 /// Characters `get_text` returns unless `limit` says otherwise. A whole
 /// web page read 20,000 (5,000 tokens, re-read on every later turn) where
@@ -7653,6 +7684,117 @@ impl<B: Backend> Server<B> {
         Ok(map)
     }
 
+    /// The visible interactive elements of the window `target` names (of
+    /// `app`, allowed), with their screen boxes, those of its web page or
+    /// document first: one tree read, then one box read each.
+    async fn mark_candidates(
+        &self,
+        target: &backend::ShotTarget,
+        app: &str,
+    ) -> R<Vec<MarkCandidate<B::Id>>> {
+        self.b.enable().await;
+        let app = app.to_lowercase();
+        let windows = self.app_windows(&app).await?;
+        let fetch = |limit| Fetch {
+            only_showing: true,
+            text_limit: TREE_TEXT_LIMIT,
+            limit,
+            actions: true,
+            stop_roles: &[],
+            offscreen: false,
+        };
+        let (found, cache, _) = self
+            .read_app(
+                Some(&app),
+                &windows,
+                Cache::new(),
+                fetch(1000),
+                fetch(PREFETCH_MORE),
+                |c| match render::window_titled(c, &windows, &target.caption) {
+                    Some(w) => render::mark_candidates(c, &w, MARKS_SEEN).map(Some),
+                    None => Ok(None),
+                },
+            )
+            .await;
+        let mut found = found.ok_or_else(|| {
+            format!(
+                "no window of '{app}' titled {} in the accessibility tree",
+                render::py_repr(&render::short_title(&target.caption))
+            )
+        })?;
+        // Stable: document order within each part.
+        found.sort_by_key(|(_, in_doc)| !in_doc);
+        found.truncate(MARKS_BOXES);
+        let ids: Vec<B::Id> = found.into_iter().map(|(id, _)| id).collect();
+        let boxes = trace::time("element_boxes", self.b.element_boxes(target, &ids)).await;
+        Ok(ids
+            .into_iter()
+            .zip(boxes)
+            .filter_map(|(id, area)| {
+                let area = area.filter(|b| b.2 >= 2.0 && b.3 >= 2.0)?;
+                let mut info = cache.get(&id)?.clone();
+                info.children.clear();
+                Some(MarkCandidate {
+                    id,
+                    info,
+                    app: app.clone(),
+                    area,
+                })
+            })
+            .collect())
+    }
+
+    /// The marks to draw on a capture of screen area `area` whose part
+    /// `kept` is sent, from `found` (`mark_candidates`), their ids
+    /// registered; and the reply's line about them.
+    async fn choose_marks(
+        &self,
+        found: R<Vec<MarkCandidate<B::Id>>>,
+        area: Option<(f64, f64, f64, f64)>,
+        kept: shot::Frac,
+    ) -> (Vec<shot::Mark>, String) {
+        let found = match (found, area) {
+            (Err(e), _) => return (Vec::new(), format!("no marks: {e}")),
+            (Ok(_), None) => {
+                return (
+                    Vec::new(),
+                    "no marks: the screen area of the capture is unknown here".into(),
+                );
+            }
+            (Ok(f), Some((ax, ay, aw, ah))) => f
+                .into_iter()
+                .map(|c| {
+                    let (x, y, w, h) = c.area;
+                    let rect = shot::Frac {
+                        x: (x - ax) / aw,
+                        y: (y - ay) / ah,
+                        w: w / aw,
+                        h: h / ah,
+                    };
+                    (c, rect)
+                })
+                .collect::<Vec<_>>(),
+        };
+        let rects: Vec<shot::Frac> = found.iter().map(|(_, r)| *r).collect();
+        let picked = shot::choose_marks(&rects, kept, MARKS_MAX);
+        if picked.is_empty() {
+            let line = "no marks: no interactive element with a known box in view";
+            return (Vec::new(), line.into());
+        }
+        let mut marks = Vec::with_capacity(picked.len());
+        let mut legend = Vec::with_capacity(picked.len());
+        for i in picked {
+            let (c, rect) = &found[i];
+            let rid = self.add_ref(&c.id, &c.info, &c.app).await;
+            marks.push(shot::Mark {
+                id: rid,
+                rect: *rect,
+            });
+            legend.push(mark_legend(rid, &c.info));
+        }
+        (marks, format!("marks: {}", legend.join(", ")))
+    }
+
     /// Capture the active window, or `background` (from `background_shot`)
     /// where it is. With `region` (pixels of the last screenshot): capture
     /// again and keep only that part, at up to full resolution, mapped so
@@ -7709,9 +7851,16 @@ impl<B: Backend> Server<B> {
         *self.last_shot.lock().await = None;
         *self.shot_behind.lock().await =
             behind.then(|| (target.handle.clone(), target.caption.clone()));
-        let Shot { path, pixels, area } = trace::time("capture", self.b.screenshot(&target))
-            .await
-            .map_err(|e| format!("screenshot failed: {e}"))?;
+        // The marks' tree read runs while the window is captured.
+        let capture = trace::time("capture", self.b.screenshot(&target));
+        let (shot, found) = if arg_b(a, "marks", false) {
+            let marks = trace::time("mark_candidates", self.mark_candidates(&target, &app));
+            let (shot, found) = tokio::join!(capture, marks);
+            (shot, Some(found))
+        } else {
+            (capture.await, None)
+        };
+        let Shot { path, pixels, area } = shot.map_err(|e| format!("screenshot failed: {e}"))?;
         let frac = match (zoom, area) {
             (None, _) => shot::Frac::ALL,
             (Some((_, want)), Some(area)) => region_frac(area, want).ok_or_else(|| {
@@ -7725,12 +7874,21 @@ impl<B: Backend> Server<B> {
         };
         let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, 8192) as u32;
         let inline = arg_b(a, "inline", true) && save_to.is_none();
+        let (marks, marks_line) = match found {
+            Some(found) => {
+                let (m, line) = self.choose_marks(found, area, frac).await;
+                (m, Some(line))
+            }
+            None => (Vec::new(), None),
+        };
         // Converting, shrinking and encoding take milliseconds: keep other
         // calls moving.
         let file = path.clone();
         let done = trace::time(
             "convert+encode",
-            tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac, inline)),
+            tokio::task::spawn_blocking(move || {
+                shot::finish(&file, pixels, max, frac, inline, &marks)
+            }),
         )
         .await
         .map_err(|e| e.to_string())??;
@@ -7783,6 +7941,10 @@ impl<B: Backend> Server<B> {
                 " (zoom of region [{x}, {y}, {w}, {h}] of the previous screenshot; \
                  image_x/image_y now refer to this image)"
             ));
+        }
+        if let Some(line) = marks_line {
+            text.push('\n');
+            text.push_str(&line);
         }
         Ok(Out {
             text,
@@ -9063,6 +9225,8 @@ mod tests {
         adds: std::cell::Cell<bool>,
         /// `element_at`: the element at each point, and its app.
         points: RefCell<Vec<FakePoint>>,
+        /// `element_boxes`: each element's screen box.
+        boxes: RefCell<HashMap<u32, Frame>>,
         /// The user types once this many more key presses went out.
         user_after_presses: std::cell::Cell<Option<usize>>,
         /// `labels` per element.
@@ -9752,6 +9916,10 @@ mod tests {
             }
             Ok((0, 0))
         }
+        async fn element_boxes(&self, _: &backend::ShotTarget, ids: &[u32]) -> Vec<Option<Frame>> {
+            let boxes = self.sem.boxes.borrow();
+            ids.iter().map(|id| boxes.get(id).copied()).collect()
+        }
         async fn has_area(&self, ids: &[u32]) -> Vec<Option<bool>> {
             let no_area = self.no_area.borrow();
             ids.iter().map(|id| Some(!no_area.contains(id))).collect()
@@ -9984,6 +10152,7 @@ mod tests {
                 class,
                 caption: title.clone(),
                 area: Some((10.0, 20.0, 400.0, 200.0)),
+                client: Some((10.0, 40.0)),
                 handle: title,
             })
         }
@@ -10006,6 +10175,7 @@ mod tests {
                     class: app.into(),
                     caption: title.into(),
                     area: Some((10.0, 20.0, 400.0, 200.0)),
+                    client: Some((10.0, 40.0)),
                     handle: title.into(),
                 };
                 (target, self.active.borrow().1 == title)
@@ -11435,6 +11605,90 @@ mod tests {
             let size = format!("\n{}x{} px", img.width, img.height);
             assert!(reply_text(&r).contains(&size), "{r}");
             std::fs::remove_file(path).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_marked_screenshot_numbers_the_elements_to_act_on_by_id() {
+        local(async {
+            let mut s = session("marks");
+            fake_reads(&s);
+            {
+                let mut n = s.nodes.borrow_mut();
+                let mut label = fake_node("label", "Notes", &[]);
+                label.actions.clear();
+                n.insert(32, label);
+                n.get_mut(&31).unwrap().name =
+                    "Open a file from the disk, any of the recent ones".into();
+            }
+            s.focus.borrow_mut().children.push(32);
+            {
+                // 2 screen px per image pixel: Save's box is image pixels
+                // (20, 20)-(60, 30); Open's (120, 40)-(160, 50).
+                let mut b = s.sem.boxes.borrow_mut();
+                b.insert(30, (50.0, 60.0, 80.0, 20.0));
+                b.insert(31, (250.0, 100.0, 80.0, 20.0));
+                b.insert(32, (50.0, 150.0, 80.0, 20.0));
+            }
+            let r = call_tool(
+                &mut s,
+                2,
+                "screenshot",
+                json!({"marks": true, "inline": false}),
+            )
+            .await;
+            let text = reply_text(&r);
+            let last = text.lines().last().unwrap();
+            assert_eq!(
+                last,
+                "marks: [1] push button 'Save', [2] push button 'Open a file from the disk, \
+                 any of the re…'",
+                "{text}"
+            );
+            // The frames are on the image the reply names.
+            let path = text.lines().next().unwrap();
+            let img = shot::read_png(path).unwrap();
+            let at =
+                |x: usize, y: usize| img.data[(y * 200 + x) * 3..(y * 200 + x) * 3 + 3].to_vec();
+            assert_eq!(at(20, 25), vec![200, 20, 60]);
+            assert_eq!(at(120, 45), vec![0, 100, 190]);
+            assert_eq!(at(40, 25), vec![128; 3]);
+            std::fs::remove_file(path).unwrap();
+            // The ids work as find's do.
+            let r = call_tool(&mut s, 3, "tree", json!({"root_id": 2})).await;
+            assert!(
+                reply_text(&r).starts_with("[2] push button \"Open a file"),
+                "{r}"
+            );
+            // A zoom marks only what it shows.
+            let r = call_tool(
+                &mut s,
+                4,
+                "screenshot",
+                json!({"marks": true, "region": [100, 0, 100, 100]}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.ends_with(
+                    "\nmarks: [2] push button 'Open a file from the disk, any of the re…'"
+                ),
+                "{text}"
+            );
+            // Nothing with a box: said so, the image still sent.
+            s.sem.boxes.borrow_mut().clear();
+            let r = call_tool(&mut s, 5, "screenshot", json!({"marks": true})).await;
+            assert!(
+                reply_text(&r)
+                    .ends_with("\nno marks: no interactive element with a known box in view"),
+                "{r}"
+            );
+            assert_eq!(r["result"]["content"][1]["type"], "image", "{r}");
+            // Without marks: no tree read, no line.
+            let before = prefetches(&s);
+            let r = call_tool(&mut s, 6, "screenshot", json!({})).await;
+            assert!(!reply_text(&r).contains("marks"), "{r}");
+            assert_eq!(prefetches(&s), before);
         });
     }
 

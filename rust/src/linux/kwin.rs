@@ -61,6 +61,9 @@ pub struct RawImage {
 #[derive(Debug, PartialEq)]
 pub struct Frame {
     pub area: (f64, f64, f64, f64),
+    /// Origin of its client area (where its AT-SPI window coordinates
+    /// start), when KWin reported it.
+    pub client: Option<(f64, f64)>,
     pub handle: Option<String>,
     pub pid: Option<u32>,
     pub caption: String,
@@ -79,6 +82,7 @@ pub fn frame_of(raw: &str) -> R<Option<Frame>> {
     };
     Ok(Some(Frame {
         area: (num("x")?, num("y")?, num("width")?, num("height")?),
+        client: g["cx"].as_f64().zip(g["cy"].as_f64()),
         handle: g["id"]
             .as_str()
             .filter(|id| id.starts_with('{'))
@@ -234,11 +238,12 @@ return JSON.stringify({caption: best.caption, pid: best.pid});
 const PICK_FRAME: &str = r#"(() => { %PICK%
 if (!best) return "";
 const g = best.frameGeometry;
+const c = best.clientGeometry;
 const cur = workspace.currentDesktop;
 const here = best.onAllDesktops || !cur
   || (best.desktops || []).some(d => d.id === cur.id);
 return JSON.stringify({x: g.x, y: g.y, width: g.width, height: g.height,
-  id: String(best.internalId), pid: best.pid, caption: best.caption,
+  cx: c.x, cy: c.y, id: String(best.internalId), pid: best.pid, caption: best.caption,
   cls: best.resourceClass || "", minimized: best.minimized,
   active: best === workspace.activeWindow, here: here});
 })()"#;
@@ -369,7 +374,8 @@ const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow
 /// CaptureWindow takes, "{uuid}"), and its process, caption and class, so
 /// a screenshot checks the window it captures.
 const FRAME: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
-     const g = w.frameGeometry; return {x: g.x, y: g.y, width: g.width, height: g.height, \
+     const g = w.frameGeometry; const c = w.clientGeometry; \
+     return {x: g.x, y: g.y, width: g.width, height: g.height, cx: c.x, cy: c.y, \
      id: String(w.internalId), pid: w.pid, caption: w.caption, cls: w.resourceClass || ''}; })())";
 
 /// The active window's caption and process, and the window it is a
@@ -925,12 +931,13 @@ mod tests {
 
     #[test]
     fn the_frame_names_the_window_it_belongs_to() {
-        let raw = r#"{"x":1,"y":2,"width":30,"height":40,"id":"{abc}","pid":77,
-                      "caption":"Inbox","cls":"firefox"}"#;
+        let raw = r#"{"x":1,"y":2,"width":30,"height":40,"cx":1,"cy":12,"id":"{abc}",
+                      "pid":77,"caption":"Inbox","cls":"firefox"}"#;
         assert_eq!(
             frame_of(raw).unwrap(),
             Some(Frame {
                 area: (1.0, 2.0, 30.0, 40.0),
+                client: Some((1.0, 12.0)),
                 handle: Some("{abc}".into()),
                 pid: Some(77),
                 caption: "Inbox".into(),
@@ -942,7 +949,7 @@ mod tests {
         let f = frame_of(r#"{"x":0,"y":0,"width":1,"height":1,"id":"7","pid":0}"#)
             .unwrap()
             .unwrap();
-        assert_eq!((f.handle, f.pid), (None, None));
+        assert_eq!((f.handle, f.pid, f.client), (None, None, None));
         assert!(frame_of(r#"{"x":0}"#).unwrap_err().contains("'y'"));
     }
 

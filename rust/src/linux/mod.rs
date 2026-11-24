@@ -623,6 +623,7 @@ fn kde_target(names: &HashMap<i64, String>, f: kwin::Frame) -> R<ShotTarget> {
         caption: f.caption,
         class: f.class,
         area: Some(f.area),
+        client: f.client,
         handle,
     })
 }
@@ -636,6 +637,7 @@ fn hypr_target(names: &HashMap<i64, String>, c: &Json) -> ShotTarget {
         caption: c["title"].as_str().unwrap_or_default().to_string(),
         class,
         area: hypr_area(c),
+        client: None,
         handle: c["address"].as_str().unwrap_or_default().to_string(),
     }
 }
@@ -2056,6 +2058,30 @@ impl Backend for LinuxBackend {
         .await
     }
 
+    async fn element_boxes(
+        &self,
+        target: &ShotTarget,
+        ids: &[Obj],
+    ) -> Vec<Option<(f64, f64, f64, f64)>> {
+        // Window coordinates from the client origin KWin gave with the
+        // window (Hyprland: none, as for `element_at`).
+        let Some((gx, gy)) = target.client else {
+            return vec![None; ids.len()];
+        };
+        futures_util::future::join_all(ids.iter().map(|id| async move {
+            let (x, y, w, h) = self.a11y.extents(id, atspi::COORD_WINDOW).await.ok()?;
+            (w > 0 && h > 0).then(|| {
+                (
+                    gx + f64::from(x),
+                    gy + f64::from(y),
+                    f64::from(w),
+                    f64::from(h),
+                )
+            })
+        }))
+        .await
+    }
+
     async fn element_centers(&self, ids: &[Obj]) -> Vec<R<(i32, i32)>> {
         let kwin = match &self.comp {
             Compositor::Kde(kwin) => kwin,
@@ -3097,6 +3123,7 @@ mod tests {
         let names = HashMap::from([(4242, "Firefox".to_string())]);
         let frame = |pid: Option<u32>, handle: Option<&str>| kwin::Frame {
             area: (1.0, 2.0, 30.0, 40.0),
+            client: Some((1.0, 12.0)),
             handle: handle.map(str::to_string),
             pid,
             caption: "Inbox".into(),
@@ -3106,6 +3133,7 @@ mod tests {
         assert_eq!(t.app, "firefox");
         assert_eq!(t.handle, "{a-b}");
         assert_eq!(t.area, Some((1.0, 2.0, 30.0, 40.0)));
+        assert_eq!(t.client, Some((1.0, 12.0)));
         assert_eq!(t.describe(), "'Inbox' (class 'org.mozilla.firefox')");
         // Without accessibility (or a pid): the class, which the user can
         // allowlist.

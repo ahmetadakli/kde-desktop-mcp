@@ -1812,6 +1812,82 @@ pub fn first_with_role<Id: Clone + Eq + Hash>(
     done(None, missing)
 }
 
+/// The window of `windows` a capture titled `caption` shows: the one of
+/// that name, else the active one, else the only visible one.
+pub fn window_titled<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    windows: &[Id],
+    caption: &str,
+) -> Option<Id> {
+    let shown: Vec<(&Id, &Info<Id>)> = windows
+        .iter()
+        .filter_map(|w| cache.get(w).map(|i| (w, i)))
+        .filter(|(_, i)| i.showing)
+        .collect();
+    let caption = caption.trim();
+    let named = |exact: bool| {
+        shown.iter().find(|(_, i)| {
+            let name = i.name.trim();
+            !name.is_empty()
+                && if exact {
+                    name == caption
+                } else {
+                    caption.starts_with(name)
+                }
+        })
+    };
+    named(true)
+        .or_else(|| named(false))
+        .or_else(|| shown.iter().find(|(_, i)| i.states.contains(&"active")))
+        .or_else(|| (shown.len() == 1).then(|| &shown[0]))
+        .map(|(w, _)| (*w).clone())
+}
+
+/// The visible interactive elements below `root` (as `tree(interactive=true)`
+/// lists them; title roles aside: a browser's dozens of tabs would crowd
+/// out the page and its toolbar, and find names them) in document order,
+/// each with whether it lies in a document (a web page). Stops after
+/// `max_seen` nodes; what is missing then is not asked for.
+pub fn mark_candidates<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    root: &Id,
+    max_seen: usize,
+) -> Result<Vec<(Id, bool)>, Vec<Id>> {
+    let mut missing = Vec::new();
+    let mut out = Vec::new();
+    let Some(info) = cache.get(root) else {
+        return Err(vec![root.clone()]);
+    };
+    // (node, in a document); the stack pops in document order.
+    let mut stack: Vec<(&Id, bool)> = Vec::new();
+    fn push<'a, Id: Clone + Eq + Hash>(
+        cache: &'a Cache<Id>,
+        kids: &'a [Id],
+        doc: bool,
+        stack: &mut Vec<(&'a Id, bool)>,
+        missing: &mut Vec<Id>,
+    ) {
+        let mut ids = Vec::new();
+        push_showing(cache, kids, &mut ids, missing);
+        stack.extend(ids.into_iter().map(|c| (c, doc)));
+    }
+    push(cache, &info.children, false, &mut stack, &mut missing);
+    let mut seen = 0;
+    while let Some((id, doc)) = stack.pop() {
+        seen += 1;
+        if seen > max_seen {
+            return Ok(out);
+        }
+        let info = &cache[id];
+        let doc = doc || DOCUMENT_ROLES.contains(&info.role.as_str());
+        if !TITLE_ROLES.contains(&info.role.as_str()) && interactive(info) {
+            out.push((id.clone(), doc));
+        }
+        push(cache, &info.children, doc, &mut stack, &mut missing);
+    }
+    done(out, missing)
+}
+
 /// Roles whose content starts on a line of its own in `container_text`.
 const BLOCK_ROLES: [&str; 30] = [
     "paragraph",
@@ -3726,6 +3802,55 @@ mod tests {
             Some("/d1")
         );
         assert_eq!(first_with_role(&cache, &["/w"], &["table"]).unwrap(), None);
+    }
+
+    #[test]
+    fn marks_are_a_windows_interactive_elements_page_ones_flagged() {
+        let mut c = Cache::new();
+        c.insert(
+            "/w",
+            node("frame", "Inbox — Firefox", true, &[], &["/tb", "/doc"]),
+        );
+        c.insert(
+            "/w2",
+            node("frame", "Other — Firefox", true, &["active"], &[]),
+        );
+        c.insert("/tb", node("tool bar", "", true, &[], &["/back", "/gone"]));
+        let back = with_actions(node("push button", "Back", true, &[], &[]), &["press"]);
+        c.insert("/back", back);
+        let gone = with_actions(node("push button", "Hidden", false, &[], &[]), &["press"]);
+        c.insert("/gone", gone);
+        c.insert(
+            "/doc",
+            node("document web", "Inbox", true, &[], &["/p", "/link"]),
+        );
+        c.insert(
+            "/p",
+            node("paragraph", "", true, &[], &["/entry", "/missing"]),
+        );
+        c.insert("/entry", node("entry", "Search", true, &["editable"], &[]));
+        let link = with_actions(node("link", "Home", true, &[], &[]), &["jump"]);
+        c.insert("/link", link);
+        // "/missing" is not read yet: asked for, with nothing else.
+        assert_eq!(mark_candidates(&c, &"/w", 100), Err(vec!["/missing"]));
+        c.insert("/missing", node("static", "text", true, &[], &[]));
+        assert_eq!(
+            mark_candidates(&c, &"/w", 100).unwrap(),
+            vec![("/back", false), ("/entry", true), ("/link", true)]
+        );
+        // Past the nodes it may look through: what it saw, nothing asked.
+        c.remove("/missing");
+        assert_eq!(
+            mark_candidates(&c, &"/w", 2).unwrap(),
+            vec![("/back", false)]
+        );
+        // The window a capture shows: by its title, else the active one.
+        let ws = ["/w", "/w2"];
+        assert_eq!(window_titled(&c, &ws, "Inbox — Firefox"), Some("/w"));
+        assert_eq!(window_titled(&c, &ws, "Other — Firefox x"), Some("/w2"));
+        assert_eq!(window_titled(&c, &ws, "Settings"), Some("/w2"));
+        assert_eq!(window_titled(&c, &["/w"], "Settings"), Some("/w"));
+        assert_eq!(window_titled(&c, &["/gone", "/x"], "Settings"), None);
     }
 
     fn with_actions(mut n: Info<&'static str>, actions: &[&str]) -> Info<&'static str> {

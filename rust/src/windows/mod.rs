@@ -676,6 +676,27 @@ impl Backend for WindowsBackend {
             .ok_or_else(|| NO_AREA.into())
     }
 
+    async fn element_boxes(
+        &self,
+        _target: &ShotTarget,
+        ids: &[Elem],
+    ) -> Vec<Option<(f64, f64, f64, f64)>> {
+        // UIA bounds are screen pixels, as the capture's area is.
+        ids.iter()
+            .map(|id| {
+                let (l, t, r, b) = self.uia.bounds(&id.el)?;
+                (r > l && b > t).then(|| {
+                    (
+                        f64::from(l),
+                        f64::from(t),
+                        f64::from(r - l),
+                        f64::from(b - t),
+                    )
+                })
+            })
+            .collect()
+    }
+
     fn check_combo(&self, combo: &str) -> R<()> {
         logic::parse_combo(combo).map(|_| ())
     }
@@ -1100,6 +1121,7 @@ impl Backend for WindowsBackend {
             caption: wm::title(h),
             class: wm::class_name(h),
             area,
+            client: None,
             handle: (h.0 as usize).to_string(),
         })
     }
