@@ -2030,35 +2030,64 @@ pub fn first_with_role<Id: Clone + Eq + Hash>(
     done(None, missing)
 }
 
-/// The window of `windows` a capture titled `caption` shows: the one of
-/// that name, else the active one, else the only visible one.
+/// The window of `windows` a capture titled `caption` shows (`front`: the
+/// capture is of the window in front).
 pub fn window_titled<Id: Clone + Eq + Hash>(
     cache: &Cache<Id>,
     windows: &[Id],
     caption: &str,
+    front: bool,
 ) -> Option<Id> {
     let shown: Vec<(&Id, &Info<Id>)> = windows
         .iter()
         .filter_map(|w| cache.get(w).map(|i| (w, i)))
         .filter(|(_, i)| i.showing)
         .collect();
+    pick_window(&shown, caption, front)
+}
+
+/// Of an app's shown windows, the one a capture titled `caption` shows:
+/// in front, its active window (unless another has that title); behind,
+/// the one of that title (else the only one) that is not active. None
+/// when that is not one window: two of the same title, say, where one's
+/// element boxes would be placed on the other's pixels.
+pub fn pick_window<Id: Clone>(
+    shown: &[(&Id, &Info<Id>)],
+    caption: &str,
+    front: bool,
+) -> Option<Id> {
     let caption = caption.trim();
-    let named = |exact: bool| {
-        shown.iter().find(|(_, i)| {
-            let name = i.name.trim();
-            !name.is_empty()
-                && if exact {
-                    name == caption
-                } else {
-                    caption.starts_with(name)
-                }
-        })
+    let active = |i: &Info<Id>| i.states.contains(&"active");
+    let by_name = |exact: bool| -> Vec<usize> {
+        (0..shown.len())
+            .filter(|&k| {
+                let name = shown[k].1.name.trim();
+                !name.is_empty()
+                    && if exact {
+                        name == caption
+                    } else {
+                        caption.starts_with(name)
+                    }
+            })
+            .collect()
     };
-    named(true)
-        .or_else(|| named(false))
-        .or_else(|| shown.iter().find(|(_, i)| i.states.contains(&"active")))
-        .or_else(|| (shown.len() == 1).then(|| &shown[0]))
-        .map(|(w, _)| (*w).clone())
+    let mut named = by_name(true);
+    if named.is_empty() {
+        named = by_name(false);
+    }
+    let only = |v: Vec<usize>| (v.len() == 1).then(|| shown[v[0]].0.clone());
+    match front {
+        true => match (0..shown.len()).find(|&k| active(shown[k].1)) {
+            Some(k) => (named.is_empty() || named.contains(&k)).then(|| shown[k].0.clone()),
+            None if named.is_empty() => only((0..shown.len()).collect()),
+            None => only(named),
+        },
+        false if named.is_empty() => {
+            only((0..shown.len()).filter(|&k| !active(shown[k].1)).collect())
+                .filter(|_| shown.len() == 1)
+        }
+        false => only(named.into_iter().filter(|&k| !active(shown[k].1)).collect()),
+    }
 }
 
 /// The visible interactive elements below `root` (as `tree(interactive=true)`
@@ -4202,13 +4231,32 @@ mod tests {
             mark_candidates(&c, &"/w", 2).unwrap(),
             vec![("/back", false)]
         );
-        // The window a capture shows: by its title, else the active one.
+        // The window a capture shows: in front, the active one; behind,
+        // the one of its title that is not.
         let ws = ["/w", "/w2"];
-        assert_eq!(window_titled(&c, &ws, "Inbox — Firefox"), Some("/w"));
-        assert_eq!(window_titled(&c, &ws, "Other — Firefox x"), Some("/w2"));
-        assert_eq!(window_titled(&c, &ws, "Settings"), Some("/w2"));
-        assert_eq!(window_titled(&c, &["/w"], "Settings"), Some("/w"));
-        assert_eq!(window_titled(&c, &["/gone", "/x"], "Settings"), None);
+        assert_eq!(window_titled(&c, &ws, "Inbox — Firefox", false), Some("/w"));
+        assert_eq!(window_titled(&c, &ws, "Inbox — Firefox", true), None);
+        assert_eq!(
+            window_titled(&c, &ws, "Other — Firefox x", true),
+            Some("/w2")
+        );
+        assert_eq!(window_titled(&c, &ws, "Other — Firefox x", false), None);
+        assert_eq!(window_titled(&c, &ws, "Settings", true), Some("/w2"));
+        assert_eq!(window_titled(&c, &ws, "Settings", false), None);
+        assert_eq!(window_titled(&c, &["/w"], "Settings", false), Some("/w"));
+        assert_eq!(window_titled(&c, &["/w"], "Settings", true), Some("/w"));
+        assert_eq!(window_titled(&c, &["/gone", "/x"], "Settings", true), None);
+        // Two of the same title: the active one in front; behind, unsure.
+        c.insert("/w3", node("frame", "Other — Firefox", true, &[], &[]));
+        let ws = ["/w", "/w2", "/w3"];
+        assert_eq!(window_titled(&c, &ws, "Other — Firefox", true), Some("/w2"));
+        assert_eq!(
+            window_titled(&c, &ws, "Other — Firefox", false),
+            Some("/w3")
+        );
+        c.get_mut("/w2").unwrap().states.clear();
+        assert_eq!(window_titled(&c, &ws, "Other — Firefox", false), None);
+        assert_eq!(window_titled(&c, &ws, "Other — Firefox", true), None);
     }
 
     fn with_actions(mut n: Info<&'static str>, actions: &[&str]) -> Info<&'static str> {

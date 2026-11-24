@@ -1031,13 +1031,6 @@ fn region_frac(
     })
 }
 
-/// Whether the window title an element's frame gives (`window_title`) is
-/// that of the window captioned `caption`; an unknown (empty) one is.
-fn same_window(caption: &str, title: &str) -> bool {
-    let (caption, title) = (caption.trim(), title.trim());
-    title.is_empty() || caption == title || caption.starts_with(title)
-}
-
 /// The screen area `screenshot(id=…)` shows of an element's box `b`.
 fn around((x, y, w, h): (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
     let m = SHOT_ID_MARGIN;
@@ -7712,13 +7705,43 @@ impl<B: Backend> Server<B> {
         Ok(map)
     }
 
+    /// Whether the capture `target` (`front`: of the window in front)
+    /// shows the window `frame` of `app`, the one an element is in (None:
+    /// not known; then only a capture in front of its app does).
+    async fn shows_window(
+        &self,
+        target: &backend::ShotTarget,
+        front: bool,
+        app: &str,
+        frame: Option<&B::Id>,
+    ) -> bool {
+        if !self.shot_app(target).eq_ignore_ascii_case(app) {
+            return false;
+        }
+        let Some(frame) = frame else {
+            return front;
+        };
+        let Some(windows) = self.b.app_windows(&app.to_lowercase()).await else {
+            return false;
+        };
+        let infos = futures_util::future::join_all(windows.iter().map(|w| self.b.info(w, 0))).await;
+        let shown: Vec<(&B::Id, &Info<B::Id>)> = windows
+            .iter()
+            .zip(infos.iter())
+            .filter(|(_, i)| i.showing)
+            .collect();
+        render::pick_window(&shown, &target.caption, front).as_ref() == Some(frame)
+    }
+
     /// The visible interactive elements of the window `target` names (of
-    /// `app`, allowed), with their screen boxes, those of its web page or
-    /// document first: one tree read, then one box read each.
+    /// `app`, allowed; `front`: the window in front), with their screen
+    /// boxes, those of its web page or document first: one tree read, then
+    /// one box read each.
     async fn mark_candidates(
         &self,
         target: &backend::ShotTarget,
         app: &str,
+        front: bool,
     ) -> R<Vec<MarkCandidate<B::Id>>> {
         self.b.enable().await;
         let app = app.to_lowercase();
@@ -7738,7 +7761,7 @@ impl<B: Backend> Server<B> {
                 Cache::new(),
                 fetch(1000),
                 fetch(PREFETCH_MORE),
-                |c| match render::window_titled(c, &windows, &target.caption) {
+                |c| match render::window_titled(c, &windows, &target.caption, front) {
                     Some(w) => render::mark_candidates(c, &w, MARKS_SEEN).map(Some),
                     None => Ok(None),
                 },
@@ -7746,7 +7769,7 @@ impl<B: Backend> Server<B> {
             .await;
         let mut found = found.ok_or_else(|| {
             format!(
-                "no window of '{app}' titled {} in the accessibility tree",
+                "no single window of '{app}' titled {} in the accessibility tree",
                 render::py_repr(&render::short_title(&target.caption))
             )
         })?;
@@ -7870,25 +7893,44 @@ impl<B: Backend> Server<B> {
         let element = match rid {
             Some(rid) => {
                 let r = self.resolve_ref(rid).await?;
-                let title = self.b.window_title(&r.id).await.unwrap_or_default();
-                if !same_window(&target.caption, &title) {
-                    let found = match named {
-                        true => None,
-                        false => self.background_shot(&title).await,
+                // Its window by the element's own frame, not by a title
+                // another window may share.
+                let (frame, title) = match self.b.window_of(&r.id).await {
+                    Some((f, t)) => (Some(f), t),
+                    None => (None, String::new()),
+                };
+                if !self
+                    .shows_window(&target, !behind, &r.app, frame.as_ref())
+                    .await
+                {
+                    let found = match (named, title.is_empty()) {
+                        (false, false) => self.background_shot(&title).await,
+                        _ => None,
                     };
-                    let Some((t, active)) = found.filter(|(t, _)| same_window(&t.caption, &title))
-                    else {
+                    let mut shown = None;
+                    if let Some((t, active)) = found
+                        && self.shows_window(&t, active, &r.app, frame.as_ref()).await
+                    {
+                        shown = Some((t, !active));
+                    }
+                    let Some(shown) = shown else {
                         let how = match named {
                             true => "",
                             false => "; pass window=… to bring it to the front",
                         };
-                        return Err(format!(
-                            "id {rid} is in window {}, not in {}{how}",
-                            render::short_title(&title),
-                            render::short_title(&target.caption)
-                        ));
+                        let title = render::short_title(&title);
+                        let caption = render::short_title(&target.caption);
+                        return Err(match title == caption {
+                            true => format!(
+                                "id {rid} is in another window titled {title}, not in the \
+                                 one captured; bring it to the front (act on it) first"
+                            ),
+                            false => {
+                                format!("id {rid} is in window {title}, not in {caption}{how}")
+                            }
+                        });
                     };
-                    (target, behind) = (t, !active);
+                    (target, behind) = shown;
                 }
                 Some((rid, r.id))
             }
@@ -7956,7 +7998,10 @@ impl<B: Backend> Server<B> {
             }
         };
         let (shot, found, boxed) = if arg_b(a, "marks", false) {
-            let marks = trace::time("mark_candidates", self.mark_candidates(&target, &app));
+            let marks = trace::time(
+                "mark_candidates",
+                self.mark_candidates(&target, &app, !behind),
+            );
             let (shot, found, boxed) = tokio::join!(capture, marks, boxed);
             (shot, Some(found), boxed)
         } else {
@@ -11898,6 +11943,7 @@ mod tests {
                 .borrow_mut()
                 .insert(90, fake_node("frame", "todo.txt — Fake", &[30]));
             s.shown.parents.borrow_mut().insert(30, 90);
+            s.more_windows.borrow_mut().push(90);
             let r = call_tool(&mut s, 9, "screenshot", json!({"id": 1})).await;
             assert_eq!(r["result"]["isError"], true, "{r}");
             assert!(
@@ -11916,6 +11962,16 @@ mod tests {
                 text.contains("captured in background: 'todo.txt — Fake'"),
                 "{r}"
             );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // Another window of the same title: which one shows it is not
+            // known, so no other window's pixels are passed off as it.
+            s.nodes
+                .borrow_mut()
+                .insert(91, fake_node("frame", "todo.txt — Fake", &[]));
+            s.more_windows.borrow_mut().push(91);
+            let r = call_tool(&mut s, 11, "screenshot", json!({"id": 1})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("id 1 is in window"), "{r}");
             assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
         });
     }

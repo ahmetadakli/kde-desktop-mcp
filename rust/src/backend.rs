@@ -581,12 +581,17 @@ pub trait Backend {
     /// Title of the window `id` is in (`WindowWalk`), for a NOT_ACTIVE
     /// refusal; None when it is not found.
     async fn window_title(&self, id: &Self::Id) -> Option<String> {
+        self.window_of(id).await.map(|(_, title)| title)
+    }
+    /// The window `id` is in (`WindowWalk`) and its title; None when it
+    /// is not found.
+    async fn window_of(&self, id: &Self::Id) -> Option<(Self::Id, String)> {
         let mut walk = WindowWalk::default();
         let mut cur = id.clone();
         for _ in 0..WINDOW_WALK_MAX {
             let (role, name) = self.identity(&cur).await;
-            if let Some(name) = walk.step(name, &role) {
-                return Some(name);
+            if let Some(w) = walk.step((cur.clone(), name), &role) {
+                return Some(w);
             }
             match self.parent(&cur).await {
                 Some(p) => cur = p,

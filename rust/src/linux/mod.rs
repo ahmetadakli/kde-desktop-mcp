@@ -1453,9 +1453,10 @@ impl Backend for LinuxBackend {
         self.a11y.parent(id).await
     }
 
-    async fn window_title(&self, id: &Obj) -> Option<String> {
+    async fn window_of(&self, id: &Obj) -> Option<(Obj, String)> {
         let frame = self.a11y.frame_of(id).await?;
-        Some(self.a11y.identity(&frame).await.1)
+        let title = self.a11y.identity(&frame).await.1;
+        Some((frame, title))
     }
 
     fn read_mark(&self) -> Option<u64> {
