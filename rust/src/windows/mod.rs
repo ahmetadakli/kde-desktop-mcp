@@ -652,7 +652,17 @@ impl Backend for WindowsBackend {
         if !wm::answers(front, HIT_ANSWER_MS) {
             return None;
         }
-        let (hit, p) = self.uia.element_from_point(x, y)?;
+        let (mut hit, mut p) = self.uia.element_from_point(x, y)?;
+        // UIA gives the deepest element: the "7" text inside Calculator's
+        // "Yedi" button. The click is named by the control it is part of.
+        if logic::hit_is_part(p.role(), &p.name)
+            && let Some((owner, op)) = self
+                .uia
+                .ancestor_where(&hit.el, |q| logic::hit_owner(q.role()))
+        {
+            hit = owner;
+            p = op;
+        }
         // Only an element of the window in front, whose box holds the
         // point: else no name rather than a wrong one.
         let h = self.uia.window_handle(&hit.el)?;

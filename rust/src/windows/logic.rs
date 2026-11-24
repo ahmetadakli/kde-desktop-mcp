@@ -488,6 +488,32 @@ impl Default for Props {
     }
 }
 
+/// A pixel click's hit that is only part of a control (the text or image
+/// inside a button, an unnamed piece): its owner names the click better.
+pub fn hit_is_part(role: &str, name: &str) -> bool {
+    matches!(role, "text" | "image" | "custom" | "group" | "pane" | "") || name.trim().is_empty()
+}
+
+/// Controls a pixel click on one of their parts is named by.
+pub fn hit_owner(role: &str) -> bool {
+    matches!(
+        role,
+        "button"
+            | "splitbutton"
+            | "hyperlink"
+            | "checkbox"
+            | "radiobutton"
+            | "menuitem"
+            | "listitem"
+            | "treeitem"
+            | "tabitem"
+            | "combobox"
+            | "dataitem"
+            | "headeritem"
+            | "edit"
+    )
+}
+
 impl Props {
     /// The control type's name; a password field (IsPassword) reads as
     /// AT-SPI's "password text", so its text is hidden like on Linux.
@@ -1328,6 +1354,11 @@ mod tests {
     #[test]
     fn roles_match_uiautomation_names() {
         assert_eq!(role_name(50000), Some("button"));
+        assert!(hit_is_part("text", "7"));
+        assert!(hit_is_part("button", " "));
+        assert!(!hit_is_part("button", "Yedi"));
+        assert!(hit_owner("button") && hit_owner("hyperlink"));
+        assert!(!hit_owner("pane") && !hit_owner("window"));
         assert_eq!(role_name(50004), Some("edit"));
         assert_eq!(role_name(50011), Some("menuitem"));
         assert_eq!(role_name(50030), Some("document"));
