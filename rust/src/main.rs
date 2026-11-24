@@ -155,10 +155,16 @@ fn locate_with_synonyms<Id: Clone + Eq + std::hash::Hash>(
 /// How long a read of an app's tree is reused at most, even when the app
 /// reported no change: a safety net for changes no event announces.
 const READ_MAX_AGE: Duration = Duration::from_secs(2);
-/// The same for an app heard sending change events (`Backend::heard_changes`):
-/// its changes drop the read, so only those no event announces are left,
-/// and agents think longer than READ_MAX_AGE between calls.
+/// The same for an app heard sending change events (`Backend::heard_changes`)
+/// while the user's scrolling is watched (`Takeover::watches_view`): its
+/// changes and the user's view input drop the read, so only changes no
+/// event announces are left, and agents think longer than READ_MAX_AGE
+/// between calls.
 const READ_MAX_AGE_HEARD: Duration = Duration::from_secs(15);
+/// How long what our input started may still move the view after the
+/// input ended (a smooth scroll, an animation): a read begun meanwhile is
+/// reused only until then.
+const INPUT_TAIL: Duration = Duration::from_millis(500);
 /// Reads kept at once (one per app and `ReadKey`).
 const READS_KEPT: usize = 4;
 
@@ -190,6 +196,8 @@ struct ReadStart {
     mark: u64,
     generation: u64,
     at: Instant,
+    /// Begun within INPUT_TAIL of our last input: reused only until this.
+    until: Option<Instant>,
 }
 
 /// A read of an app's windows kept for reuse (`Server::kept_read`).
@@ -208,6 +216,8 @@ struct Reads<Id> {
     generation: u64,
     /// Such calls running now: meanwhile no read is kept or reused.
     inputs: u32,
+    /// When the last of them ended.
+    input_end: Option<Instant>,
     kept: Vec<KeptRead<Id>>,
 }
 
@@ -216,6 +226,7 @@ impl<Id> Reads<Id> {
         Reads {
             generation: 0,
             inputs: 0,
+            input_end: None,
             kept: Vec::new(),
         }
     }
@@ -243,6 +254,7 @@ impl<Id> Drop for InputRun<'_, Id> {
     fn drop(&mut self) {
         let mut r = self.0.lock().unwrap_or_else(|e| e.into_inner());
         r.inputs = r.inputs.saturating_sub(1);
+        r.input_end = Some(Instant::now());
         r.invalidate();
     }
 }
@@ -2878,10 +2890,12 @@ impl<B: Backend> Server<B> {
     fn read_start(&self) -> Option<ReadStart> {
         let mark = self.b.read_mark()?;
         let r = self.reads();
+        let at = Instant::now();
         (r.inputs == 0).then(|| ReadStart {
             mark,
             generation: r.generation,
-            at: Instant::now(),
+            at,
+            until: r.input_end.map(|e| e + INPUT_TAIL).filter(|u| *u > at),
         })
     }
 
@@ -2894,6 +2908,7 @@ impl<B: Backend> Server<B> {
         r.inputs == 0
             && r.generation == start.generation
             && start.at.elapsed() < self.read_max_age(windows)
+            && start.until.is_none_or(|u| Instant::now() < u)
             && self.b.unchanged_since(windows, start.mark)
             && !self
                 .takeover
@@ -2903,7 +2918,8 @@ impl<B: Backend> Server<B> {
 
     /// How long a read of `windows` is reused at most.
     fn read_max_age(&self, windows: &[B::Id]) -> Duration {
-        match self.b.heard_changes(windows) {
+        let watched = self.takeover.as_ref().is_some_and(|t| t.watches_view());
+        match watched && self.b.heard_changes(windows) {
             true => READ_MAX_AGE_HEARD,
             false => READ_MAX_AGE,
         }
@@ -2928,7 +2944,9 @@ impl<B: Backend> Server<B> {
                 "windows differ"
             } else if r.inputs > 0 || r.generation != k.start.generation {
                 "input since"
-            } else if k.start.at.elapsed() >= self.read_max_age(windows) {
+            } else if k.start.at.elapsed() >= self.read_max_age(windows)
+                || k.start.until.is_some_and(|u| Instant::now() >= u)
+            {
                 "too old"
             } else if !self.b.unchanged_since(windows, k.start.mark) {
                 "app changed"
@@ -17703,6 +17721,30 @@ mod tests {
     }
 
     #[test]
+    fn a_read_right_after_input_is_reused_only_until_the_view_settles() {
+        local(async {
+            let mut s = session("reads-tail");
+            fake_reads(&s);
+            s.reads.heard.set(true);
+            s.takeover.set_activity_source(true, "evdev".into());
+            let find = json!({"app": "fake", "query": "Save"});
+            // A smooth scroll the key started may still be moving.
+            call_tool(&mut s, 2, "key", json!({"combo": "Page_Down"})).await;
+            call_tool(&mut s, 3, "find", find.clone()).await;
+            let read = prefetches(&s);
+            call_tool(&mut s, 4, "find", find.clone()).await;
+            assert_eq!(prefetches(&s), read, "reused at once");
+            tokio::time::sleep(INPUT_TAIL).await;
+            call_tool(&mut s, 5, "find", find.clone()).await;
+            assert!(prefetches(&s) > read, "reused past the tail");
+            // Read after the tail: kept as long as usual.
+            let read = prefetches(&s);
+            call_tool(&mut s, 6, "find", find).await;
+            assert_eq!(prefetches(&s), read);
+        });
+    }
+
+    #[test]
     fn kept_reads_expire() {
         local(async {
             let mut s = session("reads-age");
@@ -17723,6 +17765,13 @@ mod tests {
             fake_reads(&s);
             s.reads.heard.set(true);
             let find = json!({"app": "fake", "query": "Save"});
+            // Unless the user's scrolling is watched: no longer.
+            call_tool(&mut s, 2, "find", find.clone()).await;
+            let read = prefetches(&s);
+            tokio::time::sleep(READ_MAX_AGE + Duration::from_millis(50)).await;
+            call_tool(&mut s, 3, "find", find.clone()).await;
+            assert!(prefetches(&s) > read, "kept unwatched");
+            s.takeover.set_activity_source(true, "evdev".into());
             call_tool(&mut s, 2, "find", find.clone()).await;
             let read = prefetches(&s);
             tokio::time::sleep(READ_MAX_AGE + Duration::from_millis(50)).await;

@@ -42,6 +42,9 @@ pub const DEFAULT_STOP_KEY: &str = "meta+alt+esc";
 pub const IDLE_TIMEOUT: Duration = Duration::from_millis(300);
 /// Compositor events arrive a little after the input that caused them.
 const OURS_SLACK: Duration = Duration::from_millis(150);
+/// How long a view the user's input changed may go on changing after it
+/// (kinetic scrolling after the fingers lift, a smooth scroll).
+const VIEW_TAIL: Duration = Duration::from_millis(500);
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Device {
@@ -297,13 +300,19 @@ impl Takeover {
         }
     }
 
+    /// Whether what changes the view (wheels, scrolling, keys) is watched:
+    /// a source of the user's input works.
+    pub fn watches_view(&self) -> bool {
+        matches!(self.lock().activity_source, Some((true, _)))
+    }
+
     /// Whether the user's input after `at` may have changed what apps show
     /// (a scroll shows other elements without an event), as far as it is
     /// watched: plain pointer motion does not count; idle notifications,
     /// which do not tell motion apart, always do.
     pub fn view_input_since(&self, at: Instant) -> bool {
         let s = self.lock();
-        s.last_view.is_some_and(|t| t > at)
+        s.last_view.is_some_and(|t| t + VIEW_TAIL > at)
             || Self::idle_user(&s, Instant::now()).is_some_and(|t| t > at)
     }
 
@@ -581,7 +590,9 @@ mod tests {
         // A key, a button or a wheel does.
         t.user_input(t0 + ms(20), Device::Pointer);
         assert!(t.view_input_since(t0));
-        assert!(!t.view_input_since(t0 + ms(20)));
+        // Kinetic scrolling goes on for a while after it.
+        assert!(t.view_input_since(t0 + ms(20)));
+        assert!(!t.view_input_since(t0 + ms(20) + VIEW_TAIL));
         // Idle notifications do not tell motion apart: they count.
         let t = Takeover::new(ms(1500), None);
         let t0 = Instant::now() - ms(100);
