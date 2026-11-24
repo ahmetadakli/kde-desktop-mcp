@@ -727,7 +727,14 @@ tool; `off` turns it off). Not available on Windows yet.
   missing or failing with its error, KWin's `ScreenShot2` error, the
   temporary file). A screenshot whose `window` is already in front sends no
   input: it does not wait for the user's typing, and as a batch's last step
-  it is not stopped by the user starting to use the seat.
+  it is not stopped by the user starting to use the seat. On KDE a
+  screenshot with `window` activates nothing: KWin captures the window
+  `activate_window` would pick (allowlist checked on it) by its handle
+  where it is, behind others too, and the reply adds `captured in
+  background: '<title>' is not in front`. `image_x`/`image_y` of such an
+  image are refused until that window is in front (`window` on `mouse`).
+  A minimized window, one on another virtual desktop, and Hyprland and
+  Windows are activated first, as before.
 - `batch`: runs several tools in order in one call and stops at the first
   error; reduces Claude's number of turns. A step with `"optional": true`
   (typically a `wait_for`) may fail without stopping the batch: it is reported

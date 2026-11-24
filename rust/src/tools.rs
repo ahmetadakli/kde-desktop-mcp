@@ -512,7 +512,7 @@ pub fn tools() -> Json {
         ),
         t(
             "screenshot",
-            "Last resort only: capture the active window. The image comes back in the\nreply (JPEG when much smaller than PNG), shrunk so its longer side is at\nmost `max_size` px; `inline`=false instead saves a PNG and returns only\nits path (`save_to`: a new .png path in a folder of yours under home). Also says which screen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution; image_x/image_y then refer to the zoomed image.",
+            "Last resort only: capture the active window (or `window`'s, on KDE in place). The image comes back in the\nreply (JPEG when much smaller than PNG), shrunk so its longer side is at\nmost `max_size` px; `inline`=false instead saves a PNG and returns only\nits path (`save_to`: a new .png path in a folder of yours under home). Also says which screen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution; image_x/image_y then refer to the zoomed image.",
             schema(&[
                 ("max_size", "integer", Some(json!(1024))),
                 ("inline", "boolean", Some(json!(true))),

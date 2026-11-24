@@ -2732,6 +2732,31 @@ impl Backend for LinuxBackend {
         Ok(t)
     }
 
+    async fn background_target(
+        &self,
+        query: &str,
+        allowed: &[String],
+    ) -> R<Option<(ShotTarget, bool)>> {
+        // spectacle, the fallback, captures only the active window.
+        let Compositor::Kde(kwin) = &self.comp else {
+            return Ok(None);
+        };
+        if self.shot_unauthorized.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let apps = self.apps_with_pids().await;
+        let allow = Self::allow_of(allowed, &apps);
+        let Some(p) = kwin.pick_frame(query, &allow).await? else {
+            return Ok(None);
+        };
+        // Minimized or elsewhere: nothing current to capture.
+        if p.minimized || !p.here || p.frame.handle.is_none() {
+            return Ok(None);
+        }
+        let target = kde_target(&Self::names_by_pid(&apps), p.frame)?;
+        Ok(Some((target, p.active)))
+    }
+
     async fn screenshot(&self, target: &ShotTarget) -> R<Shot> {
         self.hide_indicator().await;
         match &self.comp {
@@ -2753,6 +2778,20 @@ impl Backend for LinuxBackend {
                         // Older KWin without the desktop-file grant: stop asking.
                         Err(e) if e.starts_with(kwin::SHOT_NOT_AUTHORIZED) => {
                             self.shot_unauthorized.store(true, Ordering::Relaxed);
+                            // spectacle captures only the window in front: a
+                            // window captured in the background is activated
+                            // by the next screenshot (`background_target`).
+                            let front = kwin.active_frame().await.ok().flatten();
+                            if front.and_then(|f| f.handle).as_deref()
+                                != Some(target.handle.as_str())
+                            {
+                                return Err(format!(
+                                    "KWin refused to capture {} where it is; nothing \
+                                     captured: take the screenshot again to bring it to \
+                                     the front first",
+                                    target.describe()
+                                ));
+                            }
                         }
                         Err(e) => {
                             return Err(format!(

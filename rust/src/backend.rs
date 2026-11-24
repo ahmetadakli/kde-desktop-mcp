@@ -966,6 +966,19 @@ pub trait Backend {
     /// allowlist names it; Err with the cause when there is none or it
     /// cannot be read.
     async fn shot_target(&self) -> R<ShotTarget>;
+    /// The window `activate_window(query)` would bring forward, as a
+    /// screenshot target `screenshot` captures where it is, without
+    /// activating it, and whether it is the active one. None where the
+    /// backend cannot (only KDE captures by handle), or that window can
+    /// not be captured so (minimized, on another virtual desktop, no
+    /// handle): the caller activates it first.
+    async fn background_target(
+        &self,
+        _query: &str,
+        _allowed: &[String],
+    ) -> R<Option<(ShotTarget, bool)>> {
+        Ok(None)
+    }
     /// Capture `target` (from `shot_target`) and nothing else: a capture
     /// that could show another window fails instead. `path` is a new
     /// private file. Err names the real cause (a tool missing or failing,

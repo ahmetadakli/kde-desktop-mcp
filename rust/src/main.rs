@@ -471,6 +471,9 @@ struct Server<B: Backend> {
     shown_pending: Mutex<Option<(u64, Vec<u64>)>>,
     /// Maps pixels of the last screenshot to screen coordinates.
     last_shot: Mutex<Option<ShotMap>>,
+    /// The handle and caption of the window the last screenshot captured
+    /// in the background: its pixels are only clicked once it is in front.
+    shot_behind: Mutex<Option<(String, String)>>,
     /// Held by tools that send keyboard or pointer input, so two concurrent
     /// calls never interleave their events.
     input: Mutex<()>,
@@ -1883,6 +1886,7 @@ impl<B: Backend> Server<B> {
             seen_surfaces: Mutex::new(Vec::new()),
             shown_pending: Mutex::new(None),
             last_shot: Mutex::new(None),
+            shot_behind: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
             held: std::sync::Mutex::new(Vec::new()),
@@ -4132,7 +4136,7 @@ impl<B: Backend> Server<B> {
                     Err(e) => text.push_str(&format!("\nobserve tree failed: {e}")),
                 }
             }
-            Observe::Screenshot => match self.screenshot(&json!({})).await {
+            Observe::Screenshot => match self.screenshot(&json!({}), None).await {
                 Ok(o) => {
                     text.push_str(&format!("\n{}", o.text));
                     images = o.images;
@@ -4716,7 +4720,7 @@ impl<B: Backend> Server<B> {
             ));
             return Ok(Out::from(text));
         }
-        match self.screenshot(&json!({})).await {
+        match self.screenshot(&json!({}), None).await {
             Ok(shot) => Ok(Out {
                 text: format!("{text}\nscreenshot: {}", shot.text),
                 images: shot.images,
@@ -6795,8 +6799,7 @@ impl<B: Backend> Server<B> {
             req_i(a, &format!("{end}_y"))?,
         );
         if arg_b(a, "image", false) {
-            let map = (*self.last_shot.lock().await)
-                .ok_or("image=true needs a screenshot taken first")?;
+            let map = self.shot_map("image=true needs").await?;
             return Ok(DragEnd::Point(map.to_screen(x, y)));
         }
         Ok(DragEnd::Point((x, y)))
@@ -7040,8 +7043,7 @@ impl<B: Backend> Server<B> {
     async fn mouse(&self, a: &Json) -> R<String> {
         let (x, y) = match (a.get("image_x"), a.get("image_y")) {
             (Some(_), Some(_)) => {
-                let map = (*self.last_shot.lock().await)
-                    .ok_or("image_x/image_y need a screenshot taken first")?;
+                let map = self.shot_map("image_x/image_y need").await?;
                 map.to_screen(req_i(a, "image_x")?, req_i(a, "image_y")?)
             }
             _ => (req_i(a, "x")?, req_i(a, "y")?),
@@ -7478,10 +7480,54 @@ impl<B: Backend> Server<B> {
         ))
     }
 
-    /// Capture the active window. With `region` (pixels of the last
-    /// screenshot): capture again and keep only that part, at up to full
-    /// resolution, mapped so image_x/image_y refer to the zoomed image.
-    async fn screenshot(&self, a: &Json) -> R<Out> {
+    /// The window a screenshot's `window` names, to capture without
+    /// activating it, and whether it is the active one (see
+    /// `Backend::background_target`); None: activate it first.
+    async fn background_shot(&self, query: &str) -> Option<(backend::ShotTarget, bool)> {
+        if terminal_query(query).is_some() {
+            return None;
+        }
+        let query = self.prefer_other(query).await;
+        let allowed = self.allowed();
+        let found = self.b.background_target(&query, &allowed);
+        match trace::time("background_target", found).await {
+            Ok(t) => t,
+            Err(e) => {
+                trace::note(&format!("no background capture: {e}"));
+                None
+            }
+        }
+    }
+
+    /// The map of the last screenshot's pixels, for `need` ("image_x/image_y
+    /// need"). One of a window captured in the background only while that
+    /// window is in front: its pixels would land on whatever covers it.
+    async fn shot_map(&self, need: &str) -> R<ShotMap> {
+        let map =
+            (*self.last_shot.lock().await).ok_or(format!("{need} a screenshot taken first"))?;
+        let behind = self.shot_behind.lock().await.clone();
+        if let Some((handle, caption)) = behind {
+            let front = self.b.shot_target().await.ok().map(|t| t.handle);
+            if front.as_deref() != Some(handle.as_str()) {
+                return Err(delivery::nothing_sent(format!(
+                    "the last screenshot was of {} in the background; pass window=… to \
+                     bring it to the front first",
+                    render::short_title(&caption)
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Capture the active window, or `background` (from `background_shot`)
+    /// where it is. With `region` (pixels of the last screenshot): capture
+    /// again and keep only that part, at up to full resolution, mapped so
+    /// image_x/image_y refer to the zoomed image.
+    async fn screenshot(
+        &self,
+        a: &Json,
+        background: Option<(backend::ShotTarget, bool)>,
+    ) -> R<Out> {
         let region = region_arg(a)?;
         // A path to save at is checked before anything is captured.
         let save_to = match a.get("save_to").and_then(Json::as_str) {
@@ -7495,11 +7541,25 @@ impl<B: Backend> Server<B> {
         };
         // The window captured is the one checked: read once, its app by
         // its process.
-        let target = trace::time("shot_target", self.b.shot_target())
-            .await
-            .map_err(|e| format!("screenshot failed: {e}"))?;
+        let (target, behind) = match background {
+            Some((t, active)) => (t, !active),
+            None => (
+                trace::time("shot_target", self.b.shot_target())
+                    .await
+                    .map_err(|e| format!("screenshot failed: {e}"))?,
+                false,
+            ),
+        };
         let app = self.shot_app(&target);
         if !self.is_allowed(&app) {
+            if behind {
+                return Err(refusal(format!(
+                    "window {} of app '{}' is not in {}",
+                    target.describe(),
+                    target.app,
+                    self.allow_file.display()
+                )));
+            }
             return Err(self.active_refusal(&target.app, Some(&target)).await);
         }
         self.permit(&app).await?;
@@ -7513,6 +7573,8 @@ impl<B: Backend> Server<B> {
             None => None,
         };
         *self.last_shot.lock().await = None;
+        *self.shot_behind.lock().await =
+            behind.then(|| (target.handle.clone(), target.caption.clone()));
         let Shot { path, pixels, area } = trace::time("capture", self.b.screenshot(&target))
             .await
             .map_err(|e| format!("screenshot failed: {e}"))?;
@@ -7574,6 +7636,12 @@ impl<B: Backend> Server<B> {
                 r(y),
                 r(w),
                 r(h)
+            ));
+        }
+        if behind {
+            text.push_str(&format!(
+                "; captured in background: {} is not in front",
+                render::short_title(&target.caption)
             ));
         }
         if let Some(((x, y, w, h), _)) = zoom {
@@ -7931,6 +7999,15 @@ impl<B: Backend> Server<B> {
     /// `call_inner`'s work, inside its GATE scope.
     async fn call_body(&self, name: &str, a: &Json, held: bool, settle: bool) -> R<Out> {
         let window = window_arg(name, a)?;
+        // A screenshot captures its window where it is when the backend
+        // can (KDE): nothing is activated, so no input either.
+        let (window, background) = match window {
+            Some(q) if name == "screenshot" => match self.background_shot(&q).await {
+                Some(t) => (None, Some(t)),
+                None => (Some(q), None),
+            },
+            w => (w, None),
+        };
         // A screenshot whose window is in front already sends no input:
         // it neither waits for the user's input to stop nor counts as a
         // run's input (a batch's last look after its input went through),
@@ -8070,7 +8147,7 @@ impl<B: Backend> Server<B> {
             "cursor_position" => self.cursor_position().await.map(Out::from),
             "activate_window" => self.activate_window(a).await.map(Out::from),
             "file_dialog" => self.file_dialog(a).await.map(Out::from),
-            "screenshot" => self.screenshot(a).await,
+            "screenshot" => self.screenshot(a, background).await,
             "batch" => self.batch(a).await,
             _ => Err(format!("Unknown tool: {name}")),
         };
@@ -8969,6 +9046,10 @@ mod tests {
         flyouts: RefCell<HashMap<u32, u32>>,
         /// `screenshot` fails with this cause.
         shot_error: RefCell<Option<String>>,
+        /// Screenshots capture a window where it is (as on KDE):
+        /// `background_target` finds any window, allowed or not, so the
+        /// server's own check shows.
+        background_shots: std::cell::Cell<bool>,
     }
 
     /// Where the fake shows a flyout (`FakeShown::flyouts`).
@@ -9767,12 +9848,39 @@ mod tests {
                 handle: title,
             })
         }
+        async fn background_target(
+            &self,
+            query: &str,
+            _allowed: &[String],
+        ) -> R<Option<(backend::ShotTarget, bool)>> {
+            if !self.shown.background_shots.get() {
+                return Ok(None);
+            }
+            let q = query.to_lowercase();
+            let found = FAKE_WINDOWS
+                .into_iter()
+                .find(|(app, title)| title.to_lowercase().contains(&q) || app.contains(&q));
+            Ok(found.map(|(app, title)| {
+                let target = backend::ShotTarget {
+                    app: app.into(),
+                    by_class: false,
+                    class: app.into(),
+                    caption: title.into(),
+                    area: Some((10.0, 20.0, 400.0, 200.0)),
+                    handle: title.into(),
+                };
+                (target, self.active.borrow().1 == title)
+            }))
+        }
         async fn screenshot(&self, target: &backend::ShotTarget) -> R<Shot> {
             if let Some(e) = self.shown.shot_error.borrow().clone() {
                 return Err(e);
             }
-            // The capture is of the window checked, or fails.
-            if self.active.borrow().1 != target.handle {
+            // The capture is of the window checked, or fails; where
+            // windows are captured where they are, of any window.
+            let known = self.shown.background_shots.get()
+                && FAKE_WINDOWS.iter().any(|(_, t)| *t == target.handle);
+            if self.active.borrow().1 != target.handle && !known {
                 return Err("the active window changed".into());
             }
             // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.
@@ -15295,6 +15403,76 @@ mod tests {
             *s.active.borrow_mut() = ("classy".into(), "Notes".into());
             let r = call_tool(&mut s, 5, "screenshot", json!({})).await;
             assert_ne!(r["result"]["isError"], true, "{r}");
+        });
+    }
+
+    #[test]
+    fn a_background_window_is_captured_without_activating_it() {
+        local(async {
+            let mut s = session("shot-background");
+            s.shown.background_shots.set(true);
+            // The user is typing: activating would wait, a capture where
+            // the window is does not.
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Keyboard);
+            let started = Instant::now();
+            let r = call_tool(&mut s, 2, "screenshot", json!({"window": "todo"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(text.starts_with("200x100 px"), "{r}");
+            assert!(
+                text.contains("; captured in background: 'todo.txt — Fake' is not in front"),
+                "{r}"
+            );
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            assert_eq!(s.active.borrow().1, FAKE_WINDOWS[1].1);
+            // Its pixels are not clicked while another window covers it.
+            let mut s = session("shot-background-click");
+            s.shown.background_shots.set(true);
+            call_tool(&mut s, 2, "screenshot", json!({"window": "todo"})).await;
+            let r = call_tool(&mut s, 3, "mouse", json!({"image_x": 50, "image_y": 25})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "the last screenshot was of 'todo.txt — Fake' in the background; pass \
+                     window=… to bring it to the front first"
+                ) && reply_text(&r).contains("nothing sent"),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // Once it is in front, they are.
+            let r = call_tool(
+                &mut s,
+                4,
+                "mouse",
+                json!({"image_x": 50, "image_y": 25, "clicks": 0, "window": "todo"}),
+            )
+            .await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow()[0], "activate todo.txt — Fake");
+            // The window in front: captured as before, said as before.
+            let r = call_tool(&mut s, 5, "screenshot", json!({"window": "todo"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(!reply_text(&r).contains("background"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_background_capture_checks_the_window_it_captures() {
+        local(async {
+            let mut s = session("shot-background-fence");
+            s.shown.background_shots.set(true);
+            let r = call_tool(&mut s, 2, "screenshot", json!({"window": "bash"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "window '~ : bash — Konsole' (class 'konsole') of app 'konsole' is not in"
+                ),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            assert_eq!(s.active.borrow().1, FAKE_WINDOWS[1].1);
         });
     }
 

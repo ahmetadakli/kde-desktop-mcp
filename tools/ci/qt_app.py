@@ -2,7 +2,8 @@
 editor, a button, a check box and a status label, all through accessibility.
 
 The status label shows what happened: "Status: hello <name>" after Greet,
-"Status: shortcut" after Ctrl+K (which only real key events trigger). Its
+"Status: shortcut" after Ctrl+K (which only real key events trigger). A
+second window, OTHER, covers it for the background screenshot check. Its
 AT-SPI application name and Wayland app id are both "desktop-mcp-ci", the
 name the test's allowlist holds.
 
@@ -24,6 +25,7 @@ except ImportError:  # PyQt5 keeps QShortcut in QtWidgets
 
 NAME = "desktop-mcp-ci"
 TITLE = "desktop-mcp CI window"
+OTHER = "desktop-mcp CI other"
 
 
 def main() -> int:
@@ -53,6 +55,11 @@ def main() -> int:
 
     win.resize(480, 360)
     win.show()
+
+    other = QLabel("Other window")
+    other.setWindowTitle(OTHER)
+    other.resize(480, 360)
+    other.show()
     return app.exec()
 
 

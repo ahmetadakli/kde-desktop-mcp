@@ -7,7 +7,7 @@ KWin and D-Bus session; it refuses to run anywhere else (it starts a window
 and sends it keys). Starts tools/ci/qt_app.py and the server with an
 allowlist holding only that app, then speaks MCP over stdio: apps, tree,
 find, set_text, get_text, act, activate_window, click, mouse (its hit
-test), focus, type_text, key and
+test), focus, type_text, key, a screenshot of a window in the background and
 the allowlist's refusals, each checked against what the window shows.
 
 type_text into the multi-line editor inserts through AT-SPI and needs no
@@ -33,6 +33,7 @@ from pathlib import Path
 
 APP = "desktop-mcp-ci"
 TITLE = "desktop-mcp CI window"
+OTHER = "desktop-mcp CI other"
 HERE = Path(__file__).resolve().parent
 results: list[tuple[str, str, str]] = []
 
@@ -181,11 +182,35 @@ def pointer_hit_test(c: Client, ids: dict) -> None:
         step("the id a mouse reply names is usable", ok, one_line(got))
 
 
+def background_screenshot(c: Client) -> None:
+    """screenshot with window= captures a window behind another where it
+    is (KWin ScreenShot2 by handle), without activating it."""
+    ok, out = c.call("activate_window", query=OTHER)
+    if not step("activate_window raises the second window", ok, one_line(out)):
+        return
+    ok, out = c.call("screenshot", window=TITLE)
+    if not ok and "KWin refused" in out:
+        record("screenshot captures a window in the background", "SKIP",
+               f"KWin refuses ScreenShot2 here: {one_line(out)}")
+        return
+    step("screenshot captures a window in the background",
+         ok and "captured in background" in out, one_line(out))
+    apps = c.text("apps")
+    front = [line for line in apps.splitlines() if "[active]" in line]
+    step("the background screenshot activates nothing",
+         any(OTHER in line for line in front) and not any(TITLE in line for line in front),
+         one_line(apps))
+    ok, out = c.call("mouse", image_x=10, image_y=10, clicks=0)
+    step("its pixels are not used while the window is behind",
+         not ok and "in the background" in out and "nothing sent" in out, one_line(out))
+
+
 def run(c: Client, input_mode: str) -> None:
     ok, out = c.call("doctor")
     print(f"--- doctor ---\n{out}\n---", flush=True)
 
-    apps = wait_for(lambda: (a := c.text("apps")) and APP in a and TITLE in a and a, 30)
+    apps = wait_for(lambda: (a := c.text("apps")) and APP in a and TITLE in a and OTHER in a
+                    and a, 30)
     if not step("apps lists the test window", bool(apps), one_line(apps or c.text("apps"))):
         return
 
@@ -230,6 +255,8 @@ def run(c: Client, input_mode: str) -> None:
     step("type_text into the editor (accessibility insert)", ok and bool(got), one_line(out))
 
     input_tests(c, ids, input_mode)
+
+    background_screenshot(c)
 
     ok, out = c.call("find", app="definitely-not-allowed-app", query="x")
     step("allowlist refuses another app", not ok and "not in" in out, one_line(out))
