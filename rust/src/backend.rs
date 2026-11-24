@@ -119,6 +119,10 @@ impl<T> WindowWalk<T> {
 /// The error `element_center` gives for an element whose window is not in
 /// front (a click there would land on the window covering it). The tool
 /// layer names the window (`not_active`) when the backend does not.
+/// How a screenshot of a window in the background that KWin refused to
+/// capture where it is fails: taken again, it brings the window forward.
+pub const SHOT_REFUSED_BEHIND: &str = "KWin refused to capture";
+
 pub const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
 
 /// NOT_ACTIVE naming the element's window `title` (quoted and cut as

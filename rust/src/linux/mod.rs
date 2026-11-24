@@ -2821,9 +2821,9 @@ impl Backend for LinuxBackend {
                                 != Some(target.handle.as_str())
                             {
                                 return Err(format!(
-                                    "KWin refused to capture {} where it is; nothing \
-                                     captured: take the screenshot again to bring it to \
-                                     the front first",
+                                    "{} {} where it is; nothing captured: take the \
+                                     screenshot again to bring it to the front first",
+                                    crate::backend::SHOT_REFUSED_BEHIND,
                                     target.describe()
                                 ));
                             }

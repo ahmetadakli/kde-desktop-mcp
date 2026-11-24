@@ -8549,6 +8549,18 @@ impl<B: Backend> Server<B> {
 
     /// `call_inner`'s work, inside its GATE scope.
     async fn call_body(&self, name: &str, a: &Json, held: bool, settle: bool) -> R<Out> {
+        match self.call_body_once(name, a, held, settle).await {
+            // An older KWin refused a capture where the window is, and is
+            // no longer asked: the window is brought forward and captured
+            // in the same call.
+            Err(e) if name == "screenshot" && e.contains(backend::SHOT_REFUSED_BEHIND) => {
+                self.call_body_once(name, a, held, settle).await
+            }
+            r => r,
+        }
+    }
+
+    async fn call_body_once(&self, name: &str, a: &Json, held: bool, settle: bool) -> R<Out> {
         let window = window_arg(name, a)?;
         // A screenshot captures its window where it is when the backend
         // can (KDE): nothing is activated, so no input either.
@@ -9603,6 +9615,9 @@ mod tests {
         /// `background_target` finds any window, allowed or not, so the
         /// server's own check shows.
         background_shots: std::cell::Cell<bool>,
+        /// As an older KWin: the first capture of a window not in front is
+        /// refused, and windows are no longer captured where they are.
+        refuse_behind: std::cell::Cell<bool>,
     }
 
     /// Where the fake shows a flyout (`FakeShown::flyouts`).
@@ -10445,6 +10460,11 @@ mod tests {
         async fn screenshot(&self, target: &backend::ShotTarget) -> R<Shot> {
             if let Some(e) = self.shown.shot_error.borrow().clone() {
                 return Err(e);
+            }
+            if self.shown.refuse_behind.get() && self.active.borrow().1 != target.handle {
+                self.shown.refuse_behind.set(false);
+                self.shown.background_shots.set(false);
+                return Err(format!("{} it where it is", backend::SHOT_REFUSED_BEHIND));
             }
             // The capture is of the window checked, or fails; where
             // windows are captured where they are, of any window.
@@ -16376,6 +16396,19 @@ mod tests {
                 ),
                 "{r}"
             );
+        });
+    }
+
+    #[test]
+    fn a_refused_background_capture_brings_the_window_forward_in_the_same_call() {
+        local(async {
+            let mut s = session("shot-refused");
+            s.shown.background_shots.set(true);
+            s.shown.refuse_behind.set(true);
+            let r = call_tool(&mut s, 2, "screenshot", json!({"window": "todo"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(!reply_text(&r).contains("background"), "{r}");
+            assert_eq!(s.keys.borrow()[0], "activate todo.txt — Fake");
         });
     }
 
