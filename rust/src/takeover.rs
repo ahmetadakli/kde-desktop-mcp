@@ -123,6 +123,9 @@ struct IdleRun {
 #[derive(Default)]
 struct State {
     last_user: Option<(Instant, Device)>,
+    /// The user's latest input that may change what apps show: all but
+    /// plain pointer motion (`Takeover::user_motion`).
+    last_view: Option<Instant>,
     stopped: bool,
     /// Our input tools running now, and when the last one ended.
     ours_running: u32,
@@ -192,11 +195,25 @@ impl Takeover {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Input from a real device of the user's.
+    /// Input from a real device of the user's that may change what apps
+    /// show: a key, a button, a wheel, a touchpad scroll.
     pub fn user_input(&self, at: Instant, dev: Device) {
         let mut s = self.lock();
         if s.last_user.is_none_or(|(t, _)| at >= t) {
             s.last_user = Some((at, dev));
+        }
+        if s.last_view.is_none_or(|t| at >= t) {
+            s.last_view = Some(at);
+        }
+    }
+
+    /// Plain pointer motion of the user's: it pauses input tools like any
+    /// input, but changes nothing an app shows by itself (a hover that
+    /// does sends events), so kept reads survive it.
+    pub fn user_motion(&self, at: Instant) {
+        let mut s = self.lock();
+        if s.last_user.is_none_or(|(t, _)| at >= t) {
+            s.last_user = Some((at, Device::Pointer));
         }
     }
 
@@ -254,32 +271,40 @@ impl Takeover {
     fn last_user(&self, now: Instant) -> Option<(Instant, Device)> {
         let s = self.lock();
         let mut last = s.last_user;
-        if let Some(run) = s.idle {
-            // Input within the last IDLE_TIMEOUT that ours does not explain.
-            let recent = now.checked_sub(IDLE_TIMEOUT).unwrap_or(now);
-            let derived = if run.user {
-                Some(run.since.max(recent))
-            } else if s.ours_running == 0
-                && s.ours_end
-                    .is_none_or(|e| now > e + IDLE_TIMEOUT + OURS_SLACK)
-            {
-                Some(recent.max(run.since))
-            } else {
-                None
-            };
-            if let Some(t) = derived
-                && last.is_none_or(|(l, _)| t > l)
-            {
-                last = Some((t, Device::Any));
-            }
+        if let Some(t) = Self::idle_user(&s, now)
+            && last.is_none_or(|(l, _)| t > l)
+        {
+            last = Some((t, Device::Any));
         }
         last
     }
 
-    /// Whether the user used the keyboard or mouse after `at`, as far as
-    /// it is watched.
-    pub fn user_input_since(&self, at: Instant) -> bool {
-        self.last_user(Instant::now()).is_some_and(|(t, _)| t > at)
+    /// The user's input the compositor still reports as going on (idle
+    /// notifications), as of `now`.
+    fn idle_user(s: &State, now: Instant) -> Option<Instant> {
+        let run = s.idle?;
+        // Input within the last IDLE_TIMEOUT that ours does not explain.
+        let recent = now.checked_sub(IDLE_TIMEOUT).unwrap_or(now);
+        if run.user {
+            Some(run.since.max(recent))
+        } else if s.ours_running == 0
+            && s.ours_end
+                .is_none_or(|e| now > e + IDLE_TIMEOUT + OURS_SLACK)
+        {
+            Some(recent.max(run.since))
+        } else {
+            None
+        }
+    }
+
+    /// Whether the user's input after `at` may have changed what apps show
+    /// (a scroll shows other elements without an event), as far as it is
+    /// watched: plain pointer motion does not count; idle notifications,
+    /// which do not tell motion apart, always do.
+    pub fn view_input_since(&self, at: Instant) -> bool {
+        let s = self.lock();
+        s.last_view.is_some_and(|t| t > at)
+            || Self::idle_user(&s, Instant::now()).is_some_and(|t| t > at)
     }
 
     /// Whether an input tool may start now.
@@ -541,6 +566,27 @@ mod tests {
         let last = idled - IDLE_TIMEOUT;
         assert!(matches!(t.check(last + ms(1400)), Err(Block::Paused(..))));
         assert_eq!(t.check(last + ms(1500)), Ok(()));
+    }
+
+    #[test]
+    fn plain_pointer_motion_pauses_but_changes_no_view() {
+        let t = Takeover::new(ms(1500), None);
+        let t0 = Instant::now() - ms(100);
+        t.user_motion(t0 + ms(10));
+        assert!(matches!(
+            t.check(t0 + ms(20)),
+            Err(Block::Paused(Device::Pointer, ..))
+        ));
+        assert!(!t.view_input_since(t0));
+        // A key, a button or a wheel does.
+        t.user_input(t0 + ms(20), Device::Pointer);
+        assert!(t.view_input_since(t0));
+        assert!(!t.view_input_since(t0 + ms(20)));
+        // Idle notifications do not tell motion apart: they count.
+        let t = Takeover::new(ms(1500), None);
+        let t0 = Instant::now() - ms(100);
+        t.idle_resumed(t0 + ms(10));
+        assert!(t.view_input_since(t0));
     }
 
     #[test]

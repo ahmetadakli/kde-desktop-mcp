@@ -155,6 +155,10 @@ fn locate_with_synonyms<Id: Clone + Eq + std::hash::Hash>(
 /// How long a read of an app's tree is reused at most, even when the app
 /// reported no change: a safety net for changes no event announces.
 const READ_MAX_AGE: Duration = Duration::from_secs(2);
+/// The same for an app heard sending change events (`Backend::heard_changes`):
+/// its changes drop the read, so only those no event announces are left,
+/// and agents think longer than READ_MAX_AGE between calls.
+const READ_MAX_AGE_HEARD: Duration = Duration::from_secs(15);
 /// Reads kept at once (one per app and `ReadKey`).
 const READS_KEPT: usize = 4;
 
@@ -2839,18 +2843,26 @@ impl<B: Backend> Server<B> {
 
     /// Whether a read of `windows` that began at `start` still shows them
     /// as they are: no input of ours since, the app provably sent no change
-    /// (`Backend::unchanged_since`), the user did not use the keyboard or
-    /// mouse (scrolling shows other elements without an event), and it is
-    /// younger than READ_MAX_AGE.
+    /// (`Backend::unchanged_since`), the user used no key, button or wheel
+    /// (scrolling shows other elements without an event; plain pointer
+    /// motion does not count), and it is younger than `read_max_age`.
     fn read_current(&self, r: &Reads<B::Id>, windows: &[B::Id], start: &ReadStart) -> bool {
         r.inputs == 0
             && r.generation == start.generation
-            && start.at.elapsed() < READ_MAX_AGE
+            && start.at.elapsed() < self.read_max_age(windows)
             && self.b.unchanged_since(windows, start.mark)
             && !self
                 .takeover
                 .as_ref()
-                .is_some_and(|t| t.user_input_since(start.at))
+                .is_some_and(|t| t.view_input_since(start.at))
+    }
+
+    /// How long a read of `windows` is reused at most.
+    fn read_max_age(&self, windows: &[B::Id]) -> Duration {
+        match self.b.heard_changes(windows) {
+            true => READ_MAX_AGE_HEARD,
+            false => READ_MAX_AGE,
+        }
     }
 
     /// The kept read of `app`'s `windows` fetched as `key`, while it is
@@ -2872,7 +2884,7 @@ impl<B: Backend> Server<B> {
                 "windows differ"
             } else if r.inputs > 0 || r.generation != k.start.generation {
                 "input since"
-            } else if k.start.at.elapsed() >= READ_MAX_AGE {
+            } else if k.start.at.elapsed() >= self.read_max_age(windows) {
                 "too old"
             } else if !self.b.unchanged_since(windows, k.start.mark) {
                 "app changed"
@@ -9196,6 +9208,8 @@ mod tests {
     struct FakeReads {
         /// Change events are listened to and the app sends them.
         live: std::cell::Cell<bool>,
+        /// The app was heard sending change events (`heard_changes`).
+        heard: std::cell::Cell<bool>,
         /// Bumped by a test for each change the app reports.
         changes: std::cell::Cell<u64>,
         /// A document of the app is loading.
@@ -9494,6 +9508,9 @@ mod tests {
         }
         fn unchanged_since(&self, _: &[u32], mark: u64) -> bool {
             self.reads.live.get() && self.reads.changes.get() == mark
+        }
+        fn heard_changes(&self, _: &[u32]) -> bool {
+            self.reads.heard.get()
         }
         async fn page(&self, doc: &u32) -> Option<backend::Page> {
             let info = self.info(doc, 0).await;
@@ -16581,11 +16598,15 @@ mod tests {
             call_tool(&mut s, call, "get_text", find.clone()).await;
             call_tool(&mut s, call + 1, "find", find.clone()).await;
             assert_eq!(prefetches(&s), before);
-            // The user used the keyboard or mouse: scrolling shows other
-            // elements without an event.
+            // The user only moved the pointer: nothing changed.
+            s.takeover.user_motion(Instant::now());
+            call_tool(&mut s, call + 2, "find", find.clone()).await;
+            assert_eq!(prefetches(&s), before, "dropped on pointer motion");
+            // The user used a key, a button or the wheel: scrolling shows
+            // other elements without an event.
             s.takeover
                 .user_input(Instant::now(), takeover::Device::Pointer);
-            call_tool(&mut s, call + 2, "find", find.clone()).await;
+            call_tool(&mut s, call + 3, "find", find.clone()).await;
             assert!(prefetches(&s) > before);
         });
     }
@@ -17122,6 +17143,29 @@ mod tests {
             let read = prefetches(&s);
             tokio::time::sleep(READ_MAX_AGE + Duration::from_millis(50)).await;
             call_tool(&mut s, 3, "find", find).await;
+            assert!(prefetches(&s) > read);
+        });
+    }
+
+    #[test]
+    fn kept_reads_of_an_app_heard_sending_events_live_longer() {
+        local(async {
+            let mut s = session("reads-heard");
+            fake_reads(&s);
+            s.reads.heard.set(true);
+            let find = json!({"app": "fake", "query": "Save"});
+            call_tool(&mut s, 2, "find", find.clone()).await;
+            let read = prefetches(&s);
+            tokio::time::sleep(READ_MAX_AGE + Duration::from_millis(50)).await;
+            call_tool(&mut s, 3, "find", find.clone()).await;
+            assert_eq!(prefetches(&s), read, "dropped after READ_MAX_AGE");
+            // Still never reused after input of ours, or a change.
+            call_tool(&mut s, 4, "key", json!({"combo": "a"})).await;
+            call_tool(&mut s, 5, "find", find.clone()).await;
+            assert!(prefetches(&s) > read, "reused after input");
+            let read = prefetches(&s);
+            s.reads.changes.set(s.reads.changes.get() + 1);
+            call_tool(&mut s, 6, "find", find).await;
             assert!(prefetches(&s) > read);
         });
     }

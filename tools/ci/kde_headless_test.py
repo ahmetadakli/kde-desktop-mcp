@@ -40,6 +40,7 @@ results: list[tuple[str, str, str]] = []
 
 class Client:
     def __init__(self, cmd: list[str], env: dict, log: Path):
+        self.log = log
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=log.open("w"), text=True, encoding="utf-8", env=env)
         self.n = 0
@@ -227,6 +228,25 @@ def wait_idle_while_ticking(c: Client) -> None:
         step("act uncheck stops the clock", ok, one_line(out))
 
 
+def kept_read_outlives_think_time(c: Client) -> None:
+    """A read of an app heard sending change events is reused after a pause
+    longer than the 2 s kept for other apps (DESKTOP_MCP_TRACE's lines)."""
+    c.text("find", app=APP, query="Greet", role="button")
+    seen = c.log.stat().st_size
+    time.sleep(3)
+    c.text("find", app=APP, query="Greet", role="button")
+    with c.log.open(encoding="utf-8", errors="replace") as f:
+        f.seek(seen)
+        lines = [line.strip() for line in f if "kept read" in line]
+    name = "a kept read is reused 3 s later"
+    if any("kept read of" in line for line in lines):
+        step(name, True)
+    elif any("too old" in line for line in lines):
+        step(name, False, "; ".join(lines))
+    else:
+        record(name, "SKIP", "; ".join(lines) or "the read was not kept (no change events?)")
+
+
 def run(c: Client, input_mode: str) -> None:
     ok, out = c.call("doctor")
     print(f"--- doctor ---\n{out}\n---", flush=True)
@@ -282,6 +302,8 @@ def run(c: Client, input_mode: str) -> None:
 
     wait_idle_while_ticking(c)
 
+    kept_read_outlives_think_time(c)
+
     ok, out = c.call("find", app="definitely-not-allowed-app", query="x")
     step("allowlist refuses another app", not ok and "not in" in out, one_line(out))
     ok, out = c.call("get_text", id=999999999)
@@ -305,7 +327,8 @@ def main() -> int:
     (home / ".config/desktop-mcp").mkdir(parents=True)
     (home / ".config/desktop-mcp/allow.txt").write_text(f"{APP}\n", encoding="utf-8")
     env = dict(os.environ, HOME=str(home), DESKTOP_MCP_INDICATOR="0",
-               DESKTOP_MCP_NO_UPDATE_CHECK="1", DESKTOP_MCP_STOP_KEY="off")
+               DESKTOP_MCP_NO_UPDATE_CHECK="1", DESKTOP_MCP_STOP_KEY="off",
+               DESKTOP_MCP_TRACE="1")
 
     app = subprocess.Popen([sys.executable, str(HERE / "qt_app.py")], env=os.environ,
                            stdin=subprocess.DEVNULL, stdout=(logs / "qt_app.log").open("w"),

@@ -1467,6 +1467,10 @@ impl Backend for LinuxBackend {
         self.a11y.reads_unchanged(&buses, mark)
     }
 
+    fn heard_changes(&self, near: &[Obj]) -> bool {
+        !near.is_empty() && near.iter().all(|o| self.a11y.reads_heard(&o.bus))
+    }
+
     /// Apps known to send change events: they did since we listen, or
     /// their toolkit always does for registered events. No document of
     /// theirs may be loading (a page waiting for the network sends none).

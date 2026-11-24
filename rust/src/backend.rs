@@ -605,6 +605,12 @@ pub trait Backend {
     fn unchanged_since(&self, _near: &[Self::Id], _mark: u64) -> bool {
         false
     }
+    /// Whether the app whose windows are `near` sent change events since
+    /// this server listens: a kept read of it is reused longer, as any
+    /// change it makes drops the read anyway (`unchanged_since`).
+    fn heard_changes(&self, _near: &[Self::Id]) -> bool {
+        false
+    }
     /// Whether a read of the windows `near` may be kept at all: their app
     /// is known to send change events (`unchanged_since` means something),
     /// and no document there is still loading.
