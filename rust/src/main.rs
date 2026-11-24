@@ -6744,9 +6744,21 @@ impl<B: Backend> Server<B> {
                 loading = self.b.loading(&windows).await;
                 load_checked = Some(Instant::now());
                 if !loading {
-                    return self
-                        .steady_idle(&app, &windows, quiet, start, limit, note)
-                        .await;
+                    let content = self.steady_idle(&app, &windows, quiet, start, limit, &note);
+                    let events = self.events_quiet(&windows, quiet, since);
+                    // Whichever comes first: the content holding still, or
+                    // the events stopping after all.
+                    return tokio::select! {
+                        r = content => r,
+                        () = events => {
+                            let ms = start.elapsed().as_millis();
+                            let title = self.app_title(&app).await;
+                            Ok(format!(
+                                "idle after {ms} ms (no change for {} ms){title}{note}",
+                                quiet.as_millis()
+                            ))
+                        }
+                    };
                 }
             }
             let left = limit
@@ -6767,6 +6779,25 @@ impl<B: Backend> Server<B> {
         }
     }
 
+    /// Once `windows` sent no change event for `quiet` (the last one at
+    /// `since`) and nothing loads; never where change events are not heard.
+    async fn events_quiet(&self, windows: &[B::Id], quiet: Duration, since: Instant) {
+        if !self.b.changes_live() {
+            return std::future::pending().await;
+        }
+        let (mut since, mut mark) = (since, self.b.change_mark());
+        loop {
+            let left = quiet.saturating_sub(since.elapsed());
+            if self.b.wait_change(windows, mark, left).await || self.b.loading(windows).await {
+                (since, mark) = (Instant::now(), self.b.change_mark());
+                continue;
+            }
+            if since.elapsed() >= quiet {
+                return;
+            }
+        }
+    }
+
     /// The rest of a `wait_idle` whose app kept changing with nothing
     /// loading: settled once the content of its active page (else its
     /// windows), without the browser around it, live regions, media,
@@ -6779,7 +6810,7 @@ impl<B: Backend> Server<B> {
         quiet: Duration,
         start: Instant,
         limit: Duration,
-        note: String,
+        note: &str,
     ) -> R<String> {
         let (mut roots, mut page) = self.steady_roots(app, windows).await;
         let mut print = None;
@@ -9626,6 +9657,8 @@ mod tests {
         /// The app changes on each read of an element's actions, as a live
         /// page does between an input call's start and its input.
         noise: std::cell::Cell<bool>,
+        /// Each `prefetch` takes this many ms (a large page).
+        read_ms: std::cell::Cell<u64>,
     }
 
     /// Windows on the fake desktop: (app, title).
@@ -9940,6 +9973,10 @@ mod tests {
             _: usize,
         ) {
             self.reads.prefetches.set(self.reads.prefetches.get() + 1);
+            let ms = self.reads.read_ms.get();
+            if ms > 0 {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
             for id in roots {
                 let info = self.info(&id, 0).await;
                 cache.insert(id, info);
@@ -10903,6 +10940,34 @@ mod tests {
             // Events counted for 2 s first, then a few content reads.
             assert!(took >= Duration::from_secs(2), "{took:?}");
             assert!(took < Duration::from_millis(3500), "{took:?}");
+        });
+    }
+
+    #[test]
+    fn wait_idle_still_ends_when_events_stop_while_it_reads_the_content() {
+        local(async {
+            let mut s = session("wait-idle-late-quiet");
+            let noise = noisy_page(&s, true);
+            // A large page: each read takes 400 ms. Its events stop at
+            // 2.3 s, after the content reads began.
+            s.reads.read_ms.set(400);
+            let stop = tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(2300)).await;
+                noise.abort();
+            });
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 100, "timeout_ms": 6000}),
+            )
+            .await;
+            let took = start.elapsed();
+            stop.await.unwrap();
+            let text = reply_text(&r);
+            assert!(text.contains("(no change for 100 ms)"), "{r}");
+            assert!(took < Duration::from_millis(2900), "{took:?}");
         });
     }
 
