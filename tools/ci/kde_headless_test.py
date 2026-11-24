@@ -380,18 +380,20 @@ def run(c: Client, input_mode: str) -> None:
     screenshots(c, ids)
 
 
-KWIN_GONE = ("org.kde.KWin was not provided", "DBus.Error.NoReply")
-
-
 def screenshots(c: Client, ids: dict) -> None:
     before = len(results)
-    background_screenshot(c)
-    marked_screenshot(c, ids)
-    element_screenshot(c, ids)
-    gone = any(v == "FAIL" and any(k in d for k in KWIN_GONE) for _, v, d in results[before:])
+    try:
+        background_screenshot(c)
+        marked_screenshot(c, ids)
+        element_screenshot(c, ids)
+    except (RuntimeError, OSError) as e:
+        step("the screenshot checks ran", False, str(e))
+    # Did KWin itself go away? Then the compositor failed, not the server.
+    ok, out = c.call("windows")
+    gone = not ok and any(k in out for k in ("org.kde.KWin", "ServiceUnknown", "NoReply"))
     if gone:
-        # Turn this group's failures into skips: the compositor, not the
-        # server, failed (see kwin.log in the job's artifacts).
+        # Turn this group's failures into skips (see kwin.log in the job's
+        # artifacts).
         for i in range(before, len(results)):
             name, verdict, detail = results[i]
             if verdict == "FAIL":

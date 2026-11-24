@@ -152,7 +152,9 @@ fn box_holds((x, y, w, h): (i32, i32, i32, i32), px: i32, py: i32) -> bool {
 /// dialog (behind the active one) and a tool tip (a popup menu or a
 /// combo box's list is its own window, placed where AT-SPI does not say).
 fn may_cover(role: &str) -> bool {
-    !matches!(role, "frame" | "dialog" | "tool tip")
+    // Plain top-levels (a Qt widget window is a "filler") are windows,
+    // which KWin's stacking order answers for; only popups need this.
+    !matches!(role, "frame" | "dialog" | "tool tip" | "filler")
 }
 
 /// Screen centre of an element from its extents in window coordinates
@@ -2942,7 +2944,7 @@ mod tests {
         assert!(!box_holds((10, 20, 30, 40), 15, 60));
         assert!(!box_holds((10, 20, 0, 40), 10, 30));
         assert!(!box_holds((-1, -1, -1, -1), -1, -1));
-        for role in ["frame", "dialog", "tool tip"] {
+        for role in ["frame", "dialog", "tool tip", "filler"] {
             assert!(!may_cover(role), "{role}");
         }
         for role in ["menu", "popup menu", "window", "list"] {
