@@ -1159,8 +1159,9 @@ impl LinuxBackend {
     /// the point goes into the active window (KWin's client origin), and
     /// GetAccessibleAtPoint descends from that window's frame. Unsure (no
     /// name): the AT-SPI app in front has no ACTIVE window, a popup of it
-    /// shows, the point is outside the frame, or the element's box does
-    /// not hold it.
+    /// shows, another window (of any app: a notification, one kept above)
+    /// covers the point, the point is outside the frame, or the element's
+    /// box does not hold it.
     async fn kde_element_at(&self, kwin: &KWin, x: i64, y: i64) -> Option<Focused<Obj>> {
         let a11y = &self.a11y;
         let bus = match a11y.recent_active_bus(HIT_ACTIVE_AGE) {
@@ -1171,7 +1172,11 @@ impl LinuxBackend {
             }
         };
         let app = Obj::new(&bus, OwnedObjectPath::try_from(APP_ROOT).ok()?);
-        let (origin, windows) = tokio::join!(kwin.active_window_origin(), a11y.children(&app));
+        let (origin, windows) = tokio::join!(kwin.active_origin_at(x, y), a11y.children(&app));
+        let ((gx, gy), covered) = origin.ok()?;
+        if covered {
+            return None;
+        }
         let states = futures_util::future::join_all(windows.iter().map(|w| a11y.states(w))).await;
         let mut frame = None;
         let mut others = Vec::new();
@@ -1188,7 +1193,6 @@ impl LinuxBackend {
         if roles.iter().any(|r| may_cover(r)) {
             return None;
         }
-        let (gx, gy) = origin.ok()?;
         let (wx, wy) = (
             (x as f64 - gx).floor() as i32,
             (y as f64 - gy).floor() as i32,

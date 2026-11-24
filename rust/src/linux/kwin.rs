@@ -370,6 +370,19 @@ const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow
      return {x: g.x, y: g.y, width: g.width, height: g.height, caption: w.caption, \
      cls: w.resourceClass, screen: {x: s.x, y: s.y, width: s.width, height: s.height}}; })())";
 
+/// The active window's client origin, and whether another window shown on
+/// this desktop lies above it at (%X%, %Y%): a notification, an OSD, a
+/// window kept above, a popup. Then the point is not the active window's.
+const ORIGIN_AT: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
+     const g = w.clientGeometry; const cur = workspace.currentDesktop; \
+     const order = workspace.stackingOrder; const id = String(w.internalId); \
+     const i = order.findIndex(o => String(o.internalId) === id); \
+     const covered = i < 0 || order.slice(i + 1).some(o => !o.minimized && !o.deleted \
+       && (o.onAllDesktops || (o.desktops || []).some(d => d.id === cur.id)) \
+       && %X% >= o.frameGeometry.x && %X% < o.frameGeometry.x + o.frameGeometry.width \
+       && %Y% >= o.frameGeometry.y && %Y% < o.frameGeometry.y + o.frameGeometry.height); \
+     return {x: g.x, y: g.y, covered: covered}; })())";
+
 /// The active window's frame, its internal id (the handle ScreenShot2's
 /// CaptureWindow takes, "{uuid}"), and its process, caption and class, so
 /// a screenshot checks the window it captures.
@@ -389,6 +402,15 @@ const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtua
      return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
 
 const CURSOR_POS: &str = "JSON.stringify({x: workspace.cursorPos.x, y: workspace.cursorPos.y})";
+
+/// Parse what ORIGIN_AT reports.
+fn origin_at_of(raw: &str) -> R<((f64, f64), bool)> {
+    let v: Json = serde_json::from_str(raw).unwrap_or(Json::Null);
+    match (v["x"].as_f64(), v["y"].as_f64()) {
+        (Some(x), Some(y)) => Ok(((x, y), v["covered"].as_bool().unwrap_or(true))),
+        _ => Err("could not read the active window geometry from KWin".into()),
+    }
+}
 
 /// Parse what CURSOR_POS reports.
 fn cursor_pos_of(raw: &str) -> R<(i64, i64)> {
@@ -543,6 +565,15 @@ impl KWin {
             .await?
             .unwrap_or_default();
         picked_of(&raw)
+    }
+
+    /// Client-area origin (logical px) of KWin's active window, and
+    /// whether another window covers the point (`x`, `y`) there.
+    pub async fn active_origin_at(&self, x: i64, y: i64) -> R<((f64, f64), bool)> {
+        let js = ORIGIN_AT
+            .replace("%X%", &x.to_string())
+            .replace("%Y%", &y.to_string());
+        origin_at_of(&self.query(&js).await?.unwrap_or_default())
     }
 
     /// Client-area origin (logical px) of KWin's active window.
@@ -971,6 +1002,12 @@ mod tests {
 
     #[test]
     fn cursor_position_is_parsed_and_rounded() {
+        assert_eq!(
+            origin_at_of(r#"{"x":10,"y":40.5,"covered":false}"#),
+            Ok(((10.0, 40.5), false))
+        );
+        assert_eq!(origin_at_of(r#"{"x":10,"y":40}"#), Ok(((10.0, 40.0), true)));
+        assert!(origin_at_of("null").is_err());
         assert_eq!(cursor_pos_of(r#"{"x":1920,"y":-5}"#), Ok((1920, -5)));
         assert_eq!(cursor_pos_of(r#"{"x":10.6,"y":3.2}"#), Ok((11, 3)));
         assert!(cursor_pos_of("").is_err());
