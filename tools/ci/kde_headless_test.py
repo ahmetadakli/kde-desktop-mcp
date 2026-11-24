@@ -6,8 +6,10 @@ Run by kde_headless.sh inside the CI container, after it started its own
 KWin and D-Bus session; it refuses to run anywhere else (it starts a window
 and sends it keys). Starts tools/ci/qt_app.py and the server with an
 allowlist holding only that app, then speaks MCP over stdio: apps, tree,
-find, set_text, get_text, act, activate_window, focus, type_text, key and
-the allowlist's refusals, each checked against what the window shows.
+find, set_text, get_text, act, activate_window, click, mouse (its hit
+test), focus, type_text, key, a screenshot of a window in the background (and
+one with element marks, one of an element) and the allowlist's refusals,
+each checked against what the window shows.
 
 type_text into the multi-line editor inserts through AT-SPI and needs no
 input device. key, and type_text into a line edit (a paste with ctrl+v),
@@ -32,12 +34,14 @@ from pathlib import Path
 
 APP = "desktop-mcp-ci"
 TITLE = "desktop-mcp CI window"
+OTHER = "desktop-mcp CI other"
 HERE = Path(__file__).resolve().parent
 results: list[tuple[str, str, str]] = []
 
 
 class Client:
     def __init__(self, cmd: list[str], env: dict, log: Path):
+        self.log = log
         self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                      stderr=log.open("w"), text=True, encoding="utf-8", env=env)
         self.n = 0
@@ -157,17 +161,171 @@ def input_tests(c: Client, ids: dict, mode: str) -> None:
     step("type_text into a line edit (paste)", ok and bool(got), one_line(out))
 
 
+def pointer_hit_test(c: Client, ids: dict) -> None:
+    """mouse at a button's pixels names the button (an AT-SPI hit test, so
+    it holds whether or not the pointer input arrives)."""
+    if not os.access("/dev/uinput", os.W_OK):
+        record("mouse names the element under it", "SKIP",
+               "/dev/uinput is missing or not writable here (no pointer device)")
+        return
+    ok, out = c.call("click", id=ids["greet"], clicks=0, window=TITLE)
+    m = re.search(r"at (-?\d+),(-?\d+)", out)
+    if not step("click with clicks=0 gives the button's centre", ok and bool(m), one_line(out)):
+        return
+    x, y = int(m.group(1)), int(m.group(2))
+    ok, out = c.call("mouse", x=x, y=y, clicks=0)
+    step("mouse over a button names it", ok and re.search(r' over \[\d+\] [^"]*"Greet"', out)
+         is not None, one_line(out))
+    ok, out = c.call("mouse", x=x, y=y)
+    m = re.search(r' on \[(\d+)\] [^"]*"Greet"', out)
+    step("mouse click on a button names it", ok and bool(m), one_line(out))
+    if m:
+        ok, got = c.call("get_text", id=int(m.group(1)))
+        step("the id a mouse reply names is usable", ok, one_line(got))
+
+
+def background_screenshot(c: Client) -> None:
+    """screenshot with window= captures a window behind another where it
+    is (KWin ScreenShot2 by handle), without activating it."""
+    ok, out = c.call("activate_window", query=OTHER)
+    if not step("activate_window raises the second window", ok, one_line(out)):
+        return
+    ok, out = c.call("screenshot", window=TITLE)
+    if ok and "captured in background" not in out:
+        # Refused where it is (no ScreenShot2 grant): brought forward and
+        # captured in the same call instead.
+        apps = c.text("apps")
+        front = [line for line in apps.splitlines() if "[active]" in line]
+        step("a refused background capture brings the window forward in one call",
+             any(TITLE in line for line in front), one_line(out))
+        record("screenshot captures a window in the background", "SKIP",
+               f"KWin refuses ScreenShot2 here: {one_line(out)}")
+        return
+    step("screenshot captures a window in the background",
+         ok and "captured in background" in out, one_line(out))
+    apps = c.text("apps")
+    front = [line for line in apps.splitlines() if "[active]" in line]
+    step("the background screenshot activates nothing",
+         any(OTHER in line for line in front) and not any(TITLE in line for line in front),
+         one_line(apps))
+    ok, out = c.call("mouse", image_x=10, image_y=10, clicks=0)
+    step("its pixels are not used while the window is behind",
+         not ok and "in the background" in out and "nothing sent" in out, one_line(out))
+    ok, out = c.call("screenshot", region=[0, 0, 40, 30], inline=False)
+    lines = out.splitlines()
+    if ok and lines[0].endswith(".png"):
+        Path(lines[0]).unlink(missing_ok=True)
+    step("a region zoom is of the window captured behind, not the one in front",
+         ok and "captured in background" in out and "zoom of region" in out, one_line(out))
+
+
+def marked_screenshot(c: Client, ids: dict) -> None:
+    """screenshot marks=true numbers the window's controls (here the window
+    behind, captured in place) and the ids it lists act like find's."""
+    ok, out = c.call("screenshot", window=TITLE, marks=True, inline=False)
+    if ok and "captured in background" not in out:
+        record("screenshot marks=true lists the window's controls", "SKIP",
+               f"KWin refuses ScreenShot2 here: {one_line(out)}")
+        return
+    path = out.splitlines()[0] if ok else ""
+    if path.endswith(".png"):
+        Path(path).unlink(missing_ok=True)
+    legend = next((line for line in out.splitlines() if line.startswith("marks: ")), "")
+    m = re.search(r"\[(\d+)\] [^,]*'Greet'", legend)
+    if not step("screenshot marks=true lists the window's controls",
+                ok and bool(m) and "'Agree'" in legend, one_line(out)):
+        return
+    c.call("activate_window", query=TITLE)
+    c.call("act", id=ids["agree"], action="uncheck")
+    ok, out = c.call("act", id=int(m.group(1)))
+    seen = status_has(c, "hello")
+    step("a mark's id acts on its control", ok and bool(seen),
+         f"{one_line(out)}; {seen or status(c)!r}")
+
+
+def element_screenshot(c: Client, ids: dict) -> None:
+    """screenshot id= captures just the element and a margin around it, in
+    its own window: here the window behind, captured in place."""
+    c.call("activate_window", query=OTHER)
+    ok, out = c.call("screenshot", id=ids["greet"], inline=False)
+    if (ok and "captured in background" not in out) or (not ok and "KWin refused" in out):
+        record("screenshot id= crops to the element", "SKIP",
+               f"KWin refuses ScreenShot2 here: {one_line(out)}")
+        return
+    lines = out.splitlines()
+    if ok and lines[0].endswith(".png"):
+        Path(lines[0]).unlink(missing_ok=True)
+    m = re.search(r"(\d+)x(\d+) px of screen area", out)
+    whole = re.search(r"(\d+)x(\d+) px", c.text("screenshot", window=TITLE, max_size=2576))
+    small = bool(m and whole) and int(m.group(1)) < int(whole.group(1)) \
+        and int(m.group(2)) < int(whole.group(2))
+    step("screenshot id= crops to the element in its window",
+         ok and f"(element {ids['greet']} and 12 px around it" in out
+         and "captured in background" in out and small, one_line(out))
+    c.call("activate_window", query=TITLE)
+
+
+def wait_idle_while_ticking(c: Client) -> None:
+    """wait_idle settles on a window whose clock never stops changing: after
+    2 s of change events it compares the content, digits aside."""
+    c.call("activate_window", query=TITLE)
+    tick = find_id(c, "Tick", "check box")
+    ok, out = c.call("act", id=tick, action="check") if tick is not None else (False, "no Tick")
+    if not step("act check starts the ticking clock", ok, one_line(out)):
+        return
+    try:
+        ok, out = c.call("wait_idle", app=APP, quiet_ms=200, timeout_ms=8000)
+        step("wait_idle settles while a clock ticks", ok and "idle after" in out, one_line(out))
+        if ok and "change events never stopped" not in out:
+            record("wait_idle settles on the content past the clock's events", "SKIP",
+                   f"the clock's changes sent no events here: {one_line(out)}")
+        else:
+            step("wait_idle settles on the content past the clock's events",
+                 ok and "held still for 200 ms" in out, one_line(out))
+    finally:
+        ok, out = c.call("act", id=tick, action="uncheck")
+        step("act uncheck stops the clock", ok, one_line(out))
+
+
+def kept_read_outlives_think_time(c: Client) -> None:
+    """A read of an app heard sending change events is reused after a pause
+    longer than the 2 s kept for other apps (DESKTOP_MCP_TRACE's lines),
+    where the user's input is watched."""
+    name = "a kept read is reused 3 s later"
+    if "not watching user input" in c.text("doctor"):
+        record(name, "SKIP", "no source of the user's input works here: reads last 2 s")
+        return
+    # Past the tail of the last input, when a smooth scroll may still move.
+    time.sleep(1)
+    c.text("find", app=APP, query="Greet", role="button")
+    seen = c.log.stat().st_size
+    time.sleep(3)
+    c.text("find", app=APP, query="Greet", role="button")
+    with c.log.open(encoding="utf-8", errors="replace") as f:
+        f.seek(seen)
+        lines = [line.strip() for line in f if "kept read" in line]
+    if any("kept read of" in line for line in lines):
+        step(name, True)
+    elif any("too old" in line for line in lines):
+        step(name, False, "; ".join(lines))
+    else:
+        record(name, "SKIP", "; ".join(lines) or "the read was not kept (no change events?)")
+
+
 def run(c: Client, input_mode: str) -> None:
     ok, out = c.call("doctor")
     print(f"--- doctor ---\n{out}\n---", flush=True)
 
-    apps = wait_for(lambda: (a := c.text("apps")) and APP in a and TITLE in a and a, 30)
+    apps = wait_for(lambda: (a := c.text("apps")) and APP in a and TITLE in a and OTHER in a
+                    and a, 30)
     if not step("apps lists the test window", bool(apps), one_line(apps or c.text("apps"))):
         return
 
     tree = c.text("tree", app=APP)
     step("tree shows the window's controls",
          all(w in tree for w in ("Greet", "Name", "Notes", "Agree", "Status:")), one_line(tree))
+    # Tool bars are summed up only next to a browser's page.
+    step("tree keeps a plain app's lines", "browser tool bars" not in tree, one_line(tree))
 
     ids = {
         "greet": find_id(c, "Greet", "button"),
@@ -196,6 +354,8 @@ def run(c: Client, input_mode: str) -> None:
     ok, out = c.call("activate_window", query=TITLE)
     step("activate_window raises the test window", ok, one_line(out))
 
+    pointer_hit_test(c, ids)
+
     ok, out = c.call("focus", id=ids["notes"])
     step("focus moves to the editor", ok, one_line(out))
     typed = "Zeile çğışöü İ\nzweite"
@@ -205,10 +365,40 @@ def run(c: Client, input_mode: str) -> None:
 
     input_tests(c, ids, input_mode)
 
+    wait_idle_while_ticking(c)
+
+    kept_read_outlives_think_time(c)
+
     ok, out = c.call("find", app="definitely-not-allowed-app", query="x")
     step("allowlist refuses another app", not ok and "not in" in out, one_line(out))
     ok, out = c.call("get_text", id=999999999)
     step("an unknown id is an error", not ok and "unknown id" in out, one_line(out))
+
+    # Screenshots last: KWin's virtual backend (QPainter, no GPU) has been
+    # seen to crash in ScreenShot2's CaptureWindow, which takes the session
+    # down with it. On the real desktop the same calls work.
+    screenshots(c, ids)
+
+
+def screenshots(c: Client, ids: dict) -> None:
+    before = len(results)
+    try:
+        background_screenshot(c)
+        marked_screenshot(c, ids)
+        element_screenshot(c, ids)
+    except (RuntimeError, OSError) as e:
+        step("the screenshot checks ran", False, str(e))
+    # Did KWin itself go away? Then the compositor failed, not the server.
+    ok, out = c.call("windows")
+    gone = not ok and any(k in out for k in ("org.kde.KWin", "ServiceUnknown", "NoReply"))
+    if gone:
+        # Turn this group's failures into skips (see kwin.log in the job's
+        # artifacts).
+        for i in range(before, len(results)):
+            name, verdict, detail = results[i]
+            if verdict == "FAIL":
+                results[i] = (name, "SKIP", "KWin's virtual backend crashed in a capture: " + detail)
+                print(f"[SKIP] {name}: KWin's virtual backend crashed in a capture", flush=True)
 
 
 def main() -> int:
@@ -228,7 +418,8 @@ def main() -> int:
     (home / ".config/desktop-mcp").mkdir(parents=True)
     (home / ".config/desktop-mcp/allow.txt").write_text(f"{APP}\n", encoding="utf-8")
     env = dict(os.environ, HOME=str(home), DESKTOP_MCP_INDICATOR="0",
-               DESKTOP_MCP_NO_UPDATE_CHECK="1", DESKTOP_MCP_STOP_KEY="off")
+               DESKTOP_MCP_NO_UPDATE_CHECK="1", DESKTOP_MCP_STOP_KEY="off",
+               DESKTOP_MCP_TRACE="1")
 
     app = subprocess.Popen([sys.executable, str(HERE / "qt_app.py")], env=os.environ,
                            stdin=subprocess.DEVNULL, stdout=(logs / "qt_app.log").open("w"),

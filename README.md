@@ -695,8 +695,10 @@ tool; `off` turns it off). Not available on Windows yet.
   password manager marked as a password (`x-kde-passwordManagerHint`; on
   Windows `ExcludeClipboardContentFromMonitorProcessing`).
 - `mouse`, `screenshot`: fallback only. `screenshot` returns the image inside
-  the reply, shrinks it so its longer side is 1024 px by default (`max_size`)
-  and reports which screen area it shows. The inline image is a JPEG
+  the reply, shrinks it so its longer side is 1024 px by default (`max_size`,
+  at most 2576, and never over 3.7 megapixels: newer Claude models refuse
+  larger images rather than shrink them) and reports which screen area it
+  shows. The inline image is a JPEG
   (quality 80, full colour resolution, so small text stays sharp) when that
   takes at most three quarters of the PNG's bytes, else a PNG: a 1024x576
   YouTube window took 132 KB instead of 670 KB, a Confluence page 94 KB
@@ -717,7 +719,11 @@ tool; `off` turns it off). Not available on Windows yet.
   and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
   in pixels of the last screenshot captures again and returns only that part,
   cropped before shrinking, at up to full resolution (`max_size` still
-  applies); `image_x`/`image_y` then refer to the zoomed image. The
+  applies); `image_x`/`image_y` then refer to the zoomed image. `id` (from
+  tree/find/marks) instead crops to that element's box and 12 px around it,
+  e.g. to look at a control after `act` without a whole-window image; an
+  element in a window behind is captured there on KDE (else the reply names
+  its window), one scrolled out of view is refused. The
   allowlist is checked on the window that is captured: KDE reads KWin's
   active window (its process, caption and class) once and captures it by its
   handle; `spectacle` (older KWin), `grim` (Hyprland) and the Windows screen
@@ -727,7 +733,21 @@ tool; `off` turns it off). Not available on Windows yet.
   missing or failing with its error, KWin's `ScreenShot2` error, the
   temporary file). A screenshot whose `window` is already in front sends no
   input: it does not wait for the user's typing, and as a batch's last step
-  it is not stopped by the user starting to use the seat.
+  it is not stopped by the user starting to use the seat. On KDE a
+  screenshot with `window` activates nothing: KWin captures the window
+  `activate_window` would pick (allowlist checked on it) by its handle
+  where it is, behind others too, and the reply adds `captured in
+  background: '<title>' is not in front`. `image_x`/`image_y` of such an
+  image are refused until that window is in front (`window` on `mouse`).
+  A minimized window, one on another virtual desktop, and Hyprland and
+  Windows are activated first, as before. `marks: true` draws the ids of
+  the captured window's visible interactive elements on the image (a thin
+  frame around each, its id on a label beside it; the web page's or
+  document's first, at most 40) and adds a legend line `marks: [12] link
+  'Home', …`; the ids are registered as find's, so the next call is `act`
+  or `click` by id rather than `mouse` by pixel. It costs one tree read of
+  the window, done while it is captured, and one box read per element (KDE
+  and Windows; Hyprland draws none yet).
 - `batch`: runs several tools in order in one call and stops at the first
   error; reduces Claude's number of turns. A step with `"optional": true`
   (typically a `wait_for`) may fail without stopping the batch: it is reported

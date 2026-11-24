@@ -119,6 +119,10 @@ impl<T> WindowWalk<T> {
 /// The error `element_center` gives for an element whose window is not in
 /// front (a click there would land on the window covering it). The tool
 /// layer names the window (`not_active`) when the backend does not.
+/// How a screenshot of a window in the background that KWin refused to
+/// capture where it is fails: taken again, it brings the window forward.
+pub const SHOT_REFUSED_BEHIND: &str = "KWin refused to capture";
+
 pub const NOT_ACTIVE: &str = "element's window is not active; call activate_window first";
 
 /// NOT_ACTIVE naming the element's window `title` (quoted and cut as
@@ -303,6 +307,9 @@ pub struct ShotTarget {
     pub class: String,
     /// Its frame, in the coordinates `pointer` takes.
     pub area: Option<(f64, f64, f64, f64)>,
+    /// Origin of its client area in the same coordinates, where its
+    /// elements' window coordinates start; None when not known.
+    pub client: Option<(f64, f64)>,
     /// The backend's handle of the window (KWin's internal id, Hyprland's
     /// address, the HWND): the capture must be of this window.
     pub handle: String,
@@ -578,12 +585,17 @@ pub trait Backend {
     /// Title of the window `id` is in (`WindowWalk`), for a NOT_ACTIVE
     /// refusal; None when it is not found.
     async fn window_title(&self, id: &Self::Id) -> Option<String> {
+        self.window_of(id).await.map(|(_, title)| title)
+    }
+    /// The window `id` is in (`WindowWalk`) and its title; None when it
+    /// is not found.
+    async fn window_of(&self, id: &Self::Id) -> Option<(Self::Id, String)> {
         let mut walk = WindowWalk::default();
         let mut cur = id.clone();
         for _ in 0..WINDOW_WALK_MAX {
             let (role, name) = self.identity(&cur).await;
-            if let Some(name) = walk.step(name, &role) {
-                return Some(name);
+            if let Some(w) = walk.step((cur.clone(), name), &role) {
+                return Some(w);
             }
             match self.parent(&cur).await {
                 Some(p) => cur = p,
@@ -603,6 +615,12 @@ pub trait Backend {
     /// since `mark` (`read_mark`), and no app or window came or went.
     /// Cheap: no round trip.
     fn unchanged_since(&self, _near: &[Self::Id], _mark: u64) -> bool {
+        false
+    }
+    /// Whether the app whose windows are `near` sent change events since
+    /// this server listens: a kept read of it is reused longer, as any
+    /// change it makes drops the read anyway (`unchanged_since`).
+    fn heard_changes(&self, _near: &[Self::Id]) -> bool {
         false
     }
     /// Whether a read of the windows `near` may be kept at all: their app
@@ -800,6 +818,13 @@ pub trait Backend {
     async fn focused(&self) -> Option<Focused<Self::Id>> {
         None
     }
+    /// The deepest element at screen point (`x`, `y`) in the active
+    /// window, as `focused` gives one (role, name and states; its app).
+    /// None when unsure: the point is outside that window, a popup of its
+    /// app may cover it, or the element's box does not hold the point.
+    async fn element_at(&self, _x: i64, _y: i64) -> Option<Focused<Self::Id>> {
+        None
+    }
     /// Focus without synthesising pointer input. Ok(Some(method)) when it
     /// worked, Ok(None) so the caller can fall back to a click.
     async fn try_focus(&self, id: &Self::Id) -> R<Option<String>>;
@@ -836,6 +861,17 @@ pub trait Backend {
                 Err(_) => None,
             })
             .collect()
+    }
+
+    /// Boxes (x, y, width, height, in the coordinates `pointer` takes) of
+    /// elements of the window `target` names, in front or not, to mark
+    /// them on its capture; None for one without an area or when unknown.
+    async fn element_boxes(
+        &self,
+        _target: &ShotTarget,
+        ids: &[Self::Id],
+    ) -> Vec<Option<(f64, f64, f64, f64)>> {
+        vec![None; ids.len()]
     }
 
     /// Check a chord such as "ctrl+s" without pressing it.
@@ -959,6 +995,19 @@ pub trait Backend {
     /// allowlist names it; Err with the cause when there is none or it
     /// cannot be read.
     async fn shot_target(&self) -> R<ShotTarget>;
+    /// The window `activate_window(query)` would bring forward, as a
+    /// screenshot target `screenshot` captures where it is, without
+    /// activating it, and whether it is the active one. None where the
+    /// backend cannot (only KDE captures by handle), or that window can
+    /// not be captured so (minimized, on another virtual desktop, no
+    /// handle): the caller activates it first.
+    async fn background_target(
+        &self,
+        _query: &str,
+        _allowed: &[String],
+    ) -> R<Option<(ShotTarget, bool)>> {
+        Ok(None)
+    }
     /// Capture `target` (from `shot_target`) and nothing else: a capture
     /// that could show another window fails instead. `path` is a new
     /// private file. Err names the real cause (a tool missing or failing,

@@ -739,6 +739,22 @@ impl A11y {
         (path.as_str() != NULL_PATH).then(|| Obj::new(&bus, path))
     }
 
+    /// Component.GetAccessibleAtPoint: the child of `o` (some toolkits: a
+    /// deeper descendant) at (`x`, `y`) in `coord` coordinates; None
+    /// without one.
+    pub async fn accessible_at_point(&self, o: &Obj, x: i32, y: i32, coord: u32) -> Option<Obj> {
+        let (bus, path): (String, OwnedObjectPath) = self
+            .call(
+                o,
+                "org.a11y.atspi.Component",
+                "GetAccessibleAtPoint",
+                &(x, y, coord),
+            )
+            .await
+            .ok()?;
+        (path.as_str() != NULL_PATH && !bus.is_empty()).then(|| Obj::new(&bus, path))
+    }
+
     pub async fn actions(&self, o: &Obj) -> Vec<String> {
         let list: R<Vec<(String, String, String)>> = self
             .call(o, "org.a11y.atspi.Action", "GetActions", &())
@@ -1144,11 +1160,18 @@ impl A11y {
     pub async fn frame_of(&self, o: &Obj) -> Option<Obj> {
         let mut walk = crate::backend::WindowWalk::default();
         let mut cur = Some(o.clone());
+        let mut below: Option<Obj> = None;
         while let Some(c) = cur {
             let (role, parent) = tokio::join!(self.role(&c), self.parent(&c));
-            if let Some(w) = walk.step(c, &role) {
+            // A top-level of another role (a plain Qt widget is a "filler")
+            // is the window: the level right under the application.
+            if role == "application" {
+                return walk.end().or(below);
+            }
+            if let Some(w) = walk.step(c.clone(), &role) {
                 return Some(w);
             }
+            below = Some(c);
             cur = parent;
         }
         walk.end()

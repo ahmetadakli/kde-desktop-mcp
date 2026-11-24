@@ -155,6 +155,16 @@ fn locate_with_synonyms<Id: Clone + Eq + std::hash::Hash>(
 /// How long a read of an app's tree is reused at most, even when the app
 /// reported no change: a safety net for changes no event announces.
 const READ_MAX_AGE: Duration = Duration::from_secs(2);
+/// The same for an app heard sending change events (`Backend::heard_changes`)
+/// while the user's scrolling is watched (`Takeover::watches_view`): its
+/// changes and the user's view input drop the read, so only changes no
+/// event announces are left, and agents think longer than READ_MAX_AGE
+/// between calls.
+const READ_MAX_AGE_HEARD: Duration = Duration::from_secs(15);
+/// How long what our input started may still move the view after the
+/// input ended (a smooth scroll, an animation): a read begun meanwhile is
+/// reused only until then.
+const INPUT_TAIL: Duration = Duration::from_millis(500);
 /// Reads kept at once (one per app and `ReadKey`).
 const READS_KEPT: usize = 4;
 
@@ -186,6 +196,8 @@ struct ReadStart {
     mark: u64,
     generation: u64,
     at: Instant,
+    /// Begun within INPUT_TAIL of our last input: reused only until this.
+    until: Option<Instant>,
 }
 
 /// A read of an app's windows kept for reuse (`Server::kept_read`).
@@ -204,6 +216,8 @@ struct Reads<Id> {
     generation: u64,
     /// Such calls running now: meanwhile no read is kept or reused.
     inputs: u32,
+    /// When the last of them ended.
+    input_end: Option<Instant>,
     kept: Vec<KeptRead<Id>>,
 }
 
@@ -212,6 +226,7 @@ impl<Id> Reads<Id> {
         Reads {
             generation: 0,
             inputs: 0,
+            input_end: None,
             kept: Vec::new(),
         }
     }
@@ -239,6 +254,7 @@ impl<Id> Drop for InputRun<'_, Id> {
     fn drop(&mut self) {
         let mut r = self.0.lock().unwrap_or_else(|e| e.into_inner());
         r.inputs = r.inputs.saturating_sub(1);
+        r.input_end = Some(Instant::now());
         r.invalidate();
     }
 }
@@ -306,11 +322,19 @@ fn frame_in<Id: Clone + Eq + std::hash::Hash>(cache: &Cache<Id>, id: &Id) -> Opt
     // its ACTIVE state is never set, so the frame above it counts.
     let mut walk = backend::WindowWalk::default();
     let mut cur = id;
+    let mut below: Option<&Id> = None;
     for _ in 0..=cache.len() {
         let info = cache.get(cur)?;
+        // A top-level of another role (a plain Qt widget is a "filler")
+        // is the window: the level right under the application.
+        if info.role == "application" {
+            let end: Option<&Id> = walk.end();
+            return end.or(below).cloned();
+        }
         if let Some(w) = walk.step(cur, &info.role) {
             return Some(w.clone());
         }
+        below = Some(cur);
         match parents.get(cur) {
             Some(Some(p)) => cur = p,
             // Listed by two parents: not known for sure.
@@ -471,6 +495,12 @@ struct Server<B: Backend> {
     shown_pending: Mutex<Option<(u64, Vec<u64>)>>,
     /// Maps pixels of the last screenshot to screen coordinates.
     last_shot: Mutex<Option<ShotMap>>,
+    /// The handle and caption of the window the last screenshot captured
+    /// in the background: its pixels are only clicked once it is in front.
+    shot_behind: Mutex<Option<(String, String)>>,
+    /// The handle and caption of the window the last screenshot captured:
+    /// a `region` of it is zoomed into that window, not another.
+    shot_window: Mutex<Option<(String, String)>>,
     /// Held by tools that send keyboard or pointer input, so two concurrent
     /// calls never interleave their events.
     input: Mutex<()>,
@@ -901,6 +931,9 @@ const WAIT_MIN_GAP: Duration = Duration::from_millis(50);
 
 /// How often `wait_idle` reads the tree where no change events come.
 const IDLE_POLL: Duration = Duration::from_millis(100);
+/// Least time `wait_idle` counts change events before it looks at the
+/// page's content instead (with twice `quiet_ms`, whichever is longer).
+const IDLE_NOISE: Duration = Duration::from_secs(2);
 
 /// How often the effect line reads an app's content again while it waits
 /// for a change, where the backend gets no change events.
@@ -1016,6 +1049,12 @@ fn region_frac(
         w: (x1 - x0) / aw,
         h: (y1 - y0) / ah,
     })
+}
+
+/// The screen area `screenshot(id=…)` shows of an element's box `b`.
+fn around((x, y, w, h): (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let m = SHOT_ID_MARGIN;
+    (x - m, y - m, w + 2.0 * m, h + 2.0 * m)
 }
 
 /// The screenshot's `region` argument: [x, y, w, h], None when absent.
@@ -1145,6 +1184,9 @@ const NO_CONTENT_ROLES: [&str; 22] = [
 /// Roles of a focused element where Enter types (a new line, a command),
 /// besides multi-line text fields: no content wait.
 const NO_CONTENT_KEY_ROLES: [&str; 2] = ["terminal", "document text"];
+/// How many ancestors of a pixel click's element are asked whether one
+/// clicks them (a link holds a heading, a span, an image).
+const CLICK_ANCESTORS: usize = 6;
 /// Size of the tree `observe: "tree"` returns.
 const OBSERVE_TREE_NODES: i64 = 150;
 const OBSERVE_TREE_CHARS: usize = 6000;
@@ -1367,6 +1409,40 @@ impl From<String> for Out {
 /// Image tokens grow with the area: 1024 costs about 0.64 of 1280 and
 /// still shows a 1536 px wide window's text legibly.
 const SHOT_MAX_SIZE: i64 = 1024;
+/// Screen pixels around an element `screenshot(id=…)` shows: enough to see
+/// its label and neighbours, not the whole window.
+const SHOT_ID_MARGIN: f64 = 12.0;
+/// Elements `screenshot(marks=true)` marks at most: enough for a page's
+/// controls in view, few enough to keep the image and legend readable.
+const MARKS_MAX: usize = 40;
+/// Nodes the marks' tree read looks through at most.
+const MARKS_SEEN: usize = 4000;
+/// Interactive elements whose boxes are read at most (one call each).
+const MARKS_BOXES: usize = 300;
+/// Characters of an element's name the marks' legend shows.
+const MARKS_NAME_CHARS: usize = 40;
+
+/// An element `screenshot(marks=true)` may mark: what it is, its app (lower
+/// case) and its screen box.
+struct MarkCandidate<Id> {
+    id: Id,
+    info: Info<Id>,
+    app: String,
+    area: (f64, f64, f64, f64),
+}
+
+/// One entry of the marks' legend: `[id] role 'name'`.
+fn mark_legend<Id>(rid: u64, info: &Info<Id>) -> String {
+    let name = info.name.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut short: String = name.chars().take(MARKS_NAME_CHARS).collect();
+    if short.len() < name.len() {
+        short.push('…');
+    }
+    match short.is_empty() {
+        true => format!("[{rid}] {}", info.role),
+        false => format!("[{rid}] {} {}", info.role, render::py_repr(&short)),
+    }
+}
 
 /// Characters `get_text` returns unless `limit` says otherwise. A whole
 /// web page read 20,000 (5,000 tokens, re-read on every later turn) where
@@ -1883,6 +1959,8 @@ impl<B: Backend> Server<B> {
             seen_surfaces: Mutex::new(Vec::new()),
             shown_pending: Mutex::new(None),
             last_shot: Mutex::new(None),
+            shot_behind: Mutex::new(None),
+            shot_window: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
             held: std::sync::Mutex::new(Vec::new()),
@@ -2823,27 +2901,39 @@ impl<B: Backend> Server<B> {
     fn read_start(&self) -> Option<ReadStart> {
         let mark = self.b.read_mark()?;
         let r = self.reads();
+        let at = Instant::now();
         (r.inputs == 0).then(|| ReadStart {
             mark,
             generation: r.generation,
-            at: Instant::now(),
+            at,
+            until: r.input_end.map(|e| e + INPUT_TAIL).filter(|u| *u > at),
         })
     }
 
     /// Whether a read of `windows` that began at `start` still shows them
     /// as they are: no input of ours since, the app provably sent no change
-    /// (`Backend::unchanged_since`), the user did not use the keyboard or
-    /// mouse (scrolling shows other elements without an event), and it is
-    /// younger than READ_MAX_AGE.
+    /// (`Backend::unchanged_since`), the user used no key, button or wheel
+    /// (scrolling shows other elements without an event; plain pointer
+    /// motion does not count), and it is younger than `read_max_age`.
     fn read_current(&self, r: &Reads<B::Id>, windows: &[B::Id], start: &ReadStart) -> bool {
         r.inputs == 0
             && r.generation == start.generation
-            && start.at.elapsed() < READ_MAX_AGE
+            && start.at.elapsed() < self.read_max_age(windows)
+            && start.until.is_none_or(|u| Instant::now() < u)
             && self.b.unchanged_since(windows, start.mark)
             && !self
                 .takeover
                 .as_ref()
-                .is_some_and(|t| t.user_input_since(start.at))
+                .is_some_and(|t| t.view_input_since(start.at))
+    }
+
+    /// How long a read of `windows` is reused at most.
+    fn read_max_age(&self, windows: &[B::Id]) -> Duration {
+        let watched = self.takeover.as_ref().is_some_and(|t| t.watches_view());
+        match watched && self.b.heard_changes(windows) {
+            true => READ_MAX_AGE_HEARD,
+            false => READ_MAX_AGE,
+        }
     }
 
     /// The kept read of `app`'s `windows` fetched as `key`, while it is
@@ -2865,7 +2955,9 @@ impl<B: Backend> Server<B> {
                 "windows differ"
             } else if r.inputs > 0 || r.generation != k.start.generation {
                 "input since"
-            } else if k.start.at.elapsed() >= READ_MAX_AGE {
+            } else if k.start.at.elapsed() >= self.read_max_age(windows)
+                || k.start.until.is_some_and(|u| Instant::now() >= u)
+            {
                 "too old"
             } else if !self.b.unchanged_since(windows, k.start.mark) {
                 "app changed"
@@ -4132,7 +4224,7 @@ impl<B: Backend> Server<B> {
                     Err(e) => text.push_str(&format!("\nobserve tree failed: {e}")),
                 }
             }
-            Observe::Screenshot => match self.screenshot(&json!({})).await {
+            Observe::Screenshot => match self.screenshot(&json!({}), None).await {
                 Ok(o) => {
                     text.push_str(&format!("\n{}", o.text));
                     images = o.images;
@@ -4198,6 +4290,14 @@ impl<B: Backend> Server<B> {
         for line in lines {
             out.push(match line {
                 Line::Raw(s) => Printed::Raw(s),
+                Line::Chrome { depth, bars } => {
+                    let mut named = Vec::with_capacity(bars.len());
+                    for (id, counts) in &bars {
+                        let rid = self.add_ref(id, &cache[id], app).await;
+                        named.push((rid, &cache[id], counts.as_str()));
+                    }
+                    Printed::Raw(render::chrome_line(depth, &named))
+                }
                 Line::Node { depth, id } => {
                     let rid = self.add_ref(&id, &cache[&id], app).await;
                     Printed::Node {
@@ -4716,7 +4816,7 @@ impl<B: Backend> Server<B> {
             ));
             return Ok(Out::from(text));
         }
-        match self.screenshot(&json!({})).await {
+        match self.screenshot(&json!({}), None).await {
             Ok(shot) => Ok(Out {
                 text: format!("{text}\nscreenshot: {}", shot.text),
                 images: shot.images,
@@ -6602,7 +6702,9 @@ impl<B: Backend> Server<B> {
     /// Wait until `app` stopped changing for `quiet_ms`: no accessibility
     /// change events from it (children added or removed, names, text), or,
     /// where the backend hears none, the same fingerprint of its visible
-    /// tree.
+    /// tree. A page that never stops sending events (a clock, a video, a
+    /// live region) counts as settled once nothing loads and its own
+    /// content holds still (`steady_idle`).
     async fn wait_idle(&self, a: &Json) -> R<String> {
         let app = req_s(a, "app")?;
         let quiet = Duration::from_millis(arg_i(a, "quiet_ms", 300).clamp(10, MAX_WAIT_MS) as u64);
@@ -6611,12 +6713,16 @@ impl<B: Backend> Server<B> {
         self.b.enable().await;
         let windows = self.app_windows(&app).await?;
         let start = Instant::now();
+        // After this much noise, the content decides instead of the events.
+        let noisy = (quiet * 2).max(IDLE_NOISE);
         let mut since = Instant::now();
         let mut print = None;
         let mut loading = false;
+        let mut load_checked: Option<Instant> = None;
         loop {
             if since.elapsed() >= quiet {
                 loading = self.b.loading(&windows).await;
+                load_checked = Some(Instant::now());
                 if loading {
                     // Quiet only because the page waits for the network.
                     since = Instant::now();
@@ -6642,6 +6748,27 @@ impl<B: Backend> Server<B> {
                     "'{app}' still changing after {ms} ms ({why}){note}"
                 ));
             }
+            if start.elapsed() >= noisy && load_checked.is_none_or(|t| t.elapsed() >= IDLE_POLL) {
+                loading = self.b.loading(&windows).await;
+                load_checked = Some(Instant::now());
+                if !loading {
+                    let content = self.steady_idle(&app, &windows, quiet, start, limit, &note);
+                    let events = self.events_quiet(&windows, quiet, since);
+                    // Whichever comes first: the content holding still, or
+                    // the events stopping after all.
+                    return tokio::select! {
+                        r = content => r,
+                        () = events => {
+                            let ms = start.elapsed().as_millis();
+                            let title = self.app_title(&app).await;
+                            Ok(format!(
+                                "idle after {ms} ms (no change for {} ms){title}{note}",
+                                quiet.as_millis()
+                            ))
+                        }
+                    };
+                }
+            }
             let left = limit
                 .saturating_sub(start.elapsed())
                 .min(quiet.saturating_sub(since.elapsed()));
@@ -6658,6 +6785,129 @@ impl<B: Backend> Server<B> {
                 tokio::time::sleep(left.min(IDLE_POLL)).await;
             }
         }
+    }
+
+    /// Once `windows` sent no change event for `quiet` (the last one at
+    /// `since`) and nothing loads; never where change events are not heard.
+    async fn events_quiet(&self, windows: &[B::Id], quiet: Duration, since: Instant) {
+        if !self.b.changes_live() {
+            return std::future::pending().await;
+        }
+        let (mut since, mut mark) = (since, self.b.change_mark());
+        loop {
+            let left = quiet.saturating_sub(since.elapsed());
+            if self.b.wait_change(windows, mark, left).await || self.b.loading(windows).await {
+                (since, mark) = (Instant::now(), self.b.change_mark());
+                continue;
+            }
+            if since.elapsed() >= quiet {
+                return;
+            }
+        }
+    }
+
+    /// The rest of a `wait_idle` whose app kept changing with nothing
+    /// loading: settled once the content of its active page (else its
+    /// windows), without the browser around it, live regions, media,
+    /// progress and clocks (`render::steady_fingerprint`), reads the same
+    /// for `quiet` and nothing loads.
+    async fn steady_idle(
+        &self,
+        app: &str,
+        windows: &[B::Id],
+        quiet: Duration,
+        start: Instant,
+        limit: Duration,
+        note: &str,
+    ) -> R<String> {
+        let (mut roots, mut page) = self.steady_roots(app, windows).await;
+        let mut print = None;
+        let mut since = Instant::now();
+        let mut loading;
+        loop {
+            let (read, busy) = tokio::join!(self.steady_hash(&roots), self.b.loading(windows));
+            loading = busy;
+            match read {
+                // The page went (another tab, a new document): find it again.
+                None => {
+                    (roots, page) = self.steady_roots(app, windows).await;
+                    print = None;
+                    since = Instant::now();
+                }
+                Some(now) => {
+                    if loading || print.replace(now) != Some(now) {
+                        since = Instant::now();
+                    }
+                }
+            }
+            let ms = start.elapsed().as_millis();
+            if print.is_some() && since.elapsed() >= quiet {
+                let title = self.app_title(app).await;
+                let what = if page { "the page's" } else { "its" };
+                return Ok(format!(
+                    "idle after {ms} ms (change events never stopped; {what} content, \
+                     live regions, media and clocks aside, held still for {} ms){title}{note}",
+                    quiet.as_millis()
+                ));
+            }
+            if start.elapsed() >= limit {
+                let why = if loading {
+                    "a page is still loading".to_string()
+                } else {
+                    format!("its content never held still for {} ms", quiet.as_millis())
+                };
+                return Err(format!(
+                    "'{app}' still changing after {ms} ms ({why}){note}"
+                ));
+            }
+            let left = limit
+                .saturating_sub(start.elapsed())
+                .min(quiet.saturating_sub(since.elapsed()));
+            tokio::time::sleep(left.min(IDLE_POLL)).await;
+        }
+    }
+
+    /// What `steady_idle` reads: the active window's document (true),
+    /// else the app's windows.
+    async fn steady_roots(&self, app: &str, windows: &[B::Id]) -> (Vec<B::Id>, bool) {
+        let mut cache = Cache::new();
+        match self
+            .active_document(app, windows.to_vec(), &mut cache)
+            .await
+        {
+            Ok(doc) => (vec![doc], true),
+            Err(_) => (windows.to_vec(), false),
+        }
+    }
+
+    /// `render::steady_fingerprint` of `roots` read afresh; None when none
+    /// of them shows any more.
+    async fn steady_hash(&self, roots: &[B::Id]) -> Option<u64> {
+        let mut cache = Cache::new();
+        let mut read = roots.to_vec();
+        let hash = loop {
+            // A read that adds nothing (elements gone meanwhile) ends it.
+            let had = cache.len();
+            self.b
+                .prefetch_with(
+                    &mut cache,
+                    read,
+                    &search_fetch(TREE_TEXT_LIMIT, render::FIND_MAX_SEEN),
+                )
+                .await;
+            match render::steady_fingerprint(&cache, roots) {
+                Ok(h) => break h,
+                // Read as far as a page's content is read for a search.
+                Err((h, _)) if cache.len() >= render::FIND_MAX_SEEN || cache.len() == had => {
+                    break h;
+                }
+                Err((_, missing)) => read = missing,
+            }
+        };
+        roots
+            .iter()
+            .any(|r| cache.get(r).is_some_and(|i| i.showing))
+            .then_some(hash)
     }
 
     /// `content_hash` of `windows` read until it differs from `was` or
@@ -6795,8 +7045,7 @@ impl<B: Backend> Server<B> {
             req_i(a, &format!("{end}_y"))?,
         );
         if arg_b(a, "image", false) {
-            let map = (*self.last_shot.lock().await)
-                .ok_or("image=true needs a screenshot taken first")?;
+            let map = self.shot_map("image=true needs").await?;
             return Ok(DragEnd::Point(map.to_screen(x, y)));
         }
         Ok(DragEnd::Point((x, y)))
@@ -7040,8 +7289,7 @@ impl<B: Backend> Server<B> {
     async fn mouse(&self, a: &Json) -> R<String> {
         let (x, y) = match (a.get("image_x"), a.get("image_y")) {
             (Some(_), Some(_)) => {
-                let map = (*self.last_shot.lock().await)
-                    .ok_or("image_x/image_y need a screenshot taken first")?;
+                let map = self.shot_map("image_x/image_y need").await?;
                 map.to_screen(req_i(a, "image_x")?, req_i(a, "image_y")?)
             }
             _ => (req_i(a, "x")?, req_i(a, "y")?),
@@ -7053,14 +7301,62 @@ impl<B: Backend> Server<B> {
             self.check_button_free(&button)?;
         }
         let app = self.require_input_front().await?;
-        self.guard_point(x, y).await?;
+        // The element under the pointer, read before the input changes
+        // the page: the reply names it, and a left click on something one
+        // clicks (a link, a button, or inside one) waits for the page as a
+        // click by id does; one on text, a double or triple click does not.
+        let waits = button == "left" && clicks == 1 && mods.is_empty();
+        let hit = async {
+            let hit = trace::time("element_at", self.b.element_at(x, y)).await;
+            let role = match &hit {
+                Some(h) if waits => self.clicked_role(&h.id, &h.info.role).await,
+                _ => None,
+            };
+            hit.map(|h| (h, role))
+        };
+        let (guard, hit) = tokio::join!(self.guard_point(x, y), hit);
+        guard?;
+        let hit = hit.filter(|(h, _)| self.is_allowed(&h.app));
+        let pre = self.pre_content(hit.as_ref().map(|(h, _)| &h.id));
         self.with_modifiers(
             &mods,
             self.b.pointer(x, y, &button, clicks, arg_i(a, "scroll", 0)),
         )
         .await?;
+        let on = match hit {
+            Some((Focused { id, info, app: of }, role)) => {
+                if let Some(role) = role {
+                    self.note_content(pre, &id, &role, false).await;
+                }
+                let rid = self.add_ref(&id, &info, &of.to_lowercase()).await;
+                note_step_element(rid, false);
+                let at = if clicks > 0 { "on" } else { "over" };
+                format!(" {at} {}", render::describe(&info, rid))
+            }
+            None => String::new(),
+        };
         let m = with_modifiers_note(&mods);
-        Ok(format!("pointer at ({x},{y}) in {app}{m}"))
+        Ok(format!("pointer at ({x},{y}) in {app}{on}{m}"))
+    }
+
+    /// The role of what a click on `id` (of role `role`) operates: it, or
+    /// the nearest of a few ancestors one clicks (a link around a heading);
+    /// None for text, images and other parts of a page.
+    async fn clicked_role(&self, id: &B::Id, role: &str) -> Option<String> {
+        let (mut cur, mut role) = (id.clone(), role.to_string());
+        for _ in 0..CLICK_ANCESTORS {
+            if render::INTERACTIVE_ROLES.contains(&role.as_str()) {
+                return Some(role);
+            }
+            if render::DOCUMENT_ROLES.contains(&role.as_str())
+                || matches!(role.as_str(), "frame" | "window")
+            {
+                return None;
+            }
+            cur = self.b.parent(&cur).await?;
+            role = self.b.identity(&cur).await.0;
+        }
+        None
     }
 
     /// Press (`down`, the default) or release a key, chord or mouse button
@@ -7457,11 +7753,206 @@ impl<B: Backend> Server<B> {
         ))
     }
 
-    /// Capture the active window. With `region` (pixels of the last
-    /// screenshot): capture again and keep only that part, at up to full
-    /// resolution, mapped so image_x/image_y refer to the zoomed image.
-    async fn screenshot(&self, a: &Json) -> R<Out> {
+    /// The window a screenshot's `window` names, to capture without
+    /// activating it, and whether it is the active one (see
+    /// `Backend::background_target`); None: activate it first.
+    async fn background_shot(&self, query: &str) -> Option<(backend::ShotTarget, bool)> {
+        if terminal_query(query).is_some() {
+            return None;
+        }
+        let query = self.prefer_other(query).await;
+        let allowed = self.allowed();
+        let found = self.b.background_target(&query, &allowed);
+        match trace::time("background_target", found).await {
+            Ok(t) => t,
+            Err(e) => {
+                trace::note(&format!("no background capture: {e}"));
+                None
+            }
+        }
+    }
+
+    /// The map of the last screenshot's pixels, for `need` ("image_x/image_y
+    /// need"). One of a window captured in the background only while that
+    /// window is in front: its pixels would land on whatever covers it.
+    async fn shot_map(&self, need: &str) -> R<ShotMap> {
+        let map =
+            (*self.last_shot.lock().await).ok_or(format!("{need} a screenshot taken first"))?;
+        let behind = self.shot_behind.lock().await.clone();
+        if let Some((handle, caption)) = behind {
+            let front = self.b.shot_target().await.ok().map(|t| t.handle);
+            if front.as_deref() != Some(handle.as_str()) {
+                return Err(delivery::nothing_sent(format!(
+                    "the last screenshot was of {} in the background; pass window=… to \
+                     bring it to the front first",
+                    render::short_title(&caption)
+                )));
+            }
+        }
+        Ok(map)
+    }
+
+    /// Whether the capture `target` (`front`: of the window in front)
+    /// shows the window `frame` of `app`, the one an element is in (None:
+    /// not known; then only a capture in front of its app does).
+    async fn shows_window(
+        &self,
+        target: &backend::ShotTarget,
+        front: bool,
+        app: &str,
+        frame: Option<&B::Id>,
+    ) -> bool {
+        if !self.shot_app(target).eq_ignore_ascii_case(app) {
+            return false;
+        }
+        let Some(frame) = frame else {
+            return front;
+        };
+        let Some(windows) = self.b.app_windows(&app.to_lowercase()).await else {
+            return false;
+        };
+        let infos = futures_util::future::join_all(windows.iter().map(|w| self.b.info(w, 0))).await;
+        let shown: Vec<(&B::Id, &Info<B::Id>)> = windows
+            .iter()
+            .zip(infos.iter())
+            .filter(|(_, i)| i.showing)
+            .collect();
+        render::pick_window(&shown, &target.caption, front).as_ref() == Some(frame)
+    }
+
+    /// The visible interactive elements of the window `target` names (of
+    /// `app`, allowed; `front`: the window in front), with their screen
+    /// boxes, those of its web page or document first: one tree read, then
+    /// one box read each.
+    async fn mark_candidates(
+        &self,
+        target: &backend::ShotTarget,
+        app: &str,
+        front: bool,
+    ) -> R<Vec<MarkCandidate<B::Id>>> {
+        self.b.enable().await;
+        let app = app.to_lowercase();
+        let windows = self.app_windows(&app).await?;
+        let fetch = |limit| Fetch {
+            only_showing: true,
+            text_limit: TREE_TEXT_LIMIT,
+            limit,
+            actions: true,
+            stop_roles: &[],
+            offscreen: false,
+        };
+        let (found, cache, _) = self
+            .read_app(
+                Some(&app),
+                &windows,
+                Cache::new(),
+                fetch(1000),
+                fetch(PREFETCH_MORE),
+                |c| match render::window_titled(c, &windows, &target.caption, front) {
+                    Some(w) => render::mark_candidates(c, &w, MARKS_SEEN).map(Some),
+                    None => Ok(None),
+                },
+            )
+            .await;
+        let mut found = found.ok_or_else(|| {
+            format!(
+                "no single window of '{app}' titled {} in the accessibility tree",
+                render::py_repr(&render::short_title(&target.caption))
+            )
+        })?;
+        // Stable: document order within each part.
+        found.sort_by_key(|(_, in_doc)| !in_doc);
+        found.truncate(MARKS_BOXES);
+        let ids: Vec<B::Id> = found.into_iter().map(|(id, _)| id).collect();
+        let boxes = trace::time("element_boxes", self.b.element_boxes(target, &ids)).await;
+        Ok(ids
+            .into_iter()
+            .zip(boxes)
+            .filter_map(|(id, area)| {
+                let area = area.filter(|b| b.2 >= 2.0 && b.3 >= 2.0)?;
+                let mut info = cache.get(&id)?.clone();
+                info.children.clear();
+                Some(MarkCandidate {
+                    id,
+                    info,
+                    app: app.clone(),
+                    area,
+                })
+            })
+            .collect())
+    }
+
+    /// The marks to draw on a capture of screen area `area` whose part
+    /// `kept` is sent, from `found` (`mark_candidates`), their ids
+    /// registered; and the reply's line about them.
+    async fn choose_marks(
+        &self,
+        found: R<Vec<MarkCandidate<B::Id>>>,
+        area: Option<(f64, f64, f64, f64)>,
+        kept: shot::Frac,
+    ) -> (Vec<shot::Mark>, String) {
+        let found = match (found, area) {
+            (Err(e), _) => return (Vec::new(), format!("no marks: {e}")),
+            (Ok(_), None) => {
+                return (
+                    Vec::new(),
+                    "no marks: the screen area of the capture is unknown here".into(),
+                );
+            }
+            (Ok(f), Some((ax, ay, aw, ah))) => f
+                .into_iter()
+                .map(|c| {
+                    let (x, y, w, h) = c.area;
+                    let rect = shot::Frac {
+                        x: (x - ax) / aw,
+                        y: (y - ay) / ah,
+                        w: w / aw,
+                        h: h / ah,
+                    };
+                    (c, rect)
+                })
+                .collect::<Vec<_>>(),
+        };
+        let rects: Vec<shot::Frac> = found.iter().map(|(_, r)| *r).collect();
+        let picked = shot::choose_marks(&rects, kept, MARKS_MAX);
+        if picked.is_empty() {
+            let line = "no marks: no interactive element with a known box in view";
+            return (Vec::new(), line.into());
+        }
+        let mut marks = Vec::with_capacity(picked.len());
+        let mut legend = Vec::with_capacity(picked.len());
+        for i in picked {
+            let (c, rect) = &found[i];
+            let rid = self.add_ref(&c.id, &c.info, &c.app).await;
+            marks.push(shot::Mark {
+                id: rid,
+                rect: *rect,
+            });
+            legend.push(mark_legend(rid, &c.info));
+        }
+        (marks, format!("marks: {}", legend.join(", ")))
+    }
+
+    /// Capture the active window, or `background` (from `background_shot`)
+    /// where it is. With `region` (pixels of the last screenshot): capture
+    /// again and keep only that part, at up to full resolution, mapped so
+    /// image_x/image_y refer to the zoomed image.
+    async fn screenshot(
+        &self,
+        a: &Json,
+        background: Option<(backend::ShotTarget, bool)>,
+    ) -> R<Out> {
         let region = region_arg(a)?;
+        let rid = match a.get("id") {
+            None | Some(Json::Null) => None,
+            Some(v) => Some(
+                v.as_i64()
+                    .ok_or("id must be an element id from tree/find")?,
+            ),
+        };
+        if rid.is_some() && region.is_some() {
+            return Err("pass `region` or `id`, not both".into());
+        }
         // A path to save at is checked before anything is captured.
         let save_to = match a.get("save_to").and_then(Json::as_str) {
             Some(raw) => {
@@ -7474,46 +7965,186 @@ impl<B: Backend> Server<B> {
         };
         // The window captured is the one checked: read once, its app by
         // its process.
-        let target = trace::time("shot_target", self.b.shot_target())
-            .await
-            .map_err(|e| format!("screenshot failed: {e}"))?;
-        let app = self.shot_app(&target);
-        if !self.is_allowed(&app) {
-            return Err(self.active_refusal(&target.app, Some(&target)).await);
-        }
-        self.permit(&app).await?;
-        // The zoom's screen area, from the map of the image it was read in.
+        let named = background.is_some();
+        let (mut target, mut behind) = match background {
+            Some((t, active)) => (t, !active),
+            None => (
+                trace::time("shot_target", self.b.shot_target())
+                    .await
+                    .map_err(|e| format!("screenshot failed: {e}"))?,
+                false,
+            ),
+        };
+        // `id`: the element's window, captured where it is when it is
+        // not the one in front (KDE) and no `window` named another.
+        let element = match rid {
+            Some(rid) => {
+                let r = self.resolve_ref(rid).await?;
+                // Its window by the element's own frame, not by a title
+                // another window may share.
+                let (frame, title) = match self.b.window_of(&r.id).await {
+                    Some((f, t)) => (Some(f), t),
+                    None => (None, String::new()),
+                };
+                if !self
+                    .shows_window(&target, !behind, &r.app, frame.as_ref())
+                    .await
+                {
+                    let found = match (named, title.is_empty()) {
+                        (false, false) => self.background_shot(&title).await,
+                        _ => None,
+                    };
+                    let mut shown = None;
+                    if let Some((t, active)) = found
+                        && self.shows_window(&t, active, &r.app, frame.as_ref()).await
+                    {
+                        shown = Some((t, !active));
+                    }
+                    let Some(shown) = shown else {
+                        let how = match named {
+                            true => "",
+                            false => "; pass window=… to bring it to the front",
+                        };
+                        let title = render::short_title(&title);
+                        let caption = render::short_title(&target.caption);
+                        return Err(match title == caption {
+                            true => format!(
+                                "id {rid} is in another window titled {title}, not in the \
+                                 one captured; bring it to the front (act on it) first"
+                            ),
+                            false => {
+                                format!("id {rid} is in window {title}, not in {caption}{how}")
+                            }
+                        });
+                    };
+                    (target, behind) = shown;
+                }
+                Some((rid, r.id))
+            }
+            None => None,
+        };
+        // The zoom's screen area, from the map of the image it was read
+        // in: of the window that image showed, captured again where it is
+        // when another one is in front now.
         let zoom = match region {
             Some(r) => {
                 let map = (*self.last_shot.lock().await)
                     .ok_or("region needs a screenshot taken first (its pixels)")?;
+                let shown = self.shot_window.lock().await.clone();
+                if let Some((handle, caption)) =
+                    shown.filter(|(h, _)| !h.is_empty() && *h != target.handle)
+                {
+                    let again = match named {
+                        true => None,
+                        false => self.background_shot(&caption).await,
+                    };
+                    let Some((t, active)) = again.filter(|(t, _)| t.handle == handle) else {
+                        return Err(format!(
+                            "region is of the screenshot of {}, not of {}; take a new \
+                             screenshot",
+                            render::short_title(&caption),
+                            render::short_title(&target.caption)
+                        ));
+                    };
+                    (target, behind) = (t, !active);
+                }
                 Some((r, map.area_of(r)))
             }
             None => None,
         };
+        let app = self.shot_app(&target);
+        if !self.is_allowed(&app) {
+            if behind {
+                return Err(refusal(format!(
+                    "window {} of app '{}' is not in {}",
+                    target.describe(),
+                    target.app,
+                    self.allow_file.display()
+                )));
+            }
+            return Err(self.active_refusal(&target.app, Some(&target)).await);
+        }
+        self.permit(&app).await?;
         *self.last_shot.lock().await = None;
-        let Shot { path, pixels, area } = trace::time("capture", self.b.screenshot(&target))
-            .await
-            .map_err(|e| format!("screenshot failed: {e}"))?;
-        let frac = match (zoom, area) {
-            (None, _) => shot::Frac::ALL,
-            (Some((_, want)), Some(area)) => region_frac(area, want).ok_or_else(|| {
+        *self.shot_window.lock().await = None;
+        *self.shot_behind.lock().await =
+            behind.then(|| (target.handle.clone(), target.caption.clone()));
+        // The marks' tree read runs while the window is captured.
+        // So does the element's box read.
+        let capture = trace::time("capture", self.b.screenshot(&target));
+        let boxed = async {
+            match &element {
+                Some((_, id)) => {
+                    let ids = std::slice::from_ref(id);
+                    trace::time("element_boxes", self.b.element_boxes(&target, ids))
+                        .await
+                        .pop()
+                        .flatten()
+                }
+                None => None,
+            }
+        };
+        let (shot, found, boxed) = if arg_b(a, "marks", false) {
+            let marks = trace::time(
+                "mark_candidates",
+                self.mark_candidates(&target, &app, !behind),
+            );
+            let (shot, found, boxed) = tokio::join!(capture, marks, boxed);
+            (shot, Some(found), boxed)
+        } else {
+            let (shot, boxed) = tokio::join!(capture, boxed);
+            (shot, None, boxed)
+        };
+        let Shot { path, pixels, area } = shot.map_err(|e| format!("screenshot failed: {e}"))?;
+        let erid = element.as_ref().map(|(rid, _)| *rid);
+        let frac = match (zoom, erid, area) {
+            (None, Some(rid), Some(area)) => {
+                let shown = boxed.and_then(|b| region_frac(area, around(b)));
+                shown.ok_or_else(|| {
+                    let _ = std::fs::remove_file(&path);
+                    match boxed {
+                        None => format!("id {rid}: its screen box is unknown here"),
+                        Some(_) => format!(
+                            "id {rid} is outside the window's visible area; \
+                             act scroll_to brings it into view"
+                        ),
+                    }
+                })?
+            }
+            (None, Some(rid), None) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!(
+                    "id {rid}: the screen area of the capture is unknown here"
+                ));
+            }
+            (None, None, _) => shot::Frac::ALL,
+            (Some((_, want)), _, Some(area)) => region_frac(area, want).ok_or_else(|| {
                 let _ = std::fs::remove_file(&path);
                 "region is outside the active window now; take a new screenshot".to_string()
             })?,
-            (Some(_), None) => {
+            (Some(_), _, None) => {
                 let _ = std::fs::remove_file(&path);
                 return Err("region: the screen area of the capture is unknown here".into());
             }
         };
-        let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, 8192) as u32;
+        // Claude refuses larger images (shot::MAX_PIXELS is kept too).
+        let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, i64::from(shot::MAX_SIDE)) as u32;
         let inline = arg_b(a, "inline", true) && save_to.is_none();
+        let (marks, marks_line) = match found {
+            Some(found) => {
+                let (m, line) = self.choose_marks(found, area, frac).await;
+                (m, Some(line))
+            }
+            None => (Vec::new(), None),
+        };
         // Converting, shrinking and encoding take milliseconds: keep other
         // calls moving.
         let file = path.clone();
         let done = trace::time(
             "convert+encode",
-            tokio::task::spawn_blocking(move || shot::finish(&file, pixels, max, frac, inline)),
+            tokio::task::spawn_blocking(move || {
+                shot::finish(&file, pixels, max, frac, inline, &marks)
+            }),
         )
         .await
         .map_err(|e| e.to_string())??;
@@ -7524,6 +8155,7 @@ impl<B: Backend> Server<B> {
         });
         let map = area.and_then(|a| ShotMap::new(done.size, a));
         *self.last_shot.lock().await = map;
+        *self.shot_window.lock().await = Some((target.handle.clone(), target.caption.clone()));
         let (iw, ih) = done.size;
         // The image inline is all the agent sees (it is told not to read
         // the file): no path to read, no file left behind. Only
@@ -7555,11 +8187,27 @@ impl<B: Backend> Server<B> {
                 r(h)
             ));
         }
+        if behind {
+            text.push_str(&format!(
+                "; captured in background: {} is not in front",
+                render::short_title(&target.caption)
+            ));
+        }
         if let Some(((x, y, w, h), _)) = zoom {
             text.push_str(&format!(
                 " (zoom of region [{x}, {y}, {w}, {h}] of the previous screenshot; \
                  image_x/image_y now refer to this image)"
             ));
+        }
+        if let Some(rid) = erid {
+            text.push_str(&format!(
+                " (element {rid} and {SHOT_ID_MARGIN} px around it; image_x/image_y refer to \
+                 this image)"
+            ));
+        }
+        if let Some(line) = marks_line {
+            text.push('\n');
+            text.push_str(&line);
         }
         Ok(Out {
             text,
@@ -7909,7 +8557,28 @@ impl<B: Backend> Server<B> {
 
     /// `call_inner`'s work, inside its GATE scope.
     async fn call_body(&self, name: &str, a: &Json, held: bool, settle: bool) -> R<Out> {
+        match self.call_body_once(name, a, held, settle).await {
+            // An older KWin refused a capture where the window is, and is
+            // no longer asked: the window is brought forward and captured
+            // in the same call.
+            Err(e) if name == "screenshot" && e.contains(backend::SHOT_REFUSED_BEHIND) => {
+                self.call_body_once(name, a, held, settle).await
+            }
+            r => r,
+        }
+    }
+
+    async fn call_body_once(&self, name: &str, a: &Json, held: bool, settle: bool) -> R<Out> {
         let window = window_arg(name, a)?;
+        // A screenshot captures its window where it is when the backend
+        // can (KDE): nothing is activated, so no input either.
+        let (window, background) = match window {
+            Some(q) if name == "screenshot" => match self.background_shot(&q).await {
+                Some(t) => (None, Some(t)),
+                None => (Some(q), None),
+            },
+            w => (w, None),
+        };
         // A screenshot whose window is in front already sends no input:
         // it neither waits for the user's input to stop nor counts as a
         // run's input (a batch's last look after its input went through),
@@ -8049,7 +8718,7 @@ impl<B: Backend> Server<B> {
             "cursor_position" => self.cursor_position().await.map(Out::from),
             "activate_window" => self.activate_window(a).await.map(Out::from),
             "file_dialog" => self.file_dialog(a).await.map(Out::from),
-            "screenshot" => self.screenshot(a).await,
+            "screenshot" => self.screenshot(a, background).await,
             "batch" => self.batch(a).await,
             _ => Err(format!("Unknown tool: {name}")),
         };
@@ -8735,6 +9404,8 @@ mod tests {
     /// timeout; key presses and actions are logged.
     /// A window's x, y, width and height.
     type Frame = (f64, f64, f64, f64);
+    /// A screen point, the element `element_at` finds there and its app.
+    type FakePoint = ((i64, i64), u32, &'static str);
 
     struct FakeBackend {
         allow_file: PathBuf,
@@ -8827,6 +9498,10 @@ mod tests {
         /// `select_item` adds to the selection, as AT-SPI's SelectChild
         /// does in a multi-selection list that is not cleared first.
         adds: std::cell::Cell<bool>,
+        /// `element_at`: the element at each point, and its app.
+        points: RefCell<Vec<FakePoint>>,
+        /// `element_boxes`: each element's screen box.
+        boxes: RefCell<HashMap<u32, Frame>>,
         /// The user types once this many more key presses went out.
         user_after_presses: std::cell::Cell<Option<usize>>,
         /// `labels` per element.
@@ -8944,6 +9619,13 @@ mod tests {
         flyouts: RefCell<HashMap<u32, u32>>,
         /// `screenshot` fails with this cause.
         shot_error: RefCell<Option<String>>,
+        /// Screenshots capture a window where it is (as on KDE):
+        /// `background_target` finds any window, allowed or not, so the
+        /// server's own check shows.
+        background_shots: std::cell::Cell<bool>,
+        /// As an older KWin: the first capture of a window not in front is
+        /// refused, and windows are no longer captured where they are.
+        refuse_behind: std::cell::Cell<bool>,
     }
 
     /// Where the fake shows a flyout (`FakeShown::flyouts`).
@@ -8968,6 +9650,8 @@ mod tests {
     struct FakeReads {
         /// Change events are listened to and the app sends them.
         live: std::cell::Cell<bool>,
+        /// The app was heard sending change events (`heard_changes`).
+        heard: std::cell::Cell<bool>,
         /// Bumped by a test for each change the app reports.
         changes: std::cell::Cell<u64>,
         /// A document of the app is loading.
@@ -8996,6 +9680,8 @@ mod tests {
         /// The app changes on each read of an element's actions, as a live
         /// page does between an input call's start and its input.
         noise: std::cell::Cell<bool>,
+        /// Each `prefetch` takes this many ms (a large page).
+        read_ms: std::cell::Cell<u64>,
     }
 
     /// Windows on the fake desktop: (app, title).
@@ -9267,6 +9953,9 @@ mod tests {
         fn unchanged_since(&self, _: &[u32], mark: u64) -> bool {
             self.reads.live.get() && self.reads.changes.get() == mark
         }
+        fn heard_changes(&self, _: &[u32]) -> bool {
+            self.reads.heard.get()
+        }
         async fn page(&self, doc: &u32) -> Option<backend::Page> {
             let info = self.info(doc, 0).await;
             (info.showing && render::DOCUMENT_ROLES.contains(&info.role.as_str()))
@@ -9279,6 +9968,17 @@ mod tests {
         async fn still_there(&self, _: &u32) -> bool {
             self.reads.checks.set(self.reads.checks.get() + 1);
             !self.reads.gone.get()
+        }
+        async fn element_at(&self, x: i64, y: i64) -> Option<Focused<u32>> {
+            let points = self.sem.points.borrow().clone();
+            let (_, id, app) = points.into_iter().find(|(p, ..)| *p == (x, y))?;
+            let mut info = self.info(&id, 0).await;
+            info.children.clear();
+            Some(Focused {
+                id,
+                info,
+                app: app.into(),
+            })
         }
         async fn focused(&self) -> Option<Focused<u32>> {
             Some(Focused {
@@ -9296,6 +9996,10 @@ mod tests {
             _: usize,
         ) {
             self.reads.prefetches.set(self.reads.prefetches.get() + 1);
+            let ms = self.reads.read_ms.get();
+            if ms > 0 {
+                tokio::time::sleep(Duration::from_millis(ms)).await;
+            }
             for id in roots {
                 let info = self.info(&id, 0).await;
                 cache.insert(id, info);
@@ -9495,6 +10199,10 @@ mod tests {
                 return Err(backend::NOT_ACTIVE.into());
             }
             Ok((0, 0))
+        }
+        async fn element_boxes(&self, _: &backend::ShotTarget, ids: &[u32]) -> Vec<Option<Frame>> {
+            let boxes = self.sem.boxes.borrow();
+            ids.iter().map(|id| boxes.get(id).copied()).collect()
         }
         async fn has_area(&self, ids: &[u32]) -> Vec<Option<bool>> {
             let no_area = self.no_area.borrow();
@@ -9728,15 +10436,49 @@ mod tests {
                 class,
                 caption: title.clone(),
                 area: Some((10.0, 20.0, 400.0, 200.0)),
+                client: Some((10.0, 40.0)),
                 handle: title,
             })
+        }
+        async fn background_target(
+            &self,
+            query: &str,
+            _allowed: &[String],
+        ) -> R<Option<(backend::ShotTarget, bool)>> {
+            if !self.shown.background_shots.get() {
+                return Ok(None);
+            }
+            let q = query.to_lowercase();
+            let found = FAKE_WINDOWS
+                .into_iter()
+                .find(|(app, title)| title.to_lowercase().contains(&q) || app.contains(&q));
+            Ok(found.map(|(app, title)| {
+                let target = backend::ShotTarget {
+                    app: app.into(),
+                    by_class: false,
+                    class: app.into(),
+                    caption: title.into(),
+                    area: Some((10.0, 20.0, 400.0, 200.0)),
+                    client: Some((10.0, 40.0)),
+                    handle: title.into(),
+                };
+                (target, self.active.borrow().1 == title)
+            }))
         }
         async fn screenshot(&self, target: &backend::ShotTarget) -> R<Shot> {
             if let Some(e) = self.shown.shot_error.borrow().clone() {
                 return Err(e);
             }
-            // The capture is of the window checked, or fails.
-            if self.active.borrow().1 != target.handle {
+            if self.shown.refuse_behind.get() && self.active.borrow().1 != target.handle {
+                self.shown.refuse_behind.set(false);
+                self.shown.background_shots.set(false);
+                return Err(format!("{} it where it is", backend::SHOT_REFUSED_BEHIND));
+            }
+            // The capture is of the window checked, or fails; where
+            // windows are captured where they are, of any window.
+            let known = self.shown.background_shots.get()
+                && FAKE_WINDOWS.iter().any(|(_, t)| *t == target.handle);
+            if self.active.borrow().1 != target.handle && !known {
                 return Err("the active window changed".into());
             }
             // A 200x100 image of a 400x200 area at (10, 20): 2x scaling.
@@ -10161,6 +10903,134 @@ mod tests {
             assert!(reply_text(&r).contains("still changing after "), "{r}");
             let r = call_tool(&mut s, 4, "wait_idle", json!({"app": "konsole"})).await;
             assert!(reply_text(&r).contains("is not in"), "{r}");
+        });
+    }
+
+    /// A fake browser window: tool bar 94 around page 90, which holds
+    /// heading 91, clock 92 and live log 93. Returns a task that sends a
+    /// change event every 20 ms and on each ticks the clock, renames the
+    /// tool bar, adds to the log and, with `restless_heading`, renames the
+    /// heading too.
+    fn noisy_page(s: &Session, restless_heading: bool) -> tokio::task::JoinHandle<()> {
+        fake_page(s);
+        s.focus.borrow_mut().children = vec![94, 90];
+        {
+            let mut n = s.nodes.borrow_mut();
+            n.insert(94, fake_node("tool bar", "Navigation", &[]));
+            n.insert(90, fake_node("document web", "News", &[91, 92, 93]));
+            n.insert(91, fake_node("heading", "Top", &[]));
+            n.insert(92, fake_node("label", "12:00:00", &[]));
+            n.insert(93, fake_node("log", "Chat", &[]));
+        }
+        let (nodes, shown) = (s.nodes.clone(), s.shown.clone());
+        tokio::task::spawn_local(async move {
+            for k in 0..=u32::MAX {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                {
+                    let mut n = nodes.borrow_mut();
+                    n.get_mut(&92).unwrap().name = format!("12:00:{k:02}");
+                    n.get_mut(&94).unwrap().name = ["Stop", "Reload"][k as usize % 2].into();
+                    let id = 1000 + k;
+                    n.insert(id, fake_node("paragraph", &format!("line {k}"), &[]));
+                    n.get_mut(&93).unwrap().children.push(id);
+                    if restless_heading {
+                        n.get_mut(&91).unwrap().name =
+                            format!("Top {}", char::from(b'a' + (k % 26) as u8));
+                    }
+                }
+                shown.seq.set(shown.seq.get() + 1);
+            }
+        })
+    }
+
+    #[test]
+    fn wait_idle_settles_on_a_page_that_never_stops_sending_events() {
+        local(async {
+            let mut s = session("wait-idle-steady");
+            let noise = noisy_page(&s, false);
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 100, "timeout_ms": 6000}),
+            )
+            .await;
+            let took = start.elapsed();
+            noise.abort();
+            let text = reply_text(&r);
+            assert!(text.starts_with("idle after "), "{r}");
+            assert!(
+                text.contains("(change events never stopped; the page's content")
+                    && text.contains("held still for 100 ms"),
+                "{text}"
+            );
+            // Events counted for 2 s first, then a few content reads.
+            assert!(took >= Duration::from_secs(2), "{took:?}");
+            assert!(took < Duration::from_millis(3500), "{took:?}");
+        });
+    }
+
+    #[test]
+    fn wait_idle_still_ends_when_events_stop_while_it_reads_the_content() {
+        local(async {
+            let mut s = session("wait-idle-late-quiet");
+            let noise = noisy_page(&s, true);
+            // A large page: each read takes 400 ms. Its events stop at
+            // 2.3 s, after the content reads began.
+            s.reads.read_ms.set(400);
+            let stop = tokio::task::spawn_local(async move {
+                tokio::time::sleep(Duration::from_millis(2300)).await;
+                noise.abort();
+            });
+            let start = Instant::now();
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 100, "timeout_ms": 6000}),
+            )
+            .await;
+            let took = start.elapsed();
+            stop.await.unwrap();
+            let text = reply_text(&r);
+            assert!(text.contains("(no change for 100 ms)"), "{r}");
+            assert!(took < Duration::from_millis(2900), "{took:?}");
+        });
+    }
+
+    #[test]
+    fn wait_idle_still_fails_while_the_page_itself_changes_or_loads() {
+        local(async {
+            let mut s = session("wait-idle-restless");
+            let noise = noisy_page(&s, true);
+            let r = call_tool(
+                &mut s,
+                2,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 100, "timeout_ms": 2600}),
+            )
+            .await;
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            assert!(
+                reply_text(&r).contains("still changing after ")
+                    && reply_text(&r).contains("(its content never held still for 100 ms)"),
+                "{r}"
+            );
+            noise.abort();
+            // Only a clock ticks, but the page still loads: no content read.
+            let noise = noisy_page(&s, false);
+            s.reads.loading.set(true);
+            let r = call_tool(
+                &mut s,
+                3,
+                "wait_idle",
+                json!({"app": "fake", "quiet_ms": 100, "timeout_ms": 2600}),
+            )
+            .await;
+            noise.abort();
+            assert_eq!(r["result"]["isError"], json!(true), "{r}");
+            assert!(reply_text(&r).contains("(a page is still loading)"), "{r}");
         });
     }
 
@@ -11052,6 +11922,198 @@ mod tests {
             let size = format!("\n{}x{} px", img.width, img.height);
             assert!(reply_text(&r).contains(&size), "{r}");
             std::fs::remove_file(path).unwrap();
+        });
+    }
+
+    #[test]
+    fn a_marked_screenshot_numbers_the_elements_to_act_on_by_id() {
+        local(async {
+            let mut s = session("marks");
+            fake_reads(&s);
+            {
+                let mut n = s.nodes.borrow_mut();
+                let mut label = fake_node("label", "Notes", &[]);
+                label.actions.clear();
+                n.insert(32, label);
+                n.get_mut(&31).unwrap().name =
+                    "Open a file from the disk, any of the recent ones".into();
+            }
+            s.focus.borrow_mut().children.push(32);
+            {
+                // 2 screen px per image pixel: Save's box is image pixels
+                // (20, 20)-(60, 30); Open's (120, 40)-(160, 50).
+                let mut b = s.sem.boxes.borrow_mut();
+                b.insert(30, (50.0, 60.0, 80.0, 20.0));
+                b.insert(31, (250.0, 100.0, 80.0, 20.0));
+                b.insert(32, (50.0, 150.0, 80.0, 20.0));
+            }
+            let r = call_tool(
+                &mut s,
+                2,
+                "screenshot",
+                json!({"marks": true, "inline": false}),
+            )
+            .await;
+            let text = reply_text(&r);
+            let last = text.lines().last().unwrap();
+            assert_eq!(
+                last,
+                "marks: [1] push button 'Save', [2] push button 'Open a file from the disk, \
+                 any of the re…'",
+                "{text}"
+            );
+            // The frames are on the image the reply names.
+            let path = text.lines().next().unwrap();
+            let img = shot::read_png(path).unwrap();
+            let at =
+                |x: usize, y: usize| img.data[(y * 200 + x) * 3..(y * 200 + x) * 3 + 3].to_vec();
+            assert_eq!(at(20, 25), vec![200, 20, 60]);
+            assert_eq!(at(120, 45), vec![0, 100, 190]);
+            assert_eq!(at(40, 25), vec![128; 3]);
+            std::fs::remove_file(path).unwrap();
+            // The ids work as find's do.
+            let r = call_tool(&mut s, 3, "tree", json!({"root_id": 2})).await;
+            assert!(
+                reply_text(&r).starts_with("[2] push button \"Open a file"),
+                "{r}"
+            );
+            // A zoom marks only what it shows.
+            let r = call_tool(
+                &mut s,
+                4,
+                "screenshot",
+                json!({"marks": true, "region": [100, 0, 100, 100]}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.ends_with(
+                    "\nmarks: [2] push button 'Open a file from the disk, any of the re…'"
+                ),
+                "{text}"
+            );
+            // Nothing with a box: said so, the image still sent.
+            s.sem.boxes.borrow_mut().clear();
+            let r = call_tool(&mut s, 5, "screenshot", json!({"marks": true})).await;
+            assert!(
+                reply_text(&r)
+                    .ends_with("\nno marks: no interactive element with a known box in view"),
+                "{r}"
+            );
+            assert_eq!(r["result"]["content"][1]["type"], "image", "{r}");
+            // Without marks: no tree read, no line.
+            let before = prefetches(&s);
+            let r = call_tool(&mut s, 6, "screenshot", json!({})).await;
+            assert!(!reply_text(&r).contains("marks"), "{r}");
+            assert_eq!(prefetches(&s), before);
+        });
+    }
+
+    #[test]
+    fn a_screenshot_of_an_element_is_a_crop_around_its_box() {
+        local(async {
+            let mut s = session("shot-id");
+            fake_reads(&s);
+            s.sem
+                .boxes
+                .borrow_mut()
+                .insert(30, (50.0, 60.0, 80.0, 20.0));
+            // [1] Save, by the marks.
+            let r = call_tool(&mut s, 2, "screenshot", json!({"marks": true})).await;
+            assert!(
+                reply_text(&r).ends_with("marks: [1] push button 'Save'"),
+                "{r}"
+            );
+            // Its box and 12 px around: screen (38, 48), 104x44; the 2x
+            // capture's pixels (14, 14)-(66, 36), at full resolution.
+            let r = call_tool(&mut s, 3, "screenshot", json!({"id": 1})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "52x22 px of screen area at (38,48), 104x44 (element 1 and 12 px around \
+                 it; image_x/image_y refer to this image)"
+            );
+            assert_eq!(r["result"]["content"][1]["type"], "image", "{r}");
+            // Its pixels map to the crop.
+            let r = call_tool(
+                &mut s,
+                4,
+                "mouse",
+                json!({"image_x": 6, "image_y": 6, "clicks": 0}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("(51,61)"), "{r}");
+            // Not with region; not an unknown id.
+            let r = call_tool(
+                &mut s,
+                5,
+                "screenshot",
+                json!({"id": 1, "region": [0, 0, 5, 5]}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("pass `region` or `id`, not both"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 6, "screenshot", json!({"id": 99})).await;
+            assert!(reply_text(&r).contains("unknown id 99"), "{r}");
+            // Out of the window's view, or without a box: said, no image.
+            s.sem
+                .boxes
+                .borrow_mut()
+                .insert(30, (900.0, 900.0, 10.0, 10.0));
+            let r = call_tool(&mut s, 7, "screenshot", json!({"id": 1})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains("id 1 is outside the window's visible area"),
+                "{r}"
+            );
+            s.sem.boxes.borrow_mut().clear();
+            let r = call_tool(&mut s, 8, "screenshot", json!({"id": 1})).await;
+            assert!(
+                reply_text(&r).contains("id 1: its screen box is unknown here"),
+                "{r}"
+            );
+            // In another window: that one is captured where it is (KDE),
+            // else the call says which window to bring forward.
+            s.sem
+                .boxes
+                .borrow_mut()
+                .insert(30, (50.0, 60.0, 80.0, 20.0));
+            s.nodes
+                .borrow_mut()
+                .insert(90, fake_node("frame", "todo.txt — Fake", &[30]));
+            s.shown.parents.borrow_mut().insert(30, 90);
+            s.more_windows.borrow_mut().push(90);
+            let r = call_tool(&mut s, 9, "screenshot", json!({"id": 1})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "id 1 is in window 'todo.txt — Fake', not in 'notes.txt — Fake'; pass \
+                     window=… to bring it to the front"
+                ),
+                "{r}"
+            );
+            s.shown.background_shots.set(true);
+            let r = call_tool(&mut s, 10, "screenshot", json!({"id": 1})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(text.starts_with("52x22 px"), "{r}");
+            assert!(
+                text.contains("captured in background: 'todo.txt — Fake'"),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // Another window of the same title: which one shows it is not
+            // known, so no other window's pixels are passed off as it.
+            s.nodes
+                .borrow_mut()
+                .insert(91, fake_node("frame", "todo.txt — Fake", &[]));
+            s.more_windows.borrow_mut().push(91);
+            let r = call_tool(&mut s, 11, "screenshot", json!({"id": 1})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(reply_text(&r).contains("id 1 is in window"), "{r}");
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
         });
     }
 
@@ -15263,6 +16325,120 @@ mod tests {
     }
 
     #[test]
+    fn a_background_window_is_captured_without_activating_it() {
+        local(async {
+            let mut s = session("shot-background");
+            s.shown.background_shots.set(true);
+            // The user is typing: activating would wait, a capture where
+            // the window is does not.
+            s.takeover
+                .user_input(Instant::now(), takeover::Device::Keyboard);
+            let started = Instant::now();
+            let r = call_tool(&mut s, 2, "screenshot", json!({"window": "todo"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(text.starts_with("200x100 px"), "{r}");
+            assert!(
+                text.contains("; captured in background: 'todo.txt — Fake' is not in front"),
+                "{r}"
+            );
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            assert_eq!(s.active.borrow().1, FAKE_WINDOWS[1].1);
+            // Its pixels are not clicked while another window covers it.
+            let mut s = session("shot-background-click");
+            s.shown.background_shots.set(true);
+            call_tool(&mut s, 2, "screenshot", json!({"window": "todo"})).await;
+            let r = call_tool(&mut s, 3, "mouse", json!({"image_x": 50, "image_y": 25})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "the last screenshot was of 'todo.txt — Fake' in the background; pass \
+                     window=… to bring it to the front first"
+                ) && reply_text(&r).contains("nothing sent"),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            // Once it is in front, they are.
+            let r = call_tool(
+                &mut s,
+                4,
+                "mouse",
+                json!({"image_x": 50, "image_y": 25, "clicks": 0, "window": "todo"}),
+            )
+            .await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(s.keys.borrow()[0], "activate todo.txt — Fake");
+            // The window in front: captured as before, said as before.
+            let r = call_tool(&mut s, 5, "screenshot", json!({"window": "todo"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(!reply_text(&r).contains("background"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_region_is_zoomed_into_the_window_the_last_screenshot_showed() {
+        local(async {
+            let mut s = session("zoom-background");
+            s.shown.background_shots.set(true);
+            call_tool(&mut s, 2, "screenshot", json!({"window": "todo"})).await;
+            // Not the window in front: the one captured, again where it is.
+            let r = call_tool(&mut s, 3, "screenshot", json!({"region": [10, 10, 20, 20]})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("captured in background: 'todo.txt — Fake'")
+                    && text.contains("(zoom of region [10, 10, 20, 20]"),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            let r = call_tool(&mut s, 4, "mouse", json!({"image_x": 5, "image_y": 5})).await;
+            assert!(reply_text(&r).contains("in the background"), "{r}");
+            // Where it cannot be: refused, never the front window's pixels.
+            s.shown.background_shots.set(false);
+            let r = call_tool(&mut s, 5, "screenshot", json!({"region": [1, 1, 5, 5]})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "region is of the screenshot of 'todo.txt — Fake', not of 'notes.txt — Fake'"
+                ),
+                "{r}"
+            );
+        });
+    }
+
+    #[test]
+    fn a_refused_background_capture_brings_the_window_forward_in_the_same_call() {
+        local(async {
+            let mut s = session("shot-refused");
+            s.shown.background_shots.set(true);
+            s.shown.refuse_behind.set(true);
+            let r = call_tool(&mut s, 2, "screenshot", json!({"window": "todo"})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert!(!reply_text(&r).contains("background"), "{r}");
+            assert_eq!(s.keys.borrow()[0], "activate todo.txt — Fake");
+        });
+    }
+
+    #[test]
+    fn a_background_capture_checks_the_window_it_captures() {
+        local(async {
+            let mut s = session("shot-background-fence");
+            s.shown.background_shots.set(true);
+            let r = call_tool(&mut s, 2, "screenshot", json!({"window": "bash"})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "window '~ : bash — Konsole' (class 'konsole') of app 'konsole' is not in"
+                ),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            assert_eq!(s.active.borrow().1, FAKE_WINDOWS[1].1);
+        });
+    }
+
+    #[test]
     fn a_failed_screenshot_says_why() {
         local(async {
             let mut s = session("shot-cause");
@@ -16145,11 +17321,15 @@ mod tests {
             call_tool(&mut s, call, "get_text", find.clone()).await;
             call_tool(&mut s, call + 1, "find", find.clone()).await;
             assert_eq!(prefetches(&s), before);
-            // The user used the keyboard or mouse: scrolling shows other
-            // elements without an event.
+            // The user only moved the pointer: nothing changed.
+            s.takeover.user_motion(Instant::now());
+            call_tool(&mut s, call + 2, "find", find.clone()).await;
+            assert_eq!(prefetches(&s), before, "dropped on pointer motion");
+            // The user used a key, a button or the wheel: scrolling shows
+            // other elements without an event.
             s.takeover
                 .user_input(Instant::now(), takeover::Device::Pointer);
-            call_tool(&mut s, call + 2, "find", find.clone()).await;
+            call_tool(&mut s, call + 3, "find", find.clone()).await;
             assert!(prefetches(&s) > before);
         });
     }
@@ -16267,6 +17447,116 @@ mod tests {
                 "{r}"
             );
             assert!(start.elapsed() < Duration::from_millis(500));
+        });
+    }
+
+    #[test]
+    fn a_pixel_click_names_the_element_under_it_and_waits_for_the_page() {
+        local(async {
+            let mut s = session("mouse-hit");
+            fake_page(&s);
+            s.sem.points.borrow_mut().push(((40, 50), 31, "fake"));
+            s.reads
+                .next
+                .replace(vec![(250, Some((30, "Saved".into()))), (300, None)]);
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "mouse", json!({"x": 40, "y": 50})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with("pointer at (40,50) in fake on [")
+                    && text.contains("] push button \"Open\"; page changed (settled after "),
+                "{text}"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(450));
+            // The id it printed is usable.
+            let id = id_before(text, "Open");
+            let r = call_tool(&mut s, 3, "get_text", json!({"id": id})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            // The next read sees the new content.
+            let r = call_tool(&mut s, 4, "find", json!({"app": "fake", "query": "Saved"})).await;
+            assert!(reply_text(&r).contains("push button \"Saved\""), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_pixel_input_names_nothing_it_is_unsure_of_and_waits_only_after_a_left_click() {
+        local(async {
+            let mut s = session("mouse-unsure");
+            fake_page(&s);
+            {
+                let mut points = s.sem.points.borrow_mut();
+                points.push(((40, 50), 31, "fake"));
+                points.push(((60, 70), 30, "notallowed"));
+            }
+            // No element found there: no name, no wait.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "mouse", json!({"x": 1, "y": 1})).await;
+            assert_eq!(reply_text(&r), "pointer at (1,1) in fake", "{r}");
+            assert!(start.elapsed() < Duration::from_millis(300));
+            // An element of an app not on the allowlist is not named.
+            let r = call_tool(&mut s, 3, "mouse", json!({"x": 60, "y": 70})).await;
+            assert_eq!(reply_text(&r), "pointer at (60,70) in fake", "{r}");
+            // A move names what it is over; a right click what it is on:
+            // neither waits for the page.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 4, "mouse", json!({"x": 40, "y": 50, "clicks": 0})).await;
+            let text = reply_text(&r);
+            assert!(text.contains(" over [") && !text.contains("page"), "{text}");
+            let r = call_tool(
+                &mut s,
+                5,
+                "mouse",
+                json!({"x": 40, "y": 50, "button": "right"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains(" on [") && text.contains("\"Open\"") && !text.contains("page"),
+                "{text}"
+            );
+            assert!(start.elapsed() < Duration::from_millis(300));
+            // A click on text, or a double click: no wait either; one on
+            // text inside a link waits for the link's page.
+            s.nodes
+                .borrow_mut()
+                .insert(40, fake_node("paragraph", "Some text", &[]));
+            s.nodes
+                .borrow_mut()
+                .insert(41, fake_node("link", "More", &[40]));
+            s.sem.points.borrow_mut().push(((80, 90), 40, "fake"));
+            let start = Instant::now();
+            let r = call_tool(&mut s, 6, "mouse", json!({"x": 80, "y": 90})).await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            let r = call_tool(&mut s, 7, "mouse", json!({"x": 40, "y": 50, "clicks": 2})).await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(300));
+            s.shown.parents.borrow_mut().insert(40, 41);
+            let r = call_tool(&mut s, 8, "mouse", json!({"x": 80, "y": 90})).await;
+            assert!(reply_text(&r).contains("; no page change seen in"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_batch_step_after_a_pixel_click_takes_the_element_it_named() {
+        local(async {
+            let mut s = session("mouse-step");
+            fake_reads(&s);
+            s.sem.points.borrow_mut().push(((40, 50), 31, "fake"));
+            let r = call_tool(
+                &mut s,
+                2,
+                "batch",
+                json!({"steps": [
+                    {"tool": "mouse", "args": {"x": 40, "y": 50}},
+                    {"tool": "get_text", "args": {"id": "$1"}}]}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("on [1] push button \"Open\"")
+                    && text.contains("[2] get_text: (empty: the element has no text)"),
+                "{text}"
+            );
         });
     }
 
@@ -16585,6 +17875,30 @@ mod tests {
     }
 
     #[test]
+    fn a_read_right_after_input_is_reused_only_until_the_view_settles() {
+        local(async {
+            let mut s = session("reads-tail");
+            fake_reads(&s);
+            s.reads.heard.set(true);
+            s.takeover.set_activity_source(true, "evdev".into());
+            let find = json!({"app": "fake", "query": "Save"});
+            // A smooth scroll the key started may still be moving.
+            call_tool(&mut s, 2, "key", json!({"combo": "Page_Down"})).await;
+            call_tool(&mut s, 3, "find", find.clone()).await;
+            let read = prefetches(&s);
+            call_tool(&mut s, 4, "find", find.clone()).await;
+            assert_eq!(prefetches(&s), read, "reused at once");
+            tokio::time::sleep(INPUT_TAIL).await;
+            call_tool(&mut s, 5, "find", find.clone()).await;
+            assert!(prefetches(&s) > read, "reused past the tail");
+            // Read after the tail: kept as long as usual.
+            let read = prefetches(&s);
+            call_tool(&mut s, 6, "find", find).await;
+            assert_eq!(prefetches(&s), read);
+        });
+    }
+
+    #[test]
     fn kept_reads_expire() {
         local(async {
             let mut s = session("reads-age");
@@ -16594,6 +17908,36 @@ mod tests {
             let read = prefetches(&s);
             tokio::time::sleep(READ_MAX_AGE + Duration::from_millis(50)).await;
             call_tool(&mut s, 3, "find", find).await;
+            assert!(prefetches(&s) > read);
+        });
+    }
+
+    #[test]
+    fn kept_reads_of_an_app_heard_sending_events_live_longer() {
+        local(async {
+            let mut s = session("reads-heard");
+            fake_reads(&s);
+            s.reads.heard.set(true);
+            let find = json!({"app": "fake", "query": "Save"});
+            // Unless the user's scrolling is watched: no longer.
+            call_tool(&mut s, 2, "find", find.clone()).await;
+            let read = prefetches(&s);
+            tokio::time::sleep(READ_MAX_AGE + Duration::from_millis(50)).await;
+            call_tool(&mut s, 3, "find", find.clone()).await;
+            assert!(prefetches(&s) > read, "kept unwatched");
+            s.takeover.set_activity_source(true, "evdev".into());
+            call_tool(&mut s, 2, "find", find.clone()).await;
+            let read = prefetches(&s);
+            tokio::time::sleep(READ_MAX_AGE + Duration::from_millis(50)).await;
+            call_tool(&mut s, 3, "find", find.clone()).await;
+            assert_eq!(prefetches(&s), read, "dropped after READ_MAX_AGE");
+            // Still never reused after input of ours, or a change.
+            call_tool(&mut s, 4, "key", json!({"combo": "a"})).await;
+            call_tool(&mut s, 5, "find", find.clone()).await;
+            assert!(prefetches(&s) > read, "reused after input");
+            let read = prefetches(&s);
+            s.reads.changes.set(s.reads.changes.get() + 1);
+            call_tool(&mut s, 6, "find", find).await;
             assert!(prefetches(&s) > read);
         });
     }
@@ -16962,6 +18306,16 @@ mod tests {
         assert_eq!(frame_in(&cache, &4), Some(1));
         assert_eq!(frame_in(&cache, &1), Some(1));
         assert_eq!(frame_in(&cache, &9), None);
+        // A top-level that is no frame (a plain Qt widget: "filler") is
+        // the window when the walk reaches the application.
+        let mut app: Cache<u32> = Cache::new();
+        app.insert(10, node("application", &[11, 12]));
+        app.insert(11, node("filler", &[13]));
+        app.insert(12, node("filler", &[14]));
+        app.insert(13, node("push button", &[]));
+        app.insert(14, node("label", &[]));
+        assert_eq!(frame_in(&app, &13), Some(11));
+        assert_eq!(frame_in(&app, &14), Some(12));
         // Listed by two parents: not known for sure.
         cache.insert(6, node("panel", &[4]));
         assert_eq!(frame_in(&cache, &4), None);
@@ -16979,6 +18333,52 @@ mod tests {
         cache.insert(15, node("push button", &[]));
         assert_eq!(frame_in(&cache, &15), Some(10));
         assert_eq!(frame_in(&cache, &14), Some(10));
+    }
+
+    #[test]
+    fn a_browsers_tool_bars_print_on_one_line_with_ids_to_expand() {
+        local(async {
+            let mut s = session("browser-chrome");
+            *s.focus.borrow_mut() = Info {
+                role: "frame".into(),
+                name: "Page — Firefox".into(),
+                showing: true,
+                children: vec![30, 33],
+                ..Info::default()
+            };
+            {
+                let mut nodes = s.nodes.borrow_mut();
+                nodes.insert(30, fake_node("tool bar", "Tabs", &[31, 32]));
+                let mut tab = fake_node("page tab", "Page", &[]);
+                tab.states = vec!["selected"];
+                nodes.insert(31, tab);
+                nodes.insert(32, fake_node("page tab", "Other", &[]));
+                nodes.insert(33, fake_node("internal frame", "", &[34]));
+                nodes.insert(34, fake_node("document web", "Page", &[35]));
+                nodes.insert(35, fake_node("push button", "OK", &[]));
+            }
+            let r = call_tool(&mut s, 2, "tree", json!({"app": "fake"})).await;
+            let text = reply_text(&r);
+            let line = text
+                .lines()
+                .find(|l| l.contains("browser tool bars"))
+                .unwrap_or_else(|| panic!("{text}"));
+            assert!(line.ends_with("\"Tabs\": page tab ×2"), "{text}");
+            assert!(text.contains("page tab \"Page\" {selected}"), "{text}");
+            assert!(!text.contains("Other"), "{text}");
+            assert!(text.contains("button \"OK\""), "{text}");
+            // The bar's id lists it in full.
+            let rid: u64 = line
+                .split('[')
+                .nth(1)
+                .and_then(|r| r.split(']').next())
+                .and_then(|r| r.parse().ok())
+                .unwrap_or_else(|| panic!("{line}"));
+            let r = call_tool(&mut s, 3, "tree", json!({"root_id": rid})).await;
+            let text = reply_text(&r);
+            assert!(text.contains("\"Other\""), "{text}");
+            assert!(!text.contains("browser tool bars"), "{text}");
+        });
     }
 
     /// A web mail page in the fake: a table of rows and cells.

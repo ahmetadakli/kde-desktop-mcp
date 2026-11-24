@@ -25,8 +25,8 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use crate::backend::{
-    Activated, AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_AREA, Page, R,
-    Screen, Shot, ShotTarget, WindowChange, WindowEntry, WindowGeo,
+    Activated, AppEntry, Backend, Cache, Check, Clip, FileDialog, Focused, Info, Launched, NO_AREA,
+    Page, R, Screen, Shot, ShotTarget, WindowChange, WindowEntry, WindowGeo,
 };
 use crate::delivery::nothing_sent;
 use crate::launch_pick::{self as pick, Found};
@@ -71,6 +71,10 @@ const RESTORE_WAIT: Duration = Duration::from_millis(500);
 /// The executables of the installed Store apps ApplicationFrameHost hosts,
 /// read once in the background (`warm_up`).
 static INSTALLED_HOSTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// How long the window in front may take to answer before a pixel click
+/// goes without naming the element under it (KDE's limit is 40 ms).
+const HIT_ANSWER_MS: u32 = 40;
 
 pub struct WindowsBackend {
     uia: Uia,
@@ -639,6 +643,34 @@ impl Backend for WindowsBackend {
         self.uia.scroll_container(&id.el)
     }
 
+    async fn element_at(&self, x: i64, y: i64) -> Option<Focused<Elem>> {
+        let (x, y) = (i32::try_from(x).ok()?, i32::try_from(y).ok()?);
+        // The calls below wait for the app's provider and block the
+        // server: not for an app that is busy or hung (often why a pixel
+        // click is used), whose click must not wait for a name.
+        let front = input::root(input::foreground());
+        if !wm::answers(front, HIT_ANSWER_MS) {
+            return None;
+        }
+        let (hit, p) = self.uia.element_from_point(x, y)?;
+        // Only an element of the window in front, whose box holds the
+        // point: else no name rather than a wrong one.
+        let h = self.uia.window_handle(&hit.el)?;
+        if input::root(input::hwnd_from_i32(h)) != front {
+            return None;
+        }
+        let (l, t, r, b) = self.uia.bounds(&hit.el)?;
+        if !(l..r).contains(&x) || !(t..b).contains(&y) {
+            return None;
+        }
+        let info = self.info_of(&hit.el, &p, input::hwnd_i32(front), 0, Vec::new());
+        Some(Focused {
+            app: input::window_app(front, p.pid),
+            id: hit,
+            info,
+        })
+    }
+
     async fn element_center(&self, id: &Elem) -> R<(i32, i32)> {
         // Like the Linux backends: a click at a background element's
         // coordinates would land on whatever window covers them.
@@ -652,6 +684,27 @@ impl Backend for WindowsBackend {
             .bounds(&id.el)
             .and_then(|(l, t, r, b)| logic::center(l, t, r, b))
             .ok_or_else(|| NO_AREA.into())
+    }
+
+    async fn element_boxes(
+        &self,
+        _target: &ShotTarget,
+        ids: &[Elem],
+    ) -> Vec<Option<(f64, f64, f64, f64)>> {
+        // UIA bounds are screen pixels, as the capture's area is.
+        ids.iter()
+            .map(|id| {
+                let (l, t, r, b) = self.uia.bounds(&id.el)?;
+                (r > l && b > t).then(|| {
+                    (
+                        f64::from(l),
+                        f64::from(t),
+                        f64::from(r - l),
+                        f64::from(b - t),
+                    )
+                })
+            })
+            .collect()
     }
 
     fn check_combo(&self, combo: &str) -> R<()> {
@@ -1078,6 +1131,7 @@ impl Backend for WindowsBackend {
             caption: wm::title(h),
             class: wm::class_name(h),
             area,
+            client: None,
             handle: (h.0 as usize).to_string(),
         })
     }

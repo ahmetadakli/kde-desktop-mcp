@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
-use windows::Win32::Foundation::HWND;
+use windows::Win32::Foundation::{HWND, POINT};
 use windows::Win32::System::Com::{
     CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, SAFEARRAY,
 };
@@ -489,6 +489,15 @@ impl Uia {
             cur = unsafe { walker.GetParentElement(&cur) }.ok()?;
         }
         None
+    }
+
+    /// The element UIA finds at screen point (`x`, `y`), the deepest it
+    /// exposes there, read with every property in PROPS.
+    pub fn element_from_point(&self, x: i32, y: i32) -> Option<(Elem, Props)> {
+        let req = &self.req.as_ref()?.element;
+        let el = unsafe { self.auto.ElementFromPointBuildCache(POINT { x, y }, req) }.ok()?;
+        let p = props(&el);
+        Some((Self::wrap(el, false), p))
     }
 
     pub fn bounds(&self, el: &IUIAutomationElement) -> Option<(i32, i32, i32, i32)> {

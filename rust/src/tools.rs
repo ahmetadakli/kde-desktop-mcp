@@ -143,8 +143,8 @@ tree(interactive=true) for large pages.
 view. Menus an input opened (Linux: also lists, dialogs) come with ids (`opened:`). Failures \
 end with the active window and focus.
 - menu (app + path, e.g. \"File > Save As\") runs a menu entry.
-- screenshot is a last resort. To click something seen \
-only in it, pass its pixels to mouse (image_x/image_y); `region`=[x, y, w, h] zooms in.
+- screenshot is a last resort; `marks`=true numbers elements for act by id, else pass its \
+pixels to mouse (image_x/image_y); `region` zooms.
 
 Allowlist: only apps in the user's allowlist file can be read, activated or sent input, and \
 input only goes to an allowed active window. An app may be limited to a tier: view \
@@ -422,7 +422,7 @@ pub fn tools() -> Json {
         ),
         t(
             "mouse",
-            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. A right click lists the menu it opened with ids (opened: …; Linux; Windows: menus).",
+            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. The reply names the element under it with an id. A right click lists the menu it\nopened with ids (opened: …; Linux; Windows: menus).",
             schema(&[
                 ("x", "integer", Some(Json::Null)),
                 ("y", "integer", Some(Json::Null)),
@@ -512,12 +512,14 @@ pub fn tools() -> Json {
         ),
         t(
             "screenshot",
-            "Last resort only: capture the active window. The image comes back in the\nreply (JPEG when much smaller than PNG), shrunk so its longer side is at\nmost `max_size` px; `inline`=false instead saves a PNG and returns only\nits path (`save_to`: a new .png path in a folder of yours under home). Also says which screen area it shows. Prefer tree/find; they also list web page popups and\nmenus. To click something seen only in the image, pass its pixel position\nto mouse as image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution; image_x/image_y then refer to the zoomed image.",
+            "Last resort only: capture the active window (or `window`'s, on KDE in place). The image comes back in the\nreply (JPEG when much smaller than PNG), shrunk so its longer side is at\nmost `max_size` px (up to 2576); `inline`=false instead saves a PNG and returns only\nits path (`save_to`: a new .png path in a folder of yours under home). Prefer tree/find; they also list web page popups and\nmenus. `marks`=true draws the ids of visible interactive elements on it\n(and lists them) for act/click by id; else pass a pixel position to mouse\nas image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution, or `id` just that element; image_x/image_y then refer to the zoomed image.",
             schema(&[
                 ("max_size", "integer", Some(json!(1024))),
                 ("inline", "boolean", Some(json!(true))),
                 ("save_to", "string", Some(Json::Null)),
                 ("region", "array", Some(Json::Null)),
+                ("marks", "boolean", Some(json!(false))),
+                ("id", "integer", Some(Json::Null)),
             ])
         ),
         t(

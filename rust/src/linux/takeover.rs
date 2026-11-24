@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use evdev::{AbsoluteAxisCode, Device as EvDevice, EventSummary, KeyCode, RelativeAxisCode};
+use evdev::{
+    AbsoluteAxisCode, Device as EvDevice, EventSummary, KeyCode, PropType, RelativeAxisCode,
+};
 
 use super::input;
 use crate::takeover::{Device, IDLE_TIMEOUT, Takeover, pretty_key};
@@ -224,43 +226,173 @@ fn open(path: &Path) -> std::io::Result<EvDevice> {
 /// Note every key, button and motion event of `dev` as the user's, and
 /// stop on the chord. Returns when the device goes away.
 fn read(mut dev: EvDevice, t: &Takeover, chord: Option<&Chord>) {
-    let mut held = HashSet::new();
+    let mut sort = Sorter::new(&dev);
     loop {
         let Ok(events) = dev.fetch_events() else {
             return;
         };
         let now = Instant::now();
-        let mut kind = None;
         for e in events {
-            match e.destructure() {
-                EventSummary::Key(_, code, value) => {
-                    // Below BTN_MISC: keyboard keys; above: buttons.
-                    kind = Some(match code.0 < 0x100 {
-                        true => Device::Keyboard,
-                        false => Device::Pointer,
-                    });
-                    match value {
-                        0 => {
-                            held.remove(&left(code));
-                        }
-                        1 => {
-                            if chord.is_some_and(|c| c.hit(code, &held)) {
-                                t.stop();
-                            }
-                            held.insert(left(code));
-                        }
-                        _ => {}
-                    }
+            let e = e.destructure();
+            if let EventSummary::Key(_, code, 1) = e
+                && chord.is_some_and(|c| c.hit(code, &sort.held))
+            {
+                t.stop();
+            }
+            sort.feed(&e, now);
+        }
+        match sort.take() {
+            Some((_, false)) => t.user_motion(now),
+            Some((k, true)) => t.user_input(now, k),
+            None => {}
+        }
+    }
+}
+
+/// The longest touch of a touchpad that may be a tap (a click: libinput
+/// sends no button for it).
+const TAP_MAX: Duration = Duration::from_millis(300);
+
+/// The part of a touchpad's width and height along its right and bottom
+/// edges where one finger may scroll (libinput's edge scrolling, about
+/// 7 mm of a touchpad).
+const EDGE_PERCENT: i32 = 10;
+
+/// Tells a device's plain pointer motion from input that may change what
+/// apps show (`Takeover::user_motion`, `Takeover::user_input`): keys,
+/// buttons, wheels, a drag, a touchpad tap, multi-finger or edge scroll,
+/// any touch of a touchscreen.
+struct Sorter {
+    /// A touchpad: one finger on it only moves the pointer, but along its
+    /// edges it may scroll.
+    touchpad: bool,
+    /// Where a touchpad's scroll edges start (ABS_X, ABS_Y), when known.
+    edges: (Option<i32>, Option<i32>),
+    /// The finger's position on the touchpad (ABS_X, ABS_Y).
+    pos: (Option<i32>, Option<i32>),
+    /// A touchscreen or tablet surface: touching it presses.
+    direct: bool,
+    /// Keys and buttons held now (left variants).
+    held: HashSet<KeyCode>,
+    /// When the finger now on the touchpad touched it.
+    touched: Option<Instant>,
+    /// What the events fed since the last `take` were.
+    seen: Option<(Device, bool)>,
+}
+
+impl Sorter {
+    fn new(dev: &EvDevice) -> Self {
+        let keys = dev.supported_keys();
+        let has = |k| keys.is_some_and(|s| s.contains(k));
+        let direct = dev.properties().contains(PropType::DIRECT);
+        let touchpad = !direct && has(KeyCode::BTN_TOOL_FINGER) && !has(KeyCode::BTN_TOOL_PEN);
+        let mut sorter = Sorter::of(touchpad, direct);
+        if touchpad && let Ok(axes) = dev.get_absinfo() {
+            for (axis, info) in axes {
+                let (lo, hi) = (info.minimum(), info.maximum());
+                let edge = (hi > lo).then(|| hi - (hi - lo) * EDGE_PERCENT / 100);
+                match axis {
+                    AbsoluteAxisCode::ABS_X => sorter.edges.0 = edge,
+                    AbsoluteAxisCode::ABS_Y => sorter.edges.1 = edge,
+                    _ => {}
                 }
-                EventSummary::RelativeAxis(..) | EventSummary::AbsoluteAxis(..) => {
-                    kind = kind.or(Some(Device::Pointer));
-                }
-                _ => {}
             }
         }
-        if let Some(k) = kind {
-            t.user_input(now, k);
+        sorter
+    }
+
+    fn of(touchpad: bool, direct: bool) -> Self {
+        Sorter {
+            touchpad,
+            edges: (None, None),
+            pos: (None, None),
+            direct,
+            held: HashSet::new(),
+            touched: None,
+            seen: None,
         }
+    }
+
+    /// Whether holding `code` turns motion into more than motion (a drag,
+    /// a multi-finger scroll): all but a tool near the surface (pen,
+    /// finger: 0x140..=0x147) and a touchpad's one-finger touch.
+    fn drags(&self, code: KeyCode) -> bool {
+        !(0x140..=0x147).contains(&code.0) && !(self.touchpad && code == KeyCode::BTN_TOUCH)
+    }
+
+    fn note(&mut self, dev: Device, view: bool) {
+        let (d, v) = self.seen.get_or_insert((dev, false));
+        if dev == Device::Keyboard {
+            *d = dev;
+        }
+        *v |= view;
+    }
+
+    fn feed(&mut self, e: &EventSummary, now: Instant) {
+        match *e {
+            EventSummary::Key(_, code, value) => {
+                // Below BTN_MISC: keyboard keys; above: buttons.
+                if code.0 < 0x100 {
+                    self.note(Device::Keyboard, true);
+                } else {
+                    let view = if self.touchpad && code == KeyCode::BTN_TOUCH {
+                        // A short touch may be a tap: a click.
+                        match value {
+                            1 => {
+                                self.touched = Some(now);
+                                false
+                            }
+                            0 => self
+                                .touched
+                                .take()
+                                .is_some_and(|t| now.duration_since(t) <= TAP_MAX),
+                            _ => false,
+                        }
+                    } else {
+                        self.drags(code) || self.direct
+                    };
+                    self.note(Device::Pointer, view);
+                }
+                match value {
+                    0 => {
+                        self.held.remove(&left(code));
+                    }
+                    1 => {
+                        self.held.insert(left(code));
+                    }
+                    _ => {}
+                }
+            }
+            EventSummary::RelativeAxis(_, axis, _) => {
+                let motion = matches!(axis, RelativeAxisCode::REL_X | RelativeAxisCode::REL_Y);
+                let drag = self.held.iter().any(|&k| self.drags(k));
+                self.note(Device::Pointer, !motion || drag);
+            }
+            EventSummary::AbsoluteAxis(_, axis, value) => {
+                match axis {
+                    AbsoluteAxisCode::ABS_X => self.pos.0 = Some(value),
+                    AbsoluteAxisCode::ABS_Y => self.pos.1 = Some(value),
+                    _ => {}
+                }
+                let drag = self.held.iter().any(|&k| self.drags(k));
+                self.note(Device::Pointer, self.direct || drag || self.on_edge());
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether a finger touches a touchpad along an edge it scrolls by.
+    fn on_edge(&self) -> bool {
+        let past = |pos: Option<i32>, edge: Option<i32>| pos.zip(edge).is_some_and(|(p, e)| p >= e);
+        self.touchpad
+            && self.touched.is_some()
+            && (past(self.pos.0, self.edges.0) || past(self.pos.1, self.edges.1))
+    }
+
+    /// What the events fed since the last call were: the device, and
+    /// whether they may have changed what apps show. None: none counted.
+    fn take(&mut self) -> Option<(Device, bool)> {
+        self.seen.take()
     }
 }
 
@@ -539,6 +671,135 @@ mod tests {
         assert_eq!(qt_key("meta+s"), Ok(0x1000_0053));
         assert!(qt_key("meta+hyper+esc").is_err());
         assert!(qt_key("meta+volumeup").is_err());
+    }
+
+    fn ev(kind: evdev::EventType, code: u16, value: i32) -> EventSummary {
+        evdev::InputEvent::new(kind.0, code, value).destructure()
+    }
+
+    fn key(code: KeyCode, value: i32) -> EventSummary {
+        ev(evdev::EventType::KEY, code.0, value)
+    }
+
+    fn rel(axis: RelativeAxisCode) -> EventSummary {
+        ev(evdev::EventType::RELATIVE, axis.0, 1)
+    }
+
+    fn abs() -> EventSummary {
+        ev(evdev::EventType::ABSOLUTE, AbsoluteAxisCode::ABS_X.0, 100)
+    }
+
+    /// What `events`, fed at `now`, were.
+    fn sort(s: &mut Sorter, events: &[EventSummary], now: Instant) -> Option<(Device, bool)> {
+        for e in events {
+            s.feed(e, now);
+        }
+        s.take()
+    }
+
+    #[test]
+    fn plain_pointer_motion_is_told_from_input_that_changes_the_view() {
+        let now = Instant::now();
+        let mut mouse = Sorter::of(false, false);
+        assert_eq!(sort(&mut mouse, &[], now), None);
+        let moved = [rel(RelativeAxisCode::REL_X), rel(RelativeAxisCode::REL_Y)];
+        assert_eq!(
+            sort(&mut mouse, &moved, now),
+            Some((Device::Pointer, false))
+        );
+        let wheel = rel(RelativeAxisCode::REL_WHEEL);
+        assert_eq!(
+            sort(&mut mouse, &[wheel], now),
+            Some((Device::Pointer, true))
+        );
+        let hi_res = rel(RelativeAxisCode::REL_HWHEEL_HI_RES);
+        assert_eq!(
+            sort(&mut mouse, &[hi_res], now),
+            Some((Device::Pointer, true))
+        );
+        // A button, and motion while it is held (a drag); not after.
+        let press = key(KeyCode::BTN_LEFT, 1);
+        assert_eq!(
+            sort(&mut mouse, &[press], now),
+            Some((Device::Pointer, true))
+        );
+        assert_eq!(sort(&mut mouse, &moved, now), Some((Device::Pointer, true)));
+        sort(&mut mouse, &[key(KeyCode::BTN_LEFT, 0)], now);
+        assert_eq!(
+            sort(&mut mouse, &moved, now),
+            Some((Device::Pointer, false))
+        );
+        // Keys, a release and a repeat too.
+        let mut kbd = Sorter::of(false, false);
+        for v in [1, 2, 0] {
+            let k = [key(KeyCode::KEY_A, v)];
+            assert_eq!(sort(&mut kbd, &k, now), Some((Device::Keyboard, true)));
+        }
+    }
+
+    #[test]
+    fn a_touchpad_stroke_is_motion_but_a_tap_or_scroll_is_not() {
+        let t0 = Instant::now();
+        let mut pad = Sorter::of(true, false);
+        let down = [
+            key(KeyCode::BTN_TOUCH, 1),
+            key(KeyCode::BTN_TOOL_FINGER, 1),
+            abs(),
+        ];
+        let up = [key(KeyCode::BTN_TOUCH, 0), key(KeyCode::BTN_TOOL_FINGER, 0)];
+        // A stroke: one finger moving the pointer for a while.
+        assert_eq!(sort(&mut pad, &down, t0), Some((Device::Pointer, false)));
+        assert_eq!(sort(&mut pad, &[abs()], t0), Some((Device::Pointer, false)));
+        let late = t0 + TAP_MAX + Duration::from_millis(50);
+        assert_eq!(sort(&mut pad, &up, late), Some((Device::Pointer, false)));
+        // A tap clicks.
+        sort(&mut pad, &down, t0);
+        let soon = t0 + Duration::from_millis(80);
+        assert_eq!(sort(&mut pad, &up, soon), Some((Device::Pointer, true)));
+        // Two fingers scroll, for as long as they stay.
+        sort(&mut pad, &down, t0);
+        let two = [
+            key(KeyCode::BTN_TOOL_FINGER, 0),
+            key(KeyCode::BTN_TOOL_DOUBLETAP, 1),
+        ];
+        assert_eq!(sort(&mut pad, &two, t0), Some((Device::Pointer, true)));
+        assert_eq!(sort(&mut pad, &[abs()], t0), Some((Device::Pointer, true)));
+        sort(&mut pad, &[key(KeyCode::BTN_TOOL_DOUBLETAP, 0)], late);
+        sort(&mut pad, &up, late);
+        assert_eq!(
+            sort(&mut pad, &[abs()], late),
+            Some((Device::Pointer, false))
+        );
+        // One finger along an edge scrolls (libinput's edge scrolling).
+        pad.edges = (Some(900), Some(500));
+        let at = |x| ev(evdev::EventType::ABSOLUTE, AbsoluteAxisCode::ABS_X.0, x);
+        sort(&mut pad, &down, t0);
+        assert_eq!(
+            sort(&mut pad, &[at(950)], t0),
+            Some((Device::Pointer, true))
+        );
+        assert_eq!(
+            sort(&mut pad, &[at(400)], t0),
+            Some((Device::Pointer, false))
+        );
+        sort(&mut pad, &up, late);
+        assert_eq!(
+            sort(&mut pad, &[at(950)], late),
+            Some((Device::Pointer, false))
+        );
+        // A touchscreen presses where it is touched.
+        let mut screen = Sorter::of(false, true);
+        assert_eq!(sort(&mut screen, &down, t0), Some((Device::Pointer, true)));
+        assert_eq!(
+            sort(&mut screen, &[abs()], t0),
+            Some((Device::Pointer, true))
+        );
+        // A pen near a tablet moves the pointer; touching it presses.
+        let mut tablet = Sorter::of(false, false);
+        let near = [key(KeyCode::BTN_TOOL_PEN, 1), abs()];
+        assert_eq!(sort(&mut tablet, &near, t0), Some((Device::Pointer, false)));
+        let touch = [key(KeyCode::BTN_TOUCH, 1)];
+        assert_eq!(sort(&mut tablet, &touch, t0), Some((Device::Pointer, true)));
     }
 
     /// Watches the real devices (read-only) for a few seconds and prints

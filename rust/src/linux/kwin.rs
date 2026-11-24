@@ -61,6 +61,9 @@ pub struct RawImage {
 #[derive(Debug, PartialEq)]
 pub struct Frame {
     pub area: (f64, f64, f64, f64),
+    /// Origin of its client area (where its AT-SPI window coordinates
+    /// start), when KWin reported it.
+    pub client: Option<(f64, f64)>,
     pub handle: Option<String>,
     pub pid: Option<u32>,
     pub caption: String,
@@ -79,6 +82,7 @@ pub fn frame_of(raw: &str) -> R<Option<Frame>> {
     };
     Ok(Some(Frame {
         area: (num("x")?, num("y")?, num("width")?, num("height")?),
+        client: g["cx"].as_f64().zip(g["cy"].as_f64()),
         handle: g["id"]
             .as_str()
             .filter(|id| id.starts_with('{'))
@@ -197,11 +201,12 @@ function okApp(w) {
 }
 "#;
 
-/// Raises the window of an allowed app that best matches the query (ranked
-/// as backend::window_rank: title equal, class equal or ending it after a
-/// dot, class containing it, title containing it; the first of a rank
-/// wins); evaluates to its caption and pid as JSON, "" when none matched.
-const ACTIVATE: &str = r#"(() => { %OK_APP%
+/// Shared by ACTIVATE and PICK_FRAME: `best`, the window of an allowed app
+/// that best matches the query (ranked as backend::window_rank: title
+/// equal, class equal or ending it after a dot, class containing it, title
+/// containing it; the first of a rank wins), so a capture in the
+/// background is of the window an activation would bring forward.
+const PICK: &str = r#"%OK_APP%
 const q = %QUERY%.toLowerCase().trim();
 function rank(w) {
   const t = w.caption.toLowerCase().trim();
@@ -217,11 +222,70 @@ for (const w of workspace.windowList()) {
   if (!okApp(w)) continue;
   const r = rank(w);
   if (r >= 0 && r < bestRank) { best = w; bestRank = r; }
-}
+}"#;
+
+/// Raises PICK's window; evaluates to its caption and pid as JSON, "" when
+/// none matched.
+const ACTIVATE: &str = r#"(() => { %PICK%
 if (!best) return "";
 workspace.activeWindow = best;
 return JSON.stringify({caption: best.caption, pid: best.pid});
 })()"#;
+
+/// PICK's window as FRAME reports the active one, with whether it is
+/// minimized, active, and on the current virtual desktop; "" when none
+/// matched.
+const PICK_FRAME: &str = r#"(() => { %PICK%
+if (!best) return "";
+const g = best.frameGeometry;
+const c = best.clientGeometry;
+const cur = workspace.currentDesktop;
+const here = best.onAllDesktops || !cur
+  || (best.desktops || []).some(d => d.id === cur.id);
+return JSON.stringify({x: g.x, y: g.y, width: g.width, height: g.height,
+  cx: c.x, cy: c.y, id: String(best.internalId), pid: best.pid, caption: best.caption,
+  cls: best.resourceClass || "", minimized: best.minimized,
+  active: best === workspace.activeWindow, here: here});
+})()"#;
+
+/// `script` with PICK in it, for `query` and `allow`.
+fn pick_js(script: &str, query: &str, allow: &Allow) -> String {
+    script.replace(
+        "%PICK%",
+        &PICK
+            .replace("%OK_APP%", &allow.ok_app_js())
+            .replace("%QUERY%", &Json::from(query).to_string()),
+    )
+}
+
+/// The window PICK_FRAME found: its frame, and whether it is minimized,
+/// the active one, and on the current virtual desktop.
+#[derive(Debug, PartialEq)]
+pub struct Picked {
+    pub frame: Frame,
+    pub minimized: bool,
+    pub active: bool,
+    pub here: bool,
+}
+
+/// Parse what PICK_FRAME reports; None when no window matched.
+fn picked_of(raw: &str) -> R<Option<Picked>> {
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    let Some(frame) = frame_of(raw)? else {
+        return Ok(None);
+    };
+    let v: Json = serde_json::from_str(raw).map_err(|e| format!("KWin: {e}"))?;
+    let flag = |k: &str| v[k].as_bool();
+    Ok(Some(Picked {
+        frame,
+        // Unknown counts against a capture in the background.
+        minimized: flag("minimized").unwrap_or(true),
+        active: flag("active").unwrap_or(false),
+        here: flag("here").unwrap_or(false),
+    }))
+}
 
 /// Shared by WINDOWS and SET_WINDOW: windows of allowed apps whose caption
 /// or class contains the query, and their geometry.
@@ -306,11 +370,28 @@ const GEOMETRY: &str = "JSON.stringify((() => { const w = workspace.activeWindow
      return {x: g.x, y: g.y, width: g.width, height: g.height, caption: w.caption, \
      cls: w.resourceClass, screen: {x: s.x, y: s.y, width: s.width, height: s.height}}; })())";
 
+/// The active window's client origin, and whether another window shown on
+/// this desktop lies above it at (%X%, %Y%): a notification, an OSD, a
+/// window kept above, a popup. Then the point is not the active window's.
+const ORIGIN_AT: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
+     const g = w.clientGeometry; const cur = workspace.currentDesktop; \
+     const order = workspace.stackingOrder; const id = String(w.internalId); \
+     const i = order.findIndex(o => String(o.internalId) === id); \
+     const skip = [%SKIP%]; \
+     const covered = i < 0 || order.slice(i + 1).some(o => !o.minimized && !o.deleted \
+       && !o.tooltip && !skip.includes(o.pid) \
+       && (o.onAllDesktops || (o.desktops || []).some(d => d.id === cur.id)) \
+       && %X% >= o.frameGeometry.x && %X% < o.frameGeometry.x + o.frameGeometry.width \
+       && %Y% >= o.frameGeometry.y && %Y% < o.frameGeometry.y + o.frameGeometry.height); \
+     const sc = (w.output && w.output.devicePixelRatio) || 1; \
+     return {x: g.x, y: g.y, covered: covered, scale: sc}; })())";
+
 /// The active window's frame, its internal id (the handle ScreenShot2's
 /// CaptureWindow takes, "{uuid}"), and its process, caption and class, so
 /// a screenshot checks the window it captures.
 const FRAME: &str = "JSON.stringify((() => { const w = workspace.activeWindow; if (!w) return null; \
-     const g = w.frameGeometry; return {x: g.x, y: g.y, width: g.width, height: g.height, \
+     const g = w.frameGeometry; const c = w.clientGeometry; \
+     return {x: g.x, y: g.y, width: g.width, height: g.height, cx: c.x, cy: c.y, \
      id: String(w.internalId), pid: w.pid, caption: w.caption, cls: w.resourceClass || ''}; })())";
 
 /// The active window's caption and process, and the window it is a
@@ -324,6 +405,16 @@ const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtua
      return {x: g.x, y: g.y, width: g.width, height: g.height}; })())";
 
 const CURSOR_POS: &str = "JSON.stringify({x: workspace.cursorPos.x, y: workspace.cursorPos.y})";
+
+/// Parse what ORIGIN_AT reports.
+fn origin_at_of(raw: &str) -> R<((f64, f64), bool, f64)> {
+    let v: Json = serde_json::from_str(raw).unwrap_or(Json::Null);
+    let scale = v["scale"].as_f64().filter(|s| *s > 0.0).unwrap_or(1.0);
+    match (v["x"].as_f64(), v["y"].as_f64()) {
+        (Some(x), Some(y)) => Ok(((x, y), v["covered"].as_bool().unwrap_or(true), scale)),
+        _ => Err("could not read the active window geometry from KWin".into()),
+    }
+}
 
 /// Parse what CURSOR_POS reports.
 fn cursor_pos_of(raw: &str) -> R<(i64, i64)> {
@@ -459,15 +550,45 @@ impl KWin {
     /// Raise a window; returns its caption and pid, None when nothing
     /// matched.
     pub async fn activate(&self, query: &str, allow: &Allow) -> R<Option<Raised>> {
-        let script = ACTIVATE
-            .replace("%OK_APP%", &allow.ok_app_js())
-            .replace("%QUERY%", &Json::from(query).to_string());
-        let raw = self.query(&script).await?.unwrap_or_default();
+        let raw = self
+            .query(&pick_js(ACTIVATE, query, allow))
+            .await?
+            .unwrap_or_default();
         if raw.is_empty() {
             return Ok(None);
         }
         let v: Json = serde_json::from_str(&raw).map_err(|e| format!("KWin: {e}"))?;
         Ok(Some(raised_of(&v)))
+    }
+
+    /// The window `activate` would raise, without raising it; None when
+    /// no allowed window matches `query`.
+    pub async fn pick_frame(&self, query: &str, allow: &Allow) -> R<Option<Picked>> {
+        let raw = self
+            .query(&pick_js(PICK_FRAME, query, allow))
+            .await?
+            .unwrap_or_default();
+        picked_of(&raw)
+    }
+
+    /// Client-area origin (logical px) of KWin's active window, and
+    /// whether another window covers the point (`x`, `y`) there.
+    /// The active window's client origin, whether another window covers
+    /// (x, y), and the scale of the window's screen.
+    /// Windows of the processes in `skip` (the server's own indicator) and
+    /// tool tips do not count as covering.
+    pub async fn active_origin_at(
+        &self,
+        x: i64,
+        y: i64,
+        skip: &[u32],
+    ) -> R<((f64, f64), bool, f64)> {
+        let skip: Vec<String> = skip.iter().map(|p| p.to_string()).collect();
+        let js = ORIGIN_AT
+            .replace("%SKIP%", &skip.join(","))
+            .replace("%X%", &x.to_string())
+            .replace("%Y%", &y.to_string());
+        origin_at_of(&self.query(&js).await?.unwrap_or_default())
     }
 
     /// Client-area origin (logical px) of KWin's active window.
@@ -856,12 +977,13 @@ mod tests {
 
     #[test]
     fn the_frame_names_the_window_it_belongs_to() {
-        let raw = r#"{"x":1,"y":2,"width":30,"height":40,"id":"{abc}","pid":77,
-                      "caption":"Inbox","cls":"firefox"}"#;
+        let raw = r#"{"x":1,"y":2,"width":30,"height":40,"cx":1,"cy":12,"id":"{abc}",
+                      "pid":77,"caption":"Inbox","cls":"firefox"}"#;
         assert_eq!(
             frame_of(raw).unwrap(),
             Some(Frame {
                 area: (1.0, 2.0, 30.0, 40.0),
+                client: Some((1.0, 12.0)),
                 handle: Some("{abc}".into()),
                 pid: Some(77),
                 caption: "Inbox".into(),
@@ -873,12 +995,37 @@ mod tests {
         let f = frame_of(r#"{"x":0,"y":0,"width":1,"height":1,"id":"7","pid":0}"#)
             .unwrap()
             .unwrap();
-        assert_eq!((f.handle, f.pid), (None, None));
+        assert_eq!((f.handle, f.pid, f.client), (None, None, None));
         assert!(frame_of(r#"{"x":0}"#).unwrap_err().contains("'y'"));
     }
 
     #[test]
+    fn the_picked_frame_says_if_it_can_be_captured_where_it_is() {
+        let raw = r#"{"x":1,"y":2,"width":30,"height":40,"id":"{abc}","pid":77,
+                      "caption":"Inbox","cls":"firefox","minimized":false,
+                      "active":false,"here":true}"#;
+        let p = picked_of(raw).unwrap().unwrap();
+        assert_eq!(p.frame.handle.as_deref(), Some("{abc}"));
+        assert_eq!((p.minimized, p.active, p.here), (false, false, true));
+        assert_eq!(picked_of("").unwrap(), None);
+        // An older KWin without the fields: not captured in the background.
+        let p = picked_of(r#"{"x":0,"y":0,"width":1,"height":1,"id":"{a}"}"#)
+            .unwrap()
+            .unwrap();
+        assert_eq!((p.minimized, p.active, p.here), (true, false, false));
+    }
+
+    #[test]
     fn cursor_position_is_parsed_and_rounded() {
+        assert_eq!(
+            origin_at_of(r#"{"x":10,"y":40.5,"covered":false,"scale":1.25}"#),
+            Ok(((10.0, 40.5), false, 1.25))
+        );
+        assert_eq!(
+            origin_at_of(r#"{"x":10,"y":40}"#),
+            Ok(((10.0, 40.0), true, 1.0))
+        );
+        assert!(origin_at_of("null").is_err());
         assert_eq!(cursor_pos_of(r#"{"x":1920,"y":-5}"#), Ok((1920, -5)));
         assert_eq!(cursor_pos_of(r#"{"x":10.6,"y":3.2}"#), Ok((11, 3)));
         assert!(cursor_pos_of("").is_err());
@@ -947,8 +1094,12 @@ mod tests {
         assert!(js.contains("const blockPids = [30];"));
         assert!(js.contains(r#"const q = "Ferdium".toLowerCase();"#));
         assert!(!js.contains('%'));
-        let act = ACTIVATE.replace("%OK_APP%", &allow.ok_app_js());
-        assert!(act.contains("const allowPids = [10];") && act.contains("okApp(w)"));
+        for script in [ACTIVATE, PICK_FRAME] {
+            let act = pick_js(script, "Ferdium", &allow);
+            assert!(act.contains("const allowPids = [10];") && act.contains("okApp(w)"));
+            assert!(act.contains(r#"const q = "Ferdium".toLowerCase().trim();"#));
+            assert!(!act.contains('%'), "{act}");
+        }
         let both = LAYOUT
             .replace("%JS%", &js)
             .replace("%SCREENS%", SCREENS_JS)

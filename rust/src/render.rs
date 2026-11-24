@@ -20,8 +20,17 @@ pub const FIND_MAX_SEEN: usize = 20000;
 /// A rendered line: either a node (gets an id when printed) or plain text.
 #[derive(Debug, PartialEq)]
 pub enum Line<Id> {
-    Node { depth: usize, id: Id },
+    Node {
+        depth: usize,
+        id: Id,
+    },
     Raw(String),
+    /// A browser's tool bars on one line (`chrome_line`): each bar with the
+    /// roles it holds, counted.
+    Chrome {
+        depth: usize,
+        bars: Vec<(Id, String)>,
+    },
 }
 
 /// The fetched nodes among `ids`, in order; the others go to `missing`.
@@ -503,8 +512,9 @@ pub fn walk<Id: Clone + Eq + Hash>(
         after,
         start: None,
         truncated: false,
+        chrome: Vec::new(),
     };
-    walk_into(&mut st, children, depth, None);
+    walk_into(&mut st, children, depth, None, false);
     let after_found = after.is_none() || st.start.is_some();
     match st.start {
         Some(start) => drop(st.lines.drain(base..start)),
@@ -515,6 +525,9 @@ pub fn walk<Id: Clone + Eq + Hash>(
         truncated: st.truncated,
         after_found,
     };
+    // The chrome check looks ahead at nodes the walk reaches again.
+    let mut seen = std::collections::HashSet::new();
+    st.missing.retain(|m| seen.insert(m.clone()));
     done(walked, st.missing)
 }
 
@@ -529,6 +542,9 @@ struct Walk<'a, Id> {
     /// Index of the first line after `after`'s, once it was printed.
     start: Option<usize>,
     truncated: bool,
+    /// The browser tool bars among the elements printed at the current
+    /// level (`browser_chrome`).
+    chrome: Vec<ChromeBar<'a, Id>>,
 }
 
 impl<Id> Walk<'_, Id> {
@@ -552,7 +568,7 @@ impl<Id> Walk<'_, Id> {
         }
         if lift {
             for line in &mut self.lines[at..] {
-                if let Line::Node { depth, .. } = line {
+                if let Line::Node { depth, .. } | Line::Chrome { depth, .. } = line {
                     *depth = depth.saturating_sub(1);
                 }
             }
@@ -562,7 +578,7 @@ impl<Id> Walk<'_, Id> {
 
 /// Roles one operates whatever actions the platform lists (AT-SPI, then
 /// UI Automation names).
-const INTERACTIVE_ROLES: [&str; 25] = [
+pub const INTERACTIVE_ROLES: [&str; 25] = [
     "push button",
     "button",
     "toggle button",
@@ -717,17 +733,24 @@ fn shape<Id: Clone + Eq + Hash>(cache: &Cache<Id>, info: &Info<Id>, opts: &WalkO
 /// get thrown away) to collect all of them. In an interactive walk, true
 /// when a line it kept still wants its nearest named ancestor printed.
 /// `parent`: the element printed above `children` (lifted ones skipped).
+/// `lifted`: `children` are those of a lifted element, printed at the same
+/// level as its siblings.
 fn walk_into<'c, Id: Clone + Eq + Hash>(
     st: &mut Walk<'c, Id>,
     children: &'c [Id],
     depth: usize,
     parent: Option<&'c Info<Id>>,
+    lifted: bool,
 ) -> bool {
     let (cache, opts) = (st.cache, st.opts);
     let mut wants_context = false;
     if st.truncated || depth > opts.max_depth {
         return false;
     }
+    let outer = (!lifted).then(|| {
+        let bars = browser_chrome(cache, children, opts, &mut st.missing);
+        std::mem::replace(&mut st.chrome, bars)
+    });
     for (c, info) in get(cache, children, &mut st.missing) {
         if st.truncated {
             break;
@@ -739,8 +762,15 @@ fn walk_into<'c, Id: Clone + Eq + Hash>(
         if opts.only_showing && !info.showing {
             continue;
         }
+        if let Some(i) = st.chrome.iter().position(|b| b.id == c) {
+            // The first bar prints them all, the others are done.
+            if !st.chrome[i].printed {
+                wants_context |= push_chrome(st, depth);
+            }
+            continue;
+        }
         if shape(cache, info, opts) == Shape::Lift {
-            wants_context |= walk_into(st, &info.children, depth, parent);
+            wants_context |= walk_into(st, &info.children, depth, parent, true);
             continue;
         }
         let at = st.lines.len();
@@ -753,7 +783,7 @@ fn walk_into<'c, Id: Clone + Eq + Hash>(
         }
         // Whether the children were looked at, not cut by budget or depth.
         let walked = st.counted() < opts.budget && depth < opts.max_depth;
-        let kids_want = walk_into(st, &info.children, depth + 1, Some(info));
+        let kids_want = walk_into(st, &info.children, depth + 1, Some(info), false);
         if opts.interactive {
             if interactive(info) {
                 wants_context = true;
@@ -772,7 +802,195 @@ fn walk_into<'c, Id: Clone + Eq + Hash>(
             st.remove(at, false);
         }
     }
+    if let Some(outer) = outer {
+        st.chrome = outer;
+    }
     wants_context
+}
+
+/// Role of the frame that holds a browser's page (PAGE_ROLE), next to the
+/// tool bars around it.
+const PAGE_FRAME_ROLE: &str = "internal frame";
+const TOOL_BAR_ROLE: &str = "tool bar";
+
+/// Elements a browser's tool bar walk visits at most (`bar_summary`).
+const CHROME_MAX_SEEN: usize = 2000;
+
+/// A browser tool bar collapsed into the chrome line.
+struct ChromeBar<'c, Id> {
+    id: &'c Id,
+    /// The roles it holds, counted: "page tab ×17, button ×9".
+    counts: String,
+    /// Elements that stay on lines of their own: the selected tab and the
+    /// address bar (anything editable).
+    kept: Vec<&'c Id>,
+    printed: bool,
+}
+
+/// The elements of `ids` printed at their level: lifted ones (`shape`)
+/// replaced by theirs, hidden ones left out.
+fn printed_level<'c, Id: Clone + Eq + Hash>(
+    cache: &'c Cache<Id>,
+    ids: &'c [Id],
+    opts: &WalkOpts,
+    missing: &mut Vec<Id>,
+    out: &mut Vec<&'c Id>,
+) {
+    for (id, info) in get(cache, ids, missing) {
+        if opts.only_showing && !info.showing {
+            continue;
+        }
+        if shape(cache, info, opts) == Shape::Lift {
+            printed_level(cache, &info.children, opts, missing, out);
+        } else {
+            out.push(id);
+        }
+    }
+}
+
+/// The tool bars printed at the level of `children` next to an internal
+/// frame holding a web page (PAGE_ROLE): a browser's tab strip, navigation
+/// and menu bars, a third of its tree. A bar in use (holding the focus) or
+/// with nothing to operate is left to the walk. Firefox's layout; AT-SPI
+/// names only.
+fn browser_chrome<'c, Id: Clone + Eq + Hash>(
+    cache: &'c Cache<Id>,
+    children: &'c [Id],
+    opts: &WalkOpts,
+    missing: &mut Vec<Id>,
+) -> Vec<ChromeBar<'c, Id>> {
+    let roles = |ids: &[&Id]| -> Vec<&'c str> {
+        ids.iter()
+            .filter_map(|id| cache.get(*id).map(|i| i.role.as_str()))
+            .collect()
+    };
+    let mut level = Vec::new();
+    printed_level(cache, children, opts, missing, &mut level);
+    if !roles(&level).contains(&TOOL_BAR_ROLE) {
+        return Vec::new();
+    }
+    let page_frame = level.iter().any(|f| {
+        let frame = &cache[*f];
+        let mut inside = Vec::new();
+        frame.role == PAGE_FRAME_ROLE && {
+            printed_level(cache, &frame.children, opts, missing, &mut inside);
+            roles(&inside).contains(&PAGE_ROLE)
+        }
+    });
+    if !page_frame {
+        return Vec::new();
+    }
+    level
+        .into_iter()
+        .filter(|b| cache[*b].role == TOOL_BAR_ROLE)
+        .filter_map(|b| bar_summary(cache, b, opts.only_showing, missing))
+        .filter(|b| !b.counts.is_empty() || !b.kept.is_empty())
+        .collect()
+}
+
+/// `bar`'s counts and kept elements; None when it holds the focus.
+fn bar_summary<'c, Id: Clone + Eq + Hash>(
+    cache: &'c Cache<Id>,
+    bar: &'c Id,
+    only_showing: bool,
+    missing: &mut Vec<Id>,
+) -> Option<ChromeBar<'c, Id>> {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    let mut kept = Vec::new();
+    let mut stack: Vec<&Id> = cache[bar].children.iter().rev().collect();
+    let mut seen = 0;
+    while let Some(id) = stack.pop() {
+        seen += 1;
+        if seen > CHROME_MAX_SEEN {
+            break;
+        }
+        let Some(info) = cache.get(id) else {
+            missing.push(id.clone());
+            continue;
+        };
+        if only_showing && !info.showing {
+            continue;
+        }
+        if info.states.contains(&"focused") {
+            return None;
+        }
+        if interactive(info) {
+            match counts.iter_mut().find(|(r, _)| *r == info.role) {
+                Some((_, n)) => *n += 1,
+                None => counts.push((&info.role, 1)),
+            }
+        }
+        let selected_tab = info.role == "page tab" && info.states.contains(&"selected");
+        if selected_tab || editable(info) {
+            kept.push(id);
+            continue;
+        }
+        stack.extend(info.children.iter().rev());
+    }
+    let counts = counts
+        .iter()
+        .map(|(r, n)| format!("{r} ×{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(ChromeBar {
+        id: bar,
+        counts,
+        kept,
+        printed: false,
+    })
+}
+
+/// Print the chrome line for all of `bars`, then their kept elements as
+/// lines of their own (without children) at the same depth. True when a
+/// kept line wants context (an interactive walk).
+fn push_chrome<Id: Clone + Eq + Hash>(st: &mut Walk<'_, Id>, depth: usize) -> bool {
+    st.lines.push(Line::Chrome {
+        depth,
+        bars: st
+            .chrome
+            .iter()
+            .map(|b| (b.id.clone(), b.counts.clone()))
+            .collect(),
+    });
+    let mut kept = false;
+    for bar in st.chrome.iter_mut() {
+        bar.printed = true;
+        for &id in &bar.kept {
+            let at = st.lines.len();
+            st.lines.push(Line::Node {
+                depth,
+                id: id.clone(),
+            });
+            if st.start.is_none() && st.after == Some(id) {
+                st.start = Some(at + 1);
+            }
+            kept = true;
+        }
+    }
+    kept && st.opts.interactive
+}
+
+/// The text of a `Line::Chrome`: each bar with its id, name and counts,
+/// and how to list one in full.
+pub fn chrome_line<Id>(depth: usize, bars: &[(u64, &Info<Id>, &str)]) -> String {
+    let bars: Vec<String> = bars
+        .iter()
+        .map(|(rid, info, counts)| {
+            let name = match short_name(info) {
+                n if n.is_empty() => String::new(),
+                n => format!(" {}", json_str(&n)),
+            };
+            match *counts {
+                "" => format!("[{rid}]{name}"),
+                c => format!("[{rid}]{name}: {c}"),
+            }
+        })
+        .collect();
+    format!(
+        "{}browser tool bars, tree(root_id=<id>) lists one: {}",
+        " ".repeat(depth),
+        bars.join("; ")
+    )
 }
 
 /// Whether the line at `at` (`info`'s) has a single line right below it
@@ -1696,25 +1914,91 @@ pub fn closest<Id: Clone + Eq + Hash>(
 /// text), in document order, for telling whether a window changed. Nodes
 /// not fetched are left out.
 pub fn fingerprint<Id: Clone + Eq + Hash>(cache: &Cache<Id>, roots: &[Id]) -> u64 {
+    hash_showing(cache, roots, false).0
+}
+
+/// Roles whose content changes on its own, not because a page is still
+/// building: live regions (a log, a ticker, a status line), media,
+/// progress and clocks.
+pub const RESTLESS_ROLES: [&str; 8] = [
+    "log",
+    "marquee",
+    "timer",
+    "status bar",
+    "progress bar",
+    "animation",
+    "video",
+    "audio",
+];
+
+/// `fingerprint` without what changes on its own: the subtrees of
+/// `RESTLESS_ROLES` are left out, and each run of digits in names and text
+/// counts as one digit (a clock, a counter, "3 s ago"), so a page whose
+/// only changes are those hashes the same. Err: the hash, and the elements
+/// it would read that `cache` lacks.
+pub fn steady_fingerprint<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+) -> Result<u64, (u64, Vec<Id>)> {
+    match hash_showing(cache, roots, true) {
+        (h, missing) if missing.is_empty() => Ok(h),
+        out => Err(out),
+    }
+}
+
+/// `s` with each run of digits as a single "0".
+fn digits_folded(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut digit = false;
+    for c in s.chars() {
+        let d = c.is_ascii_digit();
+        if !(d && digit) {
+            out.push(if d { '0' } else { c });
+        }
+        digit = d;
+    }
+    out
+}
+
+/// The hash, and the elements it would have read that `cache` lacks.
+fn hash_showing<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    roots: &[Id],
+    steady: bool,
+) -> (u64, Vec<Id>) {
     use std::hash::Hasher;
     let mut h = std::collections::hash_map::DefaultHasher::new();
     let mut stack: Vec<&Id> = roots.iter().rev().collect();
     let mut seen = 0;
+    let mut missing = Vec::new();
     while let Some(id) = stack.pop() {
         seen += 1;
         if seen > FIND_MAX_SEEN {
             break;
         }
-        let Some(info) = cache.get(id) else { continue };
+        let Some(info) = cache.get(id) else {
+            missing.push(id.clone());
+            continue;
+        };
         if !info.showing {
             continue;
         }
-        (&info.role, &info.name, &info.states, &info.text).hash(&mut h);
+        if steady {
+            if RESTLESS_ROLES.contains(&info.role.as_str()) {
+                // Where it is still counts: one coming or going changes the page.
+                info.role.hash(&mut h);
+                continue;
+            }
+            let text = info.text.as_deref().map(digits_folded);
+            (&info.role, digits_folded(&info.name), &info.states, text).hash(&mut h);
+        } else {
+            (&info.role, &info.name, &info.states, &info.text).hash(&mut h);
+        }
         // Where a subtree ends, so moving a node changes the hash.
         info.children.len().hash(&mut h);
         stack.extend(info.children.iter().rev());
     }
-    h.finish()
+    (h.finish(), missing)
 }
 
 /// Roles of the page or document inside an app window: a browser tab's web
@@ -1744,6 +2028,111 @@ pub fn first_with_role<Id: Clone + Eq + Hash>(
         push_showing(cache, &info.children, &mut stack, &mut missing);
     }
     done(None, missing)
+}
+
+/// The window of `windows` a capture titled `caption` shows (`front`: the
+/// capture is of the window in front).
+pub fn window_titled<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    windows: &[Id],
+    caption: &str,
+    front: bool,
+) -> Option<Id> {
+    let shown: Vec<(&Id, &Info<Id>)> = windows
+        .iter()
+        .filter_map(|w| cache.get(w).map(|i| (w, i)))
+        .filter(|(_, i)| i.showing)
+        .collect();
+    pick_window(&shown, caption, front)
+}
+
+/// Of an app's shown windows, the one a capture titled `caption` shows:
+/// in front, its active window (unless another has that title); behind,
+/// the one of that title (else the only one) that is not active. None
+/// when that is not one window: two of the same title, say, where one's
+/// element boxes would be placed on the other's pixels.
+pub fn pick_window<Id: Clone>(
+    shown: &[(&Id, &Info<Id>)],
+    caption: &str,
+    front: bool,
+) -> Option<Id> {
+    let caption = caption.trim();
+    let active = |i: &Info<Id>| i.states.contains(&"active");
+    let by_name = |exact: bool| -> Vec<usize> {
+        (0..shown.len())
+            .filter(|&k| {
+                let name = shown[k].1.name.trim();
+                !name.is_empty()
+                    && if exact {
+                        name == caption
+                    } else {
+                        caption.starts_with(name)
+                    }
+            })
+            .collect()
+    };
+    let mut named = by_name(true);
+    if named.is_empty() {
+        named = by_name(false);
+    }
+    let only = |v: Vec<usize>| (v.len() == 1).then(|| shown[v[0]].0.clone());
+    match front {
+        true => match (0..shown.len()).find(|&k| active(shown[k].1)) {
+            Some(k) => (named.is_empty() || named.contains(&k)).then(|| shown[k].0.clone()),
+            None if named.is_empty() => only((0..shown.len()).collect()),
+            None => only(named),
+        },
+        false if named.is_empty() => {
+            only((0..shown.len()).filter(|&k| !active(shown[k].1)).collect())
+                .filter(|_| shown.len() == 1)
+        }
+        false => only(named.into_iter().filter(|&k| !active(shown[k].1)).collect()),
+    }
+}
+
+/// The visible interactive elements below `root` (as `tree(interactive=true)`
+/// lists them; title roles aside: a browser's dozens of tabs would crowd
+/// out the page and its toolbar, and find names them) in document order,
+/// each with whether it lies in a document (a web page). Stops after
+/// `max_seen` nodes; what is missing then is not asked for.
+pub fn mark_candidates<Id: Clone + Eq + Hash>(
+    cache: &Cache<Id>,
+    root: &Id,
+    max_seen: usize,
+) -> Result<Vec<(Id, bool)>, Vec<Id>> {
+    let mut missing = Vec::new();
+    let mut out = Vec::new();
+    let Some(info) = cache.get(root) else {
+        return Err(vec![root.clone()]);
+    };
+    // (node, in a document); the stack pops in document order.
+    let mut stack: Vec<(&Id, bool)> = Vec::new();
+    fn push<'a, Id: Clone + Eq + Hash>(
+        cache: &'a Cache<Id>,
+        kids: &'a [Id],
+        doc: bool,
+        stack: &mut Vec<(&'a Id, bool)>,
+        missing: &mut Vec<Id>,
+    ) {
+        let mut ids = Vec::new();
+        push_showing(cache, kids, &mut ids, missing);
+        stack.extend(ids.into_iter().map(|c| (c, doc)));
+    }
+    push(cache, &info.children, false, &mut stack, &mut missing);
+    let mut seen = 0;
+    while let Some((id, doc)) = stack.pop() {
+        seen += 1;
+        if seen > max_seen {
+            return Ok(out);
+        }
+        let info = &cache[id];
+        let doc = doc || DOCUMENT_ROLES.contains(&info.role.as_str());
+        if !TITLE_ROLES.contains(&info.role.as_str()) && interactive(info) {
+            out.push((id.clone(), doc));
+        }
+        push(cache, &info.children, doc, &mut stack, &mut missing);
+    }
+    done(out, missing)
 }
 
 /// Roles whose content starts on a line of its own in `container_text`.
@@ -2812,7 +3201,7 @@ mod tests {
             .iter()
             .map(|l| match l {
                 Line::Node { depth, id } => (*depth, *id),
-                Line::Raw(_) => (0, "raw"),
+                _ => (0, "raw"),
             })
             .collect();
         assert_eq!(got, vec![(1, "/w"), (2, "/b1"), (2, "/b2")]);
@@ -3276,6 +3665,146 @@ mod tests {
         assert_eq!((m.picked, m.over_chrome), (vec![("/cancel", "/w")], 2));
     }
 
+    /// `browser()` with its first tab selected and an address bar.
+    fn browser_with_address_bar() -> Cache<&'static str> {
+        let mut c = browser();
+        c.get_mut("/t1").unwrap().states = vec!["selected"];
+        let bar = c.get_mut("/bar").unwrap();
+        bar.children.push("/url");
+        c.insert("/url", node("entry", "Adres", true, &["editable"], &[]));
+        c
+    }
+
+    /// The walk's lines as (depth, id), a chrome line as (depth, "chrome:
+    /// <bar>=<counts> ...").
+    fn chrome_walk(
+        c: &Cache<&'static str>,
+        roots: &[&'static str],
+        o: &WalkOpts,
+        after: Option<&'static str>,
+    ) -> Vec<(usize, String)> {
+        let mut lines = Vec::new();
+        walk(c, roots, 1, o, after.as_ref(), &mut lines).unwrap();
+        lines
+            .into_iter()
+            .filter_map(|l| match l {
+                Line::Node { depth, id } => Some((depth, id.to_string())),
+                Line::Chrome { depth, bars } => {
+                    let bars: Vec<String> =
+                        bars.iter().map(|(id, n)| format!("{id}={n}")).collect();
+                    Some((depth, format!("chrome: {}", bars.join(" "))))
+                }
+                Line::Raw(_) => None,
+            })
+            .collect()
+    }
+
+    fn lines(want: &[(usize, &str)]) -> Vec<(usize, String)> {
+        want.iter().map(|(d, s)| (*d, s.to_string())).collect()
+    }
+
+    #[test]
+    fn a_browsers_tool_bars_share_a_line_but_the_tab_and_address_bar() {
+        let c = browser_with_address_bar();
+        let page = [
+            (2, "/if"),
+            (3, "/doc"),
+            (4, "/plus"),
+            (4, "/fwd"),
+            (4, "/close"),
+        ];
+        let mut want = vec![
+            (1, "/w"),
+            (2, "chrome: /bar=page tab ×2, push button ×5, entry ×1"),
+            (2, "/t1"),
+            (2, "/url"),
+        ];
+        want.extend(page);
+        assert_eq!(chrome_walk(&c, &["/w"], &opts(300), None), lines(&want));
+        // From the window as root (observe=tree), the same; from the bar,
+        // all of it.
+        assert_eq!(
+            chrome_walk(&c, &["/bar", "/if"], &opts(300), None)[0],
+            (
+                1,
+                "chrome: /bar=page tab ×2, push button ×5, entry ×1".into()
+            )
+        );
+        let bar = chrome_walk(&c, &c["/bar"].children, &opts(300), None);
+        assert_eq!(bar.len(), 10);
+        // Interactive: the chrome line stays, with the window as context.
+        let o = WalkOpts {
+            interactive: true,
+            ..opts(300)
+        };
+        let got = chrome_walk(&c, &["/w"], &o, None);
+        assert_eq!(got[..4], lines(&want[..4])[..]);
+        // A page cut after the address bar goes on with the page.
+        assert_eq!(
+            chrome_walk(&c, &["/w"], &opts(300), Some("/url")),
+            lines(&page)
+        );
+    }
+
+    #[test]
+    fn a_browsers_tool_bars_collapse_through_nameless_wrappers() {
+        let mut c = browser_with_address_bar();
+        c.get_mut("/w").unwrap().children = vec!["/p1", "/if"];
+        c.insert("/p1", node("panel", "", true, &[], &["/bar"]));
+        c.get_mut("/if").unwrap().children = vec!["/f1"];
+        c.insert("/f1", node("filler", "", true, &[], &["/doc"]));
+        let got = chrome_walk(&c, &["/w"], &opts(300), None);
+        assert_eq!(
+            got[..3],
+            lines(&[
+                (1, "/w"),
+                (2, "chrome: /bar=page tab ×2, push button ×5, entry ×1"),
+                (2, "/t1"),
+            ])[..]
+        );
+    }
+
+    #[test]
+    fn tool_bars_print_in_full_without_a_page_or_with_the_focus() {
+        // Focus in a bar: it is in use.
+        let mut c = browser_with_address_bar();
+        c.get_mut("/url").unwrap().states = vec!["focused", "editable"];
+        let got = chrome_walk(&c, &["/w"], &opts(300), None);
+        assert!(got.iter().all(|(_, l)| !l.starts_with("chrome")));
+        assert_eq!(got[1], (2, "/bar".into()));
+        // No web page next to the bars: an app's own tool bars.
+        let mut c = browser_with_address_bar();
+        c.get_mut("/doc").unwrap().role = "text".into();
+        let got = chrome_walk(&c, &["/w"], &opts(300), None);
+        assert_eq!(got[1], (2, "/bar".into()));
+        // An empty bar is dropped as before, not summed up.
+        let mut c = browser_with_address_bar();
+        c.get_mut("/w").unwrap().children.insert(0, "/empty");
+        c.insert("/empty", node("tool bar", "", true, &[], &[]));
+        let got = chrome_walk(&c, &["/w"], &opts(300), None);
+        assert_eq!(
+            got[1],
+            (
+                2,
+                "chrome: /bar=page tab ×2, push button ×5, entry ×1".into()
+            )
+        );
+    }
+
+    #[test]
+    fn the_chrome_line_names_each_bar_by_id() {
+        let named = node("tool bar", "Gezinme", true, &[], &[]);
+        let nameless = node("tool bar", "", true, &[], &[]);
+        assert_eq!(
+            chrome_line(
+                1,
+                &[(6, &named, "page tab ×11, button ×3"), (25, &nameless, "")]
+            ),
+            " browser tool bars, tree(root_id=<id>) lists one: \
+             [6] \"Gezinme\": page tab ×11, button ×3; [25]"
+        );
+    }
+
     #[test]
     fn the_page_never_takes_a_field_of_the_browser() {
         // A page's look-alike of the address bar: a tie, refused.
@@ -3662,6 +4191,74 @@ mod tests {
         assert_eq!(first_with_role(&cache, &["/w"], &["table"]).unwrap(), None);
     }
 
+    #[test]
+    fn marks_are_a_windows_interactive_elements_page_ones_flagged() {
+        let mut c = Cache::new();
+        c.insert(
+            "/w",
+            node("frame", "Inbox — Firefox", true, &[], &["/tb", "/doc"]),
+        );
+        c.insert(
+            "/w2",
+            node("frame", "Other — Firefox", true, &["active"], &[]),
+        );
+        c.insert("/tb", node("tool bar", "", true, &[], &["/back", "/gone"]));
+        let back = with_actions(node("push button", "Back", true, &[], &[]), &["press"]);
+        c.insert("/back", back);
+        let gone = with_actions(node("push button", "Hidden", false, &[], &[]), &["press"]);
+        c.insert("/gone", gone);
+        c.insert(
+            "/doc",
+            node("document web", "Inbox", true, &[], &["/p", "/link"]),
+        );
+        c.insert(
+            "/p",
+            node("paragraph", "", true, &[], &["/entry", "/missing"]),
+        );
+        c.insert("/entry", node("entry", "Search", true, &["editable"], &[]));
+        let link = with_actions(node("link", "Home", true, &[], &[]), &["jump"]);
+        c.insert("/link", link);
+        // "/missing" is not read yet: asked for, with nothing else.
+        assert_eq!(mark_candidates(&c, &"/w", 100), Err(vec!["/missing"]));
+        c.insert("/missing", node("static", "text", true, &[], &[]));
+        assert_eq!(
+            mark_candidates(&c, &"/w", 100).unwrap(),
+            vec![("/back", false), ("/entry", true), ("/link", true)]
+        );
+        // Past the nodes it may look through: what it saw, nothing asked.
+        c.remove("/missing");
+        assert_eq!(
+            mark_candidates(&c, &"/w", 2).unwrap(),
+            vec![("/back", false)]
+        );
+        // The window a capture shows: in front, the active one; behind,
+        // the one of its title that is not.
+        let ws = ["/w", "/w2"];
+        assert_eq!(window_titled(&c, &ws, "Inbox — Firefox", false), Some("/w"));
+        assert_eq!(window_titled(&c, &ws, "Inbox — Firefox", true), None);
+        assert_eq!(
+            window_titled(&c, &ws, "Other — Firefox x", true),
+            Some("/w2")
+        );
+        assert_eq!(window_titled(&c, &ws, "Other — Firefox x", false), None);
+        assert_eq!(window_titled(&c, &ws, "Settings", true), Some("/w2"));
+        assert_eq!(window_titled(&c, &ws, "Settings", false), None);
+        assert_eq!(window_titled(&c, &["/w"], "Settings", false), Some("/w"));
+        assert_eq!(window_titled(&c, &["/w"], "Settings", true), Some("/w"));
+        assert_eq!(window_titled(&c, &["/gone", "/x"], "Settings", true), None);
+        // Two of the same title: the active one in front; behind, unsure.
+        c.insert("/w3", node("frame", "Other — Firefox", true, &[], &[]));
+        let ws = ["/w", "/w2", "/w3"];
+        assert_eq!(window_titled(&c, &ws, "Other — Firefox", true), Some("/w2"));
+        assert_eq!(
+            window_titled(&c, &ws, "Other — Firefox", false),
+            Some("/w3")
+        );
+        c.get_mut("/w2").unwrap().states.clear();
+        assert_eq!(window_titled(&c, &ws, "Other — Firefox", false), None);
+        assert_eq!(window_titled(&c, &ws, "Other — Firefox", true), None);
+    }
+
     fn with_actions(mut n: Info<&'static str>, actions: &[&str]) -> Info<&'static str> {
         n.actions = actions.iter().map(|a| a.to_string()).collect();
         n
@@ -3871,7 +4468,7 @@ mod tests {
             .iter()
             .filter_map(|l| match l {
                 Line::Node { depth, id } => Some((*depth, *id)),
-                Line::Raw(_) => None,
+                _ => None,
             })
             .collect()
     }
@@ -4202,7 +4799,7 @@ mod tests {
             .iter()
             .filter_map(|l| match l {
                 Line::Node { depth, id } => Some((*depth, *id)),
-                Line::Raw(_) => None,
+                _ => None,
             })
             .collect();
         (nodes, w)
@@ -4338,6 +4935,53 @@ mod tests {
         let mut hidden = sample();
         hidden.get_mut("/h").unwrap().name = "other".into();
         assert_eq!(fp, fingerprint(&hidden, &["/w"]));
+    }
+
+    #[test]
+    fn steady_fingerprint_ignores_clocks_media_and_live_regions() {
+        let page = |clock: &str, log: &str, heading: &str| {
+            let mut c = Cache::new();
+            c.insert(
+                "/d",
+                node(
+                    "document web",
+                    "News",
+                    true,
+                    &[],
+                    &["/h", "/t", "/log", "/v"],
+                ),
+            );
+            c.insert("/h", node("heading", heading, true, &[], &[]));
+            let mut t = node("label", "", true, &[], &[]);
+            t.text = Some(clock.into());
+            c.insert("/t", t);
+            c.insert("/log", node("log", "", true, &[], &["/e"]));
+            c.insert("/e", node("paragraph", log, true, &[], &[]));
+            c.insert("/v", node("video", "", true, &[], &[]));
+            c
+        };
+        let sfp = |c: &Cache<&'static str>, r: &[&'static str]| steady_fingerprint(c, r).unwrap();
+        let fp = sfp(&page("12:04:59", "a", "Top"), &["/d"]);
+        // The clock ticked and the log grew: the same page.
+        assert_eq!(fp, sfp(&page("12:05:00", "b", "Top"), &["/d"]));
+        assert_ne!(
+            fingerprint(&page("12:04:59", "a", "Top"), &["/d"]),
+            fingerprint(&page("12:05:00", "b", "Top"), &["/d"])
+        );
+        // Its real content changed.
+        assert_ne!(fp, sfp(&page("12:04:59", "a", "Bottom"), &["/d"]));
+        // A live region going away changes it too.
+        let mut gone = page("12:04:59", "a", "Top");
+        gone.get_mut("/d").unwrap().children.pop();
+        assert_ne!(fp, sfp(&gone, &["/d"]));
+        // Elements not read yet are named, for reading them.
+        let mut short = page("12:04:59", "a", "Top");
+        short.remove("/h");
+        assert_eq!(
+            steady_fingerprint(&short, &["/d"]).unwrap_err().1,
+            vec!["/h"]
+        );
+        assert_eq!(digits_folded("3 of 120, 4.5 s"), "0 of 0, 0.0 s");
     }
 
     #[test]

@@ -142,6 +142,21 @@ fn zero_size(ext: &R<(i32, i32, i32, i32)>) -> bool {
     matches!(ext, Ok((_, _, w, h)) if *w <= 0 || *h <= 0)
 }
 
+/// Whether a box (x, y, w, h) with area holds the point (`px`, `py`).
+fn box_holds((x, y, w, h): (i32, i32, i32, i32), px: i32, py: i32) -> bool {
+    w > 0 && h > 0 && (x..x + w).contains(&px) && (y..y + h).contains(&py)
+}
+
+/// Whether a showing top-level of the app in front that is not its
+/// active window may cover a point of it: anything but another frame or
+/// dialog (behind the active one) and a tool tip (a popup menu or a
+/// combo box's list is its own window, placed where AT-SPI does not say).
+fn may_cover(role: &str) -> bool {
+    // Plain top-levels (a Qt widget window is a "filler") are windows,
+    // which KWin's stacking order answers for; only popups need this.
+    !matches!(role, "frame" | "dialog" | "tool tip" | "filler")
+}
+
 /// Screen centre of an element from its extents in window coordinates
 /// and the active window's origin, once its window is known to be active.
 /// An element without an area says so whether its window is active or not.
@@ -177,6 +192,14 @@ const FOCUS_POLL: Duration = Duration::from_millis(20);
 /// The same for Gecko, which applies focus in the page's own process: a
 /// grab that works may show only after tens of ms there.
 const FOCUS_POLL_GECKO: Duration = Duration::from_millis(150);
+/// Longest `element_at` takes before giving up (it runs before a pointer
+/// input): about 40 levels of a web page's tree read one by one.
+const HIT_LIMIT: Duration = Duration::from_millis(40);
+/// Levels `element_at` descends from the window.
+const HIT_DEPTH: usize = 40;
+/// How recent `active_app`'s look at the app in front must be for
+/// `element_at` to take its answer (the input tool's check just ran it).
+const HIT_ACTIVE_AGE: Duration = Duration::from_millis(1000);
 const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
 const NOT_A_FILE_DIALOG: &str = "the active window is not a KDE file dialog";
 /// Roles holding rows of data (files, places) or tool buttons, never the
@@ -602,6 +625,7 @@ fn kde_target(names: &HashMap<i64, String>, f: kwin::Frame) -> R<ShotTarget> {
         caption: f.caption,
         class: f.class,
         area: Some(f.area),
+        client: f.client,
         handle,
     })
 }
@@ -615,6 +639,7 @@ fn hypr_target(names: &HashMap<i64, String>, c: &Json) -> ShotTarget {
         caption: c["title"].as_str().unwrap_or_default().to_string(),
         class,
         area: hypr_area(c),
+        client: None,
         handle: c["address"].as_str().unwrap_or_default().to_string(),
     }
 }
@@ -1132,6 +1157,128 @@ impl LinuxBackend {
             .any(|st| atspi::has(st.unwrap_or(0), atspi::ACTIVE))
     }
 
+    /// `element_at` on KDE: AT-SPI reports boxes in window coordinates, so
+    /// the point goes into the active window (KWin's client origin), and
+    /// GetAccessibleAtPoint descends from that window's frame. Unsure (no
+    /// name): the AT-SPI app in front has no ACTIVE window, a popup of it
+    /// shows, another window (of any app: a notification, one kept above)
+    /// covers the point, the point is outside the frame, or the element's
+    /// box does not hold it.
+    /// The deepest element under window point (x, y), from `frame` down.
+    async fn descend_at(&self, frame: &Obj, x: i32, y: i32) -> Obj {
+        let mut cur = frame.clone();
+        for _ in 0..HIT_DEPTH {
+            match self
+                .a11y
+                .accessible_at_point(&cur, x, y, atspi::COORD_WINDOW)
+                .await
+            {
+                Some(c) if c != cur => cur = c,
+                _ => break,
+            }
+        }
+        cur
+    }
+
+    async fn kde_element_at(&self, kwin: &KWin, x: i64, y: i64) -> Option<Focused<Obj>> {
+        let a11y = &self.a11y;
+        let bus = match a11y.recent_active_bus(HIT_ACTIVE_AGE) {
+            Some(bus) => bus,
+            None => {
+                a11y.active_app().await;
+                a11y.recent_active_bus(HIT_ACTIVE_AGE)?
+            }
+        };
+        let app = Obj::new(&bus, OwnedObjectPath::try_from(APP_ROOT).ok()?);
+        // The server's own pointer indicator sits over the point it shows.
+        let skip: Vec<u32> = self
+            .indicator
+            .lock()
+            .await
+            .child
+            .as_ref()
+            .and_then(|(c, _, _)| c.id())
+            .into_iter()
+            .collect();
+        let (origin, windows) =
+            tokio::join!(kwin.active_origin_at(x, y, &skip), a11y.children(&app));
+        let ((gx, gy), covered, scale) = origin.ok()?;
+        if covered {
+            return None;
+        }
+        let states = futures_util::future::join_all(windows.iter().map(|w| a11y.states(w))).await;
+        let mut frame = None;
+        let mut others = Vec::new();
+        for (w, st) in windows.iter().zip(states) {
+            let st = st.unwrap_or(0);
+            if atspi::has(st, atspi::ACTIVE) && frame.is_none() {
+                frame = Some(w.clone());
+            } else if atspi::has(st, atspi::SHOWING) {
+                others.push(w);
+            }
+        }
+        let frame = frame?;
+        let roles = futures_util::future::join_all(others.iter().map(|w| a11y.role(w))).await;
+        if roles.iter().any(|r| may_cover(r)) {
+            return None;
+        }
+        let (wx, wy) = (
+            (x as f64 - gx).floor() as i32,
+            (y as f64 - gy).floor() as i32,
+        );
+        if !box_holds(
+            a11y.extents(&frame, atspi::COORD_WINDOW).await.ok()?,
+            wx,
+            wy,
+        ) {
+            return None;
+        }
+        // Gecko takes GetAccessibleAtPoint's point in device pixels on a
+        // scaled screen while it reports extents in logical ones: when the
+        // logical point lands on an element that does not hold it, ask
+        // again with the point scaled. The box check below decides.
+        let mut cur = self.descend_at(&frame, wx, wy).await;
+        if cur != frame
+            && (scale - 1.0).abs() > 0.01
+            && !matches!(a11y.extents(&cur, atspi::COORD_WINDOW).await, Ok(b) if box_holds(b, wx, wy))
+        {
+            let (sx, sy) = (
+                (wx as f64 * scale).round() as i32,
+                (wy as f64 * scale).round() as i32,
+            );
+            cur = self.descend_at(&frame, sx, sy).await;
+        }
+        if cur == frame {
+            return None;
+        }
+        let root = Self::app_of(&cur);
+        let (ext, (role, name), states, app_name) = tokio::join!(
+            a11y.extents(&cur, atspi::COORD_WINDOW),
+            a11y.identity(&cur),
+            a11y.states(&cur),
+            a11y.name(&root)
+        );
+        let st = states?;
+        if !box_holds(ext.ok()?, wx, wy) || !atspi::has(st, atspi::SHOWING) || role.is_empty() {
+            return None;
+        }
+        let info = Info {
+            role,
+            name,
+            states: atspi::state_labels(Some(st)),
+            showing: true,
+            actions: Vec::new(),
+            text: None,
+            children: Vec::new(),
+            operable: false,
+        };
+        Some(Focused {
+            id: cur,
+            info,
+            app: app_name,
+        })
+    }
+
     /// Whether the window holding `id` (its nearest frame, window or
     /// dialog ancestor) is ACTIVE.
     async fn frame_active(&self, id: &Obj) -> bool {
@@ -1344,9 +1491,10 @@ impl Backend for LinuxBackend {
         self.a11y.parent(id).await
     }
 
-    async fn window_title(&self, id: &Obj) -> Option<String> {
+    async fn window_of(&self, id: &Obj) -> Option<(Obj, String)> {
         let frame = self.a11y.frame_of(id).await?;
-        Some(self.a11y.identity(&frame).await.1)
+        let title = self.a11y.identity(&frame).await.1;
+        Some((frame, title))
     }
 
     fn read_mark(&self) -> Option<u64> {
@@ -1358,6 +1506,10 @@ impl Backend for LinuxBackend {
         buses.sort_unstable();
         buses.dedup();
         self.a11y.reads_unchanged(&buses, mark)
+    }
+
+    fn heard_changes(&self, near: &[Obj]) -> bool {
+        !near.is_empty() && near.iter().all(|o| self.a11y.reads_heard(&o.bus))
     }
 
     /// Apps known to send change events: they did since we listen, or
@@ -1842,6 +1994,16 @@ impl Backend for LinuxBackend {
         })
     }
 
+    async fn element_at(&self, x: i64, y: i64) -> Option<Focused<Obj>> {
+        // Hyprland: no name rather than one off by a toolkit's shadow
+        // (see `hypr_center`).
+        let Compositor::Kde(kwin) = &self.comp else {
+            return None;
+        };
+        let hit = tokio::time::timeout(HIT_LIMIT, self.kde_element_at(kwin, x, y)).await;
+        hit.ok().flatten()
+    }
+
     async fn is_focused(&self, id: &Obj) -> bool {
         self.a11y.has_state(id, atspi::FOCUSED).await
     }
@@ -1931,6 +2093,30 @@ impl Backend for LinuxBackend {
         futures_util::future::join_all(ids.iter().map(|id| async move {
             let ext = self.a11y.extents(id, atspi::COORD_WINDOW).await;
             ext.is_ok().then(|| !zero_size(&ext))
+        }))
+        .await
+    }
+
+    async fn element_boxes(
+        &self,
+        target: &ShotTarget,
+        ids: &[Obj],
+    ) -> Vec<Option<(f64, f64, f64, f64)>> {
+        // Window coordinates from the client origin KWin gave with the
+        // window (Hyprland: none, as for `element_at`).
+        let Some((gx, gy)) = target.client else {
+            return vec![None; ids.len()];
+        };
+        futures_util::future::join_all(ids.iter().map(|id| async move {
+            let (x, y, w, h) = self.a11y.extents(id, atspi::COORD_WINDOW).await.ok()?;
+            (w > 0 && h > 0).then(|| {
+                (
+                    gx + f64::from(x),
+                    gy + f64::from(y),
+                    f64::from(w),
+                    f64::from(h),
+                )
+            })
         }))
         .await
     }
@@ -2615,6 +2801,31 @@ impl Backend for LinuxBackend {
         Ok(t)
     }
 
+    async fn background_target(
+        &self,
+        query: &str,
+        allowed: &[String],
+    ) -> R<Option<(ShotTarget, bool)>> {
+        // spectacle, the fallback, captures only the active window.
+        let Compositor::Kde(kwin) = &self.comp else {
+            return Ok(None);
+        };
+        if self.shot_unauthorized.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let apps = self.apps_with_pids().await;
+        let allow = Self::allow_of(allowed, &apps);
+        let Some(p) = kwin.pick_frame(query, &allow).await? else {
+            return Ok(None);
+        };
+        // Minimized or elsewhere: nothing current to capture.
+        if p.minimized || !p.here || p.frame.handle.is_none() {
+            return Ok(None);
+        }
+        let target = kde_target(&Self::names_by_pid(&apps), p.frame)?;
+        Ok(Some((target, p.active)))
+    }
+
     async fn screenshot(&self, target: &ShotTarget) -> R<Shot> {
         self.hide_indicator().await;
         match &self.comp {
@@ -2636,6 +2847,20 @@ impl Backend for LinuxBackend {
                         // Older KWin without the desktop-file grant: stop asking.
                         Err(e) if e.starts_with(kwin::SHOT_NOT_AUTHORIZED) => {
                             self.shot_unauthorized.store(true, Ordering::Relaxed);
+                            // spectacle captures only the window in front: a
+                            // window captured in the background is activated
+                            // by the next screenshot (`background_target`).
+                            let front = kwin.active_frame().await.ok().flatten();
+                            if front.and_then(|f| f.handle).as_deref()
+                                != Some(target.handle.as_str())
+                            {
+                                return Err(format!(
+                                    "{} {} where it is; nothing captured: take the \
+                                     screenshot again to bring it to the front first",
+                                    crate::backend::SHOT_REFUSED_BEHIND,
+                                    target.describe()
+                                ));
+                            }
                         }
                         Err(e) => {
                             return Err(format!(
@@ -2709,6 +2934,23 @@ fn is_client(me: &crate::selfguard::SelfClient, pid: u32) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_hit_needs_a_box_that_holds_the_point_and_no_popup_over_it() {
+        assert!(box_holds((10, 20, 30, 40), 10, 20));
+        assert!(box_holds((10, 20, 30, 40), 39, 59));
+        // Right and bottom edges are outside; no area holds nothing.
+        assert!(!box_holds((10, 20, 30, 40), 40, 30));
+        assert!(!box_holds((10, 20, 30, 40), 15, 60));
+        assert!(!box_holds((10, 20, 0, 40), 10, 30));
+        assert!(!box_holds((-1, -1, -1, -1), -1, -1));
+        for role in ["frame", "dialog", "tool tip", "filler"] {
+            assert!(!may_cover(role), "{role}");
+        }
+        for role in ["menu", "popup menu", "window", "list"] {
+            assert!(may_cover(role), "{role}");
+        }
+    }
 
     fn chain(list: &[(&str, bool)]) -> Vec<(String, bool)> {
         list.iter().map(|(r, s)| (r.to_string(), *s)).collect()
@@ -2920,6 +3162,7 @@ mod tests {
         let names = HashMap::from([(4242, "Firefox".to_string())]);
         let frame = |pid: Option<u32>, handle: Option<&str>| kwin::Frame {
             area: (1.0, 2.0, 30.0, 40.0),
+            client: Some((1.0, 12.0)),
             handle: handle.map(str::to_string),
             pid,
             caption: "Inbox".into(),
@@ -2929,6 +3172,7 @@ mod tests {
         assert_eq!(t.app, "firefox");
         assert_eq!(t.handle, "{a-b}");
         assert_eq!(t.area, Some((1.0, 2.0, 30.0, 40.0)));
+        assert_eq!(t.client, Some((1.0, 12.0)));
         assert_eq!(t.describe(), "'Inbox' (class 'org.mozilla.firefox')");
         // Without accessibility (or a pid): the class, which the user can
         // allowlist.
