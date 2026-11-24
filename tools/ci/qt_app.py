@@ -69,13 +69,19 @@ def main() -> int:
     shortcut = QShortcut(QKeySequence("Ctrl+K"), win)
     shortcut.activated.connect(lambda: status.setText("Status: shortcut"))
 
-    win.resize(480, 360)
-    win.show()
-
-    other = QLabel("Other window")
+    # A second, plain window for the background screenshot check. It is a
+    # QWidget with a title (a bare QLabel window is named by its text), and
+    # it is shown first so the main window ends up in front.
+    other = QWidget()
     other.setWindowTitle(OTHER)
+    QVBoxLayout(other).addWidget(QLabel("Other window"))
     other.resize(480, 360)
     other.show()
+
+    win.resize(480, 360)
+    win.show()
+    win.raise_()
+    win.activateWindow()
     return app.exec()
 
 
