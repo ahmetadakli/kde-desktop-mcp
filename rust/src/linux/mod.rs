@@ -1162,6 +1162,22 @@ impl LinuxBackend {
     /// shows, another window (of any app: a notification, one kept above)
     /// covers the point, the point is outside the frame, or the element's
     /// box does not hold it.
+    /// The deepest element under window point (x, y), from `frame` down.
+    async fn descend_at(&self, frame: &Obj, x: i32, y: i32) -> Obj {
+        let mut cur = frame.clone();
+        for _ in 0..HIT_DEPTH {
+            match self
+                .a11y
+                .accessible_at_point(&cur, x, y, atspi::COORD_WINDOW)
+                .await
+            {
+                Some(c) if c != cur => cur = c,
+                _ => break,
+            }
+        }
+        cur
+    }
+
     async fn kde_element_at(&self, kwin: &KWin, x: i64, y: i64) -> Option<Focused<Obj>> {
         let a11y = &self.a11y;
         let bus = match a11y.recent_active_bus(HIT_ACTIVE_AGE) {
@@ -1172,8 +1188,19 @@ impl LinuxBackend {
             }
         };
         let app = Obj::new(&bus, OwnedObjectPath::try_from(APP_ROOT).ok()?);
-        let (origin, windows) = tokio::join!(kwin.active_origin_at(x, y), a11y.children(&app));
-        let ((gx, gy), covered) = origin.ok()?;
+        // The server's own pointer indicator sits over the point it shows.
+        let skip: Vec<u32> = self
+            .indicator
+            .lock()
+            .await
+            .child
+            .as_ref()
+            .and_then(|(c, _, _)| c.id())
+            .into_iter()
+            .collect();
+        let (origin, windows) =
+            tokio::join!(kwin.active_origin_at(x, y, &skip), a11y.children(&app));
+        let ((gx, gy), covered, scale) = origin.ok()?;
         if covered {
             return None;
         }
@@ -1204,15 +1231,20 @@ impl LinuxBackend {
         ) {
             return None;
         }
-        let mut cur = frame.clone();
-        for _ in 0..HIT_DEPTH {
-            match a11y
-                .accessible_at_point(&cur, wx, wy, atspi::COORD_WINDOW)
-                .await
-            {
-                Some(c) if c != cur => cur = c,
-                _ => break,
-            }
+        // Gecko takes GetAccessibleAtPoint's point in device pixels on a
+        // scaled screen while it reports extents in logical ones: when the
+        // logical point lands on an element that does not hold it, ask
+        // again with the point scaled. The box check below decides.
+        let mut cur = self.descend_at(&frame, wx, wy).await;
+        if cur != frame
+            && (scale - 1.0).abs() > 0.01
+            && !matches!(a11y.extents(&cur, atspi::COORD_WINDOW).await, Ok(b) if box_holds(b, wx, wy))
+        {
+            let (sx, sy) = (
+                (wx as f64 * scale).round() as i32,
+                (wy as f64 * scale).round() as i32,
+            );
+            cur = self.descend_at(&frame, sx, sy).await;
         }
         if cur == frame {
             return None;

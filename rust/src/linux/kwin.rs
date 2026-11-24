@@ -377,11 +377,14 @@ const ORIGIN_AT: &str = "JSON.stringify((() => { const w = workspace.activeWindo
      const g = w.clientGeometry; const cur = workspace.currentDesktop; \
      const order = workspace.stackingOrder; const id = String(w.internalId); \
      const i = order.findIndex(o => String(o.internalId) === id); \
+     const skip = [%SKIP%]; \
      const covered = i < 0 || order.slice(i + 1).some(o => !o.minimized && !o.deleted \
+       && !o.tooltip && !skip.includes(o.pid) \
        && (o.onAllDesktops || (o.desktops || []).some(d => d.id === cur.id)) \
        && %X% >= o.frameGeometry.x && %X% < o.frameGeometry.x + o.frameGeometry.width \
        && %Y% >= o.frameGeometry.y && %Y% < o.frameGeometry.y + o.frameGeometry.height); \
-     return {x: g.x, y: g.y, covered: covered}; })())";
+     const sc = (w.output && w.output.devicePixelRatio) || 1; \
+     return {x: g.x, y: g.y, covered: covered, scale: sc}; })())";
 
 /// The active window's frame, its internal id (the handle ScreenShot2's
 /// CaptureWindow takes, "{uuid}"), and its process, caption and class, so
@@ -404,10 +407,11 @@ const VIRTUAL_SCREEN: &str = "JSON.stringify((() => { const g = workspace.virtua
 const CURSOR_POS: &str = "JSON.stringify({x: workspace.cursorPos.x, y: workspace.cursorPos.y})";
 
 /// Parse what ORIGIN_AT reports.
-fn origin_at_of(raw: &str) -> R<((f64, f64), bool)> {
+fn origin_at_of(raw: &str) -> R<((f64, f64), bool, f64)> {
     let v: Json = serde_json::from_str(raw).unwrap_or(Json::Null);
+    let scale = v["scale"].as_f64().filter(|s| *s > 0.0).unwrap_or(1.0);
     match (v["x"].as_f64(), v["y"].as_f64()) {
-        (Some(x), Some(y)) => Ok(((x, y), v["covered"].as_bool().unwrap_or(true))),
+        (Some(x), Some(y)) => Ok(((x, y), v["covered"].as_bool().unwrap_or(true), scale)),
         _ => Err("could not read the active window geometry from KWin".into()),
     }
 }
@@ -569,8 +573,19 @@ impl KWin {
 
     /// Client-area origin (logical px) of KWin's active window, and
     /// whether another window covers the point (`x`, `y`) there.
-    pub async fn active_origin_at(&self, x: i64, y: i64) -> R<((f64, f64), bool)> {
+    /// The active window's client origin, whether another window covers
+    /// (x, y), and the scale of the window's screen.
+    /// Windows of the processes in `skip` (the server's own indicator) and
+    /// tool tips do not count as covering.
+    pub async fn active_origin_at(
+        &self,
+        x: i64,
+        y: i64,
+        skip: &[u32],
+    ) -> R<((f64, f64), bool, f64)> {
+        let skip: Vec<String> = skip.iter().map(|p| p.to_string()).collect();
         let js = ORIGIN_AT
+            .replace("%SKIP%", &skip.join(","))
             .replace("%X%", &x.to_string())
             .replace("%Y%", &y.to_string());
         origin_at_of(&self.query(&js).await?.unwrap_or_default())
@@ -1003,10 +1018,13 @@ mod tests {
     #[test]
     fn cursor_position_is_parsed_and_rounded() {
         assert_eq!(
-            origin_at_of(r#"{"x":10,"y":40.5,"covered":false}"#),
-            Ok(((10.0, 40.5), false))
+            origin_at_of(r#"{"x":10,"y":40.5,"covered":false,"scale":1.25}"#),
+            Ok(((10.0, 40.5), false, 1.25))
         );
-        assert_eq!(origin_at_of(r#"{"x":10,"y":40}"#), Ok(((10.0, 40.0), true)));
+        assert_eq!(
+            origin_at_of(r#"{"x":10,"y":40}"#),
+            Ok(((10.0, 40.0), true, 1.0))
+        );
         assert!(origin_at_of("null").is_err());
         assert_eq!(cursor_pos_of(r#"{"x":1920,"y":-5}"#), Ok((1920, -5)));
         assert_eq!(cursor_pos_of(r#"{"x":10.6,"y":3.2}"#), Ok((11, 3)));
