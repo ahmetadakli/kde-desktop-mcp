@@ -695,8 +695,10 @@ tool; `off` turns it off). Not available on Windows yet.
   password manager marked as a password (`x-kde-passwordManagerHint`; on
   Windows `ExcludeClipboardContentFromMonitorProcessing`).
 - `mouse`, `screenshot`: fallback only. `screenshot` returns the image inside
-  the reply, shrinks it so its longer side is 1024 px by default (`max_size`)
-  and reports which screen area it shows. The inline image is a JPEG
+  the reply, shrinks it so its longer side is 1024 px by default (`max_size`,
+  at most 2576, and never over 3.7 megapixels: newer Claude models refuse
+  larger images rather than shrink them) and reports which screen area it
+  shows. The inline image is a JPEG
   (quality 80, full colour resolution, so small text stays sharp) when that
   takes at most three quarters of the PNG's bytes, else a PNG: a 1024x576
   YouTube window took 132 KB instead of 670 KB, a Confluence page 94 KB
@@ -717,7 +719,11 @@ tool; `off` turns it off). Not available on Windows yet.
   and display scaling, e.g. 125 %, included). Zoom: `region: [x, y, w, h]`
   in pixels of the last screenshot captures again and returns only that part,
   cropped before shrinking, at up to full resolution (`max_size` still
-  applies); `image_x`/`image_y` then refer to the zoomed image. The
+  applies); `image_x`/`image_y` then refer to the zoomed image. `id` (from
+  tree/find/marks) instead crops to that element's box and 12 px around it,
+  e.g. to look at a control after `act` without a whole-window image; an
+  element in a window behind is captured there on KDE (else the reply names
+  its window), one scrolled out of view is refused. The
   allowlist is checked on the window that is captured: KDE reads KWin's
   active window (its process, caption and class) once and captures it by its
   handle; `spectacle` (older KWin), `grim` (Hyprland) and the Windows screen

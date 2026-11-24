@@ -1028,6 +1028,19 @@ fn region_frac(
     })
 }
 
+/// Whether the window title an element's frame gives (`window_title`) is
+/// that of the window captioned `caption`; an unknown (empty) one is.
+fn same_window(caption: &str, title: &str) -> bool {
+    let (caption, title) = (caption.trim(), title.trim());
+    title.is_empty() || caption == title || caption.starts_with(title)
+}
+
+/// The screen area `screenshot(id=…)` shows of an element's box `b`.
+fn around((x, y, w, h): (f64, f64, f64, f64)) -> (f64, f64, f64, f64) {
+    let m = SHOT_ID_MARGIN;
+    (x - m, y - m, w + 2.0 * m, h + 2.0 * m)
+}
+
 /// The screenshot's `region` argument: [x, y, w, h], None when absent.
 fn region_arg(a: &Json) -> R<Option<(f64, f64, f64, f64)>> {
     let bad =
@@ -1377,6 +1390,9 @@ impl From<String> for Out {
 /// Image tokens grow with the area: 1024 costs about 0.64 of 1280 and
 /// still shows a 1536 px wide window's text legibly.
 const SHOT_MAX_SIZE: i64 = 1024;
+/// Screen pixels around an element `screenshot(id=…)` shows: enough to see
+/// its label and neighbours, not the whole window.
+const SHOT_ID_MARGIN: f64 = 12.0;
 /// Elements `screenshot(marks=true)` marks at most: enough for a page's
 /// controls in view, few enough to keep the image and legend readable.
 const MARKS_MAX: usize = 40;
@@ -7813,6 +7829,16 @@ impl<B: Backend> Server<B> {
         background: Option<(backend::ShotTarget, bool)>,
     ) -> R<Out> {
         let region = region_arg(a)?;
+        let rid = match a.get("id") {
+            None | Some(Json::Null) => None,
+            Some(v) => Some(
+                v.as_i64()
+                    .ok_or("id must be an element id from tree/find")?,
+            ),
+        };
+        if rid.is_some() && region.is_some() {
+            return Err("pass `region` or `id`, not both".into());
+        }
         // A path to save at is checked before anything is captured.
         let save_to = match a.get("save_to").and_then(Json::as_str) {
             Some(raw) => {
@@ -7825,7 +7851,8 @@ impl<B: Backend> Server<B> {
         };
         // The window captured is the one checked: read once, its app by
         // its process.
-        let (target, behind) = match background {
+        let named = background.is_some();
+        let (mut target, mut behind) = match background {
             Some((t, active)) => (t, !active),
             None => (
                 trace::time("shot_target", self.b.shot_target())
@@ -7833,6 +7860,35 @@ impl<B: Backend> Server<B> {
                     .map_err(|e| format!("screenshot failed: {e}"))?,
                 false,
             ),
+        };
+        // `id`: the element's window, captured where it is when it is
+        // not the one in front (KDE) and no `window` named another.
+        let element = match rid {
+            Some(rid) => {
+                let r = self.resolve_ref(rid).await?;
+                let title = self.b.window_title(&r.id).await.unwrap_or_default();
+                if !same_window(&target.caption, &title) {
+                    let found = match named {
+                        true => None,
+                        false => self.background_shot(&title).await,
+                    };
+                    let Some((t, active)) = found.filter(|(t, _)| same_window(&t.caption, &title))
+                    else {
+                        let how = match named {
+                            true => "",
+                            false => "; pass window=… to bring it to the front",
+                        };
+                        return Err(format!(
+                            "id {rid} is in window {}, not in {}{how}",
+                            render::short_title(&title),
+                            render::short_title(&target.caption)
+                        ));
+                    };
+                    (target, behind) = (t, !active);
+                }
+                Some((rid, r.id))
+            }
+            None => None,
         };
         let app = self.shot_app(&target);
         if !self.is_allowed(&app) {
@@ -7860,27 +7916,62 @@ impl<B: Backend> Server<B> {
         *self.shot_behind.lock().await =
             behind.then(|| (target.handle.clone(), target.caption.clone()));
         // The marks' tree read runs while the window is captured.
+        // So does the element's box read.
         let capture = trace::time("capture", self.b.screenshot(&target));
-        let (shot, found) = if arg_b(a, "marks", false) {
+        let boxed = async {
+            match &element {
+                Some((_, id)) => {
+                    let ids = std::slice::from_ref(id);
+                    trace::time("element_boxes", self.b.element_boxes(&target, ids))
+                        .await
+                        .pop()
+                        .flatten()
+                }
+                None => None,
+            }
+        };
+        let (shot, found, boxed) = if arg_b(a, "marks", false) {
             let marks = trace::time("mark_candidates", self.mark_candidates(&target, &app));
-            let (shot, found) = tokio::join!(capture, marks);
-            (shot, Some(found))
+            let (shot, found, boxed) = tokio::join!(capture, marks, boxed);
+            (shot, Some(found), boxed)
         } else {
-            (capture.await, None)
+            let (shot, boxed) = tokio::join!(capture, boxed);
+            (shot, None, boxed)
         };
         let Shot { path, pixels, area } = shot.map_err(|e| format!("screenshot failed: {e}"))?;
-        let frac = match (zoom, area) {
-            (None, _) => shot::Frac::ALL,
-            (Some((_, want)), Some(area)) => region_frac(area, want).ok_or_else(|| {
+        let erid = element.as_ref().map(|(rid, _)| *rid);
+        let frac = match (zoom, erid, area) {
+            (None, Some(rid), Some(area)) => {
+                let shown = boxed.and_then(|b| region_frac(area, around(b)));
+                shown.ok_or_else(|| {
+                    let _ = std::fs::remove_file(&path);
+                    match boxed {
+                        None => format!("id {rid}: its screen box is unknown here"),
+                        Some(_) => format!(
+                            "id {rid} is outside the window's visible area; \
+                             act scroll_to brings it into view"
+                        ),
+                    }
+                })?
+            }
+            (None, Some(rid), None) => {
+                let _ = std::fs::remove_file(&path);
+                return Err(format!(
+                    "id {rid}: the screen area of the capture is unknown here"
+                ));
+            }
+            (None, None, _) => shot::Frac::ALL,
+            (Some((_, want)), _, Some(area)) => region_frac(area, want).ok_or_else(|| {
                 let _ = std::fs::remove_file(&path);
                 "region is outside the active window now; take a new screenshot".to_string()
             })?,
-            (Some(_), None) => {
+            (Some(_), _, None) => {
                 let _ = std::fs::remove_file(&path);
                 return Err("region: the screen area of the capture is unknown here".into());
             }
         };
-        let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, 8192) as u32;
+        // Claude refuses larger images (shot::MAX_PIXELS is kept too).
+        let max = arg_i(a, "max_size", SHOT_MAX_SIZE).clamp(64, i64::from(shot::MAX_SIDE)) as u32;
         let inline = arg_b(a, "inline", true) && save_to.is_none();
         let (marks, marks_line) = match found {
             Some(found) => {
@@ -7948,6 +8039,12 @@ impl<B: Backend> Server<B> {
             text.push_str(&format!(
                 " (zoom of region [{x}, {y}, {w}, {h}] of the previous screenshot; \
                  image_x/image_y now refer to this image)"
+            ));
+        }
+        if let Some(rid) = erid {
+            text.push_str(&format!(
+                " (element {rid} and {SHOT_ID_MARGIN} px around it; image_x/image_y refer to \
+                 this image)"
             ));
         }
         if let Some(line) = marks_line {
@@ -11697,6 +11794,103 @@ mod tests {
             let r = call_tool(&mut s, 6, "screenshot", json!({})).await;
             assert!(!reply_text(&r).contains("marks"), "{r}");
             assert_eq!(prefetches(&s), before);
+        });
+    }
+
+    #[test]
+    fn a_screenshot_of_an_element_is_a_crop_around_its_box() {
+        local(async {
+            let mut s = session("shot-id");
+            fake_reads(&s);
+            s.sem
+                .boxes
+                .borrow_mut()
+                .insert(30, (50.0, 60.0, 80.0, 20.0));
+            // [1] Save, by the marks.
+            let r = call_tool(&mut s, 2, "screenshot", json!({"marks": true})).await;
+            assert!(
+                reply_text(&r).ends_with("marks: [1] push button 'Save'"),
+                "{r}"
+            );
+            // Its box and 12 px around: screen (38, 48), 104x44; the 2x
+            // capture's pixels (14, 14)-(66, 36), at full resolution.
+            let r = call_tool(&mut s, 3, "screenshot", json!({"id": 1})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            assert_eq!(
+                reply_text(&r),
+                "52x22 px of screen area at (38,48), 104x44 (element 1 and 12 px around \
+                 it; image_x/image_y refer to this image)"
+            );
+            assert_eq!(r["result"]["content"][1]["type"], "image", "{r}");
+            // Its pixels map to the crop.
+            let r = call_tool(
+                &mut s,
+                4,
+                "mouse",
+                json!({"image_x": 6, "image_y": 6, "clicks": 0}),
+            )
+            .await;
+            assert!(reply_text(&r).contains("(51,61)"), "{r}");
+            // Not with region; not an unknown id.
+            let r = call_tool(
+                &mut s,
+                5,
+                "screenshot",
+                json!({"id": 1, "region": [0, 0, 5, 5]}),
+            )
+            .await;
+            assert!(
+                reply_text(&r).contains("pass `region` or `id`, not both"),
+                "{r}"
+            );
+            let r = call_tool(&mut s, 6, "screenshot", json!({"id": 99})).await;
+            assert!(reply_text(&r).contains("unknown id 99"), "{r}");
+            // Out of the window's view, or without a box: said, no image.
+            s.sem
+                .boxes
+                .borrow_mut()
+                .insert(30, (900.0, 900.0, 10.0, 10.0));
+            let r = call_tool(&mut s, 7, "screenshot", json!({"id": 1})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains("id 1 is outside the window's visible area"),
+                "{r}"
+            );
+            s.sem.boxes.borrow_mut().clear();
+            let r = call_tool(&mut s, 8, "screenshot", json!({"id": 1})).await;
+            assert!(
+                reply_text(&r).contains("id 1: its screen box is unknown here"),
+                "{r}"
+            );
+            // In another window: that one is captured where it is (KDE),
+            // else the call says which window to bring forward.
+            s.sem
+                .boxes
+                .borrow_mut()
+                .insert(30, (50.0, 60.0, 80.0, 20.0));
+            s.nodes
+                .borrow_mut()
+                .insert(90, fake_node("frame", "todo.txt — Fake", &[30]));
+            s.shown.parents.borrow_mut().insert(30, 90);
+            let r = call_tool(&mut s, 9, "screenshot", json!({"id": 1})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "id 1 is in window 'todo.txt — Fake', not in 'notes.txt — Fake'; pass \
+                     window=… to bring it to the front"
+                ),
+                "{r}"
+            );
+            s.shown.background_shots.set(true);
+            let r = call_tool(&mut s, 10, "screenshot", json!({"id": 1})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(text.starts_with("52x22 px"), "{r}");
+            assert!(
+                text.contains("captured in background: 'todo.txt — Fake'"),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
         });
     }
 

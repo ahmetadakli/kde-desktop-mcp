@@ -8,7 +8,8 @@ and sends it keys). Starts tools/ci/qt_app.py and the server with an
 allowlist holding only that app, then speaks MCP over stdio: apps, tree,
 find, set_text, get_text, act, activate_window, click, mouse (its hit
 test), focus, type_text, key, a screenshot of a window in the background (and
-one with element marks) and the allowlist's refusals, each checked against what the window shows.
+one with element marks, one of an element) and the allowlist's refusals,
+each checked against what the window shows.
 
 type_text into the multi-line editor inserts through AT-SPI and needs no
 input device. key, and type_text into a line edit (a paste with ctrl+v),
@@ -230,6 +231,28 @@ def marked_screenshot(c: Client, ids: dict) -> None:
          f"{one_line(out)}; {seen or status(c)!r}")
 
 
+def element_screenshot(c: Client, ids: dict) -> None:
+    """screenshot id= captures just the element and a margin around it, in
+    its own window: here the window behind, captured in place."""
+    c.call("activate_window", query=OTHER)
+    ok, out = c.call("screenshot", id=ids["greet"], inline=False)
+    if not ok and "KWin refused" in out:
+        record("screenshot id= crops to the element", "SKIP",
+               f"KWin refuses ScreenShot2 here: {one_line(out)}")
+        return
+    lines = out.splitlines()
+    if ok and lines[0].endswith(".png"):
+        Path(lines[0]).unlink(missing_ok=True)
+    m = re.search(r"(\d+)x(\d+) px of screen area", out)
+    whole = re.search(r"(\d+)x(\d+) px", c.text("screenshot", window=TITLE, max_size=2576))
+    small = bool(m and whole) and int(m.group(1)) < int(whole.group(1)) \
+        and int(m.group(2)) < int(whole.group(2))
+    step("screenshot id= crops to the element in its window",
+         ok and f"(element {ids['greet']} and 12 px around it" in out
+         and "captured in background" in out and small, one_line(out))
+    c.call("activate_window", query=TITLE)
+
+
 def wait_idle_while_ticking(c: Client) -> None:
     """wait_idle settles on a window whose clock never stops changing: after
     2 s of change events it compares the content, digits aside."""
@@ -327,6 +350,8 @@ def run(c: Client, input_mode: str) -> None:
     background_screenshot(c)
 
     marked_screenshot(c, ids)
+
+    element_screenshot(c, ids)
 
     wait_idle_while_ticking(c)
 

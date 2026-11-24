@@ -73,6 +73,27 @@ pub fn fit((w, h): (u32, u32), max_w: u32, max_h: u32) -> (u32, u32) {
     )
 }
 
+/// Longest side of an image Claude takes as it is: larger ones are refused
+/// by newer models, not shrunk.
+pub const MAX_SIDE: u32 = 2576;
+/// Most pixels of an image Claude takes (about 3.7 megapixels).
+pub const MAX_PIXELS: u64 = 3_700_000;
+
+/// `fit` in `max` x `max`, and then in MAX_PIXELS.
+pub fn fit_sent(size: (u32, u32), max: u32) -> (u32, u32) {
+    let (w, h) = fit(size, max, max);
+    let area = u64::from(w) * u64::from(h);
+    if area <= MAX_PIXELS {
+        return (w, h);
+    }
+    let s = (MAX_PIXELS as f64 / area as f64).sqrt();
+    // Rounded down: the result stays within the limit.
+    (
+        ((f64::from(w) * s).floor() as u32).max(1),
+        ((f64::from(h) * s).floor() as u32).max(1),
+    )
+}
+
 /// Fixed-point unit of the shrink weights: the shares of the source pixels
 /// under one output pixel add up to exactly this.
 const ONE: u32 = 1 << 16;
@@ -491,7 +512,7 @@ pub fn finish(
                 let img = read_png(path)?;
                 if whole
                     && marks.is_empty()
-                    && fit((img.width, img.height), max, max) == (img.width, img.height)
+                    && fit_sent((img.width, img.height), max) == (img.width, img.height)
                 {
                     let png = std::fs::read(path).map_err(|e| e.to_string())?;
                     return Ok(Finished {
@@ -522,7 +543,7 @@ pub fn finish(
             };
             (crop(&img, r), kept)
         };
-        let (w, h) = fit((img.width, img.height), max, max);
+        let (w, h) = fit_sent((img.width, img.height), max);
         let img = if (w, h) == (img.width, img.height) {
             img
         } else {
@@ -597,6 +618,17 @@ mod tests {
         assert_eq!(fit((720, 1280), 1280, 1280), (720, 1280));
         assert_eq!(fit((800, 600), 1280, 1280), (800, 600));
         assert_eq!(fit((4000, 10), 100, 100), (100, 1));
+    }
+
+    #[test]
+    fn a_sent_image_stays_within_claudes_size_limits() {
+        assert_eq!(fit_sent((1920, 1080), 1024), (1024, 576));
+        assert_eq!(fit_sent((5120, 1440), MAX_SIDE), (2576, 725));
+        // Square at the side limit: 6.6 MP, cut to 3.7 MP.
+        let (w, h) = fit_sent((4000, 4000), MAX_SIDE);
+        assert!(u64::from(w) * u64::from(h) <= MAX_PIXELS, "{w}x{h}");
+        assert_eq!((w, h), (1923, 1923));
+        assert_eq!(fit_sent((800, 600), MAX_SIDE), (800, 600));
     }
 
     #[test]

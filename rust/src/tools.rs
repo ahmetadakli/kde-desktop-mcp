@@ -512,13 +512,14 @@ pub fn tools() -> Json {
         ),
         t(
             "screenshot",
-            "Last resort only: capture the active window (or `window`'s, on KDE in place). The image comes back in the\nreply (JPEG when much smaller than PNG), shrunk so its longer side is at\nmost `max_size` px; `inline`=false instead saves a PNG and returns only\nits path (`save_to`: a new .png path in a folder of yours under home). Also says which screen area it shows. Prefer tree/find; they also list web page popups and\nmenus. `marks`=true draws the ids of visible interactive elements on it\n(and lists them) for act/click by id; else pass a pixel position to mouse\nas image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution; image_x/image_y then refer to the zoomed image.",
+            "Last resort only: capture the active window (or `window`'s, on KDE in place). The image comes back in the\nreply (JPEG when much smaller than PNG), shrunk so its longer side is at\nmost `max_size` px (up to 2576); `inline`=false instead saves a PNG and returns only\nits path (`save_to`: a new .png path in a folder of yours under home). Prefer tree/find; they also list web page popups and\nmenus. `marks`=true draws the ids of visible interactive elements on it\n(and lists them) for act/click by id; else pass a pixel position to mouse\nas image_x/image_y. To read small text, zoom: `region`=[x, y, w, h]\nin pixels of the last screenshot captures again and returns just that part\nat up to full resolution, or `id` just that element; image_x/image_y then refer to the zoomed image.",
             schema(&[
                 ("max_size", "integer", Some(json!(1024))),
                 ("inline", "boolean", Some(json!(true))),
                 ("save_to", "string", Some(Json::Null)),
                 ("region", "array", Some(Json::Null)),
                 ("marks", "boolean", Some(json!(false))),
+                ("id", "integer", Some(Json::Null)),
             ])
         ),
         t(
