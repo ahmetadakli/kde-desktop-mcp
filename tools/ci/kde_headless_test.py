@@ -191,7 +191,13 @@ def background_screenshot(c: Client) -> None:
     if not step("activate_window raises the second window", ok, one_line(out)):
         return
     ok, out = c.call("screenshot", window=TITLE)
-    if not ok and "KWin refused" in out:
+    if ok and "captured in background" not in out:
+        # Refused where it is (no ScreenShot2 grant): brought forward and
+        # captured in the same call instead.
+        apps = c.text("apps")
+        front = [line for line in apps.splitlines() if "[active]" in line]
+        step("a refused background capture brings the window forward in one call",
+             any(TITLE in line for line in front), one_line(out))
         record("screenshot captures a window in the background", "SKIP",
                f"KWin refuses ScreenShot2 here: {one_line(out)}")
         return
@@ -205,13 +211,19 @@ def background_screenshot(c: Client) -> None:
     ok, out = c.call("mouse", image_x=10, image_y=10, clicks=0)
     step("its pixels are not used while the window is behind",
          not ok and "in the background" in out and "nothing sent" in out, one_line(out))
+    ok, out = c.call("screenshot", region=[0, 0, 40, 30], inline=False)
+    lines = out.splitlines()
+    if ok and lines[0].endswith(".png"):
+        Path(lines[0]).unlink(missing_ok=True)
+    step("a region zoom is of the window captured behind, not the one in front",
+         ok and "captured in background" in out and "zoom of region" in out, one_line(out))
 
 
 def marked_screenshot(c: Client, ids: dict) -> None:
     """screenshot marks=true numbers the window's controls (here the window
     behind, captured in place) and the ids it lists act like find's."""
     ok, out = c.call("screenshot", window=TITLE, marks=True, inline=False)
-    if not ok and "KWin refused" in out:
+    if ok and "captured in background" not in out:
         record("screenshot marks=true lists the window's controls", "SKIP",
                f"KWin refuses ScreenShot2 here: {one_line(out)}")
         return
@@ -236,7 +248,7 @@ def element_screenshot(c: Client, ids: dict) -> None:
     its own window: here the window behind, captured in place."""
     c.call("activate_window", query=OTHER)
     ok, out = c.call("screenshot", id=ids["greet"], inline=False)
-    if not ok and "KWin refused" in out:
+    if (ok and "captured in background" not in out) or (not ok and "KWin refused" in out):
         record("screenshot id= crops to the element", "SKIP",
                f"KWin refuses ScreenShot2 here: {one_line(out)}")
         return
@@ -277,7 +289,14 @@ def wait_idle_while_ticking(c: Client) -> None:
 
 def kept_read_outlives_think_time(c: Client) -> None:
     """A read of an app heard sending change events is reused after a pause
-    longer than the 2 s kept for other apps (DESKTOP_MCP_TRACE's lines)."""
+    longer than the 2 s kept for other apps (DESKTOP_MCP_TRACE's lines),
+    where the user's input is watched."""
+    name = "a kept read is reused 3 s later"
+    if "not watching user input" in c.text("doctor"):
+        record(name, "SKIP", "no source of the user's input works here: reads last 2 s")
+        return
+    # Past the tail of the last input, when a smooth scroll may still move.
+    time.sleep(1)
     c.text("find", app=APP, query="Greet", role="button")
     seen = c.log.stat().st_size
     time.sleep(3)
@@ -285,7 +304,6 @@ def kept_read_outlives_think_time(c: Client) -> None:
     with c.log.open(encoding="utf-8", errors="replace") as f:
         f.seek(seen)
         lines = [line.strip() for line in f if "kept read" in line]
-    name = "a kept read is reused 3 s later"
     if any("kept read of" in line for line in lines):
         step(name, True)
     elif any("too old" in line for line in lines):
