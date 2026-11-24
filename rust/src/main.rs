@@ -1176,6 +1176,9 @@ const NO_CONTENT_ROLES: [&str; 22] = [
 /// Roles of a focused element where Enter types (a new line, a command),
 /// besides multi-line text fields: no content wait.
 const NO_CONTENT_KEY_ROLES: [&str; 2] = ["terminal", "document text"];
+/// How many ancestors of a pixel click's element are asked whether one
+/// clicks them (a link holds a heading, a span, an image).
+const CLICK_ANCESTORS: usize = 6;
 /// Size of the tree `observe: "tree"` returns.
 const OBSERVE_TREE_NODES: i64 = 150;
 const OBSERVE_TREE_CHARS: usize = 6000;
@@ -7260,24 +7263,31 @@ impl<B: Backend> Server<B> {
         }
         let app = self.require_input_front().await?;
         // The element under the pointer, read before the input changes
-        // the page: the reply names it, and a left click waits for the
-        // page as a click by id does.
-        let (guard, hit) = tokio::join!(
-            self.guard_point(x, y),
-            trace::time("element_at", self.b.element_at(x, y))
-        );
+        // the page: the reply names it, and a left click on something one
+        // clicks (a link, a button, or inside one) waits for the page as a
+        // click by id does; one on text, a double or triple click does not.
+        let waits = button == "left" && clicks == 1 && mods.is_empty();
+        let hit = async {
+            let hit = trace::time("element_at", self.b.element_at(x, y)).await;
+            let role = match &hit {
+                Some(h) if waits => self.clicked_role(&h.id, &h.info.role).await,
+                _ => None,
+            };
+            hit.map(|h| (h, role))
+        };
+        let (guard, hit) = tokio::join!(self.guard_point(x, y), hit);
         guard?;
-        let hit = hit.filter(|h| self.is_allowed(&h.app));
-        let pre = self.pre_content(hit.as_ref().map(|h| &h.id));
+        let hit = hit.filter(|(h, _)| self.is_allowed(&h.app));
+        let pre = self.pre_content(hit.as_ref().map(|(h, _)| &h.id));
         self.with_modifiers(
             &mods,
             self.b.pointer(x, y, &button, clicks, arg_i(a, "scroll", 0)),
         )
         .await?;
         let on = match hit {
-            Some(Focused { id, info, app: of }) => {
-                if button == "left" && clicks > 0 && mods.is_empty() {
-                    self.note_content(pre, &id, &info.role, false).await;
+            Some((Focused { id, info, app: of }, role)) => {
+                if let Some(role) = role {
+                    self.note_content(pre, &id, &role, false).await;
                 }
                 let rid = self.add_ref(&id, &info, &of.to_lowercase()).await;
                 note_step_element(rid, false);
@@ -7288,6 +7298,26 @@ impl<B: Backend> Server<B> {
         };
         let m = with_modifiers_note(&mods);
         Ok(format!("pointer at ({x},{y}) in {app}{on}{m}"))
+    }
+
+    /// The role of what a click on `id` (of role `role`) operates: it, or
+    /// the nearest of a few ancestors one clicks (a link around a heading);
+    /// None for text, images and other parts of a page.
+    async fn clicked_role(&self, id: &B::Id, role: &str) -> Option<String> {
+        let (mut cur, mut role) = (id.clone(), role.to_string());
+        for _ in 0..CLICK_ANCESTORS {
+            if render::INTERACTIVE_ROLES.contains(&role.as_str()) {
+                return Some(role);
+            }
+            if render::DOCUMENT_ROLES.contains(&role.as_str())
+                || matches!(role.as_str(), "frame" | "window")
+            {
+                return None;
+            }
+            cur = self.b.parent(&cur).await?;
+            role = self.b.identity(&cur).await.0;
+        }
+        None
     }
 
     /// Press (`down`, the default) or release a key, chord or mouse button
@@ -17379,6 +17409,24 @@ mod tests {
                 "{text}"
             );
             assert!(start.elapsed() < Duration::from_millis(300));
+            // A click on text, or a double click: no wait either; one on
+            // text inside a link waits for the link's page.
+            s.nodes
+                .borrow_mut()
+                .insert(40, fake_node("paragraph", "Some text", &[]));
+            s.nodes
+                .borrow_mut()
+                .insert(41, fake_node("link", "More", &[40]));
+            s.sem.points.borrow_mut().push(((80, 90), 40, "fake"));
+            let start = Instant::now();
+            let r = call_tool(&mut s, 6, "mouse", json!({"x": 80, "y": 90})).await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            let r = call_tool(&mut s, 7, "mouse", json!({"x": 40, "y": 50, "clicks": 2})).await;
+            assert!(!reply_text(&r).contains("page"), "{r}");
+            assert!(start.elapsed() < Duration::from_millis(300));
+            s.shown.parents.borrow_mut().insert(40, 41);
+            let r = call_tool(&mut s, 8, "mouse", json!({"x": 80, "y": 90})).await;
+            assert!(reply_text(&r).contains("; no page change seen in"), "{r}");
         });
     }
 

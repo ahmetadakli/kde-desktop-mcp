@@ -578,7 +578,7 @@ impl<Id> Walk<'_, Id> {
 
 /// Roles one operates whatever actions the platform lists (AT-SPI, then
 /// UI Automation names).
-const INTERACTIVE_ROLES: [&str; 25] = [
+pub const INTERACTIVE_ROLES: [&str; 25] = [
     "push button",
     "button",
     "toggle button",
