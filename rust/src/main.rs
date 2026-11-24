@@ -478,6 +478,9 @@ struct Server<B: Backend> {
     /// The handle and caption of the window the last screenshot captured
     /// in the background: its pixels are only clicked once it is in front.
     shot_behind: Mutex<Option<(String, String)>>,
+    /// The handle and caption of the window the last screenshot captured:
+    /// a `region` of it is zoomed into that window, not another.
+    shot_window: Mutex<Option<(String, String)>>,
     /// Held by tools that send keyboard or pointer input, so two concurrent
     /// calls never interleave their events.
     input: Mutex<()>,
@@ -1941,6 +1944,7 @@ impl<B: Backend> Server<B> {
             shown_pending: Mutex::new(None),
             last_shot: Mutex::new(None),
             shot_behind: Mutex::new(None),
+            shot_window: Mutex::new(None),
             input: Mutex::new(()),
             inert_writes: Mutex::new(HashSet::new()),
             held: std::sync::Mutex::new(Vec::new()),
@@ -7890,6 +7894,35 @@ impl<B: Backend> Server<B> {
             }
             None => None,
         };
+        // The zoom's screen area, from the map of the image it was read
+        // in: of the window that image showed, captured again where it is
+        // when another one is in front now.
+        let zoom = match region {
+            Some(r) => {
+                let map = (*self.last_shot.lock().await)
+                    .ok_or("region needs a screenshot taken first (its pixels)")?;
+                let shown = self.shot_window.lock().await.clone();
+                if let Some((handle, caption)) =
+                    shown.filter(|(h, _)| !h.is_empty() && *h != target.handle)
+                {
+                    let again = match named {
+                        true => None,
+                        false => self.background_shot(&caption).await,
+                    };
+                    let Some((t, active)) = again.filter(|(t, _)| t.handle == handle) else {
+                        return Err(format!(
+                            "region is of the screenshot of {}, not of {}; take a new \
+                             screenshot",
+                            render::short_title(&caption),
+                            render::short_title(&target.caption)
+                        ));
+                    };
+                    (target, behind) = (t, !active);
+                }
+                Some((r, map.area_of(r)))
+            }
+            None => None,
+        };
         let app = self.shot_app(&target);
         if !self.is_allowed(&app) {
             if behind {
@@ -7903,16 +7936,8 @@ impl<B: Backend> Server<B> {
             return Err(self.active_refusal(&target.app, Some(&target)).await);
         }
         self.permit(&app).await?;
-        // The zoom's screen area, from the map of the image it was read in.
-        let zoom = match region {
-            Some(r) => {
-                let map = (*self.last_shot.lock().await)
-                    .ok_or("region needs a screenshot taken first (its pixels)")?;
-                Some((r, map.area_of(r)))
-            }
-            None => None,
-        };
         *self.last_shot.lock().await = None;
+        *self.shot_window.lock().await = None;
         *self.shot_behind.lock().await =
             behind.then(|| (target.handle.clone(), target.caption.clone()));
         // The marks' tree read runs while the window is captured.
@@ -7998,6 +8023,7 @@ impl<B: Backend> Server<B> {
         });
         let map = area.and_then(|a| ShotMap::new(done.size, a));
         *self.last_shot.lock().await = map;
+        *self.shot_window.lock().await = Some((target.handle.clone(), target.caption.clone()));
         let (iw, ih) = done.size;
         // The image inline is all the agent sees (it is told not to read
         // the file): no path to read, no file left behind. Only
@@ -16150,6 +16176,37 @@ mod tests {
             let r = call_tool(&mut s, 5, "screenshot", json!({"window": "todo"})).await;
             assert_ne!(r["result"]["isError"], true, "{r}");
             assert!(!reply_text(&r).contains("background"), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_region_is_zoomed_into_the_window_the_last_screenshot_showed() {
+        local(async {
+            let mut s = session("zoom-background");
+            s.shown.background_shots.set(true);
+            call_tool(&mut s, 2, "screenshot", json!({"window": "todo"})).await;
+            // Not the window in front: the one captured, again where it is.
+            let r = call_tool(&mut s, 3, "screenshot", json!({"region": [10, 10, 20, 20]})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            let text = reply_text(&r);
+            assert!(
+                text.contains("captured in background: 'todo.txt — Fake'")
+                    && text.contains("(zoom of region [10, 10, 20, 20]"),
+                "{r}"
+            );
+            assert!(s.keys.borrow().is_empty(), "{:?}", s.keys.borrow());
+            let r = call_tool(&mut s, 4, "mouse", json!({"image_x": 5, "image_y": 5})).await;
+            assert!(reply_text(&r).contains("in the background"), "{r}");
+            // Where it cannot be: refused, never the front window's pixels.
+            s.shown.background_shots.set(false);
+            let r = call_tool(&mut s, 5, "screenshot", json!({"region": [1, 1, 5, 5]})).await;
+            assert_eq!(r["result"]["isError"], true, "{r}");
+            assert!(
+                reply_text(&r).contains(
+                    "region is of the screenshot of 'todo.txt — Fake', not of 'notes.txt — Fake'"
+                ),
+                "{r}"
+            );
         });
     }
 
