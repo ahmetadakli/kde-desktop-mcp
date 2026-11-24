@@ -332,6 +332,12 @@ pub fn replace_edit_text(h: HWND, text: &str) -> bool {
     send(logic::EM_SETSEL, 0, -1) && send(logic::EM_REPLACESEL, 1, wide.as_ptr() as isize)
 }
 
+/// Whether the window `h`'s thread answers a message within `ms` (a hung
+/// or busy app does not; nor then does its UI Automation provider).
+pub fn answers(h: HWND, ms: u32) -> bool {
+    unsafe { SendMessageTimeoutW(h, 0, WPARAM(0), LPARAM(0), SMTO_ABORTIFHUNG, ms, None).0 != 0 }
+}
+
 pub fn is_minimized(h: HWND) -> bool {
     unsafe { IsIconic(h) }.as_bool()
 }

@@ -72,6 +72,10 @@ const RESTORE_WAIT: Duration = Duration::from_millis(500);
 /// read once in the background (`warm_up`).
 static INSTALLED_HOSTED: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
 
+/// How long the window in front may take to answer before a pixel click
+/// goes without naming the element under it (KDE's limit is 40 ms).
+const HIT_ANSWER_MS: u32 = 40;
+
 pub struct WindowsBackend {
     uia: Uia,
     clip: clipboard::Clipboard,
@@ -641,10 +645,16 @@ impl Backend for WindowsBackend {
 
     async fn element_at(&self, x: i64, y: i64) -> Option<Focused<Elem>> {
         let (x, y) = (i32::try_from(x).ok()?, i32::try_from(y).ok()?);
+        // The calls below wait for the app's provider and block the
+        // server: not for an app that is busy or hung (often why a pixel
+        // click is used), whose click must not wait for a name.
+        let front = input::root(input::foreground());
+        if !wm::answers(front, HIT_ANSWER_MS) {
+            return None;
+        }
         let (hit, p) = self.uia.element_from_point(x, y)?;
         // Only an element of the window in front, whose box holds the
         // point: else no name rather than a wrong one.
-        let front = input::root(input::foreground());
         let h = self.uia.window_handle(&hit.el)?;
         if input::root(input::hwnd_from_i32(h)) != front {
             return None;
