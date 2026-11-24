@@ -594,6 +594,25 @@ impl Uia {
         Some(unsafe { p.ScrollIntoView() }.is_ok())
     }
 
+    /// The nearest of `el`'s three closest ancestors that `keep` accepts,
+    /// with its properties.
+    pub fn ancestor_where(
+        &self,
+        el: &IUIAutomationElement,
+        keep: impl Fn(&Props) -> bool,
+    ) -> Option<(Elem, Props)> {
+        let walker = unsafe { self.auto.ControlViewWalker() }.ok()?;
+        let mut cur = el.clone();
+        for _ in 0..3 {
+            cur = unsafe { walker.GetParentElement(&cur) }.ok()?;
+            let p = self.fetch(&cur)?;
+            if keep(&p) {
+                return Some((Self::wrap(cur, false), p));
+            }
+        }
+        None
+    }
+
     /// The nearest ancestor of `el` that is on screen and scrolls (a
     /// ScrollPattern that says it can): a list, a web page.
     pub fn scroll_container(&self, el: &IUIAutomationElement) -> Option<Elem> {
