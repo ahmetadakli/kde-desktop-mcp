@@ -322,11 +322,19 @@ fn frame_in<Id: Clone + Eq + std::hash::Hash>(cache: &Cache<Id>, id: &Id) -> Opt
     // its ACTIVE state is never set, so the frame above it counts.
     let mut walk = backend::WindowWalk::default();
     let mut cur = id;
+    let mut below: Option<&Id> = None;
     for _ in 0..=cache.len() {
         let info = cache.get(cur)?;
+        // A top-level of another role (a plain Qt widget is a "filler")
+        // is the window: the level right under the application.
+        if info.role == "application" {
+            let end: Option<&Id> = walk.end();
+            return end.or(below).cloned();
+        }
         if let Some(w) = walk.step(cur, &info.role) {
             return Some(w.clone());
         }
+        below = Some(cur);
         match parents.get(cur) {
             Some(Some(p)) => cur = p,
             // Listed by two parents: not known for sure.
@@ -18298,6 +18306,16 @@ mod tests {
         assert_eq!(frame_in(&cache, &4), Some(1));
         assert_eq!(frame_in(&cache, &1), Some(1));
         assert_eq!(frame_in(&cache, &9), None);
+        // A top-level that is no frame (a plain Qt widget: "filler") is
+        // the window when the walk reaches the application.
+        let mut app: Cache<u32> = Cache::new();
+        app.insert(10, node("application", &[11, 12]));
+        app.insert(11, node("filler", &[13]));
+        app.insert(12, node("filler", &[14]));
+        app.insert(13, node("push button", &[]));
+        app.insert(14, node("label", &[]));
+        assert_eq!(frame_in(&app, &13), Some(11));
+        assert_eq!(frame_in(&app, &14), Some(12));
         // Listed by two parents: not known for sure.
         cache.insert(6, node("panel", &[4]));
         assert_eq!(frame_in(&cache, &4), None);

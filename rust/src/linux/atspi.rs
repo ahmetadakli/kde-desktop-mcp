@@ -1160,11 +1160,18 @@ impl A11y {
     pub async fn frame_of(&self, o: &Obj) -> Option<Obj> {
         let mut walk = crate::backend::WindowWalk::default();
         let mut cur = Some(o.clone());
+        let mut below: Option<Obj> = None;
         while let Some(c) = cur {
             let (role, parent) = tokio::join!(self.role(&c), self.parent(&c));
-            if let Some(w) = walk.step(c, &role) {
+            // A top-level of another role (a plain Qt widget is a "filler")
+            // is the window: the level right under the application.
+            if role == "application" {
+                return walk.end().or(below);
+            }
+            if let Some(w) = walk.step(c.clone(), &role) {
                 return Some(w);
             }
+            below = Some(c);
             cur = parent;
         }
         walk.end()
