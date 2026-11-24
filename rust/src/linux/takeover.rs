@@ -253,13 +253,23 @@ fn read(mut dev: EvDevice, t: &Takeover, chord: Option<&Chord>) {
 /// sends no button for it).
 const TAP_MAX: Duration = Duration::from_millis(300);
 
+/// The part of a touchpad's width and height along its right and bottom
+/// edges where one finger may scroll (libinput's edge scrolling, about
+/// 7 mm of a touchpad).
+const EDGE_PERCENT: i32 = 10;
+
 /// Tells a device's plain pointer motion from input that may change what
 /// apps show (`Takeover::user_motion`, `Takeover::user_input`): keys,
-/// buttons, wheels, a drag, a touchpad tap or multi-finger scroll, any
-/// touch of a touchscreen.
+/// buttons, wheels, a drag, a touchpad tap, multi-finger or edge scroll,
+/// any touch of a touchscreen.
 struct Sorter {
-    /// A touchpad: one finger on it only moves the pointer.
+    /// A touchpad: one finger on it only moves the pointer, but along its
+    /// edges it may scroll.
     touchpad: bool,
+    /// Where a touchpad's scroll edges start (ABS_X, ABS_Y), when known.
+    edges: (Option<i32>, Option<i32>),
+    /// The finger's position on the touchpad (ABS_X, ABS_Y).
+    pos: (Option<i32>, Option<i32>),
     /// A touchscreen or tablet surface: touching it presses.
     direct: bool,
     /// Keys and buttons held now (left variants).
@@ -275,15 +285,27 @@ impl Sorter {
         let keys = dev.supported_keys();
         let has = |k| keys.is_some_and(|s| s.contains(k));
         let direct = dev.properties().contains(PropType::DIRECT);
-        Sorter::of(
-            !direct && has(KeyCode::BTN_TOOL_FINGER) && !has(KeyCode::BTN_TOOL_PEN),
-            direct,
-        )
+        let touchpad = !direct && has(KeyCode::BTN_TOOL_FINGER) && !has(KeyCode::BTN_TOOL_PEN);
+        let mut sorter = Sorter::of(touchpad, direct);
+        if touchpad && let Ok(axes) = dev.get_absinfo() {
+            for (axis, info) in axes {
+                let (lo, hi) = (info.minimum(), info.maximum());
+                let edge = (hi > lo).then(|| hi - (hi - lo) * EDGE_PERCENT / 100);
+                match axis {
+                    AbsoluteAxisCode::ABS_X => sorter.edges.0 = edge,
+                    AbsoluteAxisCode::ABS_Y => sorter.edges.1 = edge,
+                    _ => {}
+                }
+            }
+        }
+        sorter
     }
 
     fn of(touchpad: bool, direct: bool) -> Self {
         Sorter {
             touchpad,
+            edges: (None, None),
+            pos: (None, None),
             direct,
             held: HashSet::new(),
             touched: None,
@@ -346,12 +368,25 @@ impl Sorter {
                 let drag = self.held.iter().any(|&k| self.drags(k));
                 self.note(Device::Pointer, !motion || drag);
             }
-            EventSummary::AbsoluteAxis(..) => {
+            EventSummary::AbsoluteAxis(_, axis, value) => {
+                match axis {
+                    AbsoluteAxisCode::ABS_X => self.pos.0 = Some(value),
+                    AbsoluteAxisCode::ABS_Y => self.pos.1 = Some(value),
+                    _ => {}
+                }
                 let drag = self.held.iter().any(|&k| self.drags(k));
-                self.note(Device::Pointer, self.direct || drag);
+                self.note(Device::Pointer, self.direct || drag || self.on_edge());
             }
             _ => {}
         }
+    }
+
+    /// Whether a finger touches a touchpad along an edge it scrolls by.
+    fn on_edge(&self) -> bool {
+        let past = |pos: Option<i32>, edge: Option<i32>| pos.zip(edge).is_some_and(|(p, e)| p >= e);
+        self.touchpad
+            && self.touched.is_some()
+            && (past(self.pos.0, self.edges.0) || past(self.pos.1, self.edges.1))
     }
 
     /// What the events fed since the last call were: the device, and
@@ -733,6 +768,23 @@ mod tests {
         sort(&mut pad, &up, late);
         assert_eq!(
             sort(&mut pad, &[abs()], late),
+            Some((Device::Pointer, false))
+        );
+        // One finger along an edge scrolls (libinput's edge scrolling).
+        pad.edges = (Some(900), Some(500));
+        let at = |x| ev(evdev::EventType::ABSOLUTE, AbsoluteAxisCode::ABS_X.0, x);
+        sort(&mut pad, &down, t0);
+        assert_eq!(
+            sort(&mut pad, &[at(950)], t0),
+            Some((Device::Pointer, true))
+        );
+        assert_eq!(
+            sort(&mut pad, &[at(400)], t0),
+            Some((Device::Pointer, false))
+        );
+        sort(&mut pad, &up, late);
+        assert_eq!(
+            sort(&mut pad, &[at(950)], late),
             Some((Device::Pointer, false))
         );
         // A touchscreen presses where it is touched.
