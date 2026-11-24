@@ -25,8 +25,8 @@ use windows::Win32::UI::HiDpi::{
 };
 
 use crate::backend::{
-    Activated, AppEntry, Backend, Cache, Check, Clip, FileDialog, Info, Launched, NO_AREA, Page, R,
-    Screen, Shot, ShotTarget, WindowChange, WindowEntry, WindowGeo,
+    Activated, AppEntry, Backend, Cache, Check, Clip, FileDialog, Focused, Info, Launched, NO_AREA,
+    Page, R, Screen, Shot, ShotTarget, WindowChange, WindowEntry, WindowGeo,
 };
 use crate::delivery::nothing_sent;
 use crate::launch_pick::{self as pick, Found};
@@ -637,6 +637,28 @@ impl Backend for WindowsBackend {
 
     async fn scroll_container(&self, id: &Elem) -> Option<Elem> {
         self.uia.scroll_container(&id.el)
+    }
+
+    async fn element_at(&self, x: i64, y: i64) -> Option<Focused<Elem>> {
+        let (x, y) = (i32::try_from(x).ok()?, i32::try_from(y).ok()?);
+        let (hit, p) = self.uia.element_from_point(x, y)?;
+        // Only an element of the window in front, whose box holds the
+        // point: else no name rather than a wrong one.
+        let front = input::root(input::foreground());
+        let h = self.uia.window_handle(&hit.el)?;
+        if input::root(input::hwnd_from_i32(h)) != front {
+            return None;
+        }
+        let (l, t, r, b) = self.uia.bounds(&hit.el)?;
+        if !(l..r).contains(&x) || !(t..b).contains(&y) {
+            return None;
+        }
+        let info = self.info_of(&hit.el, &p, input::hwnd_i32(front), 0, Vec::new());
+        Some(Focused {
+            app: input::window_app(front, p.pid),
+            id: hit,
+            info,
+        })
     }
 
     async fn element_center(&self, id: &Elem) -> R<(i32, i32)> {

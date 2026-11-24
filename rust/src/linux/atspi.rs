@@ -739,6 +739,22 @@ impl A11y {
         (path.as_str() != NULL_PATH).then(|| Obj::new(&bus, path))
     }
 
+    /// Component.GetAccessibleAtPoint: the child of `o` (some toolkits: a
+    /// deeper descendant) at (`x`, `y`) in `coord` coordinates; None
+    /// without one.
+    pub async fn accessible_at_point(&self, o: &Obj, x: i32, y: i32, coord: u32) -> Option<Obj> {
+        let (bus, path): (String, OwnedObjectPath) = self
+            .call(
+                o,
+                "org.a11y.atspi.Component",
+                "GetAccessibleAtPoint",
+                &(x, y, coord),
+            )
+            .await
+            .ok()?;
+        (path.as_str() != NULL_PATH && !bus.is_empty()).then(|| Obj::new(&bus, path))
+    }
+
     pub async fn actions(&self, o: &Obj) -> Vec<String> {
         let list: R<Vec<(String, String, String)>> = self
             .call(o, "org.a11y.atspi.Action", "GetActions", &())

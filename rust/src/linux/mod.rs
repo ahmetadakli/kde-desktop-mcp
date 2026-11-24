@@ -142,6 +142,19 @@ fn zero_size(ext: &R<(i32, i32, i32, i32)>) -> bool {
     matches!(ext, Ok((_, _, w, h)) if *w <= 0 || *h <= 0)
 }
 
+/// Whether a box (x, y, w, h) with area holds the point (`px`, `py`).
+fn box_holds((x, y, w, h): (i32, i32, i32, i32), px: i32, py: i32) -> bool {
+    w > 0 && h > 0 && (x..x + w).contains(&px) && (y..y + h).contains(&py)
+}
+
+/// Whether a showing top-level of the app in front that is not its
+/// active window may cover a point of it: anything but another frame or
+/// dialog (behind the active one) and a tool tip (a popup menu or a
+/// combo box's list is its own window, placed where AT-SPI does not say).
+fn may_cover(role: &str) -> bool {
+    !matches!(role, "frame" | "dialog" | "tool tip")
+}
+
 /// Screen centre of an element from its extents in window coordinates
 /// and the active window's origin, once its window is known to be active.
 /// An element without an area says so whether its window is active or not.
@@ -177,6 +190,14 @@ const FOCUS_POLL: Duration = Duration::from_millis(20);
 /// The same for Gecko, which applies focus in the page's own process: a
 /// grab that works may show only after tens of ms there.
 const FOCUS_POLL_GECKO: Duration = Duration::from_millis(150);
+/// Longest `element_at` takes before giving up (it runs before a pointer
+/// input): about 40 levels of a web page's tree read one by one.
+const HIT_LIMIT: Duration = Duration::from_millis(40);
+/// Levels `element_at` descends from the window.
+const HIT_DEPTH: usize = 40;
+/// How recent `active_app`'s look at the app in front must be for
+/// `element_at` to take its answer (the input tool's check just ran it).
+const HIT_ACTIVE_AGE: Duration = Duration::from_millis(1000);
 const APP_ROOT: &str = "/org/a11y/atspi/accessible/root";
 const NOT_A_FILE_DIALOG: &str = "the active window is not a KDE file dialog";
 /// Roles holding rows of data (files, places) or tool buttons, never the
@@ -1132,6 +1153,92 @@ impl LinuxBackend {
             .any(|st| atspi::has(st.unwrap_or(0), atspi::ACTIVE))
     }
 
+    /// `element_at` on KDE: AT-SPI reports boxes in window coordinates, so
+    /// the point goes into the active window (KWin's client origin), and
+    /// GetAccessibleAtPoint descends from that window's frame. Unsure (no
+    /// name): the AT-SPI app in front has no ACTIVE window, a popup of it
+    /// shows, the point is outside the frame, or the element's box does
+    /// not hold it.
+    async fn kde_element_at(&self, kwin: &KWin, x: i64, y: i64) -> Option<Focused<Obj>> {
+        let a11y = &self.a11y;
+        let bus = match a11y.recent_active_bus(HIT_ACTIVE_AGE) {
+            Some(bus) => bus,
+            None => {
+                a11y.active_app().await;
+                a11y.recent_active_bus(HIT_ACTIVE_AGE)?
+            }
+        };
+        let app = Obj::new(&bus, OwnedObjectPath::try_from(APP_ROOT).ok()?);
+        let (origin, windows) = tokio::join!(kwin.active_window_origin(), a11y.children(&app));
+        let states = futures_util::future::join_all(windows.iter().map(|w| a11y.states(w))).await;
+        let mut frame = None;
+        let mut others = Vec::new();
+        for (w, st) in windows.iter().zip(states) {
+            let st = st.unwrap_or(0);
+            if atspi::has(st, atspi::ACTIVE) && frame.is_none() {
+                frame = Some(w.clone());
+            } else if atspi::has(st, atspi::SHOWING) {
+                others.push(w);
+            }
+        }
+        let frame = frame?;
+        let roles = futures_util::future::join_all(others.iter().map(|w| a11y.role(w))).await;
+        if roles.iter().any(|r| may_cover(r)) {
+            return None;
+        }
+        let (gx, gy) = origin.ok()?;
+        let (wx, wy) = (
+            (x as f64 - gx).floor() as i32,
+            (y as f64 - gy).floor() as i32,
+        );
+        if !box_holds(
+            a11y.extents(&frame, atspi::COORD_WINDOW).await.ok()?,
+            wx,
+            wy,
+        ) {
+            return None;
+        }
+        let mut cur = frame.clone();
+        for _ in 0..HIT_DEPTH {
+            match a11y
+                .accessible_at_point(&cur, wx, wy, atspi::COORD_WINDOW)
+                .await
+            {
+                Some(c) if c != cur => cur = c,
+                _ => break,
+            }
+        }
+        if cur == frame {
+            return None;
+        }
+        let root = Self::app_of(&cur);
+        let (ext, (role, name), states, app_name) = tokio::join!(
+            a11y.extents(&cur, atspi::COORD_WINDOW),
+            a11y.identity(&cur),
+            a11y.states(&cur),
+            a11y.name(&root)
+        );
+        let st = states?;
+        if !box_holds(ext.ok()?, wx, wy) || !atspi::has(st, atspi::SHOWING) || role.is_empty() {
+            return None;
+        }
+        let info = Info {
+            role,
+            name,
+            states: atspi::state_labels(Some(st)),
+            showing: true,
+            actions: Vec::new(),
+            text: None,
+            children: Vec::new(),
+            operable: false,
+        };
+        Some(Focused {
+            id: cur,
+            info,
+            app: app_name,
+        })
+    }
+
     /// Whether the window holding `id` (its nearest frame, window or
     /// dialog ancestor) is ACTIVE.
     async fn frame_active(&self, id: &Obj) -> bool {
@@ -1840,6 +1947,16 @@ impl Backend for LinuxBackend {
             info,
             app: name,
         })
+    }
+
+    async fn element_at(&self, x: i64, y: i64) -> Option<Focused<Obj>> {
+        // Hyprland: no name rather than one off by a toolkit's shadow
+        // (see `hypr_center`).
+        let Compositor::Kde(kwin) = &self.comp else {
+            return None;
+        };
+        let hit = tokio::time::timeout(HIT_LIMIT, self.kde_element_at(kwin, x, y)).await;
+        hit.ok().flatten()
     }
 
     async fn is_focused(&self, id: &Obj) -> bool {
@@ -2709,6 +2826,23 @@ fn is_client(me: &crate::selfguard::SelfClient, pid: u32) -> bool {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_hit_needs_a_box_that_holds_the_point_and_no_popup_over_it() {
+        assert!(box_holds((10, 20, 30, 40), 10, 20));
+        assert!(box_holds((10, 20, 30, 40), 39, 59));
+        // Right and bottom edges are outside; no area holds nothing.
+        assert!(!box_holds((10, 20, 30, 40), 40, 30));
+        assert!(!box_holds((10, 20, 30, 40), 15, 60));
+        assert!(!box_holds((10, 20, 0, 40), 10, 30));
+        assert!(!box_holds((-1, -1, -1, -1), -1, -1));
+        for role in ["frame", "dialog", "tool tip"] {
+            assert!(!may_cover(role), "{role}");
+        }
+        for role in ["menu", "popup menu", "window", "list"] {
+            assert!(may_cover(role), "{role}");
+        }
+    }
 
     fn chain(list: &[(&str, bool)]) -> Vec<(String, bool)> {
         list.iter().map(|(r, s)| (r.to_string(), *s)).collect()

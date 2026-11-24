@@ -7053,14 +7053,35 @@ impl<B: Backend> Server<B> {
             self.check_button_free(&button)?;
         }
         let app = self.require_input_front().await?;
-        self.guard_point(x, y).await?;
+        // The element under the pointer, read before the input changes
+        // the page: the reply names it, and a left click waits for the
+        // page as a click by id does.
+        let (guard, hit) = tokio::join!(
+            self.guard_point(x, y),
+            trace::time("element_at", self.b.element_at(x, y))
+        );
+        guard?;
+        let hit = hit.filter(|h| self.is_allowed(&h.app));
+        let pre = self.pre_content(hit.as_ref().map(|h| &h.id));
         self.with_modifiers(
             &mods,
             self.b.pointer(x, y, &button, clicks, arg_i(a, "scroll", 0)),
         )
         .await?;
+        let on = match hit {
+            Some(Focused { id, info, app: of }) => {
+                if button == "left" && clicks > 0 && mods.is_empty() {
+                    self.note_content(pre, &id, &info.role, false).await;
+                }
+                let rid = self.add_ref(&id, &info, &of.to_lowercase()).await;
+                note_step_element(rid, false);
+                let at = if clicks > 0 { "on" } else { "over" };
+                format!(" {at} {}", render::describe(&info, rid))
+            }
+            None => String::new(),
+        };
         let m = with_modifiers_note(&mods);
-        Ok(format!("pointer at ({x},{y}) in {app}{m}"))
+        Ok(format!("pointer at ({x},{y}) in {app}{on}{m}"))
     }
 
     /// Press (`down`, the default) or release a key, chord or mouse button
@@ -8735,6 +8756,8 @@ mod tests {
     /// timeout; key presses and actions are logged.
     /// A window's x, y, width and height.
     type Frame = (f64, f64, f64, f64);
+    /// A screen point, the element `element_at` finds there and its app.
+    type FakePoint = ((i64, i64), u32, &'static str);
 
     struct FakeBackend {
         allow_file: PathBuf,
@@ -8827,6 +8850,8 @@ mod tests {
         /// `select_item` adds to the selection, as AT-SPI's SelectChild
         /// does in a multi-selection list that is not cleared first.
         adds: std::cell::Cell<bool>,
+        /// `element_at`: the element at each point, and its app.
+        points: RefCell<Vec<FakePoint>>,
         /// The user types once this many more key presses went out.
         user_after_presses: std::cell::Cell<Option<usize>>,
         /// `labels` per element.
@@ -9279,6 +9304,17 @@ mod tests {
         async fn still_there(&self, _: &u32) -> bool {
             self.reads.checks.set(self.reads.checks.get() + 1);
             !self.reads.gone.get()
+        }
+        async fn element_at(&self, x: i64, y: i64) -> Option<Focused<u32>> {
+            let points = self.sem.points.borrow().clone();
+            let (_, id, app) = points.into_iter().find(|(p, ..)| *p == (x, y))?;
+            let mut info = self.info(&id, 0).await;
+            info.children.clear();
+            Some(Focused {
+                id,
+                info,
+                app: app.into(),
+            })
         }
         async fn focused(&self) -> Option<Focused<u32>> {
             Some(Focused {
@@ -16267,6 +16303,98 @@ mod tests {
                 "{r}"
             );
             assert!(start.elapsed() < Duration::from_millis(500));
+        });
+    }
+
+    #[test]
+    fn a_pixel_click_names_the_element_under_it_and_waits_for_the_page() {
+        local(async {
+            let mut s = session("mouse-hit");
+            fake_page(&s);
+            s.sem.points.borrow_mut().push(((40, 50), 31, "fake"));
+            s.reads
+                .next
+                .replace(vec![(250, Some((30, "Saved".into()))), (300, None)]);
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "mouse", json!({"x": 40, "y": 50})).await;
+            let text = reply_text(&r);
+            assert!(
+                text.starts_with("pointer at (40,50) in fake on [")
+                    && text.contains("] push button \"Open\"; page changed (settled after "),
+                "{text}"
+            );
+            assert!(start.elapsed() >= Duration::from_millis(450));
+            // The id it printed is usable.
+            let id = id_before(text, "Open");
+            let r = call_tool(&mut s, 3, "get_text", json!({"id": id})).await;
+            assert_ne!(r["result"]["isError"], true, "{r}");
+            // The next read sees the new content.
+            let r = call_tool(&mut s, 4, "find", json!({"app": "fake", "query": "Saved"})).await;
+            assert!(reply_text(&r).contains("push button \"Saved\""), "{r}");
+        });
+    }
+
+    #[test]
+    fn a_pixel_input_names_nothing_it_is_unsure_of_and_waits_only_after_a_left_click() {
+        local(async {
+            let mut s = session("mouse-unsure");
+            fake_page(&s);
+            {
+                let mut points = s.sem.points.borrow_mut();
+                points.push(((40, 50), 31, "fake"));
+                points.push(((60, 70), 30, "notallowed"));
+            }
+            // No element found there: no name, no wait.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 2, "mouse", json!({"x": 1, "y": 1})).await;
+            assert_eq!(reply_text(&r), "pointer at (1,1) in fake", "{r}");
+            assert!(start.elapsed() < Duration::from_millis(300));
+            // An element of an app not on the allowlist is not named.
+            let r = call_tool(&mut s, 3, "mouse", json!({"x": 60, "y": 70})).await;
+            assert_eq!(reply_text(&r), "pointer at (60,70) in fake", "{r}");
+            // A move names what it is over; a right click what it is on:
+            // neither waits for the page.
+            let start = Instant::now();
+            let r = call_tool(&mut s, 4, "mouse", json!({"x": 40, "y": 50, "clicks": 0})).await;
+            let text = reply_text(&r);
+            assert!(text.contains(" over [") && !text.contains("page"), "{text}");
+            let r = call_tool(
+                &mut s,
+                5,
+                "mouse",
+                json!({"x": 40, "y": 50, "button": "right"}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains(" on [") && text.contains("\"Open\"") && !text.contains("page"),
+                "{text}"
+            );
+            assert!(start.elapsed() < Duration::from_millis(300));
+        });
+    }
+
+    #[test]
+    fn a_batch_step_after_a_pixel_click_takes_the_element_it_named() {
+        local(async {
+            let mut s = session("mouse-step");
+            fake_reads(&s);
+            s.sem.points.borrow_mut().push(((40, 50), 31, "fake"));
+            let r = call_tool(
+                &mut s,
+                2,
+                "batch",
+                json!({"steps": [
+                    {"tool": "mouse", "args": {"x": 40, "y": 50}},
+                    {"tool": "get_text", "args": {"id": "$1"}}]}),
+            )
+            .await;
+            let text = reply_text(&r);
+            assert!(
+                text.contains("on [1] push button \"Open\"")
+                    && text.contains("[2] get_text: (empty: the element has no text)"),
+                "{text}"
+            );
         });
     }
 

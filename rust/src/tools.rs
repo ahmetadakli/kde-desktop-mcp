@@ -422,7 +422,7 @@ pub fn tools() -> Json {
         ),
         t(
             "mouse",
-            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. A right click lists the menu it opened with ids (opened: …; Linux; Windows: menus).",
+            "Fallback pointer input: move, then click (`clicks`=0 to only move, 2 =\ndouble, 3 = triple) and/or scroll (positive\n= down), with `modifiers` (ctrl, shift, alt, meta) held meanwhile. Give\neither screen coordinates `x`/`y`, or `image_x`/`image_y`: a pixel\nposition in the last screenshot, converted to the screen for you (window\nposition and display scaling included). With a button held (hold), a move\ndrags. The reply names the element under it with an id. A right click lists the menu it\nopened with ids (opened: …; Linux; Windows: menus).",
             schema(&[
                 ("x", "integer", Some(Json::Null)),
                 ("y", "integer", Some(Json::Null)),

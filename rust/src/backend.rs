@@ -800,6 +800,13 @@ pub trait Backend {
     async fn focused(&self) -> Option<Focused<Self::Id>> {
         None
     }
+    /// The deepest element at screen point (`x`, `y`) in the active
+    /// window, as `focused` gives one (role, name and states; its app).
+    /// None when unsure: the point is outside that window, a popup of its
+    /// app may cover it, or the element's box does not hold the point.
+    async fn element_at(&self, _x: i64, _y: i64) -> Option<Focused<Self::Id>> {
+        None
+    }
     /// Focus without synthesising pointer input. Ok(Some(method)) when it
     /// worked, Ok(None) so the caller can fall back to a click.
     async fn try_focus(&self, id: &Self::Id) -> R<Option<String>>;

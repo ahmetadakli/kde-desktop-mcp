@@ -6,7 +6,8 @@ Run by kde_headless.sh inside the CI container, after it started its own
 KWin and D-Bus session; it refuses to run anywhere else (it starts a window
 and sends it keys). Starts tools/ci/qt_app.py and the server with an
 allowlist holding only that app, then speaks MCP over stdio: apps, tree,
-find, set_text, get_text, act, activate_window, focus, type_text, key and
+find, set_text, get_text, act, activate_window, click, mouse (its hit
+test), focus, type_text, key and
 the allowlist's refusals, each checked against what the window shows.
 
 type_text into the multi-line editor inserts through AT-SPI and needs no
@@ -157,6 +158,29 @@ def input_tests(c: Client, ids: dict, mode: str) -> None:
     step("type_text into a line edit (paste)", ok and bool(got), one_line(out))
 
 
+def pointer_hit_test(c: Client, ids: dict) -> None:
+    """mouse at a button's pixels names the button (an AT-SPI hit test, so
+    it holds whether or not the pointer input arrives)."""
+    if not os.access("/dev/uinput", os.W_OK):
+        record("mouse names the element under it", "SKIP",
+               "/dev/uinput is missing or not writable here (no pointer device)")
+        return
+    ok, out = c.call("click", id=ids["greet"], clicks=0, window=TITLE)
+    m = re.search(r"at (-?\d+),(-?\d+)", out)
+    if not step("click with clicks=0 gives the button's centre", ok and bool(m), one_line(out)):
+        return
+    x, y = int(m.group(1)), int(m.group(2))
+    ok, out = c.call("mouse", x=x, y=y, clicks=0)
+    step("mouse over a button names it", ok and re.search(r' over \[\d+\] [^"]*"Greet"', out)
+         is not None, one_line(out))
+    ok, out = c.call("mouse", x=x, y=y)
+    m = re.search(r' on \[(\d+)\] [^"]*"Greet"', out)
+    step("mouse click on a button names it", ok and bool(m), one_line(out))
+    if m:
+        ok, got = c.call("get_text", id=int(m.group(1)))
+        step("the id a mouse reply names is usable", ok, one_line(got))
+
+
 def run(c: Client, input_mode: str) -> None:
     ok, out = c.call("doctor")
     print(f"--- doctor ---\n{out}\n---", flush=True)
@@ -195,6 +219,8 @@ def run(c: Client, input_mode: str) -> None:
 
     ok, out = c.call("activate_window", query=TITLE)
     step("activate_window raises the test window", ok, one_line(out))
+
+    pointer_hit_test(c, ids)
 
     ok, out = c.call("focus", id=ids["notes"])
     step("focus moves to the editor", ok, one_line(out))
