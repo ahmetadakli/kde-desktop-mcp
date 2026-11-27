@@ -1,6 +1,6 @@
 {
   "name": "desktop-mcp-windows",
-  "version": "0.18.0",
+  "version": "0.19.0",
   "description": "The desktop MCP server on Windows 10 and 11: UI Automation targeting with real keyboard and mouse input.",
   "author": {
     "name": "Ahmet Adaklı",
